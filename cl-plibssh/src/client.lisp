@@ -1,0 +1,525 @@
+(in-package #:cl-pnet-ssh)
+
+;;;; The libssh client role.  The session is put in non-blocking mode from the
+;;;; first byte, and every libssh call is retried from the event loop: a call
+;;;; that would wait returns SSH_AGAIN and the descriptor watch comes back when
+;;;; the socket moves.  Name resolution happens off the loop through
+;;;; BALKORT-RESOLVE and the TCP connection is made here, because libssh's
+;;;; SSH_OPTIONS_HOST path would call getaddrinfo on this thread.
+
+(defconstant +ssh-eof+ -127)
+
+;;; EINPROGRESS and friends; connect(2) says "wait for writability" this way.
+(defparameter *connect-pending-errno* '(36 37 114 115))
+
+;;; ---- Small helpers ----
+
+(defun ssh-plibssh-close-fd (fd)
+  (when (and fd (not (minusp fd)))
+    (cl-pnet-sockets:c-close fd)))
+
+(defun ssh-plibssh-host-spec (client)
+  "The host as known_hosts spells it: bracketed on a non-default port."
+  (if (= (ssh-client-port client) 22)
+      (ssh-client-host client)
+      (format nil "[~A]:~D" (ssh-client-host client) (ssh-client-port client))))
+
+(defun ssh-plibssh-known-hosts-files (client)
+  "The known-hosts files CLIENT checks, in order."
+  (let ((source (ssh-client-known-hosts client)))
+    (cond
+      ((null source)
+       (list (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))))
+      ((listp source) source)
+      (t (list source)))))
+
+(defun ssh-plibssh-remember-host-key (client key-blob)
+  "Record KEY-BLOB in the first known-hosts file, trust-on-first-use."
+  (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+    (declare (ignore data))
+    (ssh-remember-known-host (first (ssh-plibssh-known-hosts-files client))
+                             (ssh-plibssh-host-spec client)
+                             type key-blob)))
+
+(defun ssh-plibssh-known-host-status (client key-blob)
+  "How KEY-BLOB stands for CLIENT's host across every known-hosts file."
+  (let ((host (ssh-plibssh-host-spec client))
+        (status :unknown))
+    (dolist (file (ssh-plibssh-known-hosts-files client) status)
+      (case (ssh-known-host-status file host key-blob)
+        (:match (return :match))
+        (:mismatch (setf status :mismatch))))))
+
+(defun ssh-plibssh-verify-host-key (client)
+  "Apply CLIENT's host-key policy to the key the server presented, or signal."
+  (let* ((blob (ssh-plibssh-server-key-blob client))
+         (fingerprint (and blob (ssh-key-fingerprint blob))))
+    (unless blob
+      (error 'ssh-host-key-error
+             :detail "the server did not present a host key"))
+    (setf (ssh-client-host-key-blob client) blob)
+    (ecase (ssh-plibssh-known-host-status client blob)
+      (:match t)
+      (:mismatch
+       (error 'ssh-host-key-error
+              :detail (format nil "the host key for ~A changed"
+                              (ssh-plibssh-host-spec client))
+              :fingerprint fingerprint))
+      (:unknown
+       (ssh-plibssh-accept-unknown-host-key client blob fingerprint)))))
+
+(defun ssh-plibssh-accept-unknown-host-key (client blob fingerprint)
+  "Decide what to do with a host key never seen before."
+  (let ((policy (ssh-client-host-key-policy client)))
+    (cond
+      ((eq policy :insecure) nil)
+      ((eq policy :accept-new)
+       (ssh-plibssh-remember-host-key client blob))
+      ((eq policy :strict)
+       (error 'ssh-host-key-error
+              :detail "the host key is not in known_hosts"
+              :fingerprint fingerprint))
+      ((functionp policy)
+       (when (funcall policy client fingerprint blob)
+         (ssh-plibssh-remember-host-key client blob)))
+      (t (error 'ssh-host-key-error
+                :detail (format nil "unknown host key policy ~S" policy)
+                :fingerprint fingerprint)))))
+
+(defun ssh-plibssh-server-key-blob (client)
+  "The host key CLIENT's server presented, as the SSH wire blob."
+  (cffi:with-foreign-object (pointer :pointer)
+    (when (zerop (ssh-get-server-publickey (ssh-client-session client) pointer))
+      (let ((key (cffi:mem-ref pointer :pointer)))
+        (unwind-protect
+             (ssh-plibssh-public-key-blob key)
+          (ssh-key-free key))))))
+
+;;; ---- TCP connection ----
+
+(defun ssh-plibssh-client-connect-failed (client errno)
+  (ssh-client-fail
+   client
+   (make-condition 'ssh-connection-error
+                   :detail (format nil "could not connect to ~A:~D (~A)"
+                                   (ssh-client-connect-host client)
+                                   (ssh-client-port client)
+                                   (cl-pnet-sockets:c-strerror errno)))))
+
+(defun ssh-plibssh-client-check-connect (client)
+  "The connect socket is writable: see whether the kernel connected it."
+  (multiple-value-bind (errno answered) (cl-pnet-sockets:socket-error
+                                         (ssh-client-fd client))
+    (cond
+      ((not answered) (ssh-plibssh-client-connect-failed
+                       client (cl-pnet-sockets:c-errno)))
+      ((zerop errno) (ssh-plibssh-client-tcp-connected client))
+      (t (ssh-plibssh-client-connect-failed client errno)))))
+
+(defun ssh-plibssh-client-start-tcp (client address)
+  "Open a non-blocking TCP connection to ADDRESS for CLIENT."
+  (multiple-value-bind (socket length)
+      (cl-pnet-sockets:make-sockaddr address (ssh-client-port client))
+    (unless socket
+      (ssh-plibssh-client-connect-failed client 22))
+    (unwind-protect
+         (let ((fd (cl-pnet-sockets:c-socket
+                    (if (cl-pnet-sockets:ipv6-address-p address)
+                        cl-pnet-sockets:+af-inet6+
+                        cl-pnet-sockets:+af-inet+)
+                    cl-pnet-sockets:+sock-stream+
+                    cl-pnet-sockets:+ipproto-tcp+)))
+           (when (minusp fd)
+             (ssh-plibssh-client-connect-failed
+              client (cl-pnet-sockets:c-errno)))
+           (cl-pnet-sockets:set-nonblocking fd)
+           (let ((result (cl-pnet-sockets:c-connect fd socket length))
+                 (errno (cl-pnet-sockets:c-errno)))
+             (cond
+               ((zerop result)
+                (ssh-plibssh-client-take-fd client fd))
+               ((member errno *connect-pending-errno* :test #'eql)
+                (setf (ssh-client-fd client) fd)
+                (setf (ssh-client-watcher client)
+                      (cl-pnet:fd-watch
+                       fd
+                       :on-writable
+                       (lambda (watcher)
+                         (declare (ignore watcher))
+                         (ssh-plibssh-client-check-connect client)))))
+               (t
+                (ssh-plibssh-close-fd fd)
+                (ssh-plibssh-client-connect-failed client errno)))))
+      (cffi:foreign-free socket)))
+  client)
+
+(defun ssh-plibssh-client-take-fd (client fd)
+  "CLIENT's TCP connection is FD: hand it to a session and start SSH."
+  (setf (ssh-client-fd client) fd)
+  (ssh-plibssh-client-tcp-connected client))
+
+(defun ssh-plibssh-client-new-session (client)
+  "Make CLIENT's libssh session, pointed at its already-connected FD."
+  (let ((session (ssh-new)))
+    (when (ssh-plibssh-null-p session)
+      (error 'ssh-connection-error :detail "could not allocate a libssh session"))
+    (setf (ssh-client-session client) session)
+    ;; This library owns ~/.ssh/config; libssh must not read it again behind
+    ;; the caller's back, nor dial from the options it would add.
+    (when (minusp (ssh-plibssh-set-int-option
+                   session +ssh-options-process-config+ 0))
+      (error 'ssh-connection-error
+             :detail (format nil "libssh rejected the config flag: ~A"
+                             (ssh-plibssh-error session))))
+    (when (minusp (ssh-plibssh-set-string-option
+                   session +ssh-options-host+
+                   (ssh-client-connect-host client)))
+      (error 'ssh-connection-error
+             :detail (format nil "libssh rejected the host: ~A"
+                             (ssh-plibssh-error session))))
+    (when (minusp (ssh-plibssh-set-int-option
+                   session +ssh-options-port+ (ssh-client-port client)))
+      (error 'ssh-connection-error
+             :detail (format nil "libssh rejected the port: ~A"
+                             (ssh-plibssh-error session))))
+    (when (ssh-client-user client)
+      (ssh-plibssh-set-string-option session +ssh-options-user+
+                                     (ssh-client-user client)))
+    (when (and (ssh-client-agent client)
+               (not (eq (ssh-client-agent client) t)))
+      (ssh-plibssh-set-string-option session +ssh-options-identity-agent+
+                                     (ssh-client-agent client)))
+    (cffi:with-foreign-object (pointer :int)
+      (setf (cffi:mem-ref pointer :int) (ssh-client-fd client))
+      (when (minusp (ssh-options-set session +ssh-options-fd+ pointer))
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected the socket: ~A"
+                               (ssh-plibssh-error session)))))
+    (ssh-set-blocking session 0)
+    session))
+
+(defun ssh-plibssh-client-tcp-connected (client)
+  "The TCP connection is up: watch it and begin the SSH handshake."
+  (let ((fd (ssh-client-fd client)))
+    (unless (ssh-client-session client)
+      (ssh-plibssh-client-new-session client))
+    (when (ssh-client-watcher client)
+      (let ((watcher (ssh-client-watcher client)))
+        (setf (ssh-client-watcher client) nil)
+        (cl-pnet:fd-unwatch watcher)))
+    (setf (ssh-client-phase client) :kex
+          (ssh-client-watcher client)
+          (cl-pnet:fd-watch
+           fd
+           :on-readable
+           (lambda (watcher)
+             (declare (ignore watcher))
+             (ssh-plibssh-client-pump client))))
+    (ssh-plibssh-client-pump client)
+    client))
+
+;;; ---- Session pump ----
+
+(defun ssh-plibssh-client-sync-watchers (client)
+  "Arm the write watch exactly when libssh is waiting to send."
+  (let ((watcher (ssh-client-write-watcher client))
+        (session (ssh-client-session client))
+        (fd (ssh-client-fd client)))
+    (if (and session fd (not (ssh-client-closed client))
+             (logtest (ssh-get-poll-flags session) +ssh-write-pending+))
+        (unless watcher
+          (setf (ssh-client-write-watcher client)
+                (cl-pnet:fd-watch
+                 fd
+                 :on-writable
+                 (lambda (watcher)
+                   (declare (ignore watcher))
+                   (ssh-plibssh-client-pump client)))))
+        (when watcher
+          (setf (ssh-client-write-watcher client) nil)
+          (cl-pnet:fd-unwatch watcher)))))
+
+(defun ssh-plibssh-client-pump (client)
+  "Advance CLIENT's state machine as far as the socket allows."
+  (when (and (ssh-client-session client)
+             (not (ssh-client-closed client)))
+    (handler-case
+        (progn
+          (ecase (ssh-client-phase client)
+            (:kex (ssh-plibssh-client-drive-connect client))
+            (:auth (ssh-plibssh-client-drive-auth client))
+            (:ready (ssh-plibssh-client-drive-ready client))
+            (:connecting nil)
+            (:closed nil))
+          (ssh-plibssh-client-sync-watchers client))
+      (error (condition) (ssh-client-fail client condition)))))
+
+(defun ssh-plibssh-client-drive-connect (client)
+  "Run SSH-CONNECT until the handshake completes."
+  (let ((rc (ssh-connect (ssh-client-session client))))
+    (cond
+      ((zerop rc)
+       (setf (ssh-client-server-version client)
+             (ssh-get-serverbanner (ssh-client-session client)))
+       (ssh-plibssh-verify-host-key client)
+       (setf (ssh-client-phase client) :auth)
+       (ssh-plibssh-client-drive-auth client))
+      ((= rc +ssh-again+) nil)
+      (t
+       (error 'ssh-connection-error
+              :detail (format nil "SSH handshake failed: ~A"
+                              (ssh-plibssh-error (ssh-client-session client))))))))
+
+;;; ---- Authentication ----
+
+(defun ssh-plibssh-default-key-path ()
+  "~/.ssh/id_ed25519 when it exists, else NIL."
+  (let ((path (merge-pathnames ".ssh/id_ed25519" (user-homedir-pathname))))
+    (when (probe-file path) path)))
+
+(defun ssh-plibssh-key-path (key)
+  (if (typep key 'ssh-private-key)
+      (ssh-private-key-path key)
+      key))
+
+(defun ssh-plibssh-import-key (path passphrase)
+  "Import the private key at PATH, using PASSPHRASE when it is encrypted."
+  (cffi:with-foreign-object (pointer :pointer)
+    (let ((rc (if passphrase
+                  (cffi:with-foreign-string (secret passphrase)
+                    (ssh-pki-import-privkey-file
+                     (namestring path) secret
+                     (cffi:null-pointer) (cffi:null-pointer) pointer))
+                  (ssh-pki-import-privkey-file
+                   (namestring path) (cffi:null-pointer)
+                   (cffi:null-pointer) (cffi:null-pointer) pointer))))
+      (if (zerop rc)
+          (cffi:mem-ref pointer :pointer)
+          (error 'ssh-authentication-error
+                 :detail (format nil "could not load ~A" path))))))
+
+(defun ssh-plibssh-key-sources (client)
+  "The private keys CLIENT may offer, in order, or NIL for agent-only."
+  (or (let ((source (ssh-client-private-key client)))
+        (when source (if (listp source) source (list source))))
+      (unless (ssh-client-agent client)
+        (let ((default (ssh-plibssh-default-key-path)))
+          (unless default
+            (error 'ssh-authentication-error
+                   :detail (concatenate
+                            'string
+                            "no key given: pass PRIVATE-KEY or use "
+                            ":AGENT, or create ~/.ssh/id_ed25519")))
+          (list default)))))
+
+(defun ssh-plibssh-load-client-keys (client passphrase)
+  "Import every key CLIENT may offer, in order."
+  (let ((handles
+          (iter (for key in (ssh-plibssh-key-sources client))
+            (collect (ssh-plibssh-import-key
+                      (or (ssh-plibssh-key-path key)
+                          (error 'ssh-authentication-error
+                                 :detail
+                                 "a private key has no file path libssh can load"))
+                      passphrase)))))
+    (setf (ssh-client-key-handles client) handles
+          (ssh-client-key-index client) 0)))
+
+(defun ssh-plibssh-client-drive-auth (client)
+  "Offer CLIENT's next credential, or the agent's, in non-blocking mode."
+  (let ((rc (if (ssh-client-agent client)
+                (ssh-userauth-agent (ssh-client-session client)
+                                    (ssh-client-user client))
+                (ssh-plibssh-client-drive-key-auth client))))
+    (cond
+      ((zerop rc) (ssh-plibssh-client-ready client))
+      ;; User authentication has its own "try again" code, 4, not the
+      ;; connection-level SSH_AGAIN of -2.
+      ((= rc +ssh-auth-again+) nil)
+      ((= rc +ssh-auth-denied+)
+       (if (and (not (ssh-client-agent client))
+                (ssh-plibssh-client-next-key-p client))
+           (ssh-plibssh-client-drive-auth client)
+           (ssh-client-fail
+            client
+            (make-condition 'ssh-authentication-error
+                            :detail "the server refused every key offered"))))
+      (t
+       (error 'ssh-authentication-error
+              :detail (format nil "authentication failed: ~A"
+                              (ssh-plibssh-error (ssh-client-session client))))))))
+
+(defun ssh-plibssh-client-drive-key-auth (client)
+  "Try the current imported key, or NIL when there is none."
+  (let* ((keys (ssh-client-key-handles client))
+         (index (ssh-client-key-index client))
+         (key (nth index keys)))
+    (if key
+        (ssh-userauth-publickey (ssh-client-session client)
+                                (ssh-client-user client) key)
+        +ssh-auth-denied+)))
+
+(defun ssh-plibssh-client-next-key-p (client)
+  (let ((next (1+ (ssh-client-key-index client))))
+    (when (< next (length (ssh-client-key-handles client)))
+      (setf (ssh-client-key-index client) next)
+      t)))
+
+(defun ssh-plibssh-client-ready (client)
+  "Authenticated: let the application start channels."
+  (setf (ssh-client-phase client) :ready)
+  (when (ssh-client-on-open client)
+    (funcall (ssh-client-on-open client) client))
+  (ssh-plibssh-client-drive-ready client))
+
+;;; ---- Ready state ----
+
+(defun ssh-plibssh-client-channels (client)
+  (iter (for (id channel) in-hashtable (ssh-client-channels client))
+    (declare (ignore id))
+    (collect channel)))
+
+(defun ssh-plibssh-client-drain-messages (client)
+  "Let libssh process packets that carry no channel data.
+
+SSH-CHANNEL-POLL stops calling into libssh once the peer has sent EOF, so
+the CHANNEL-CLOSE that follows would never be seen on a session the server
+keeps open.  SSH-MESSAGE-GET reads and dispatches packets; a client should
+not receive requests, so anything it does report gets the default answer
+and is freed."
+  (let ((session (ssh-client-session client)))
+    (loop
+      (let ((message (ssh-message-get session)))
+        (when (ssh-plibssh-null-p message) (return))
+        (unwind-protect
+             (ssh-message-reply-default message)
+          (ssh-message-free message))))))
+
+(defun ssh-plibssh-client-drive-ready (client)
+  "Give every channel its turn, then notice a server that went away."
+  (ssh-plibssh-client-drain-messages client)
+  (let ((channels (ssh-plibssh-client-channels client)))
+    (iter (for channel in channels)
+      (ssh-plibssh-drive-channel channel))
+    (unless (or (ssh-client-closed client)
+                (plusp (ssh-is-connected (ssh-client-session client))))
+      (ssh-client-finish client :peer-closed :close))))
+
+;;; ---- Closing ----
+
+(defun ssh-plibssh-client-release (client)
+  "Free the session, socket and keys, once."
+  (let ((watcher (ssh-client-watcher client))
+        (write-watcher (ssh-client-write-watcher client))
+        (session (ssh-client-session client))
+        (fd (ssh-client-fd client)))
+    (setf (ssh-client-watcher client) nil
+          (ssh-client-write-watcher client) nil
+          (ssh-client-session client) nil
+          (ssh-client-fd client) nil)
+    (when watcher (cl-pnet:fd-unwatch watcher))
+    (when write-watcher (cl-pnet:fd-unwatch write-watcher))
+    (when session
+      (ssh-disconnect session)
+      (ssh-free session))
+    (ssh-plibssh-close-fd fd)
+    (iter (for key in (ssh-client-key-handles client))
+      (ssh-key-free key))
+    (setf (ssh-client-key-handles client) nil)))
+
+(defun ssh-plibssh-client-terminate-channels (client kind reason)
+  "Report the end of every channel still registered."
+  (let ((channels (ssh-plibssh-client-channels client)))
+    (iter (for channel in channels)
+      (unless (ssh-channel-close-reported channel)
+        (setf (ssh-channel-close-reported channel) t
+              (ssh-channel-state channel) :closed)
+        (ecase kind
+          (:error (when (ssh-channel-on-error channel)
+                    (funcall (ssh-channel-on-error channel) channel reason)))
+          (:close (when (ssh-channel-on-close channel)
+                    (funcall (ssh-channel-on-close channel) channel
+                             (ssh-channel-exit-status channel))))))
+      (remhash (ssh-channel-local-id channel)
+               (ssh-client-channels client)))))
+
+(defun ssh-client-finish (client reason kind)
+  "End CLIENT once, reporting REASON through the callback KIND selects."
+  (unless (ssh-client-closed client)
+    (setf (ssh-client-closed client) t
+          (ssh-client-phase client) :closed
+          (ssh-client-close-reason client) reason)
+    (ssh-plibssh-client-release client)
+    (ssh-plibssh-client-terminate-channels client kind reason)
+    (ecase kind
+      (:error (when (ssh-client-on-error client)
+                (funcall (ssh-client-on-error client) client reason)))
+      (:close (when (ssh-client-on-close client)
+                (funcall (ssh-client-on-close client) client reason))))))
+
+(defun ssh-client-fail (client condition)
+  "End CLIENT because of CONDITION, telling its error callback once."
+  (ssh-client-finish client condition :error))
+
+;;; ---- Entry points ----
+
+(defun make-ssh-client (host
+                        &key
+                          connect-host
+                          (port 22)
+                          (user (ssh-default-user))
+                          private-key
+                          agent
+                          passphrase
+                          known-hosts
+                          (host-key-policy :strict)
+                          host-key-callback
+                          on-open
+                          on-error
+                          on-close)
+  "Connect to HOST as USER, authenticate, return at once.
+
+The libssh backend resolves HOST off the event loop and dials the address
+itself, so no descriptor is ever waited on in the calling thread.  The
+arguments are the same as the pure backend's; HOST is still the name the
+host key is checked under."
+  (let ((client (%make-ssh-client
+                 :host host
+                 :connect-host (or connect-host host)
+                 :port port
+                 :user user
+                 :known-hosts known-hosts
+                 :host-key-policy (or host-key-callback host-key-policy)
+                 :private-key private-key
+                 :agent agent
+                 :passphrase passphrase
+                 :on-open on-open
+                 :on-error on-error
+                 :on-close on-close)))
+    (handler-case
+        (progn
+          (ssh-plibssh-load-client-keys client passphrase)
+          (balkort.resolve:resolve-host
+           (ssh-client-connect-host client)
+           (lambda (address)
+             (unless (ssh-client-closed client)
+               (ssh-plibssh-client-start-tcp client address)))
+           (lambda (condition)
+             (ssh-client-fail
+              client
+              (make-condition 'ssh-connection-error
+                              :detail (format nil "could not resolve ~A: ~A"
+                                              (ssh-client-connect-host client)
+                                              condition))))))
+      (error (condition) (ssh-client-fail client condition)))
+    client))
+
+(defun ssh-client-close (client)
+  "Close CLIENT and report every open channel as closed."
+  (ssh-client-finish client :client-closed :close)
+  client)
+
+(defun ssh-client-host-key-fingerprint (client)
+  "The fingerprint of the key the server presented, once the KEX has seen it."
+  (let ((blob (ssh-client-host-key-blob client)))
+    (and blob (ssh-key-fingerprint blob))))

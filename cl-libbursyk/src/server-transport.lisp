@@ -327,15 +327,6 @@ SSH-WRITE-STRING; writing its raw octets would shift every later field."
               (ssh-ed25519-key-bytes key-blob))))
     (error () nil)))
 
-(defun ssh-server-authorized-key-p (server user key-blob)
-  "Whether KEY-BLOB may log in as USER."
-  (let ((authorize (ssh-server-authorize server)))
-    (cond
-      ((functionp authorize) (funcall authorize user key-blob))
-      ((ssh-server-authorized-keys server)
-       (ssh-authorized-key-blob-p (ssh-server-authorized-keys server) key-blob))
-      (t nil))))
-
 (defun ssh-server-complete-auth (session user key-blob)
   "Accept SESSION's authenticated user, then let the application run."
   (setf (ssh-session-user session) user

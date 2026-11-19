@@ -1,17 +1,15 @@
 (defsystem #:bursyk-server
-  :description "Pure Common Lisp SSH-2 server over cl-pnet"
+  :description "SSH server command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.0"
-  :depends-on (#:cl-libbursyk
-               #:cl-pnet
-               #:balkort-resolve
-               #:iterate
-               #:uiop)
+  :version "0.0.3.0"
+  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cffi #:uiop)
   :serial t
   :components ((:module "src"
                 :serial t
-                :components ((:file "state")
-                             (:file "transport")
-                             (:file "channel")
-                             (:file "server")))))
+                :components ((:file "packages")
+                             (:file "child")
+                             (:file "main"))))
+  :build-operation "program-op"
+  :build-pathname "../_build/bursyk-server"
+  :entry-point "bursyk-server:main")

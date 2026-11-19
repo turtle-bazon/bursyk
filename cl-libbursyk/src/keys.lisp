@@ -10,7 +10,10 @@
   (type nil :type (or null string))
   (public nil :type (or null ssh-octets))
   (private nil :type (or null ssh-octets))
-  (comment "" :type string))
+  (comment "" :type string)
+  ;; Where the key came from, when it came from a file.  The libssh backend
+  ;; hands paths to libssh, so a parsed key is useful to it only with one.
+  (path nil))
 
 (defun ssh-read-octets-file (path)
   "PATH as octets, or signal."
@@ -217,7 +220,9 @@ it.  Only ed25519 keys are supported, and the file must hold one key."
   (let* ((body (ssh-private-key-body (ssh-read-octets-file path)))
          (magic (ssh-check-key-magic body)))
     (declare (ignore magic))
-    (ssh-parse-openssh-private-key body :passphrase passphrase)))
+    (let ((key (ssh-parse-openssh-private-key body :passphrase passphrase)))
+      (setf (ssh-private-key-path key) path)
+      key)))
 
 (defun ssh-public-key-blob-of (private-key)
   "The public key blob of PRIVATE-KEY."

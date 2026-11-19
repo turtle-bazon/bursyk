@@ -205,9 +205,20 @@ its KEXINIT when the connection came up."
       (ssh-client-host client)
       (format nil "[~A]:~D" (ssh-client-host client) (ssh-client-port client))))
 
+(defun ssh-client-known-hosts-files (client)
+  "The known-hosts files CLIENT checks, in order.
+
+KNOWN-HOSTS is one path, a list of paths, or NIL for ~/.ssh/known_hosts."
+  (let ((source (ssh-client-known-hosts client)))
+    (cond
+      ((null source)
+       (list (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))))
+      ((listp source) source)
+      (t (list source)))))
+
 (defun ssh-client-known-hosts-file (client)
-  (or (ssh-client-known-hosts client)
-      (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))))
+  "The first known-hosts file, the one a newly trusted key is written to."
+  (first (ssh-client-known-hosts-files client)))
 
 (defun ssh-client-remember-host-key (client host-key)
   "Record HOST-KEY for this client's host, trust-on-first-use."
@@ -217,11 +228,22 @@ its KEXINIT when the connection came up."
                              (ssh-client-host-spec client)
                              type host-key)))
 
+(defun ssh-client-known-host-status (client host-key)
+  "How HOST-KEY stands for CLIENT's host across every known-hosts file.
+
+A key found in any file wins over a mismatch in another: the same host may
+be listed in both the user's file and the system-wide one."
+  (let ((host (ssh-client-host-spec client))
+        (status :unknown))
+    (dolist (file (ssh-client-known-hosts-files client) status)
+      (case (ssh-known-host-status file host host-key)
+        (:match (return :match))
+        (:mismatch (setf status :mismatch))))))
+
 (defun ssh-client-verify-host-key (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal."
-  (let* ((file (ssh-client-known-hosts-file client))
-         (host (ssh-client-host-spec client))
-         (status (ssh-known-host-status file host host-key))
+  (let* ((host (ssh-client-host-spec client))
+         (status (ssh-client-known-host-status client host-key))
          (fingerprint (ssh-key-fingerprint host-key)))
     (ecase status
       (:match t)
