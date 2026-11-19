@@ -72,6 +72,7 @@ overrides.  NIL leaves the decision to the config and then to
 MAKE-SSH-CLIENT's own defaults."
   (list :host host
         :connect-host (or (ssh-config-options-hostname options) host)
+        :host-key-host (or (ssh-config-options-hostname options) host)
         :port (or port (ssh-config-options-port options) 22)
         :user (or user (ssh-config-options-user options) (ssh-default-user))
         :private-key (ssh-config-client-identities options private-key)
@@ -323,6 +324,7 @@ MAKE-SSH-CLIENT's own defaults."
           (make-ssh-client
            (getf parameters :host)
            :connect-host (or connect-host (getf parameters :connect-host))
+           :host-key-host (getf parameters :host-key-host)
            :connect-port (or connect-port (getf parameters :port))
            :port (getf parameters :port)
            :user (getf parameters :user)

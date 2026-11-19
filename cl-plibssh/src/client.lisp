@@ -19,10 +19,15 @@
     (cl-pnet-sockets:c-close fd)))
 
 (defun ssh-plibssh-host-spec (client)
-  "The host as known_hosts spells it: bracketed on a non-default port."
-  (if (= (ssh-client-port client) 22)
-      (ssh-client-host client)
-      (format nil "[~A]:~D" (ssh-client-host client) (ssh-client-port client))))
+  "The host as known_hosts spells it: bracketed on a non-default port.
+
+HOST-KEY-HOST names the HostName a config alias resolved to, so a
+\"Host gh / HostName github.com\" connection is checked against github.com
+as OpenSSH does, not against the alias."
+  (let ((host (or (ssh-client-host-key-host client) (ssh-client-host client))))
+    (if (= (ssh-client-port client) 22)
+        host
+        (format nil "[~A]:~D" host (ssh-client-port client)))))
 
 (defun ssh-plibssh-known-hosts-files (client)
   "The known-hosts files CLIENT checks, in order."
@@ -80,8 +85,12 @@
               :detail "the host key is not in known_hosts"
               :fingerprint fingerprint))
       ((functionp policy)
-       (when (funcall policy client fingerprint blob)
-         (ssh-plibssh-remember-host-key client blob)))
+       (if (funcall policy client fingerprint blob)
+           (ssh-plibssh-remember-host-key client blob)
+           (error 'ssh-host-key-error
+                  :detail (format nil "the host key for ~A was rejected"
+                                  (ssh-plibssh-host-spec client))
+                  :fingerprint fingerprint)))
       (t (error 'ssh-host-key-error
                 :detail (format nil "unknown host key policy ~S" policy)
                 :fingerprint fingerprint)))))
@@ -510,6 +519,7 @@ and is freed."
 (defun make-ssh-client (host
                         &key
                           connect-host
+                          host-key-host
                           (port 22)
                           connect-port
                           (user (ssh-default-user))
@@ -527,11 +537,13 @@ and is freed."
 The libssh backend resolves HOST off the event loop and dials the address
 itself, so no descriptor is ever waited on in the calling thread.  The
 arguments are the same as the pure backend's; HOST is still the name the
-host key is checked under, and CONNECT-PORT is the port dialled while PORT
-stays the server's logical one."
+host key is checked under, HOST-KEY-HOST overrides that name for known_hosts
+alone, and CONNECT-PORT is the port dialled while PORT stays the server's
+logical one."
   (let ((client (%make-ssh-client
                  :host host
                  :connect-host (or connect-host host)
+                 :host-key-host host-key-host
                  :port port
                  :connect-port (or connect-port port)
                  :user user

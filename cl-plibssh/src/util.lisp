@@ -11,6 +11,10 @@
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
   connect-host
+  ;; The name known_hosts is checked and recorded under when it differs from
+  ;; HOST, as with "Host gh / HostName github.com": OpenSSH looks up the
+  ;; HostName, not the alias the user typed.  NIL means HOST.
+  host-key-host
   (port 22)
   connect-port
   (user nil)

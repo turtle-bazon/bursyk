@@ -402,6 +402,104 @@
   #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-remember-host-key client blob)
   #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-remember-host-key client blob))
 
+(defun client-host-spec-for (client)
+  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-host-spec client)
+  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-host-spec client))
+
+(defun client-accept-unknown-host-key-for (client blob fingerprint)
+  #+ssh-backend-ffi
+  (cl-pnet-ssh::ssh-plibssh-accept-unknown-host-key client blob fingerprint)
+  #-ssh-backend-ffi
+  (cl-pnet-ssh::ssh-client-accept-unknown-host-key client blob fingerprint))
+
+(test client-known-hosts-uses-the-host-name-for-an-alias
+  "A config alias is checked and recorded under its HostName.
+
+OpenSSH treats \"Host gh / HostName github.com\" as a connection to
+github.com for known_hosts: an existing github.com entry must match the
+alias, and trust-on-first-use must write github.com, not gh."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-alias"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "gh" :connect-host "github.com"
+                  :host-key-host "github.com"
+                  :port 22
+                  :known-hosts (list file))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (is (string= "github.com" (client-host-spec-for client)))
+           (ssh-remember-known-host file "github.com" "ssh-ed25519" blob)
+           (is (eq :match (client-known-host-status-for client blob))
+               "the entry under the HostName was not found")
+           ;; Without the override the alias is what gets looked up, so
+           ;; nothing is found for the alias.
+           (let ((alias-only (cl-pnet-ssh::%make-ssh-client
+                              :host "gh" :connect-host "github.com"
+                              :port 22 :known-hosts (list file))))
+             (is (eq :unknown (client-known-host-status-for alias-only blob)))
+             ;; Trust-on-first-use records the HostName too.
+             (let ((trusted (ssh-test-known-host-blob)))
+               (client-remember-host-key-for client trusted)
+               (is (eq :match (ssh-known-host-status file "github.com"
+                                                     trusted)))
+               (is (eq :unknown (ssh-known-host-status file "gh" trusted))))
+             ;; An entry under the alias does not satisfy the override
+             ;; client, which looks under the HostName; the alias-only
+             ;; client does see it.
+             (let ((fresh (ssh-test-known-host-blob)))
+               (ssh-remember-known-host file "gh" "ssh-ed25519" fresh)
+               (is (eq :mismatch (client-known-host-status-for client fresh))
+                   "the alias entry was consulted instead of the HostName's")
+               (is (eq :match (client-known-host-status-for alias-only fresh))))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test client-rejected-host-key-signals
+  "A policy callback that declines an unknown key must refuse the connection.
+
+Returning false is the answer \"no\" to the host-key prompt; silently
+connecting without recording the key would be the opposite of what the
+caller asked for."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-reject"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (fingerprint (ssh-key-fingerprint blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy (lambda (client fingerprint key)
+                                     (declare (ignore client fingerprint key))
+                                     nil))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (signals ssh-host-key-error
+             (client-accept-unknown-host-key-for client blob fingerprint))
+           (is (eq :unknown (client-known-host-status-for client blob))
+               "a rejected key was recorded anyway"))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test client-accepted-host-key-is-recorded
+  "A policy callback that accepts an unknown key records it and does not
+signal, so the override still works."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-accept"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy (lambda (client fingerprint key)
+                                     (declare (ignore client fingerprint key))
+                                     t))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (client-accept-unknown-host-key-for client blob
+                                               (ssh-key-fingerprint blob))
+           (is (eq :match (client-known-host-status-for client blob))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
 (test client-known-hosts-checks-every-file
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khm"))
          (first-file (merge-pathnames "user_known_hosts" directory))
@@ -822,6 +920,77 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
 
+(defun ssh-test-loopback-outcome (policy)
+  "Run one client handshake against a loopback server with POLICY.
+
+Returns (VALUES OPENED ERROR): OPENED is true once authentication completed,
+ERROR is the condition the client reported, if any."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-policy"))
+         (server-key (merge-pathnames "host_key" directory))
+         (client-key (merge-pathnames "client_key" directory))
+         (authorized (merge-pathnames "authorized_keys" directory))
+         (known-hosts (merge-pathnames "known_hosts" directory))
+         (opened nil)
+         (error nil)
+         (server nil)
+         (timeout nil))
+    (ensure-directories-exist server-key)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring server-key)))
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring client-key)))
+           (ssh-test-write-authorized-keys
+            (merge-pathnames "client_key.pub" directory) authorized)
+           (setf server (make-ssh-server "127.0.0.1" 0
+                                         :host-key server-key
+                                         :authorized-keys authorized))
+           (setf timeout
+                 (cl-pnet:timer-start
+                  10 0
+                  (lambda ()
+                    (setf error :timed-out)
+                    (cl-pnet:event-loop-stop))))
+           (make-ssh-client
+            "127.0.0.1"
+            :port (ssh-server-port server)
+            :user "tester"
+            :private-key client-key
+            :known-hosts known-hosts
+            :host-key-policy policy
+            :on-open (lambda (client)
+                       (declare (ignore client))
+                       (setf opened t)
+                       (cl-pnet:event-loop-stop))
+            :on-error (lambda (client condition)
+                        (declare (ignore client))
+                        (setf error condition)
+                        (cl-pnet:event-loop-stop))
+            :on-close (lambda (client reason)
+                        (declare (ignore client reason))
+                        (cl-pnet:event-loop-stop)))
+           (cl-pnet:event-loop-run)
+           (values opened error))
+      (when timeout (cl-pnet:timer-stop timeout))
+      (when server (ssh-server-close server))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test server-loopback-declined-host-key-does-not-connect
+  "Answering \"no\" to an unknown host key must end the handshake.
+
+The callback is the prompt; returning false has to refuse the host rather
+than connect and quietly skip the known_hosts record."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             nil))
+        (is (null opened) "the client authenticated after the key was declined")
+        (is (typep error 'ssh-host-key-error)))))
+
 ;;; ---- ssh_config client policy ----
 ;;;
 ;;; MAKE-SSH-CLIENT-FROM-CONFIG is the library version of what a command
@@ -956,6 +1125,8 @@ Returns (VALUES STDOUT STDERR STATUS)."
            (cl-pnet-ssh::ssh-config-client-parameters "alias" options)))
     (is (equal "alias" (getf parameters :host)))
     (is (equal "real.example" (getf parameters :connect-host)))
+    (is (equal "real.example" (getf parameters :host-key-host))
+        "known_hosts must use the HostName, not the alias")
     (is (= 2200 (getf parameters :port)))
     (is (equal "file-user" (getf parameters :user)))
     (is (equal '("first" "second") (getf parameters :private-key)))

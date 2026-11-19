@@ -200,10 +200,15 @@ its KEXINIT when the connection came up."
 ;;; ---- Host key policy ----
 
 (defun ssh-client-host-spec (client)
-  "The host as known_hosts spells it: bracketed on a non-default port."
-  (if (= (ssh-client-port client) 22)
-      (ssh-client-host client)
-      (format nil "[~A]:~D" (ssh-client-host client) (ssh-client-port client))))
+  "The host as known_hosts spells it: bracketed on a non-default port.
+
+HOST-KEY-HOST names the HostName a config alias resolved to, so a
+\"Host gh / HostName github.com\" connection is checked against github.com
+as OpenSSH does, not against the alias."
+  (let ((host (or (ssh-client-host-key-host client) (ssh-client-host client))))
+    (if (= (ssh-client-port client) 22)
+        host
+        (format nil "[~A]:~D" host (ssh-client-port client)))))
 
 (defun ssh-client-known-hosts-files (client)
   "The known-hosts files CLIENT checks, in order.
@@ -266,8 +271,12 @@ be listed in both the user's file and the system-wide one."
               :detail "the host key is not in known_hosts"
               :fingerprint fingerprint))
       ((functionp policy)
-       (when (funcall policy client fingerprint host-key)
-         (ssh-client-remember-host-key client host-key)))
+       (if (funcall policy client fingerprint host-key)
+           (ssh-client-remember-host-key client host-key)
+           (error 'ssh-host-key-error
+                  :detail (format nil "the host key for ~A was rejected"
+                                  (ssh-client-host-spec client))
+                  :fingerprint fingerprint)))
       (t (error 'ssh-host-key-error
                 :detail (format nil "unknown host key policy ~S" policy)
                 :fingerprint fingerprint)))))
