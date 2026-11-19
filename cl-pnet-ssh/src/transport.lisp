@@ -15,7 +15,8 @@
                                    (string #\Return)
                                    (string #\Newline))))
   (let ((kexinit (ssh-make-kexinit-payload)))
-    (setf (ssh-client-client-kexinit client) kexinit)
+    (setf (ssh-client-client-kexinit client) kexinit
+          (ssh-client-kexinit-sent client) t)
     (ssh-client-send-payload client kexinit)))
 
 (defun ssh-client-read-version-line (client)
@@ -103,7 +104,16 @@ line, and NIL while the line is still incomplete."
 ;;; ---- Key exchange ----
 
 (defun ssh-client-handle-kexinit (client payload)
-  "Remember the peer's offer, choose, and start curve25519."
+  "Remember the peer's offer, choose, and start curve25519.
+
+A server-initiated rekey starts here too. Then we have not sent a KEXINIT for
+this exchange yet, and must do so before ECDH_INIT; the initial exchange sent
+its KEXINIT when the connection came up."
+  (unless (ssh-client-kexinit-sent client)
+    (let ((kexinit (ssh-make-kexinit-payload)))
+      (setf (ssh-client-client-kexinit client) kexinit
+            (ssh-client-kexinit-sent client) t)
+      (ssh-client-send-payload client kexinit)))
   (let ((offers (ssh-parse-kexinit-payload payload)))
     (setf (ssh-client-server-kexinit client) payload
           (ssh-client-negotiated client) (ssh-negotiate offers)
@@ -175,7 +185,8 @@ line, and NIL while the line is still incomplete."
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
                       :decrypt-mac (getf keys :decrypt-mac)
                       :aead (getf keys :aead))
-    (setf (ssh-client-keys-received client) t)
+    (setf (ssh-client-keys-received client) t
+          (ssh-client-kexinit-sent client) nil)
     (ssh-client-maybe-finish-kex client)))
 
 (defun ssh-client-maybe-finish-kex (client)
