@@ -231,6 +231,35 @@
     (is (equalp (ssh-derive-key shared exchange-hash session-id #\D 64)
                 (ssh-concat k1 k2)))))
 
+;;; ---- Rekey ----
+
+(defun kexinit-message-types (already-sent)
+  "Types of the messages HANDLE-KEXINIT sends when our KEXINIT was ALREADY-SENT."
+  (let ((sent '())
+        (client (cl-pnet-ssh::%make-ssh-client)))
+    (setf (cl-pnet-ssh::ssh-client-kexinit-sent client) already-sent)
+    (let ((original (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                   (lambda (client payload)
+                     (declare (ignore client))
+                     (push (aref payload 0) sent)
+                     t))
+             (cl-pnet-ssh::ssh-client-handle-kexinit
+              client (ssh-make-kexinit-payload)))
+        (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload) original)))
+    (nreverse sent)))
+
+(test rekey-sends-our-kexinit-before-ecdh-init
+  ;; A server-initiated exchange has not seen our KEXINIT yet, so both go out;
+  ;; the initial exchange already sent ours and only needs the ECDH half.
+  (is (equal (kexinit-message-types nil)
+             (list cl-pnet-ssh::+ssh-msg-kexinit+
+                   cl-pnet-ssh::+ssh-msg-kex-ecdh-init+)))
+  (is (equal (kexinit-message-types t)
+             (list cl-pnet-ssh::+ssh-msg-kex-ecdh-init+))))
+
 (test plain-hmac-packet-round-trip
   (let* ((mac-key (ssh-random-octets 32))
          (send (ssh-make-cipher-state))

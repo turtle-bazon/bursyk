@@ -16,6 +16,7 @@
   (session-id nil)
   (cipher (ssh-make-cipher-state))
   (client-kexinit nil)
+  (kexinit-sent nil)
   (server-kexinit nil)
   (negotiated nil)
   (ephemeral-private nil)
