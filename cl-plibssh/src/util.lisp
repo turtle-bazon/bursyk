@@ -12,6 +12,7 @@
   host
   connect-host
   (port 22)
+  connect-port
   (user nil)
   session
   (fd nil)

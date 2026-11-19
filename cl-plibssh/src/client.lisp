@@ -103,7 +103,8 @@
    (make-condition 'ssh-connection-error
                    :detail (format nil "could not connect to ~A:~D (~A)"
                                    (ssh-client-connect-host client)
-                                   (ssh-client-port client)
+                                   (or (ssh-client-connect-port client)
+                                       (ssh-client-port client))
                                    (cl-pnet-sockets:c-strerror errno)))))
 
 (defun ssh-plibssh-client-check-connect (client)
@@ -119,7 +120,8 @@
 (defun ssh-plibssh-client-start-tcp (client address)
   "Open a non-blocking TCP connection to ADDRESS for CLIENT."
   (multiple-value-bind (socket length)
-      (cl-pnet-sockets:make-sockaddr address (ssh-client-port client))
+      (cl-pnet-sockets:make-sockaddr
+       address (or (ssh-client-connect-port client) (ssh-client-port client)))
     (unless socket
       (ssh-plibssh-client-connect-failed client 22))
     (unwind-protect
@@ -467,6 +469,7 @@ and is freed."
                         &key
                           connect-host
                           (port 22)
+                          connect-port
                           (user (ssh-default-user))
                           private-key
                           agent
@@ -482,11 +485,13 @@ and is freed."
 The libssh backend resolves HOST off the event loop and dials the address
 itself, so no descriptor is ever waited on in the calling thread.  The
 arguments are the same as the pure backend's; HOST is still the name the
-host key is checked under."
+host key is checked under, and CONNECT-PORT is the port dialled while PORT
+stays the server's logical one."
   (let ((client (%make-ssh-client
                  :host host
                  :connect-host (or connect-host host)
                  :port port
+                 :connect-port (or connect-port port)
                  :user user
                  :known-hosts known-hosts
                  :host-key-policy (or host-key-callback host-key-policy)
