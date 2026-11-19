@@ -36,6 +36,9 @@
 (defconstant +ssh-msg-channel-success+ 99)
 (defconstant +ssh-msg-channel-failure+ 100)
 
+;; Disconnect reason codes (RFC 4250 section 4.2.2).
+(defconstant +ssh-disconnect-by-application+ 11)
+
 ;;; ---- Algorithm preferences ----
 
 (defparameter +ssh-kex-algorithms+
@@ -46,7 +49,25 @@
     "ext-info-c"
     "kex-strict-c-v00@openssh.com"))
 
-(defparameter +ssh-host-key-algorithms+ '("ssh-ed25519"))
+(defparameter +ssh-host-key-algorithms+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    ;; RSA host keys keep the ssh-rsa key format while rsa-sha2 names the
+    ;; signature; SHA-1 ssh-rsa stays last for servers that never learned
+    ;; the newer names.
+    "rsa-sha2-512"
+    "rsa-sha2-256"
+    "ssh-rsa")
+  "Host key algorithms offered to a server, in preference order.")
+
+(defparameter +ssh-server-host-key-algorithms+
+  '("ssh-ed25519")
+  "Host key algorithms the pure server can answer with.
+
+It signs with one ed25519 key, so it must not advertise an RSA or ECDSA
+algorithm a client would then select.")
 
 (defparameter +ssh-ciphers+ '("chacha20-poly1305@openssh.com"))
 
@@ -118,7 +139,7 @@ makes both sides reset packet sequence numbers at NEWKEYS."
                                                   :compressions-c2s))))
     (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c compression)
       (error 'ssh-protocol-error
-             :detail "no common algorithm (need curve25519, ssh-ed25519 and chacha20-poly1305)"))
+             :detail "no common algorithm (need curve25519, a supported host key and chacha20-poly1305)"))
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
           :mac-c2s mac-c2s :mac-s2c mac-s2c
@@ -225,13 +246,42 @@ the client-to-server and server-to-client directions, not the two ends."
     (values (ssh-read-text reader) (ssh-read-string reader))))
 
 (defun ssh-verify-host-signature (host-key-blob signature-blob exchange-hash)
-  "Signal unless SIGNATURE-BLOB by HOST-KEY-BLOB covers EXCHANGE-HASH."
+  "Signal unless SIGNATURE-BLOB by HOST-KEY-BLOB covers EXCHANGE-HASH.
+
+The key blob names the key type; the signature blob names the algorithm.
+An RSA host key keeps the ssh-rsa type while the algorithm says
+rsa-sha2-256 or rsa-sha2-512, exactly as RFC 8332 defines."
   (multiple-value-bind (type key-bytes) (ssh-public-key-parts host-key-blob)
     (multiple-value-bind (algorithm signature)
         (ssh-parse-signature-blob signature-blob)
-      (unless (and (string= type algorithm) (string= type "ssh-ed25519"))
-        (error 'ssh-protocol-error
-               :detail (format nil "host key ~A signed with ~A" type algorithm)))
-      (unless (ssh-ed25519-verify signature exchange-hash key-bytes)
-        (error 'ssh-protocol-error
-               :detail "host key signature does not verify")))))
+      (flet ((verify (ok)
+               (unless ok
+                 (error 'ssh-protocol-error
+                        :detail "host key signature does not verify"))))
+        (cond
+          ((string= type "ssh-ed25519")
+           (unless (string= algorithm "ssh-ed25519")
+             (error 'ssh-protocol-error
+                    :detail (format nil "host key ~A signed with ~A"
+                                    type algorithm)))
+           (verify (ssh-ed25519-verify signature exchange-hash key-bytes)))
+          ((string= type "ssh-rsa")
+           (let ((digest (ssh-rsa-digest-keyword algorithm)))
+             (unless digest
+               (error 'ssh-protocol-error
+                      :detail (format nil "host key ~A signed with ~A"
+                                      type algorithm)))
+             (verify (ssh-rsa-verify key-bytes signature digest
+                                     exchange-hash))))
+          ((member type '("ecdsa-sha2-nistp256"
+                          "ecdsa-sha2-nistp384"
+                          "ecdsa-sha2-nistp521")
+                   :test #'string=)
+           (unless (string= algorithm type)
+             (error 'ssh-protocol-error
+                    :detail (format nil "host key ~A signed with ~A"
+                                    type algorithm)))
+           (verify (ssh-ecdsa-verify key-bytes signature exchange-hash)))
+          (t
+           (error 'ssh-protocol-error
+                  :detail (format nil "unsupported host key type ~A" type))))))))

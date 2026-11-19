@@ -39,6 +39,8 @@
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "client-transport"
                               :if-feature (:not :ssh-backend-ffi))
+                             (:file "client-proxy"
+                              :if-feature (:not :ssh-backend-ffi))
                              (:file "client-channel"
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "client"

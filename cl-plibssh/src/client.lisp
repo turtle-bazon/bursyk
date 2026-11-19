@@ -169,8 +169,12 @@ as OpenSSH does, not against the alias."
   (setf (ssh-client-fd client) fd)
   (ssh-plibssh-client-tcp-connected client))
 
-(defun ssh-plibssh-client-new-session (client)
-  "Make CLIENT's libssh session, pointed at its already-connected FD."
+(defun ssh-plibssh-client-new-session (client &key fd proxy-command)
+  "Make CLIENT's libssh session.
+
+FD is an already-connected socket to hand over.  PROXY-COMMAND instead asks
+libssh to start the helper and run the protocol on its socketpair, so the
+host is named but no descriptor is passed: libssh dials nothing itself."
   (let ((session (ssh-new)))
     (when (ssh-plibssh-null-p session)
       (error 'ssh-connection-error :detail "could not allocate a libssh session"))
@@ -189,7 +193,9 @@ as OpenSSH does, not against the alias."
              :detail (format nil "libssh rejected the host: ~A"
                              (ssh-plibssh-error session))))
     (when (minusp (ssh-plibssh-set-int-option
-                   session +ssh-options-port+ (ssh-client-port client)))
+                   session +ssh-options-port+
+                   (or (ssh-client-connect-port client)
+                       (ssh-client-port client))))
       (error 'ssh-connection-error
              :detail (format nil "libssh rejected the port: ~A"
                              (ssh-plibssh-error session))))
@@ -200,12 +206,19 @@ as OpenSSH does, not against the alias."
                (not (eq (ssh-client-agent client) t)))
       (ssh-plibssh-set-string-option session +ssh-options-identity-agent+
                                      (ssh-client-agent client)))
-    (cffi:with-foreign-object (pointer :int)
-      (setf (cffi:mem-ref pointer :int) (ssh-client-fd client))
-      (when (minusp (ssh-options-set session +ssh-options-fd+ pointer))
+    (when proxy-command
+      (when (minusp (ssh-plibssh-set-string-option
+                     session +ssh-options-proxy-command+ proxy-command))
         (error 'ssh-connection-error
-               :detail (format nil "libssh rejected the socket: ~A"
+               :detail (format nil "libssh rejected the ProxyCommand: ~A"
                                (ssh-plibssh-error session)))))
+    (when fd
+      (cffi:with-foreign-object (pointer :int)
+        (setf (cffi:mem-ref pointer :int) fd)
+        (when (minusp (ssh-options-set session +ssh-options-fd+ pointer))
+          (error 'ssh-connection-error
+                 :detail (format nil "libssh rejected the socket: ~A"
+                                 (ssh-plibssh-error session))))))
     (ssh-set-blocking session 0)
     session))
 
@@ -213,7 +226,7 @@ as OpenSSH does, not against the alias."
   "The TCP connection is up: watch it and begin the SSH handshake."
   (let ((fd (ssh-client-fd client)))
     (unless (ssh-client-session client)
-      (ssh-plibssh-client-new-session client))
+      (ssh-plibssh-client-new-session client :fd (ssh-client-fd client)))
     (when (ssh-client-watcher client)
       (let ((watcher (ssh-client-watcher client)))
         (setf (ssh-client-watcher client) nil)
@@ -225,6 +238,9 @@ as OpenSSH does, not against the alias."
            :on-readable
            (lambda (watcher)
              (declare (ignore watcher))
+             ;; Bytes arrived, which is the proof of life a keepalive is
+             ;; looking for even when libssh consumes the reply internally.
+             (setf (ssh-client-alive-misses client) 0)
              (ssh-plibssh-client-pump client))))
     (ssh-plibssh-client-pump client)
     client))
@@ -249,6 +265,40 @@ as OpenSSH does, not against the alias."
         (when watcher
           (setf (ssh-client-write-watcher client) nil)
           (cl-pnet:fd-unwatch watcher)))))
+
+(defun ssh-plibssh-start-alive-timer (client)
+  "Start the ServerAliveInterval timer once CLIENT can carry channels.
+
+libssh consumes the keepalive reply itself, so the timer treats a readable
+socket in the interval as the proof of life OpenSSH looks for."
+  (when (and (ssh-client-server-alive-interval client)
+             (plusp (ssh-client-server-alive-interval client))
+             (not (ssh-client-alive-timer client)))
+    (setf (ssh-client-alive-timer client)
+          (cl-pnet:timer-start
+           (ssh-client-server-alive-interval client)
+           (ssh-client-server-alive-interval client)
+           (lambda ()
+             (when (and (not (ssh-client-closed client))
+                        (eq (ssh-client-phase client) :ready))
+               (incf (ssh-client-alive-misses client))
+               (let ((count-max (or (ssh-client-server-alive-count-max
+                                     client)
+                                    3)))
+                 (if (and (plusp count-max)
+                          (> (ssh-client-alive-misses client) count-max))
+                     (ssh-client-fail
+                      client
+                      (make-condition
+                       'ssh-connection-error
+                       :detail (format nil "server ~A stopped responding"
+                                       (ssh-client-host client))))
+                     (let ((session (ssh-client-session client)))
+                       (when session
+                         (ssh-send-keepalive session)
+                         ;; libssh may only buffer the request; arm the
+                         ;; write watch so the event loop actually flushes it.
+                         (ssh-plibssh-client-sync-watchers client)))))))))))
 
 (defun ssh-plibssh-client-pump (client)
   "Advance CLIENT's state machine as far as the socket allows."
@@ -283,10 +333,16 @@ as OpenSSH does, not against the alias."
 
 ;;; ---- Authentication ----
 
+(defun ssh-plibssh-default-key-paths ()
+  "The default identity files that exist, in the order OpenSSH offers them."
+  (iter (for name in '("id_ed25519" "id_ecdsa" "id_rsa"))
+    (let ((path (merge-pathnames (format nil ".ssh/~A" name)
+                                 (user-homedir-pathname))))
+      (when (probe-file path) (collect path)))))
+
 (defun ssh-plibssh-default-key-path ()
-  "~/.ssh/id_ed25519 when it exists, else NIL."
-  (let ((path (merge-pathnames ".ssh/id_ed25519" (user-homedir-pathname))))
-    (when (probe-file path) path)))
+  "The first default identity file that exists, or NIL."
+  (first (ssh-plibssh-default-key-paths)))
 
 (defun ssh-plibssh-key-path (key)
   (if (typep key 'ssh-private-key)
@@ -317,15 +373,16 @@ which is also what OpenSSH does when both are available.  NIL is valid when
 an agent is configured, and an error only when neither source exists."
   (or (let ((source (ssh-client-private-key client)))
         (when source (if (listp source) source (list source))))
-      (let ((default (ssh-plibssh-default-key-path)))
+      (let ((defaults (ssh-plibssh-default-key-paths)))
         (cond
-          (default (list default))
+          (defaults defaults)
           ((ssh-client-agent client) nil)
           (t (error 'ssh-authentication-error
                     :detail (concatenate
                              'string
                              "no key given: pass PRIVATE-KEY or use "
-                             ":AGENT, or create ~/.ssh/id_ed25519")))))))
+                             ":AGENT, or create ~/.ssh/id_ed25519, id_ecdsa "
+                             "or id_rsa")))))))
 
 (defun ssh-plibssh-load-client-keys (client passphrase)
   "Import every key CLIENT may offer, in order."
@@ -402,6 +459,8 @@ path rather than hiding a usable key."
 (defun ssh-plibssh-client-ready (client)
   "Authenticated: let the application start channels."
   (setf (ssh-client-phase client) :ready)
+  (ssh-plibssh-cancel-connect-timer client)
+  (ssh-plibssh-start-alive-timer client)
   (when (ssh-client-on-open client)
     (funcall (ssh-client-on-open client) client))
   (ssh-plibssh-client-drive-ready client))
@@ -443,6 +502,7 @@ and is freed."
 
 (defun ssh-plibssh-client-release (client)
   "Free the session, socket and keys, once."
+  (ssh-plibssh-stop-timers client)
   (let ((watcher (ssh-client-watcher client))
         (write-watcher (ssh-client-write-watcher client))
         (session (ssh-client-session client))
@@ -497,23 +557,61 @@ and is freed."
 
 ;;; ---- Entry points ----
 
+(defun ssh-plibssh-client-start-proxy (client)
+  "Let libssh run CLIENT's ProxyCommand and watch the socketpair it uses.
+
+libssh forks the helper itself, expanding %h, %p and %r, and reports the
+socketpair through ssh_get_fd; from there the ordinary handshake and pump
+take over, exactly as on a TCP descriptor."
+  (let* ((session (ssh-plibssh-client-new-session
+                   client :proxy-command (ssh-client-proxy-command client)))
+         (rc (ssh-connect session)))
+    (cond
+      ((or (zerop rc) (= rc +ssh-again+)) nil)
+      (t
+       (error 'ssh-connection-error
+              :detail (format nil "ProxyCommand failed to start: ~A"
+                              (ssh-plibssh-error session)))))
+    (setf (ssh-client-phase client) :kex)
+    (let ((fd (ssh-get-fd session)))
+      (when (minusp fd)
+        (error 'ssh-connection-error
+               :detail "libssh created no descriptor for the ProxyCommand"))
+      (setf (ssh-client-fd client) fd)
+      (setf (ssh-client-watcher client)
+            (cl-pnet:fd-watch
+             fd
+             :on-readable
+             (lambda (watcher)
+               (declare (ignore watcher))
+               (setf (ssh-client-alive-misses client) 0)
+               (ssh-plibssh-client-pump client)))))
+    (ssh-plibssh-client-pump client)
+    client))
+
 (defun ssh-plibssh-start-client (client passphrase)
-  "Load CLIENT's keys, then resolve and dial its address off the loop."
+  "Load CLIENT's keys, then resolve and dial its address off the loop.
+
+A ProxyCommand skips both the resolution and the socket: libssh runs the
+helper and hands back a socketpair to watch."
+  (ssh-plibssh-start-connect-timer client)
   (handler-case
       (progn
         (ssh-plibssh-load-client-keys client passphrase)
-        (balkort.resolve:resolve-host
-         (ssh-client-connect-host client)
-         (lambda (address)
-           (unless (ssh-client-closed client)
-             (ssh-plibssh-client-start-tcp client address)))
-         (lambda (condition)
-           (ssh-client-fail
-            client
-            (make-condition 'ssh-connection-error
-                            :detail (format nil "could not resolve ~A: ~A"
-                                            (ssh-client-connect-host client)
-                                            condition))))))
+        (if (ssh-client-proxy-command client)
+            (ssh-plibssh-client-start-proxy client)
+            (balkort.resolve:resolve-host
+             (ssh-client-connect-host client)
+             (lambda (address)
+               (unless (ssh-client-closed client)
+                 (ssh-plibssh-client-start-tcp client address)))
+             (lambda (condition)
+               (ssh-client-fail
+                client
+                (make-condition 'ssh-connection-error
+                                :detail (format nil "could not resolve ~A: ~A"
+                                                (ssh-client-connect-host client)
+                                                condition)))))))
     (error (condition) (ssh-client-fail client condition))))
 
 (defun make-ssh-client (host
@@ -529,6 +627,10 @@ and is freed."
                           known-hosts
                           (host-key-policy :strict)
                           host-key-callback
+                          connect-timeout
+                          server-alive-interval
+                          (server-alive-count-max 3)
+                          proxy-command
                           on-open
                           on-error
                           on-close)
@@ -539,7 +641,9 @@ itself, so no descriptor is ever waited on in the calling thread.  The
 arguments are the same as the pure backend's; HOST is still the name the
 host key is checked under, HOST-KEY-HOST overrides that name for known_hosts
 alone, and CONNECT-PORT is the port dialled while PORT stays the server's
-logical one."
+logical one.  CONNECT-TIMEOUT and SERVER-ALIVE-INTERVAL work as they do in
+the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
+stream on its pipes instead of dialling."
   (let ((client (%make-ssh-client
                  :host host
                  :connect-host (or connect-host host)
@@ -552,6 +656,10 @@ logical one."
                  :private-key private-key
                  :agent agent
                  :passphrase passphrase
+                 :connect-timeout connect-timeout
+                 :server-alive-interval server-alive-interval
+                 :server-alive-count-max (or server-alive-count-max 3)
+                 :proxy-command (ssh-proxy-command-value proxy-command)
                  :on-open on-open
                  :on-error on-error
                  :on-close on-close)))

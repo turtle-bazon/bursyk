@@ -11,7 +11,11 @@
 (defvar *status* nil
   "The exit status the remote command reported, or NIL before it does.")
 (defvar *channel* nil)
+(defvar *client* nil
+  "The connected client, kept so FINISH can shut it down before quitting.")
 (defvar *stdin-watcher* nil)
+(defvar *finishing* nil
+  "True once FINISH is tearing down, so nested close callbacks do not quit early.")
 
 (defvar *options*
   '(:port nil :user nil :identity nil :config nil :known-hosts nil
@@ -136,8 +140,12 @@ itself never blocks: this matcher is what a caller supplies."
     ;; keywords a newer client wrote.
     (t nil)))
 
+(defun command-line-option-list ()
+  "The -o options in the order they were written."
+  (reverse (getf *options* :options)))
+
 (defun apply-command-line-options ()
-  (dolist (option (nreverse (getf *options* :options)))
+  (dolist (option (command-line-option-list))
     (let ((equals (position #\= option)))
       (when equals
         (command-line-option (subseq option 0 equals)
@@ -180,10 +188,21 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
              (error () (stop-stdin)))))))
 
 (defun finish (status)
-  (stop-stdin)
-  (finish-output *standard-output*)
-  (finish-output *error-output*)
-  (uiop:quit (or status 255)))
+  ;; Closing the client below reports its open channels closed, whose
+  ;; callbacks call FINISH again; only the outermost call may quit, or the
+  ;; connection (and a ProxyCommand helper) would be left half torn down.
+  (unless *finishing*
+    (setf *finishing* t)
+    (stop-stdin)
+    ;; Close the client before leaving: a ProxyCommand's helper is a child
+    ;; process, and quitting without closing would leave it running.
+    (when *client*
+      (let ((client *client*))
+        (setf *client* nil)
+        (ignore-errors (cl-pnet-ssh:ssh-client-close client))))
+    (finish-output *standard-output*)
+    (finish-output *error-output*)
+    (uiop:quit (or status 255))))
 
 (defun session-error (channel condition)
   (declare (ignore channel))
@@ -247,8 +266,12 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
    :host-key-policy (getf *options* :policy)
    :proxy-jump (getf *options* :jump)
    :proxy-command (getf *options* :proxy-command)
+   ;; Every -o keyword reaches the same resolver the file uses, so facts the
+   ;; command line has no dedicated flag for (HostName, ConnectTimeout,
+   ;; ServerAliveInterval, ...) work too.
+   :options (command-line-option-list)
    :exec-matcher #'match-exec
-   :on-client (lambda (client) (declare (ignore client)))
+   :on-client (lambda (client) (setf *client* client))
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-open (lambda (client) (start-session client command))
    :on-error (lambda (client condition)

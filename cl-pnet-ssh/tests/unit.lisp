@@ -859,6 +859,10 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
             :private-key client-key
             :known-hosts known-hosts
             :host-key-policy :accept-new
+            ;; Exercise the timer wiring too: both timers must start with
+            ;; numeric repeat values or the backend rejects them.
+            :connect-timeout 10
+            :server-alive-interval 1
             :on-open (lambda (client)
                        (ssh-test-loopback-start client stdout stderr state))
             :on-error (lambda (client condition)
@@ -1032,6 +1036,16 @@ than connect and quietly skip the known_hosts record."
   (is (null (cl-pnet-ssh::ssh-config-port-number "22x")))
   (is (null (cl-pnet-ssh::ssh-config-port-number "2222-with"))))
 
+(test ssh-config-seconds-parses-bare-and-suffixed-times
+  ;; A bare number has no suffix, so the final flush runs after the loop; a
+  ;; missing flush there leaves the value at zero without diagnosing it.
+  (is (= 5 (cl-pnet-ssh::ssh-config-seconds nil "5")))
+  (is (= 30 (cl-pnet-ssh::ssh-config-seconds nil "30s")))
+  (is (= 90 (cl-pnet-ssh::ssh-config-seconds nil "1m30s")))
+  (is (= 7200 (cl-pnet-ssh::ssh-config-seconds nil "2h")))
+  (is (= 604800 (cl-pnet-ssh::ssh-config-seconds nil "1w")))
+  (is (eq :none (cl-pnet-ssh::ssh-config-seconds nil "none"))))
+
 (test facade-jump-descriptor-reads-user-and-port
   (let ((hop (cl-pnet-ssh::ssh-config-jump-descriptor "alice@other:2201")))
     (is (equal "other" (getf hop :host)))
@@ -1105,11 +1119,29 @@ than connect and quietly skip the known_hosts record."
                      :host)))
     (is (null (cl-pnet-ssh::ssh-config-proxy-jumps options "none")))))
 
-(test facade-refuses-a-proxy-command
-  (signals ssh-config-error
-    (cl-pnet-ssh::ssh-config-reject-proxy-command
-     (facade-options '(:proxy-command "nc %h %p")) nil))
-  (is (null (cl-pnet-ssh::ssh-config-reject-proxy-command (facade-options nil) nil))))
+(test facade-carries-a-proxy-command
+  ;; A ProxyCommand is a transport, not a policy refusal: it reaches the
+  ;; parameters make-ssh-client is built from, and "none" turns it off.
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-config-proxy-command
+              (facade-options '(:proxy-command "nc %h %p")) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-proxy-command (facade-options nil) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-proxy-command
+             (facade-options '(:proxy-command "none")) nil)))
+  (is (equal "manual %h"
+             (cl-pnet-ssh::ssh-config-proxy-command
+              (facade-options nil) "manual %h")))
+  (is (equal "nc %h %p"
+             (getf (cl-pnet-ssh::ssh-config-client-parameters
+                    "alias"
+                    (facade-options (list :hostname "real.example" :port 2222
+                                          :proxy-command "nc %h %p")))
+                   :proxy-command)))
+  ;; ProxyCommand wins over a ProxyJump: OpenSSH does not chain the two.
+  (let ((options (facade-options '(:proxy-command "nc %h %p"
+                                   :proxy-jump "jump.example"))))
+    (is (equal "nc %h %p"
+               (cl-pnet-ssh::ssh-config-proxy-command options nil)))))
 
 (test facade-client-parameters-carry-the-whole-config
   (let* ((options (facade-options
@@ -1142,3 +1174,286 @@ than connect and quietly skip the known_hosts record."
            :user "cli-user" :port 2222)))
     (is (equal "cli-user" (getf parameters :user)))
     (is (= 2222 (getf parameters :port)))))
+
+;;; ---- Command-line -o options ----
+
+(test option-line-parses-ssh-syntax
+  (let ((line (cl-pnet-ssh::ssh-config-option-line "HostName real.example")))
+    (is (string= "hostname" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("real.example") (cl-pnet-ssh::ssh-config-line-args line))))
+  (let ((line (cl-pnet-ssh::ssh-config-option-line "Port=2222")))
+    (is (string= "port" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("2222") (cl-pnet-ssh::ssh-config-line-args line))))
+  ;; A keyword with several arguments keeps them all, as Ciphers needs.
+  (let ((line (cl-pnet-ssh::ssh-config-option-line
+               "Ciphers=aes128-ctr,aes256-ctr")))
+    (is (string= "ciphers" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("aes128-ctr,aes256-ctr") (cl-pnet-ssh::ssh-config-line-args line))))
+  ;; The cons form is accepted too, for callers that already split it.
+  (let ((line (cl-pnet-ssh::ssh-config-option-line '("ServerAliveInterval" . 30))))
+    (is (string= "serveraliveinterval" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("30") (cl-pnet-ssh::ssh-config-line-args line))))
+  (let ((line (cl-pnet-ssh::ssh-config-option-line '("Host" ("a" "b")))))
+    (is (equal '("a" "b") (cl-pnet-ssh::ssh-config-line-args line))))
+  (signals ssh-config-error
+    (cl-pnet-ssh::ssh-config-option-line "   ")))
+
+(test proxy-command-keeps-the-whole-shell-command
+  ;; OpenSSH hands the rest of the line to the shell as written, so quotes and
+  ;; internal spaces must survive -o parsing rather than becoming one token.
+  (is (equal "sh -c 'exec nc %h %p'"
+             (cl-pnet-ssh::ssh-config-line-raw
+              (cl-pnet-ssh::ssh-config-option-line
+               "ProxyCommand sh -c 'exec nc %h %p'"))))
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-config-line-raw
+              (cl-pnet-ssh::ssh-config-option-line "ProxyCommand=nc %h %p"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyCommand sh -c 'exec nc %h %p'"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "sh -c 'exec nc %h %p'"
+               (cl-pnet-ssh::ssh-config-options-proxy-command options)))))
+
+(test option-lines-win-over-the-config
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "HostName file.example")
+                  (cl-pnet-ssh::ssh-config-option-line "Port 2200"))))
+         (combined
+           (ssh-config-add-options
+            config '("HostName real.example" "Port=2222")))
+         (options nil))
+    (ssh-config-resolve combined "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "real.example" (ssh-config-options-hostname options)))
+    (is (= 2222 (ssh-config-options-port options)))
+    ;; Adding no options leaves the parsed config itself untouched.
+    (is (eq config (ssh-config-add-options config nil)))))
+
+(test client-source-applies-options-before-the-file
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-opt"))
+         (path (merge-pathnames "config" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output
+                                        :if-exists :supersede)
+             (format stream "HostName file.example~%Port 2200~%"))
+           (let ((options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::ssh-config-client-source
+               path '("HostName cli.example" "Port=2222"))
+              "alias"
+              :on-options (lambda (value) (setf options value)))
+             (is (equal "cli.example" (ssh-config-options-hostname options)))
+             (is (= 2222 (ssh-config-options-port options)))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test facade-client-parameters-carry-timeouts
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :connect-timeout 15
+                                 :server-alive-interval 30
+                                 :server-alive-count-max 2)))))
+    (is (= 15 (getf parameters :connect-timeout)))
+    (is (= 30 (getf parameters :server-alive-interval)))
+    (is (= 2 (getf parameters :server-alive-count-max))))
+  ;; "none" and 0 both mean the feature is off.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :connect-timeout :none
+                                 :server-alive-interval 0)))))
+    (is (null (getf parameters :connect-timeout)))
+    (is (null (getf parameters :server-alive-interval)))))
+
+(test client-record-holds-timing-settings
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "example" :connect-host "example"
+                 :host-key-host "example" :port 22 :connect-port 22
+                 :user "tester"
+                 :connect-timeout 10
+                 :server-alive-interval 5
+                 :server-alive-count-max 2)))
+    (is (= 10 (cl-pnet-ssh::ssh-client-connect-timeout client)))
+    (is (= 5 (cl-pnet-ssh::ssh-client-server-alive-interval client)))
+    (is (= 2 (cl-pnet-ssh::ssh-client-server-alive-count-max client)))
+    (is (null (cl-pnet-ssh::ssh-client-connect-timer client)))
+    (is (null (cl-pnet-ssh::ssh-client-alive-timer client)))))
+
+(test proxy-command-none-means-direct
+  ;; "ProxyCommand none" is OpenSSH's way of turning a proxy off, so it must
+  ;; not try to run a helper called none.
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value nil)))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "none")))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "  NONE  ")))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "   ")))
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-proxy-command-value " nc %h %p "))))
+
+#-ssh-backend-ffi
+(test proxy-command-expands-ssh-escapes
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "alias" :connect-host "real.example"
+                 :port 2222 :connect-port 2222 :user "alice")))
+    (is (equal "nc real.example 2222"
+               (cl-pnet-ssh::ssh-proxy-expand-command "nc %h %p" client)))
+    (is (equal "alias:alice:100%"
+               (cl-pnet-ssh::ssh-proxy-expand-command
+                "%n:%r:100%%" client)))
+    ;; An escape this client does not know stays literal rather than eaten.
+    (is (equal "%z and %" (cl-pnet-ssh::ssh-proxy-expand-command
+                           "%z and %" client)))))
+
+;;; ---- RSA and ECDSA host/user keys ----
+
+(test openssh-rsa-private-key-round-trip
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa"))
+             (path (merge-pathnames "id_rsa" directory)))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring path)))
+               (let* ((key (ssh-load-private-key path))
+                      (blob (ssh-public-key-blob-of key))
+                      (type (nth-value 0 (ssh-public-key-parts blob)))
+                      (message (octets-ascii "rsa signed data"))
+                      (signature (cl-pnet-ssh::ssh-private-key-signature-blob key message)))
+                 (is (string= "ssh-rsa" type))
+                 ;; The request names rsa-sha2-256 while the key stays ssh-rsa.
+                 (multiple-value-bind (algorithm bytes)
+                     (ssh-parse-signature-blob signature)
+                   (declare (ignore bytes))
+                   (is (string= "rsa-sha2-256" algorithm)))
+                 (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                            blob signature message)))
+                 (signals ssh-protocol-error
+                   (cl-pnet-ssh::ssh-verify-host-signature
+                    blob signature (octets-ascii "different data")))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test openssh-ecdsa-private-key-signs
+  ;; An ECDSA key file holds the scalar and the point; signing must produce
+  ;; the two mpints RFC 5656 wants, and the curve key type must survive.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (spec '(("id_ecdsa_256" "256" "ecdsa-sha2-nistp256")
+                      ("id_ecdsa_384" "384" "ecdsa-sha2-nistp384")
+                      ("id_ecdsa_521" "521" "ecdsa-sha2-nistp521")))
+        (destructuring-bind (name bits type) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-ecdsa-sign"))
+                 (path (merge-pathnames name directory)))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (progn
+                   (ssh-keygen (list "-q" "-t" "ecdsa" "-b" bits "-N" ""
+                                     "-f" (namestring path)))
+                   (let* ((key (ssh-load-private-key path))
+                          (blob (ssh-public-key-blob-of key))
+                          (message (octets-ascii (format nil "ecdsa ~A signed" bits)))
+                          (signature
+                            (cl-pnet-ssh::ssh-private-key-signature-blob
+                             key message)))
+                     (is (string= type (nth-value 0 (ssh-public-key-parts blob))))
+                     (multiple-value-bind (algorithm bytes)
+                         (ssh-parse-signature-blob signature)
+                       (declare (ignore bytes))
+                       (is (string= type algorithm)))
+                     (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                                blob signature message)))
+                     (signals ssh-protocol-error
+                       (cl-pnet-ssh::ssh-verify-host-signature
+                        blob signature (octets-ascii "different data")))))
+              (ignore-errors (delete-directory-tree directory :validate t))))))))
+
+(defun ssh-test-public-key-file-blob (private-key-path)
+  "The wire blob encoded in the .pub file beside PRIVATE-KEY-PATH."
+  (let* ((line (with-open-file (stream (concatenate 'string
+                                                    (namestring private-key-path)
+                                                    ".pub"))
+                 (read-line stream)))
+         (fields (uiop:split-string line :separator '(#\Space))))
+    (cl-base64:base64-string-to-usb8-array (second fields))))
+
+(test public-key-blobs-match-ssh-keygen
+  ;; ssh-keygen's .pub file holds the exact wire blob, so comparing against
+  ;; it catches a key blob that round-trips locally but cannot be sent: an
+  ;; ssh-rsa blob has two bare mpints, not one length-prefixed string.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (spec '(("id_ed25519" "ed25519" nil)
+                      ("id_rsa" "rsa" "2048")
+                      ("id_ecdsa_256" "ecdsa" "256")
+                      ("id_ecdsa_384" "ecdsa" "384")
+                      ("id_ecdsa_521" "ecdsa" "521")))
+        (destructuring-bind (name type bits) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-pub"))
+                 (path (merge-pathnames name directory)))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (progn
+                   (ssh-keygen
+                    (append (list "-q" "-t" type)
+                            (when bits (list "-b" bits))
+                            (list "-N" "" "-f" (namestring path))))
+                   (let ((key (ssh-load-private-key path)))
+                     (is (equalp (ssh-test-public-key-file-blob path)
+                                 (ssh-public-key-blob-of key))
+                         "~A uses the wire blob ssh-keygen wrote" name)))
+              (ignore-errors (delete-directory-tree directory :validate t))))))))
+
+(defun ssh-test-ecdsa-signature (raw)
+  "RAW r||s as the SSH signature value: string r then string s.
+
+An integer whose top bit is set gets the mpint leading zero, so the test
+also covers that the verifier trims it before padding to the curve width."
+  (let* ((middle (/ (length raw) 2))
+         (writer (ssh-writer)))
+    (ssh-write-mpint writer (ssh-mpint-integer (subseq raw 0 middle)))
+    (ssh-write-mpint writer (ssh-mpint-integer (subseq raw middle)))
+    (ssh-writer-output writer)))
+
+(test ecdsa-host-signatures-verify
+  ;; Every curve SSH names, with several signatures each so the leading-zero
+  ;; cases are actually exercised rather than left to chance.
+  (dolist (spec '(("nistp256" :secp256r1 :sha256 "ecdsa-sha2-nistp256")
+                  ("nistp384" :secp384r1 :sha384 "ecdsa-sha2-nistp384")
+                  ("nistp521" :secp521r1 :sha512 "ecdsa-sha2-nistp521")))
+    (destructuring-bind (curve-name curve digest-name type) spec
+      (multiple-value-bind (private public)
+          (ironclad-unsafe:generate-key-pair curve)
+        (let* ((point (getf (ironclad-unsafe:destructure-public-key public)
+                            :y))
+               (key-data (let ((writer (ssh-writer)))
+                           (ssh-write-text writer curve-name)
+                           (ssh-write-string writer point)
+                           (ssh-writer-output writer)))
+               (blob (ssh-make-public-key-blob type key-data)))
+          (dotimes (i 5)
+            (let* ((message
+                     (ssh-hash :sha256
+                               (octets-ascii
+                                (format nil "ecdsa-~A-~D" curve-name i))))
+                   (digest (ssh-hash digest-name message))
+                   (encoded (ssh-test-ecdsa-signature
+                             (ironclad-unsafe:sign-message private digest)))
+                   (signature (let ((writer (ssh-writer)))
+                                (ssh-write-text writer type)
+                                (ssh-write-string writer encoded)
+                                (ssh-writer-output writer))))
+              (is (cl-pnet-ssh::ssh-ecdsa-verify key-data encoded message))
+              (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                         blob signature message)))
+              (is (not (cl-pnet-ssh::ssh-ecdsa-verify
+                        key-data encoded
+                        (ssh-hash :sha256 (octets-ascii "other"))))))))))))

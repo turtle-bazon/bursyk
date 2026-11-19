@@ -17,7 +17,7 @@ sequence numbers at NEWKEYS; it is not an algorithm and is never selected.")
     (ssh-write-u8 writer +ssh-msg-kexinit+)
     (ssh-write-octets writer (ssh-random-octets 16))
     (iter (for list in (list +ssh-server-kex-algorithms+
-                             +ssh-host-key-algorithms+
+                             +ssh-server-host-key-algorithms+
                              +ssh-ciphers+ +ssh-ciphers+
                              +ssh-macs+ +ssh-macs+
                              +ssh-compressions+ +ssh-compressions+
@@ -125,7 +125,7 @@ and NIL while the line is still incomplete."
   "Choose algorithms from CLIENT-KEXINIT for the server role."
   (let* ((kex (ssh-choose-algorithm +ssh-server-kex-algorithms+
                                     (getf client-kexinit :kex)))
-         (host-key (ssh-choose-algorithm +ssh-host-key-algorithms+
+         (host-key (ssh-choose-algorithm +ssh-server-host-key-algorithms+
                                          (getf client-kexinit :host-keys)))
          (cipher-c2s (ssh-choose-algorithm +ssh-ciphers+
                                            (getf client-kexinit :ciphers-c2s)))

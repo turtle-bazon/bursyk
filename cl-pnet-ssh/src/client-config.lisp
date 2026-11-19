@@ -8,17 +8,25 @@
 
 ;;; ---- Reading the options ----
 
-(defun ssh-config-client-source (config)
-  "CONFIG as an SSH-CONFIG; NIL means ~/.ssh/config."
-  (typecase config
-    (ssh-config config)
-    (null (or (ssh-config-load
-               (merge-pathnames ".ssh/config" (user-homedir-pathname)))
-              (%make-ssh-config)))
-    (t (or (ssh-config-load config)
-           (error 'ssh-config-error
-                  :path (namestring (pathname config))
-                  :detail "cannot read the ssh config")))))
+(defun ssh-config-client-source (config &optional options)
+  "CONFIG as an SSH-CONFIG; NIL means ~/.ssh/config.
+
+OPTIONS are the command-line -o answers; they are applied as if they came
+before the file, so every keyword they name wins over the file the way ssh
+itself orders them."
+  (let ((source
+          (typecase config
+            (ssh-config config)
+            (null (or (ssh-config-load
+                       (merge-pathnames ".ssh/config" (user-homedir-pathname)))
+                      (%make-ssh-config)))
+            (t (or (ssh-config-load config)
+                   (error 'ssh-config-error
+                          :path (namestring (pathname config))
+                          :detail "cannot read the ssh config"))))))
+    (if options
+        (ssh-config-add-options source options)
+        source)))
 
 (defun ssh-config-client-policy (options)
   "StrictHostKeyChecking as a MAKE-SSH-CLIENT policy."
@@ -61,10 +69,21 @@ otherwise, so an identity file alone does not disable the agent."
             (global (ssh-config-options-global-known-hosts options)))
         (when (or user global) (append user global)))))
 
+(defun ssh-config-client-seconds (value)
+  "VALUE as a positive number of seconds, or NIL when it is off or absent.
+
+The parser keeps :NONE for ssh's \"none\" and 0 for a disabled timeout; both
+mean the feature is off to MAKE-SSH-CLIENT."
+  (and (integerp value) (plusp value) value))
+
+(defun ssh-config-client-count-max (value)
+  "VALUE as a non-negative count, or NIL when it was not configured."
+  (and (integerp value) value))
+
 (defun ssh-config-client-parameters (host options
                                      &key user port private-key agent passphrase
                                        known-hosts host-key-policy
-                                       host-key-callback)
+                                       host-key-callback proxy-command)
   "MAKE-SSH-CLIENT's arguments for HOST, given resolved OPTIONS.
 
 USER and PORT win over the file; the remaining keywords are explicit
@@ -82,7 +101,19 @@ MAKE-SSH-CLIENT's own defaults."
         :host-key-policy (or host-key-policy
                              (and (null host-key-callback)
                                   (ssh-config-client-policy options)))
-        :host-key-callback host-key-callback))
+        :host-key-callback host-key-callback
+        :connect-timeout
+        (ssh-config-client-seconds
+         (ssh-config-options-connect-timeout options))
+        :server-alive-interval
+        (ssh-config-client-seconds
+         (ssh-config-options-server-alive-interval options))
+        :server-alive-count-max
+        (ssh-config-client-count-max
+         (ssh-config-options-server-alive-count-max options))
+        :proxy-command
+        (ssh-proxy-command-value
+         (or proxy-command (ssh-config-options-proxy-command options)))))
 
 ;;; ---- ProxyJump descriptors ----
 
@@ -141,13 +172,13 @@ MAKE-SSH-CLIENT's own defaults."
   (let ((value (or explicit (ssh-config-options-proxy-jump options))))
     (mapcar #'ssh-config-jump-descriptor (ssh-config-jump-list value))))
 
-(defun ssh-config-reject-proxy-command (options explicit)
-  "Signal when a ProxyCommand would be silently ignored."
-  (let ((command (or explicit (ssh-config-options-proxy-command options))))
-    (when command
-      (error 'ssh-config-error
-             :keyword "ProxyCommand"
-             :detail (format nil "ProxyCommand is not supported (~A)" command)))))
+(defun ssh-config-proxy-command (options explicit)
+  "The ProxyCommand EXPLICIT or the config asks for, or NIL for none.
+
+A ProxyCommand is a transport of its own, so it replaces ProxyJump: OpenSSH
+uses whichever of the two it saw first instead of chaining them."
+  (ssh-proxy-command-value
+   (or explicit (ssh-config-options-proxy-command options))))
 
 ;;; ---- Resolving every host ----
 
@@ -334,6 +365,10 @@ MAKE-SSH-CLIENT's own defaults."
            :known-hosts (getf parameters :known-hosts)
            :host-key-policy (getf parameters :host-key-policy)
            :host-key-callback (getf parameters :host-key-callback)
+           :connect-timeout (getf parameters :connect-timeout)
+           :server-alive-interval (getf parameters :server-alive-interval)
+           :server-alive-count-max (getf parameters :server-alive-count-max)
+           :proxy-command (getf parameters :proxy-command)
            :on-open on-open
            :on-error on-error
            :on-close on-close)))
@@ -419,7 +454,8 @@ in the tunnel's buffers."
       target)))
 
 (defun ssh-config-finish-client (host options hops overrides
-                                 on-open on-error on-close)
+                                 on-open on-error on-close
+                                 &key proxy-command)
   "Build the target client for HOST, directly or through HOPS."
   (let ((target (ssh-config-client-parameters
                  host options
@@ -430,7 +466,8 @@ in the tunnel's buffers."
                  :passphrase (getf overrides :passphrase)
                  :known-hosts (getf overrides :known-hosts)
                  :host-key-policy (getf overrides :host-key-policy)
-                 :host-key-callback (getf overrides :host-key-callback))))
+                 :host-key-callback (getf overrides :host-key-callback)
+                 :proxy-command proxy-command)))
     (cond
       (hops
        (ssh-config-start-chain
@@ -461,31 +498,37 @@ in the tunnel's buffers."
                                 on-close fail on-built)
   "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT."
   (handler-case
-      (progn
-        (ssh-config-reject-proxy-command options proxy-command)
+      (let ((command (ssh-config-proxy-command options proxy-command)))
         (ssh-config-resolve-hops
-         source (ssh-config-proxy-jumps options proxy-jump)
+         source
+         ;; A ProxyCommand carries the stream itself, so there is no chain.
+         (if command nil (ssh-config-proxy-jumps options proxy-jump))
          exec-matcher
          (lambda (hops)
            (funcall on-built
                     (ssh-config-finish-client
                      host options hops overrides
-                     on-open on-error on-close)))
+                     on-open on-error on-close
+                     :proxy-command command)))
          fail))
     (error (condition) (funcall fail condition))))
 
 (defun make-ssh-client-from-config
     (host &key config original-host user port private-key agent passphrase
               known-hosts host-key-policy host-key-callback proxy-jump
-              proxy-command exec-matcher on-client on-config-error
+              proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
-User, Port, identities, agent, known-hosts files, policy and ProxyJump are
-honoured while the explicit arguments win.  EXEC-MATCHER answers Match
-exec; ON-CLIENT receives an asynchronous client; ON-CONFIG-ERROR reports."
-  (let* ((source (ssh-config-client-source config))
+User, Port, identities, agent, known-hosts files, policy, timeouts,
+keepalive, ProxyJump and ProxyCommand are honoured while the explicit
+arguments win.  OPTIONS are free-form -o answers, each a \"Keyword value\"
+string or a (KEYWORD . VALUE) cons; they are applied before CONFIG, so any
+keyword wins over the file.  EXEC-MATCHER answers Match exec; ON-CLIENT
+receives an asynchronous client; ON-CONFIG-ERROR reports resolution
+failures."
+  (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
                      known-hosts host-key-policy host-key-callback))

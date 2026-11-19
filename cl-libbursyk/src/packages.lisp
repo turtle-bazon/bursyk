@@ -64,6 +64,9 @@
    #:ssh-config-p
    #:ssh-config-load
    #:ssh-config-resolve
+   #:ssh-config-option-line
+   #:ssh-config-option-lines
+   #:ssh-config-add-options
    #:ssh-default-user
    #:ssh-config-options
    #:ssh-config-options-p

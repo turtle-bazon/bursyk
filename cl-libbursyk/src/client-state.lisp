@@ -41,6 +41,20 @@
   (known-hosts nil)
   (host-key-policy :strict)
   (host-key-callback nil)
+  ;; ProxyCommand: a helper program carrying the stream on its stdin/stdout.
+  ;; NIL means dial the address directly.
+  proxy-command
+  ;; The running helper and its pipes, once SSH-OPEN-PROXY-CONNECTION starts
+  ;; it.  NIL on the direct TCP path.
+  pipe
+  ;; Connection timing, from ConnectTimeout and ServerAlive* in ssh_config.
+  ;; A NIL timeout or interval means the feature is off.
+  connect-timeout
+  server-alive-interval
+  (server-alive-count-max 3)
+  connect-timer
+  alive-timer
+  (alive-misses 0)
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
   (pending-actions nil)
@@ -107,8 +121,94 @@
 (defun ssh-client-close-connection (client)
   ;; CL-PNET:CLOSE-CONNECTION is idempotent, so there is nothing expected to
   ;; ignore here; swallowing every error would only hide a real bug.
-  (when (ssh-client-connection client)
-    (cl-pnet:close-connection (ssh-client-connection client))))
+  (cond
+    ((ssh-client-pipe client) (ssh-proxy-close client))
+    ((ssh-client-connection client)
+     (cl-pnet:close-connection (ssh-client-connection client)))))
+
+;;; ---- Connect timeout and server-alive keepalives ----
+
+(defun ssh-client-cancel-timer (timer)
+  "Stop TIMER when it is set, answering NIL for the caller to store."
+  (when timer
+    (cl-pnet:timer-stop timer))
+  nil)
+
+(defun ssh-client-stop-timers (client)
+  "Disarm CLIENT's connect timeout and keepalive timer, once."
+  (setf (ssh-client-connect-timer client)
+        (ssh-client-cancel-timer (ssh-client-connect-timer client))
+        (ssh-client-alive-timer client)
+        (ssh-client-cancel-timer (ssh-client-alive-timer client))))
+
+(defun ssh-client-start-connect-timer (client)
+  "Fail CLIENT when ConnectTimeout seconds pass before authentication.
+
+OpenSSH's ConnectTimeout covers the TCP connect, the version exchange, the
+key exchange and the initial authentication; it stops mattering once the
+session is ready for channels."
+  (when (and (ssh-client-connect-timeout client)
+             (plusp (ssh-client-connect-timeout client))
+             (not (ssh-client-connect-timer client)))
+    (setf (ssh-client-connect-timer client)
+          (cl-pnet:timer-start
+           (ssh-client-connect-timeout client) 0
+           (lambda ()
+             (setf (ssh-client-connect-timer client) nil)
+             (unless (ssh-client-closed client)
+               (ssh-client-fail
+                client
+                (make-condition
+                 'ssh-connection-error
+                 :detail (format nil "connecting to ~A:~D timed out after ~D seconds"
+                                 (ssh-client-connect-host client)
+                                 (or (ssh-client-connect-port client)
+                                     (ssh-client-port client))
+                                 (ssh-client-connect-timeout client))))))))))
+
+(defun ssh-client-cancel-connect-timer (client)
+  "The handshake is far enough along that ConnectTimeout no longer applies."
+  (setf (ssh-client-connect-timer client)
+        (ssh-client-cancel-timer (ssh-client-connect-timer client))))
+
+(defun ssh-client-send-keepalive (client)
+  "Ask the server to answer, as OpenSSH's ServerAliveInterval does.
+
+OpenSSH names keepalive@openssh.com with want-reply set and treats the
+REQUEST_FAILURE it gets back as proof that the peer is alive."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-global-request+)
+    (ssh-write-text writer "keepalive@openssh.com")
+    (ssh-write-boolean writer t)
+    (ssh-client-send-payload client (ssh-writer-output writer))))
+
+(defun ssh-client-start-alive-timer (client)
+  "Start the ServerAliveInterval timer once CLIENT can carry channels."
+  (when (and (ssh-client-server-alive-interval client)
+             (plusp (ssh-client-server-alive-interval client))
+             (not (ssh-client-alive-timer client)))
+    (setf (ssh-client-alive-timer client)
+          (cl-pnet:timer-start
+           (ssh-client-server-alive-interval client)
+           (ssh-client-server-alive-interval client)
+           (lambda ()
+             (when (and (not (ssh-client-closed client))
+                        (eq (ssh-client-phase client) :ready))
+               (incf (ssh-client-alive-misses client))
+               (let ((count-max (or (ssh-client-server-alive-count-max
+                                     client)
+                                    3)))
+                 ;; A count of 0 turns the disconnect off but still sends,
+                 ;; exactly as OpenSSH reads ServerAliveCountMax.
+                 (if (and (plusp count-max)
+                          (> (ssh-client-alive-misses client) count-max))
+                     (ssh-client-fail
+                      client
+                      (make-condition
+                       'ssh-connection-error
+                       :detail (format nil "server ~A stopped responding"
+                                       (ssh-client-host client))))
+                     (ssh-client-send-keepalive client)))))))))
 
 (defun ssh-client-finish (client reason kind)
   "Close CLIENT once, reporting REASON through the callback KIND selects."
@@ -116,6 +216,7 @@
     (setf (ssh-client-closed client) t
           (ssh-client-phase client) :closed
           (ssh-client-close-reason client) reason)
+    (ssh-client-stop-timers client)
     (ssh-client-terminate-channels client reason kind)
     (ssh-client-close-connection client)
     (ecase kind
@@ -131,23 +232,42 @@
 (defun ssh-client-send-bytes (client octets)
   "Queue OCTETS on CLIENT's connection. NIL once the client is closed."
   (unless (ssh-client-closed client)
-    (let ((connection (ssh-client-connection client)))
-      (when connection
-        (handler-case
-            (cl-pnet:send-data
-             connection octets
-             :on-error (lambda (status)
-                         (ssh-client-fail
-                          client
-                          (make-condition 'ssh-connection-error
-                                          :detail (format nil "send failed (~A)" status)))))
-          (error (condition) (ssh-client-fail client condition))))))
+    (if (ssh-client-pipe client)
+        (ssh-proxy-send client octets)
+        (let ((connection (ssh-client-connection client)))
+          (when connection
+            (handler-case
+                (cl-pnet:send-data
+                 connection octets
+                 :on-error (lambda (status)
+                             (ssh-client-fail
+                              client
+                              (make-condition 'ssh-connection-error
+                                              :detail (format nil "send failed (~A)" status)))))
+              (error (condition) (ssh-client-fail client condition)))))))
   (not (ssh-client-closed client)))
 
 (defun ssh-client-send-payload (client payload)
   "Frame and send one protocol PAYLOAD."
   (ssh-client-send-bytes client
                          (ssh-encode-packet payload (ssh-client-cipher client))))
+
+(defun ssh-client-send-disconnect (client &optional (description "client closed"))
+  "Tell the peer CLIENT is going away, so it can close the session.
+
+A ProxyCommand helper forwards this packet to the server; the server then
+closes the transport, which is what lets netcat exit instead of waiting on
+a half-closed connection forever."
+  (when (and (not (ssh-client-closed client))
+             (member (ssh-client-phase client) '(:kex :auth :ready)))
+    (handler-case
+        (ssh-client-send-payload
+         client
+         (ssh-concat (vector +ssh-msg-disconnect+)
+                     (ssh-uint32-octets +ssh-disconnect-by-application+)
+                     (ssh-string-octets (princ-to-string description))
+                     (ssh-uint32-octets 0)))
+      (error () nil))))
 
 (defun ssh-client-run-when-ready (client action)
   "Run ACTION now when CLIENT is ready, otherwise after authentication."
