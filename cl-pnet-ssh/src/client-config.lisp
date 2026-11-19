@@ -1,0 +1,518 @@
+(in-package #:cl-pnet-ssh)
+
+;;;; Connecting the way ssh_config says.  The parser lives in CL-LIBBURSYK;
+;;;; this is the policy layer every client program needs on top of it: which
+;;;; identity and agent to offer, which known_hosts files to check, how to
+;;;; read StrictHostKeyChecking, and how to tunnel through ProxyJump.  A
+;;;; command line should not have to repeat any of it.
+
+;;; ---- Reading the options ----
+
+(defun ssh-config-client-source (config)
+  "CONFIG as an SSH-CONFIG; NIL means ~/.ssh/config."
+  (typecase config
+    (ssh-config config)
+    (null (or (ssh-config-load
+               (merge-pathnames ".ssh/config" (user-homedir-pathname)))
+              (%make-ssh-config)))
+    (t (or (ssh-config-load config)
+           (error 'ssh-config-error
+                  :path (namestring (pathname config))
+                  :detail "cannot read the ssh config")))))
+
+(defun ssh-config-client-policy (options)
+  "StrictHostKeyChecking as a MAKE-SSH-CLIENT policy."
+  (let ((value (ssh-config-options-strict-host-key-checking options)))
+    (cond ((null value) :strict)
+          ((member value '("no" "off") :test #'string=) :insecure)
+          ((string= value "accept-new") :accept-new)
+          (t :strict))))
+
+(defun ssh-config-client-agent (options explicit)
+  "The agent to use: EXPLICIT, or the one the config and environment select.
+
+OpenSSH uses SSH_AUTH_SOCK unless IdentityAgent or IdentitiesOnly says
+otherwise, so an identity file alone does not disable the agent."
+  (cond
+    ((null explicit)
+     (if (ssh-config-options-identities-only options)
+         nil
+         (let ((value (ssh-config-options-identity-agent options)))
+           (case value
+             (:none nil)
+             (:environment t)
+             ((nil) (and (uiop:getenv "SSH_AUTH_SOCK") t))
+             (t value)))))
+    ((eq explicit :none) nil)
+    ((and (stringp explicit) (string-equal explicit "none")) nil)
+    ((and (stringp explicit) (string-equal explicit "SSH_AUTH_SOCK")) t)
+    (t explicit)))
+
+(defun ssh-config-client-identities (options explicit)
+  "The private keys to offer, EXPLICIT or every IdentityFile in order."
+  (or explicit
+      (let ((files (ssh-config-options-identity-files options)))
+        (when files (reverse files)))))
+
+(defun ssh-config-client-known-hosts (options explicit)
+  "The known_hosts files, EXPLICIT or the config's user then global ones."
+  (or explicit
+      (let ((user (ssh-config-options-known-hosts options))
+            (global (ssh-config-options-global-known-hosts options)))
+        (when (or user global) (append user global)))))
+
+(defun ssh-config-client-parameters (host options
+                                     &key user port private-key agent passphrase
+                                       known-hosts host-key-policy
+                                       host-key-callback)
+  "MAKE-SSH-CLIENT's arguments for HOST, given resolved OPTIONS.
+
+USER and PORT win over the file; the remaining keywords are explicit
+overrides.  NIL leaves the decision to the config and then to
+MAKE-SSH-CLIENT's own defaults."
+  (list :host host
+        :connect-host (or (ssh-config-options-hostname options) host)
+        :port (or port (ssh-config-options-port options) 22)
+        :user (or user (ssh-config-options-user options) (ssh-default-user))
+        :private-key (ssh-config-client-identities options private-key)
+        :agent (ssh-config-client-agent options agent)
+        :passphrase passphrase
+        :known-hosts (ssh-config-client-known-hosts options known-hosts)
+        :host-key-policy (or host-key-policy
+                             (and (null host-key-callback)
+                                  (ssh-config-client-policy options)))
+        :host-key-callback host-key-callback))
+
+;;; ---- ProxyJump descriptors ----
+
+(defun ssh-config-jump-list (value)
+  "VALUE as a list of jump host strings; NONE and empty mean direct."
+  (cond
+    ((null value) nil)
+    ((listp value) value)
+    (t (let ((text (string-trim '(#\Space #\Tab) value)))
+         (if (or (zerop (length text)) (string-equal text "none"))
+             nil
+             (loop with start = 0
+                   for comma = (position #\, text :start start)
+                   collect (string-trim '(#\Space #\Tab)
+                                        (subseq text start comma))
+                   while comma
+                   do (setf start (1+ comma))))))))
+
+(defun ssh-config-split-user (text)
+  "TEXT as (VALUES HOST USER), splitting at the first @."
+  (let ((at (position #\@ text)))
+    (if at
+        (values (subseq text (1+ at)) (subseq text 0 at))
+        (values text nil))))
+
+(defun ssh-config-split-host-port (text)
+  "TEXT as (VALUES HOST PORT-STRING), bracketing IPv6 literals."
+  (if (and (plusp (length text)) (char= (char text 0) #\[))
+      (let ((close (position #\] text)))
+        (if close
+            (let ((rest (subseq text (1+ close))))
+              (values (subseq text 1 close)
+                      (and (> (length rest) 1)
+                           (char= (char rest 0) #\:)
+                           (subseq rest 1))))
+            (values text nil)))
+      (let ((colon (position #\: text :from-end t)))
+        (if colon
+            (values (subseq text 0 colon) (subseq text (1+ colon)))
+            (values text nil)))))
+
+(defun ssh-config-port-number (text)
+  "TEXT as a port number, or NIL unless it is all digits."
+  (when text
+    (multiple-value-bind (value end) (parse-integer text :junk-allowed t)
+      (when (and value (= end (length text))) value))))
+
+(defun ssh-config-jump-descriptor (text)
+  "One ProxyJump entry as a plist of :HOST, :USER and :PORT."
+  (multiple-value-bind (destination user) (ssh-config-split-user text)
+    (multiple-value-bind (host port) (ssh-config-split-host-port destination)
+      (list :host host :user user :port (ssh-config-port-number port)))))
+
+(defun ssh-config-proxy-jumps (options explicit)
+  "The jump descriptors EXPLICIT or the config asks for, in order."
+  (let ((value (or explicit (ssh-config-options-proxy-jump options))))
+    (mapcar #'ssh-config-jump-descriptor (ssh-config-jump-list value))))
+
+(defun ssh-config-reject-proxy-command (options explicit)
+  "Signal when a ProxyCommand would be silently ignored."
+  (let ((command (or explicit (ssh-config-options-proxy-command options))))
+    (when command
+      (error 'ssh-config-error
+             :keyword "ProxyCommand"
+             :detail (format nil "ProxyCommand is not supported (~A)" command)))))
+
+;;; ---- Resolving every host ----
+
+(defun ssh-config-client-error (condition on-config-error)
+  (if on-config-error
+      (funcall on-config-error condition)
+      (error condition)))
+
+(defun ssh-config-resolve-hops (source descriptors exec-matcher on-hops on-error)
+  "Resolve each jump host's own options in turn, without blocking."
+  (labels ((next (remaining collected)
+             (if (null remaining)
+                 (funcall on-hops (nreverse collected))
+                 (let ((descriptor (first remaining)))
+                   (ssh-config-resolve
+                    source (getf descriptor :host)
+                    :original-host (getf descriptor :host)
+                    :exec-matcher exec-matcher
+                    :on-options
+                    (lambda (options)
+                      (next (rest remaining)
+                            (cons (cons descriptor options) collected)))
+                    :on-error on-error)))))
+    (next descriptors nil)))
+
+;;; ---- ProxyJump forwarding ----
+
+(defstruct (ssh-config-tunnel (:constructor %make-ssh-config-tunnel))
+  chain jump host port listener connection channel
+  (to-channel (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer 0))
+  (to-connection (make-array 0 :element-type '(unsigned-byte 8)
+                               :adjustable t :fill-pointer 0))
+  (local-eof nil)
+  (eof-sent nil))
+
+(defstruct (ssh-config-chain (:constructor %make-ssh-config-chain))
+  target
+  (tunnels nil)
+  (error nil)
+  (closed nil))
+
+(defun ssh-config-buffer-append (buffer data)
+  (iter (for octet in-vector data) (vector-push-extend octet buffer))
+  buffer)
+
+(defun ssh-config-buffer-drain (buffer)
+  (when (plusp (fill-pointer buffer))
+    (prog1 (subseq buffer 0 (fill-pointer buffer))
+      (setf (fill-pointer buffer) 0))))
+
+(defun ssh-config-chain-fail (chain condition)
+  "Report CONDITION to the target, or remember it until the target exists."
+  (if (ssh-config-chain-target chain)
+      (ssh-client-fail (ssh-config-chain-target chain) condition)
+      (unless (ssh-config-chain-error chain)
+        (setf (ssh-config-chain-error chain) condition))))
+
+(defun ssh-config-tunnel-close (tunnel)
+  (when (ssh-config-tunnel-listener tunnel)
+    (cl-pnet:close-listener (ssh-config-tunnel-listener tunnel))
+    (setf (ssh-config-tunnel-listener tunnel) nil))
+  (when (ssh-config-tunnel-connection tunnel)
+    (cl-pnet:close-connection (ssh-config-tunnel-connection tunnel))
+    (setf (ssh-config-tunnel-connection tunnel) nil))
+  (when (ssh-config-tunnel-channel tunnel)
+    (let ((channel (ssh-config-tunnel-channel tunnel)))
+      (setf (ssh-config-tunnel-channel tunnel) nil)
+      (ssh-channel-close channel))))
+
+(defun ssh-config-chain-close (chain)
+  (unless (ssh-config-chain-closed chain)
+    (setf (ssh-config-chain-closed chain) t)
+    (dolist (tunnel (ssh-config-chain-tunnels chain))
+      (ssh-config-tunnel-close tunnel))))
+
+(defun ssh-config-tunnel-fail (tunnel condition)
+  (ssh-config-chain-fail (ssh-config-tunnel-chain tunnel) condition)
+  (ssh-config-tunnel-close tunnel))
+
+(defun ssh-config-tunnel-send (tunnel data)
+  "Move bytes from the jump channel toward the local client."
+  (if (ssh-config-tunnel-connection tunnel)
+      (cl-pnet:send-data (ssh-config-tunnel-connection tunnel) data)
+      (ssh-config-buffer-append (ssh-config-tunnel-to-connection tunnel) data)))
+
+(defun ssh-config-tunnel-flush-to-connection (tunnel)
+  (when (ssh-config-tunnel-connection tunnel)
+    (let ((data (ssh-config-buffer-drain
+                 (ssh-config-tunnel-to-connection tunnel))))
+      (when data
+        (cl-pnet:send-data (ssh-config-tunnel-connection tunnel) data)))))
+
+(defun ssh-config-tunnel-read (tunnel data)
+  "Move bytes from the local client toward the jump channel."
+  (cond
+    ((null data)
+     (setf (ssh-config-tunnel-local-eof tunnel) t)
+     (when (ssh-config-tunnel-channel tunnel)
+       (ssh-channel-eof (ssh-config-tunnel-channel tunnel))))
+    ((ssh-config-tunnel-channel tunnel)
+     (ssh-channel-write (ssh-config-tunnel-channel tunnel) data))
+    (t (ssh-config-buffer-append (ssh-config-tunnel-to-channel tunnel) data))))
+
+(defun ssh-config-tunnel-flush (tunnel)
+  "Send whatever waited for the channel, then report a local EOF once."
+  (when (ssh-config-tunnel-channel tunnel)
+    (let ((data (ssh-config-buffer-drain (ssh-config-tunnel-to-channel tunnel))))
+      (when data
+        (ssh-channel-write (ssh-config-tunnel-channel tunnel) data)))
+    (when (and (ssh-config-tunnel-local-eof tunnel)
+               (not (ssh-config-tunnel-eof-sent tunnel)))
+      (setf (ssh-config-tunnel-eof-sent tunnel) t)
+      (ssh-channel-eof (ssh-config-tunnel-channel tunnel)))))
+
+(defun ssh-config-tunnel-accept (tunnel connection)
+  (setf (ssh-config-tunnel-connection tunnel) connection)
+  (when (ssh-config-tunnel-listener tunnel)
+    (cl-pnet:close-listener (ssh-config-tunnel-listener tunnel))
+    (setf (ssh-config-tunnel-listener tunnel) nil))
+  (ssh-config-tunnel-flush tunnel)
+  (ssh-config-tunnel-flush-to-connection tunnel))
+
+(defun ssh-config-tunnel-open (tunnel)
+  "Open the direct-tcpip half of TUNNEL once its jump host is ready."
+  (unless (or (ssh-config-tunnel-channel tunnel)
+              (ssh-config-chain-closed (ssh-config-tunnel-chain tunnel)))
+    (handler-case
+        (let ((channel
+                (ssh-open-direct-tcpip
+                 (ssh-config-tunnel-jump tunnel)
+                 (ssh-config-tunnel-host tunnel)
+                 (ssh-config-tunnel-port tunnel)
+                 :on-data (lambda (channel data kind)
+                            (declare (ignore channel kind))
+                            (ssh-config-tunnel-send tunnel data))
+                 :on-eof (lambda (channel)
+                           (declare (ignore channel))
+                           (ssh-config-tunnel-close tunnel))
+                 :on-close (lambda (channel reason)
+                             (declare (ignore channel reason))
+                             (ssh-config-tunnel-close tunnel))
+                 :on-error (lambda (channel condition)
+                             (declare (ignore channel))
+                             (ssh-config-tunnel-fail tunnel condition)))))
+          (setf (ssh-config-tunnel-channel tunnel) channel)
+          (ssh-config-tunnel-flush tunnel)
+          (ssh-config-tunnel-flush-to-connection tunnel))
+      (error (condition) (ssh-config-tunnel-fail tunnel condition)))))
+
+(defun ssh-config-tunnel-listen (tunnel)
+  "Bind 127.0.0.1:0 for TUNNEL and return the port actually bound."
+  (let ((listener
+          (cl-pnet:make-tcp-listener
+           "127.0.0.1" 0
+           :on-accept (lambda (connection)
+                        (ssh-config-tunnel-accept tunnel connection))
+           :read-cb (lambda (connection data)
+                      (declare (ignore connection))
+                      (ssh-config-tunnel-read tunnel data)))))
+    (unless listener
+      (error 'ssh-connection-error
+             :detail "cannot listen for a ProxyJump tunnel"))
+    (setf (ssh-config-tunnel-listener tunnel) listener)
+    (cl-pnet:listener-port listener)))
+
+;;; ---- Building the client ----
+
+(defun ssh-config-launch-client (parameters options
+                                 connect-host connect-port
+                                 on-open on-error on-close)
+  "Make the client PARAMETERS describes and remember OPTIONS on it."
+  (let ((client
+          (make-ssh-client
+           (getf parameters :host)
+           :connect-host (or connect-host (getf parameters :connect-host))
+           :connect-port (or connect-port (getf parameters :port))
+           :port (getf parameters :port)
+           :user (getf parameters :user)
+           :private-key (getf parameters :private-key)
+           :agent (getf parameters :agent)
+           :passphrase (getf parameters :passphrase)
+           :known-hosts (getf parameters :known-hosts)
+           :host-key-policy (getf parameters :host-key-policy)
+           :host-key-callback (getf parameters :host-key-callback)
+           :on-open on-open
+           :on-error on-error
+           :on-close on-close)))
+    (setf (ssh-client-config-options client) options)
+    client))
+
+(defun ssh-config-hop-parameters (descriptor options overrides)
+  "MAKE-SSH-CLIENT arguments for one jump host.
+
+The jump's own @user and :port beat its Host block, as they do in SSH;
+the destination's user and port do not apply to it."
+  (let ((parameters
+          (ssh-config-client-parameters
+           (getf descriptor :host) options
+           :private-key (getf overrides :private-key)
+           :agent (getf overrides :agent)
+           :passphrase (getf overrides :passphrase)
+           :known-hosts (getf overrides :known-hosts)
+           :host-key-policy (getf overrides :host-key-policy)
+           :host-key-callback (getf overrides :host-key-callback))))
+    (when (getf descriptor :user)
+      (setf (getf parameters :user) (getf descriptor :user)))
+    (when (getf descriptor :port)
+      (setf (getf parameters :port) (getf descriptor :port)))
+    parameters))
+
+(defun ssh-config-start-jump (chain tunnel parameters connect-host connect-port)
+  (ssh-config-launch-client
+   parameters nil connect-host connect-port
+   (lambda (client)
+     (setf (ssh-config-tunnel-jump tunnel) client)
+     (ssh-config-tunnel-open tunnel))
+   (lambda (client condition)
+     (declare (ignore client))
+     (ssh-config-chain-fail chain condition))
+   (lambda (client reason)
+     (declare (ignore client reason))
+     nil)))
+
+(defun ssh-config-hop-tunnel (chain next target-parameters)
+  "Bind a loopback listener that leads to the next hop or to the target."
+  (let* ((destination (or next target-parameters))
+         (tunnel (%make-ssh-config-tunnel
+                  :chain chain
+                  :host (getf destination :connect-host)
+                  :port (getf destination :port))))
+    (values tunnel (ssh-config-tunnel-listen tunnel))))
+
+(defun ssh-config-start-chain (hops overrides target-options target-parameters
+                               on-open on-error on-close)
+  "Build every jump client and the target, and return the target client.
+
+The listeners exist before the clients that dial them, so the whole chain
+is constructed in one pass; bytes that arrive before a channel is open wait
+in the tunnel's buffers."
+  (let ((chain (%make-ssh-config-chain))
+        (previous-port nil)
+        (tunnels nil))
+    (loop for hop in hops
+          for rest = (rest hops) then (rest rest)
+          do (multiple-value-bind (tunnel port)
+                 (ssh-config-hop-tunnel chain (first rest) target-parameters)
+               (push tunnel tunnels)
+               (ssh-config-start-jump
+                chain tunnel hop
+                (if previous-port "127.0.0.1" (getf hop :connect-host))
+                (or previous-port (getf hop :port)))
+               (setf previous-port port)))
+    (setf (ssh-config-chain-tunnels chain) (nreverse tunnels))
+    (let ((target
+            (ssh-config-launch-client
+             target-parameters target-options "127.0.0.1" previous-port
+             on-open
+             (lambda (client condition)
+               (ssh-config-chain-close chain)
+               (when on-error (funcall on-error client condition)))
+             (lambda (client reason)
+               (ssh-config-chain-close chain)
+               (when on-close (funcall on-close client reason))))))
+      (setf (ssh-config-chain-target chain) target)
+      (when (ssh-config-chain-error chain)
+        (ssh-client-fail target (ssh-config-chain-error chain)))
+      target)))
+
+(defun ssh-config-finish-client (host options hops overrides
+                                 on-open on-error on-close)
+  "Build the target client for HOST, directly or through HOPS."
+  (let ((target (ssh-config-client-parameters
+                 host options
+                 :user (getf overrides :user)
+                 :port (getf overrides :port)
+                 :private-key (getf overrides :private-key)
+                 :agent (getf overrides :agent)
+                 :passphrase (getf overrides :passphrase)
+                 :known-hosts (getf overrides :known-hosts)
+                 :host-key-policy (getf overrides :host-key-policy)
+                 :host-key-callback (getf overrides :host-key-callback))))
+    (cond
+      (hops
+       (ssh-config-start-chain
+        (mapcar (lambda (entry)
+                  (ssh-config-hop-parameters
+                   (car entry) (cdr entry) overrides))
+                hops)
+        overrides options target on-open on-error on-close))
+      (t
+       (ssh-config-launch-client target options nil nil
+                                 on-open on-error on-close)))))
+
+;;; ---- Entry point ----
+
+(defun ssh-config-client-overrides (user port private-key agent passphrase
+                                    known-hosts host-key-policy
+                                    host-key-callback)
+  "The explicit command-line answers, as a plist for the chain builder."
+  (list :user user :port port
+        :private-key private-key :agent agent
+        :passphrase passphrase
+        :known-hosts known-hosts
+        :host-key-policy host-key-policy
+        :host-key-callback host-key-callback))
+
+(defun ssh-config-build-client (source host options proxy-jump proxy-command
+                                exec-matcher overrides on-open on-error
+                                on-close fail on-built)
+  "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT."
+  (handler-case
+      (progn
+        (ssh-config-reject-proxy-command options proxy-command)
+        (ssh-config-resolve-hops
+         source (ssh-config-proxy-jumps options proxy-jump)
+         exec-matcher
+         (lambda (hops)
+           (funcall on-built
+                    (ssh-config-finish-client
+                     host options hops overrides
+                     on-open on-error on-close)))
+         fail))
+    (error (condition) (funcall fail condition))))
+
+(defun make-ssh-client-from-config
+    (host &key config original-host user port private-key agent passphrase
+              known-hosts host-key-policy host-key-callback proxy-jump
+              proxy-command exec-matcher on-client on-config-error
+              on-open on-error on-close)
+  "Connect to HOST exactly as ssh_config describes, return at once.
+
+CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
+User, Port, identities, agent, known-hosts files, policy and ProxyJump are
+honoured while the explicit arguments win.  EXEC-MATCHER answers Match
+exec; ON-CLIENT receives an asynchronous client; ON-CONFIG-ERROR reports."
+  (let* ((source (ssh-config-client-source config))
+         (overrides (ssh-config-client-overrides
+                     user port private-key agent passphrase
+                     known-hosts host-key-policy host-key-callback))
+         (finished nil)
+         (client nil)
+         (on-built (lambda (value)
+                     (setf client value finished t)
+                     (when on-client (funcall on-client value))))
+         (fail (lambda (condition)
+                 (setf finished t)
+                 (ssh-config-client-error condition on-config-error))))
+    (ssh-config-resolve
+     source host
+     :original-host (or original-host host)
+     :user user
+     :port port
+     :exec-matcher exec-matcher
+     :on-options
+     (lambda (options)
+       (ssh-config-build-client source host options proxy-jump proxy-command
+                                exec-matcher overrides on-open on-error
+                                on-close fail on-built))
+     :on-error (lambda (condition) (funcall fail condition)))
+    (when (and (not finished) (null on-client))
+      (error 'ssh-config-error
+             :detail "ssh_config resolution is asynchronous; pass :ON-CLIENT"))
+    client))
+
+(defun ssh-client-send-env (client)
+  "The SendEnv names resolved for CLIENT, or NIL when it has no config."
+  (let ((options (ssh-client-config-options client)))
+    (and options (ssh-config-options-send-env options))))

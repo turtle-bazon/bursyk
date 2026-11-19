@@ -43,6 +43,9 @@
   (on-open nil)
   (on-error nil)
   (on-close nil)
+  ;; The resolved ssh_config this client was built from, when it came from
+  ;; MAKE-SSH-CLIENT-FROM-CONFIG.  Channel code reads SendEnv from it.
+  (config-options nil)
   (closed nil)
   (close-reason nil)
   (window 2097152)

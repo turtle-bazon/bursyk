@@ -35,6 +35,8 @@
   on-open
   on-error
   on-close
+  ;; The resolved ssh_config this client was built from, if any.
+  config-options
   (closed nil)
   close-reason)
 

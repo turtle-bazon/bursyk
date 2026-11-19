@@ -301,18 +301,22 @@
                  :detail (format nil "could not load ~A" path))))))
 
 (defun ssh-plibssh-key-sources (client)
-  "The private keys CLIENT may offer, in order, or NIL for agent-only."
+  "The private keys CLIENT may offer, in order.
+
+An explicit PRIVATE-KEY wins; otherwise the default key joins the agent,
+which is also what OpenSSH does when both are available.  NIL is valid when
+an agent is configured, and an error only when neither source exists."
   (or (let ((source (ssh-client-private-key client)))
         (when source (if (listp source) source (list source))))
-      (unless (ssh-client-agent client)
-        (let ((default (ssh-plibssh-default-key-path)))
-          (unless default
-            (error 'ssh-authentication-error
-                   :detail (concatenate
-                            'string
-                            "no key given: pass PRIVATE-KEY or use "
-                            ":AGENT, or create ~/.ssh/id_ed25519")))
-          (list default)))))
+      (let ((default (ssh-plibssh-default-key-path)))
+        (cond
+          (default (list default))
+          ((ssh-client-agent client) nil)
+          (t (error 'ssh-authentication-error
+                    :detail (concatenate
+                             'string
+                             "no key given: pass PRIVATE-KEY or use "
+                             ":AGENT, or create ~/.ssh/id_ed25519")))))))
 
 (defun ssh-plibssh-load-client-keys (client passphrase)
   "Import every key CLIENT may offer, in order."
@@ -327,21 +331,50 @@
     (setf (ssh-client-key-handles client) handles
           (ssh-client-key-index client) 0)))
 
+(defun ssh-plibssh-client-agent-pending-p (client)
+  "True while the agent has not answered for this connection."
+  (and (ssh-client-agent client)
+       (not (ssh-client-agent-tried client))))
+
 (defun ssh-plibssh-client-drive-auth (client)
-  "Offer CLIENT's next credential, or the agent's, in non-blocking mode."
-  (let ((rc (if (ssh-client-agent client)
-                (ssh-userauth-agent (ssh-client-session client)
-                                    (ssh-client-user client))
-                (ssh-plibssh-client-drive-key-auth client))))
+  "Offer the agent first, then each imported key, in non-blocking mode.
+
+OpenSSH tries the agent's keys before the identity files, so a Denied from
+the agent is not the end: the keys that were loaded alongside it still get
+their turn.  A connection-level failure from the agent follows the same
+path rather than hiding a usable key."
+  (if (ssh-plibssh-client-agent-pending-p client)
+      (let ((rc (ssh-userauth-agent (ssh-client-session client)
+                                    (ssh-client-user client))))
+        (cond
+          ((zerop rc) (ssh-plibssh-client-ready client))
+          ;; User authentication has its own "try again" code, 4, not the
+          ;; connection-level SSH_AGAIN of -2.
+          ((= rc +ssh-auth-again+) nil)
+          (t
+           (setf (ssh-client-agent-tried client) t)
+           (ssh-plibssh-client-drive-key-auth client))))
+      (ssh-plibssh-client-drive-key-auth client)))
+
+(defun ssh-plibssh-client-try-current-key (client)
+  "Try the current imported key, or report DENIED when there is none."
+  (let* ((keys (ssh-client-key-handles client))
+         (index (ssh-client-key-index client))
+         (key (nth index keys)))
+    (if key
+        (ssh-userauth-publickey (ssh-client-session client)
+                                (ssh-client-user client) key)
+        +ssh-auth-denied+)))
+
+(defun ssh-plibssh-client-drive-key-auth (client)
+  "Advance through CLIENT's imported keys until one is accepted."
+  (let ((rc (ssh-plibssh-client-try-current-key client)))
     (cond
       ((zerop rc) (ssh-plibssh-client-ready client))
-      ;; User authentication has its own "try again" code, 4, not the
-      ;; connection-level SSH_AGAIN of -2.
       ((= rc +ssh-auth-again+) nil)
       ((= rc +ssh-auth-denied+)
-       (if (and (not (ssh-client-agent client))
-                (ssh-plibssh-client-next-key-p client))
-           (ssh-plibssh-client-drive-auth client)
+       (if (ssh-plibssh-client-next-key-p client)
+           (ssh-plibssh-client-drive-key-auth client)
            (ssh-client-fail
             client
             (make-condition 'ssh-authentication-error
@@ -350,16 +383,6 @@
        (error 'ssh-authentication-error
               :detail (format nil "authentication failed: ~A"
                               (ssh-plibssh-error (ssh-client-session client))))))))
-
-(defun ssh-plibssh-client-drive-key-auth (client)
-  "Try the current imported key, or NIL when there is none."
-  (let* ((keys (ssh-client-key-handles client))
-         (index (ssh-client-key-index client))
-         (key (nth index keys)))
-    (if key
-        (ssh-userauth-publickey (ssh-client-session client)
-                                (ssh-client-user client) key)
-        +ssh-auth-denied+)))
 
 (defun ssh-plibssh-client-next-key-p (client)
   (let ((next (1+ (ssh-client-key-index client))))
@@ -465,6 +488,25 @@ and is freed."
 
 ;;; ---- Entry points ----
 
+(defun ssh-plibssh-start-client (client passphrase)
+  "Load CLIENT's keys, then resolve and dial its address off the loop."
+  (handler-case
+      (progn
+        (ssh-plibssh-load-client-keys client passphrase)
+        (balkort.resolve:resolve-host
+         (ssh-client-connect-host client)
+         (lambda (address)
+           (unless (ssh-client-closed client)
+             (ssh-plibssh-client-start-tcp client address)))
+         (lambda (condition)
+           (ssh-client-fail
+            client
+            (make-condition 'ssh-connection-error
+                            :detail (format nil "could not resolve ~A: ~A"
+                                            (ssh-client-connect-host client)
+                                            condition))))))
+    (error (condition) (ssh-client-fail client condition))))
+
 (defun make-ssh-client (host
                         &key
                           connect-host
@@ -501,22 +543,7 @@ stays the server's logical one."
                  :on-open on-open
                  :on-error on-error
                  :on-close on-close)))
-    (handler-case
-        (progn
-          (ssh-plibssh-load-client-keys client passphrase)
-          (balkort.resolve:resolve-host
-           (ssh-client-connect-host client)
-           (lambda (address)
-             (unless (ssh-client-closed client)
-               (ssh-plibssh-client-start-tcp client address)))
-           (lambda (condition)
-             (ssh-client-fail
-              client
-              (make-condition 'ssh-connection-error
-                              :detail (format nil "could not resolve ~A: ~A"
-                                              (ssh-client-connect-host client)
-                                              condition))))))
-      (error (condition) (ssh-client-fail client condition)))
+    (ssh-plibssh-start-client client passphrase)
     client))
 
 (defun ssh-client-close (client)

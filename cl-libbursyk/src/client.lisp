@@ -21,44 +21,76 @@
   (mapcar (lambda (key) (ssh-load-key-signer key passphrase))
           (if (listp private-keys) private-keys (list private-keys))))
 
+(defun ssh-default-key-sources (private-key)
+  "PRIVATE-KEY when given, else ~/.ssh/id_ed25519 when it exists."
+  (or private-key
+      (let ((default (ssh-default-private-key)))
+        (and default (list default)))))
+
+(defun ssh-no-key-condition ()
+  "The error to report when no agent or key file is available."
+  (make-condition 'ssh-authentication-error
+                  :detail (concatenate
+                           'string
+                           "no key given: pass PRIVATE-KEY or use :AGENT, "
+                           "or create ~/.ssh/id_ed25519")))
+
+(defun ssh-report-key-signers (keys passphrase on-signers on-error)
+  "Load KEY files and deliver their signers, or report why not."
+  (handler-case
+      (funcall on-signers (ssh-load-key-signers keys passphrase))
+    (error (condition) (funcall on-error condition))))
+
+(defun ssh-report-agent-keys (agent keys passphrase on-signers on-error)
+  "Deliver the agent's signers followed by KEY files, tolerating either."
+  (ssh-agent-signers
+   :path agent
+   :on-signers (lambda (signers)
+                 (handler-case
+                     (funcall on-signers
+                              (append signers
+                                      (ssh-load-key-signers keys passphrase)))
+                   (error (condition) (funcall on-error condition))))
+   ;; An agent that cannot answer is not fatal while a file remains.
+   :on-error (lambda (condition)
+               (declare (ignore condition))
+               (ssh-report-key-signers
+                keys passphrase on-signers on-error))))
+
+(defun ssh-report-agent-signers (agent on-signers on-error)
+  "Deliver the agent's signers, or say that it holds no ed25519 key."
+  (ssh-agent-signers
+   :path agent
+   :on-signers
+   (lambda (signers)
+     (if signers
+         (funcall on-signers signers)
+         (funcall on-error
+                  (ssh-agent-error
+                   "the ssh-agent holds no ssh-ed25519 keys"))))
+   :on-error on-error))
+
 (defun ssh-resolve-signers (private-key agent passphrase on-signers on-error)
   "Find the signers authentication may try, in order, without blocking.
 
-PRIVATE-KEY wins when given; it may be one key or a list of keys, and each
-is loaded in turn.  Otherwise AGENT (T for SSH_AUTH_SOCK, or a socket path)
-supplies every ssh-ed25519 identity it holds.  With neither, the default key
-file is the last resort.  ON-SIGNERS receives the list; ON-ERROR receives an
-ssh-authentication-error."
-  (cond
-    (private-key
-     (handler-case
-         (funcall on-signers (ssh-load-key-signers private-key passphrase))
-       (error (condition) (funcall on-error condition))))
-    (agent
-     (ssh-agent-signers
-      :path agent
-      :on-signers
-      (lambda (signers)
-        (if signers
-            (funcall on-signers signers)
-            (funcall on-error
-                     (ssh-agent-error
-                      "the ssh-agent holds no ssh-ed25519 keys"))))
-      :on-error on-error))
-    (t
-     (handler-case
-         (let ((default (ssh-default-private-key)))
-           (unless default
-             (error 'ssh-authentication-error
-                    :detail (concatenate
-                             'string
-                             "no key given: pass PRIVATE-KEY or use :AGENT, "
-                             "or create ~/.ssh/id_ed25519")))
-           (funcall on-signers
-                    (list (ssh-private-key-signer
-                           (ssh-load-private-key default
-                                                 :passphrase passphrase)))))
-       (error (condition) (funcall on-error condition))))))
+The agent's ssh-ed25519 keys are offered first, then the key files, which
+is the order OpenSSH uses.  PRIVATE-KEY may be one key or a list, and the
+default ~/.ssh/id_ed25519 fills in when no file is named.  AGENT is T for
+SSH_AUTH_SOCK or a socket path; without an explicit key the environment's
+agent is used when SSH_AUTH_SOCK is set.  A failing agent does not hide
+working key files, and vice versa.  ON-ERROR receives an
+ssh-authentication-error only when nothing is left to try."
+  (let* ((keys (ssh-default-key-sources private-key))
+         (agent (or agent
+                    (and (null private-key)
+                         (uiop:getenv "SSH_AUTH_SOCK")
+                         t))))
+    (cond
+      ((and keys agent)
+       (ssh-report-agent-keys agent keys passphrase on-signers on-error))
+      (agent (ssh-report-agent-signers agent on-signers on-error))
+      (keys (ssh-report-key-signers keys passphrase on-signers on-error))
+      (t (funcall on-error (ssh-no-key-condition))))))
 
 (defun ssh-connect-error (client status)
   (ssh-client-fail
@@ -140,21 +172,10 @@ in either step ends CLIENT through its error callback."
      (ssh-client-fail client condition)))
   client)
 
-(defun make-ssh-client (host
-                        &key
-                          connect-host
-                          (port 22)
-                          connect-port
-                          (user (ssh-default-user))
-                          private-key
-                          agent
-                          passphrase
-                          known-hosts
-                          (host-key-policy :strict)
-                          host-key-callback
-                          on-open
-                          on-error
-                          on-close)
+(defun make-ssh-client (host &key connect-host (port 22) connect-port
+                             (user (ssh-default-user)) private-key agent
+                             passphrase known-hosts (host-key-policy :strict)
+                             host-key-callback on-open on-error on-close)
   "Connect to HOST as USER, authenticate, return at once.
 
 HOST is the name HOST-KEY checks and KNOWN-HOSTS records; it is resolved
@@ -164,9 +185,10 @@ HOST.  CONNECT-PORT defaults to PORT and is the port dialled, so a ProxyJump
 tunnel can listen on loopback while PORT still names the server's real one.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
-protected file.  With no PRIVATE-KEY, AGENT (T for SSH_AUTH_SOCK, or a socket
-path) offers every ssh-ed25519 identity the agent holds; otherwise the
-default is ~/.ssh/id_ed25519.  The default known-hosts file is
+protected file.  With no PRIVATE-KEY the default ~/.ssh/id_ed25519 is added
+when it exists.  AGENT (T for SSH_AUTH_SOCK, or a socket path) offers every
+ssh-ed25519 identity the agent holds; when both are available the agent's
+keys are tried first, as OpenSSH does.  The default known-hosts file is
 ~/.ssh/known_hosts.
 
 HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of

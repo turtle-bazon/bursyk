@@ -821,3 +821,153 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+;;; ---- ssh_config client policy ----
+;;;
+;;; MAKE-SSH-CLIENT-FROM-CONFIG is the library version of what a command
+;;; line used to do by hand: turn resolved options into client arguments.
+;;; These pin the mapping itself, which is what a caller like fold depends
+;;; on rather than reimplementing.
+
+(defun facade-options (initargs)
+  "An SSH-CONFIG-OPTIONS carrying INITARGS."
+  (apply #'cl-pnet-ssh::%make-ssh-config-options initargs))
+
+(test facade-jump-list-understands-none-and-commas
+  (is (null (cl-pnet-ssh::ssh-config-jump-list nil)))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list "none")))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list " NONE ")))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list "")))
+  (is (equal '("jump.example")
+             (cl-pnet-ssh::ssh-config-jump-list "jump.example")))
+  (is (equal '("one" "user@two:2222" "three")
+             (cl-pnet-ssh::ssh-config-jump-list "one, user@two:2222,three")))
+  ;; An already split list passes through.
+  (is (equal '("one" "two") (cl-pnet-ssh::ssh-config-jump-list '("one" "two")))))
+
+(test facade-split-host-port-brackets-ipv6
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "example.org")
+    (is (equal "example.org" host))
+    (is (null port)))
+  (multiple-value-bind (host port)
+      (cl-pnet-ssh::ssh-config-split-host-port "example.org:2200")
+    (is (equal "example.org" host))
+    (is (equal "2200" port)))
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "[::1]:2222")
+    (is (equal "::1" host))
+    (is (equal "2222" port)))
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "[::1]")
+    (is (equal "::1" host))
+    (is (null port)))
+  (is (= 2222 (cl-pnet-ssh::ssh-config-port-number "2222")))
+  (is (null (cl-pnet-ssh::ssh-config-port-number "22x")))
+  (is (null (cl-pnet-ssh::ssh-config-port-number "2222-with"))))
+
+(test facade-jump-descriptor-reads-user-and-port
+  (let ((hop (cl-pnet-ssh::ssh-config-jump-descriptor "alice@other:2201")))
+    (is (equal "other" (getf hop :host)))
+    (is (equal "alice" (getf hop :user)))
+    (is (= 2201 (getf hop :port))))
+  (let ((hop (cl-pnet-ssh::ssh-config-jump-descriptor "plain")))
+    (is (equal "plain" (getf hop :host)))
+    (is (null (getf hop :user)))
+    (is (null (getf hop :port)))))
+
+(test facade-client-policy-reads-strict-host-key-checking
+  (is (eq :insecure
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "no")))))
+  (is (eq :insecure
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "off")))))
+  (is (eq :accept-new
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "accept-new")))))
+  (is (eq :strict
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "yes")))))
+  (is (eq :strict (cl-pnet-ssh::ssh-config-client-policy (facade-options nil)))))
+
+(test facade-client-agent-understands-none-and-the-environment
+  (is (eq t (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identity-agent :environment)) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identity-agent :none)) nil)))
+  ;; An explicit command-line answer wins over the file.
+  (is (string= "/tmp/explicit.sock"
+               (cl-pnet-ssh::ssh-config-client-agent
+                (facade-options '(:identity-agent "/tmp/config.sock"))
+                "/tmp/explicit.sock")))
+  ;; "none" and SSH_AUTH_SOCK from -o mean what they do in the file.
+  (is (null (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "none")))
+  (is (eq t (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "SSH_AUTH_SOCK")))
+  ;; IdentitiesOnly turns the environment's agent off.
+  (is (null (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identities-only t)) nil))))
+
+(test facade-client-identities-keep-the-file-order
+  (let ((options (facade-options
+                  (list :identity-files (list "second" "first")))))
+    ;; The parser pushes, so the facade reverses back into file order.
+    (is (equal '("first" "second")
+               (cl-pnet-ssh::ssh-config-client-identities options nil))))
+  (is (equal '("given")
+             (cl-pnet-ssh::ssh-config-client-identities (facade-options nil) '("given")))))
+
+(test facade-client-known-hosts-put-the-user-file-first
+  (let ((known (cl-pnet-ssh::ssh-config-client-known-hosts
+                (facade-options (list :known-hosts (list #p"/u/known")
+                                      :global-known-hosts (list #p"/e/known")))
+                nil)))
+    (is (equal '("/u/known" "/e/known")
+               (mapcar #'namestring known))))
+  (is (null (cl-pnet-ssh::ssh-config-client-known-hosts (facade-options nil) nil)))
+  (is (equal '("/given")
+             (mapcar #'namestring
+                     (cl-pnet-ssh::ssh-config-client-known-hosts
+                      (facade-options nil) '("/given"))))))
+
+(test facade-proxy-jumps-let-the-command-line-win
+  (let ((options (facade-options '(:proxy-jump "from-config.example"))))
+    (is (equal "from-config.example"
+               (getf (first (cl-pnet-ssh::ssh-config-proxy-jumps options nil)) :host)))
+    (is (equal "cli.example"
+               (getf (first (cl-pnet-ssh::ssh-config-proxy-jumps options "cli.example"))
+                     :host)))
+    (is (null (cl-pnet-ssh::ssh-config-proxy-jumps options "none")))))
+
+(test facade-refuses-a-proxy-command
+  (signals ssh-config-error
+    (cl-pnet-ssh::ssh-config-reject-proxy-command
+     (facade-options '(:proxy-command "nc %h %p")) nil))
+  (is (null (cl-pnet-ssh::ssh-config-reject-proxy-command (facade-options nil) nil))))
+
+(test facade-client-parameters-carry-the-whole-config
+  (let* ((options (facade-options
+                   (list :hostname "real.example"
+                         :user "file-user"
+                         :port 2200
+                         :identity-files (list "second" "first")
+                         :known-hosts (list #p"/u/known")
+                         :global-known-hosts (list #p"/e/known")
+                         :strict-host-key-checking "accept-new"
+                         :identity-agent :none)))
+         (parameters
+           (cl-pnet-ssh::ssh-config-client-parameters "alias" options)))
+    (is (equal "alias" (getf parameters :host)))
+    (is (equal "real.example" (getf parameters :connect-host)))
+    (is (= 2200 (getf parameters :port)))
+    (is (equal "file-user" (getf parameters :user)))
+    (is (equal '("first" "second") (getf parameters :private-key)))
+    (is (null (getf parameters :agent)))
+    (is (equal '("/u/known" "/e/known")
+               (mapcar #'namestring (getf parameters :known-hosts))))
+    (is (eq :accept-new (getf parameters :host-key-policy))))
+  ;; An explicit command-line answer still wins.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :user "file-user" :port 2200))
+           :user "cli-user" :port 2222)))
+    (is (equal "cli-user" (getf parameters :user)))
+    (is (= 2222 (getf parameters :port)))))

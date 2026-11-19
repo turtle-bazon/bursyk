@@ -3,10 +3,13 @@
   (:export
    ;; client
    #:make-ssh-client
+   #:make-ssh-client-from-config
    #:ssh-client
    #:ssh-client-p
    #:ssh-client-close
    #:ssh-client-phase
+   #:ssh-client-config-options
+   #:ssh-client-send-env
    #:ssh-client-host-key-fingerprint
    #:ssh-client-server-version
    #:ssh-client-connect-host
