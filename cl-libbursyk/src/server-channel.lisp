@@ -115,15 +115,6 @@
 
 ;;; ---- Requests ----
 
-(defun ssh-server-env-allowed-p (server name value)
-  "Whether the server's AcceptEnv policy admits NAME."
-  (let ((policy (ssh-server-accept-env server)))
-    (cond
-      ((eq policy t) t)
-      ((functionp policy) (funcall policy name value))
-      ((listp policy) (member name policy :test #'string=))
-      (t nil))))
-
 (defun ssh-server-channel-reply (channel ok want-reply)
   (when want-reply
     (ssh-server-channel-send-message

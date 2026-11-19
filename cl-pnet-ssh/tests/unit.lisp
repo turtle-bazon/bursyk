@@ -232,7 +232,10 @@
                 (ssh-concat k1 k2)))))
 
 ;;; ---- Rekey ----
+;;; These two tests replace functions inside the pure client transport.  The
+;;; libssh backend has a different transport, so they only exist there.
 
+#-ssh-backend-ffi
 (defun kexinit-message-types (already-sent)
   "Types of the messages HANDLE-KEXINIT sends when our KEXINIT was ALREADY-SENT."
   (let ((sent '())
@@ -251,6 +254,7 @@
         (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload) original)))
     (nreverse sent)))
 
+#-ssh-backend-ffi
 (test rekey-sends-our-kexinit-before-ecdh-init
   ;; A server-initiated exchange has not seen our KEXINIT yet, so both go out;
   ;; the initial exchange already sent ours and only needs the ECDH half.
@@ -259,6 +263,10 @@
                    cl-pnet-ssh::+ssh-msg-kex-ecdh-init+)))
   (is (equal (kexinit-message-types t)
              (list cl-pnet-ssh::+ssh-msg-kex-ecdh-init+))))
+
+#+ssh-backend-ffi
+(test rekey-sends-our-kexinit-before-ecdh-init
+  (skip "the pure client transport is not built"))
 
 (test plain-hmac-packet-round-trip
   (let* ((mac-key (ssh-random-octets 32))
@@ -383,8 +391,49 @@
            (is (eq :unknown (ssh-known-host-status file "hashed.example:2223" blob))))
       (ignore-errors (delete-directory-tree directory :validate t)))))
 
-;;; ---- Channel requests ----
+;; Both backends accept a list of known-hosts files, as ssh_config's
+;; UserKnownHostsFile and GlobalKnownHostsFile produce, and a key found in
+;; either one is trusted.
+(defun client-known-host-status-for (client blob)
+  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-known-host-status client blob)
+  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-known-host-status client blob))
 
+(defun client-remember-host-key-for (client blob)
+  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-remember-host-key client blob)
+  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-remember-host-key client blob))
+
+(test client-known-hosts-checks-every-file
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-khm"))
+         (first-file (merge-pathnames "user_known_hosts" directory))
+         (second-file (merge-pathnames "global_known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (other (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list first-file second-file))))
+    (ensure-directories-exist first-file)
+    (unwind-protect
+         (progn
+           (ssh-remember-known-host first-file "example.org"
+                                    "ssh-ed25519" blob)
+           (ssh-remember-known-host second-file "example.org"
+                                    "ssh-ed25519" other)
+           (is (eq :match (client-known-host-status-for client blob)))
+           (is (eq :match (client-known-host-status-for client other)))
+           (is (eq :mismatch
+                   (client-known-host-status-for client
+                                                 (ssh-test-known-host-blob))))
+           ;; Trust-on-first-use writes the first file, the user's own.
+           (let ((fresh (ssh-test-known-host-blob)))
+             (client-remember-host-key-for client fresh)
+             (is (eq :match (ssh-known-host-status first-file
+                                                   "example.org" fresh)))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+;;; ---- Channel requests ----
+;;; Capturing SSH-CHANNEL-SEND only makes sense for the pure transport.
+
+#-ssh-backend-ffi
 (defun captured-channel-messages (channel thunk)
   "Payloads THUNK sends on CHANNEL, in order."
   (let ((sent '()))
@@ -410,6 +459,7 @@
             (iter (while (plusp (ssh-reader-remaining reader)))
               (collect (ssh-read-text reader))))))
 
+#-ssh-backend-ffi
 (test channel-env-precedes-a-queued-exec
   (let ((channel (cl-pnet-ssh::%make-ssh-channel
                   :client (cl-pnet-ssh::%make-ssh-client)
@@ -441,6 +491,10 @@
         (is (string= request "exec"))
         (is (eq t reply))
         (is (equal fields '("git-upload-pack 'repo'")))))))
+
+#+ssh-backend-ffi
+(test channel-env-precedes-a-queued-exec
+  (skip "the pure client transport is not built"))
 
 ;;; ---- ssh-agent ----
 

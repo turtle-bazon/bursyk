@@ -1,11 +1,14 @@
 (defsystem #:cl-libbursyk
-  :description "Pure Common Lisp SSH-2 protocol core: wire, crypto, packets, keys, KEX"
+  :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.0"
+  :version "0.0.3.0"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
+               #:cl-pnet
+               #:cl-pnet-sockets
+               #:balkort-resolve
                #:iterate
                #:uiop)
   :serial t
@@ -20,4 +23,31 @@
                              (:file "packet")
                              (:file "keys")
                              (:file "known-hosts")
-                             (:file "kex")))))
+                             (:file "server-policy")
+                             (:file "kex")
+                             ;; The agent protocol is role-neutral: both roles
+                             ;; reach an agent, and the FFI backend exposes the
+                             ;; same helpers as the pure one.
+                             (:file "agent")
+                             ;; Both ends of the protocol.  A build with
+                             ;; :ssh-backend-ffi gets these from CL-PLIBSSH
+                             ;; instead, so the pure roles are not compiled.
+                             ;; Signers describe a key; they are useful to
+                             ;; either transport and do not name a socket.
+                             (:file "client-signer")
+                             (:file "client-state"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "client-transport"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "client-channel"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "client"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "server-state"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "server-transport"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "server-channel"
+                              :if-feature (:not :ssh-backend-ffi))
+                             (:file "server"
+                              :if-feature (:not :ssh-backend-ffi))))))

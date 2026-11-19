@@ -50,6 +50,12 @@
    #:ssh-server-channel-eof
    #:ssh-server-channel-exit
    #:ssh-server-channel-close
+   ;; handlers an application attaches after ON-CHANNEL creates the channel
+   #:ssh-server-channel-on-data
+   #:ssh-server-channel-on-eof
+   #:ssh-server-channel-on-exec
+   #:ssh-server-channel-on-close
+   #:ssh-server-channel-on-error
    ;; ~/.ssh/config
    #:ssh-config
    #:ssh-config-p
@@ -84,6 +90,7 @@
    #:ssh-private-key-p
    #:ssh-private-key-type
    #:ssh-private-key-public
+   #:ssh-private-key-path
    #:ssh-load-private-key
    #:ssh-public-key-parts
    #:ssh-make-public-key-blob
