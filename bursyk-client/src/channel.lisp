@@ -90,6 +90,34 @@ the open confirmation are queued and flushed once the peer answers."
              (ssh-write-boolean writer t)
              (ssh-write-text writer command))))
 
+(defun ssh-channel-send-env (channel name value)
+  "Ask the peer to set NAME=VALUE for commands on CHANNEL's session."
+  (ssh-channel-send-message
+   channel +ssh-msg-channel-request+
+   :fields (lambda (writer)
+             (ssh-write-text writer "env")
+             (ssh-write-boolean writer nil)
+             (ssh-write-text writer name)
+             (ssh-write-text writer value))))
+
+(defun ssh-channel-env (channel name value)
+  "Set NAME=VALUE for commands run later on CHANNEL.
+
+Like SSH-CHANNEL-EXEC this queues while the channel opens, and a queued
+exec follows the queued env requests.  The peer applies the value only when
+its policy allows the name (sshd: AcceptEnv), so ask for names the remote
+side is known to accept."
+  (ecase (ssh-channel-state channel)
+    (:opening
+     (setf (ssh-channel-pending-env channel)
+           (append (ssh-channel-pending-env channel)
+                   (list (cons name value)))))
+    (:open (ssh-channel-send-env channel name value))
+    (:closing nil)
+    (:closed (error 'ssh-channel-error
+                    :channel channel :detail "channel is closed")))
+  channel)
+
 (defun ssh-channel-exec (channel command)
   "Run COMMAND on CHANNEL's session, or queue it until the channel opens."
   (ecase (ssh-channel-state channel)
@@ -104,7 +132,7 @@ the open confirmation are queued and flushed once the peer answers."
 
 (defun ssh-channel-queue (channel data)
   (let ((queue (ssh-channel-write-queue channel)))
-    (iter (for octet in-vector (ssh-copy-octets data))
+    (iter (for octet in-vector (ssh-ensure-octets data))
       (vector-push-extend octet queue))))
 
 (defun ssh-channel-drop-queue (channel count)
@@ -190,9 +218,13 @@ the open confirmation are queued and flushed once the peer answers."
         (ssh-channel-remote-window channel) (ssh-read-u32 reader)
         (ssh-channel-remote-max-packet channel) (ssh-read-u32 reader)
         (ssh-channel-state channel) :open)
-  (let ((exec (ssh-channel-pending-exec channel)))
+  (let ((env (ssh-channel-pending-env channel))
+        (exec (ssh-channel-pending-exec channel)))
+    (setf (ssh-channel-pending-env channel) nil
+          (ssh-channel-pending-exec channel) nil)
+    (iter (for (name . value) in env)
+      (ssh-channel-send-env channel name value))
     (when exec
-      (setf (ssh-channel-pending-exec channel) nil)
       (ssh-channel-send-exec channel exec)))
   (ssh-channel-flush channel))
 

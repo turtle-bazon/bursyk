@@ -16,6 +16,12 @@
         (setf (aref out i)
               (if (characterp element) (char-code element) element))))))
 
+(defun ssh-ensure-octets (data)
+  "DATA as octets: a string is UTF-8 encoded, a vector copied."
+  (if (stringp data)
+      (babel:string-to-octets data :encoding :utf-8)
+      (ssh-copy-octets data)))
+
 (defun ssh-concat (&rest sequences)
   "Concatenate SEQUENCES, which hold octets, into one fresh vector."
   (let* ((total (reduce #'+ sequences :key #'length :initial-value 0))

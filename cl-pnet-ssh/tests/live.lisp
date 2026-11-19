@@ -6,7 +6,9 @@
 ;;;;   SSH_TEST_HOST         default 127.0.0.1
 ;;;;   SSH_TEST_PORT         default 22
 ;;;;   SSH_TEST_USER         default $USER
-;;;;   SSH_TEST_KEY          required, path to an unencrypted ssh-ed25519 key
+;;;;   SSH_TEST_KEY          path to an ssh-ed25519 key
+;;;;   SSH_TEST_PASSPHRASE   passphrase for an encrypted SSH_TEST_KEY
+;;;;   SSH_TEST_AGENT        agent socket to use instead of SSH_TEST_KEY
 ;;;;   SSH_TEST_KNOWN_HOSTS  default a fresh file under /tmp
 ;;;;   SSH_TEST_COMMAND      default "printf hello; printf oops >&2; exit 7"
 ;;;;   SSH_TEST_STATUS       expected exit status, default 7
@@ -61,16 +63,20 @@
 
 (defun main ()
   (let* ((key (env "SSH_TEST_KEY" nil))
+         (agent (let ((value (env "SSH_TEST_AGENT" nil)))
+                  (if (and value (string-equal value "t")) t value)))
          (known-hosts (env "SSH_TEST_KNOWN_HOSTS"
                            (format nil "/tmp/cl-pnet-ssh-live-~D.known_hosts"
                                    (get-universal-time)))))
-    (unless key
-      (live-error "SSH_TEST_KEY is not set"))
+    (unless (or key agent)
+      (live-error "SSH_TEST_KEY or SSH_TEST_AGENT is not set"))
     (cl-pnet-ssh:make-ssh-client
      (env "SSH_TEST_HOST" "127.0.0.1")
      :port (parse-integer (env "SSH_TEST_PORT" "22"))
      :user (env "SSH_TEST_USER" (uiop:getenv "USER"))
      :private-key key
+     :agent agent
+     :passphrase (env "SSH_TEST_PASSPHRASE" nil)
      :known-hosts known-hosts
      :host-key-policy :accept-new
      :on-open (lambda (client)

@@ -59,14 +59,20 @@
   (and (> (length pattern) 3)
        (string= (subseq pattern 0 3) "|1|")))
 
+(defun ssh-known-host-base64 (string)
+  "Decode STRING, or NIL when it is not valid base64.
+
+Known-hosts is untrusted input: one corrupt hashed entry is a non-match,
+not a reason to abort the file.  Only the decode failure is caught."
+  (handler-case (ssh-base64-octets string)
+    (cl-base64:bad-base64-character () nil)))
+
 (defun ssh-hashed-known-host-matches-p (pattern host)
   "True when the hashed PATTERN was made for HOST."
   (let* ((rest (subseq pattern 3))
          (bar (position #\| rest))
-         (salt (and bar (ignore-errors
-                          (ssh-base64-octets (subseq rest 0 bar)))))
-         (expected (and bar (ignore-errors
-                              (ssh-base64-octets (subseq rest (1+ bar)))))))
+         (salt (and bar (ssh-known-host-base64 (subseq rest 0 bar))))
+         (expected (and bar (ssh-known-host-base64 (subseq rest (1+ bar))))))
     (and salt expected
          (ssh-octets= (ssh-hmac salt (ssh-string-octets host) :sha1) expected))))
 

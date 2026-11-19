@@ -264,32 +264,57 @@ its KEXINIT when the connection came up."
     (when (string= service "ssh-userauth")
       (ssh-client-send-auth-request client))))
 
+(defparameter +ssh-auth-attempt-limit+ 6
+  "Keys to offer before giving up, matching OpenSSH's default.")
+
+(defun ssh-client-current-signer (client)
+  "The signer the next publickey request uses."
+  (nth (ssh-client-auth-index client) (ssh-client-signers client)))
+
 (defun ssh-client-auth-request-unsigned (client)
   "The publickey request without its signature."
   (let ((writer (ssh-writer))
-        (key (ssh-client-private-key client)))
+        (signer (ssh-client-current-signer client)))
+    (unless signer
+      (error 'ssh-authentication-error :detail "no key left to offer"))
     (ssh-write-u8 writer +ssh-msg-userauth-request+)
     (ssh-write-text writer (ssh-client-user client))
     (ssh-write-text writer "ssh-connection")
     (ssh-write-text writer "publickey")
     (ssh-write-boolean writer t)
-    (ssh-write-text writer (ssh-private-key-type key))
-    (ssh-write-string writer (ssh-public-key-blob-of key))
+    (ssh-write-text writer (ssh-signer-type signer))
+    (ssh-write-string writer (ssh-signer-blob signer))
     (ssh-writer-output writer)))
 
-(defun ssh-client-send-auth-request (client)
-  "Offer the public key, signing the session id and the request."
-  (let* ((key (ssh-client-private-key client))
-         (unsigned (ssh-client-auth-request-unsigned client))
-         (signature-data (let ((writer (ssh-writer)))
-                           (ssh-write-string writer (ssh-client-session-id client))
-                           (ssh-write-octets writer unsigned)
-                           (ssh-writer-output writer)))
-         (signature (ssh-ed25519-signature-blob key signature-data))
-         (writer (ssh-writer)))
+(defun ssh-client-send-auth-signed (client unsigned signature)
+  "Send a publickey request that carries SIGNATURE."
+  (let ((writer (ssh-writer)))
     (ssh-write-octets writer unsigned)
     (ssh-write-string writer signature)
     (ssh-client-send-payload client (ssh-writer-output writer))))
+
+(defun ssh-client-send-auth-request (client)
+  "Offer the current key, signing the session id and the request.
+
+The signer may answer at once (a local key) or later (an agent), so the
+request goes out from the callback rather than from this function's tail."
+  (handler-case
+      (let* ((signer (ssh-client-current-signer client))
+             (unsigned (ssh-client-auth-request-unsigned client))
+             (signature-data (let ((writer (ssh-writer)))
+                               (ssh-write-string writer
+                                                 (ssh-client-session-id client))
+                               (ssh-write-octets writer unsigned)
+                               (ssh-writer-output writer))))
+        (funcall (ssh-signer-sign signer)
+                 signature-data
+                 (lambda (signature)
+                   (unless (ssh-client-closed-p client)
+                     (ssh-client-send-auth-signed client unsigned signature)))
+                 (lambda (condition)
+                   (ssh-client-fail client condition))))
+    (error (condition)
+      (ssh-client-fail client condition))))
 
 (defun ssh-client-handle-auth-success (client)
   "Authenticated: let the queued channel work start."
@@ -300,13 +325,24 @@ its KEXINIT when the connection came up."
       (funcall (ssh-client-on-open client) client))
     (iter (for action in actions) (funcall action))))
 
+(defun ssh-client-next-signer-p (client)
+  "Move to the next signer; NIL when none is left or the limit is reached."
+  (let ((next (1+ (ssh-client-auth-index client))))
+    (when (and (< next (length (ssh-client-signers client)))
+               (< next +ssh-auth-attempt-limit+))
+      (setf (ssh-client-auth-index client) next)
+      t)))
+
 (defun ssh-client-handle-auth-failure (client payload)
   (let* ((reader (ssh-make-reader payload))
          (methods (progn (ssh-read-u8 reader) (ssh-read-name-list reader))))
-    (ssh-client-fail
-     client
-     (make-condition 'ssh-authentication-error
-                     :detail (format nil "server accepts ~{~A~^, ~}" methods)))))
+    (if (ssh-client-next-signer-p client)
+        (ssh-client-send-auth-request client)
+        (ssh-client-fail
+         client
+         (make-condition 'ssh-authentication-error
+                         :detail (format nil "server accepts ~{~A~^, ~}"
+                                         methods))))))
 
 (defun ssh-client-handle-global-request (client payload)
   (let* ((reader (ssh-make-reader payload))

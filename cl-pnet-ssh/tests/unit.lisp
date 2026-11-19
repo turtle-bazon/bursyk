@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:cl-pnet-ssh-tests
-  (:use #:cl #:fiveam #:cl-pnet-ssh))
+  (:use #:cl #:fiveam #:iterate #:cl-pnet-ssh))
 
 (in-package #:cl-pnet-ssh-tests)
 
@@ -314,6 +314,34 @@
                                              (second parts)))))))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
+(test openssh-private-key-passphrase-round-trip
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-enc"))
+             (path (merge-pathnames "id_ed25519" directory)))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen
+                (list "-q" "-t" "ed25519" "-N" "secret" "-f" (namestring path)))
+               (let* ((key (ssh-load-private-key path :passphrase "secret"))
+                      (blob (ssh-public-key-blob-of key)))
+                 (is (string= "ssh-ed25519"
+                              (nth-value 0 (ssh-public-key-parts blob))))
+                 (let ((signature (ssh-ed25519-signature-blob
+                                   key (octets-ascii "locked"))))
+                   (multiple-value-bind (algorithm bytes)
+                       (ssh-parse-signature-blob signature)
+                     (declare (ignore algorithm))
+                     (is (ssh-ed25519-verify
+                          bytes (octets-ascii "locked")
+                          (nth-value 1 (ssh-public-key-parts blob))))))
+                 (signals ssh-authentication-error
+                   (ssh-load-private-key path :passphrase "wrong"))
+                 (signals ssh-authentication-error
+                   (ssh-load-private-key path))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
 ;;; ---- known_hosts ----
 
 (defun ssh-test-known-host-blob ()
@@ -354,3 +382,388 @@
            (is (eq :match (ssh-known-host-status file "hashed.example:2222" blob)))
            (is (eq :unknown (ssh-known-host-status file "hashed.example:2223" blob))))
       (ignore-errors (delete-directory-tree directory :validate t)))))
+
+;;; ---- Channel requests ----
+
+(defun captured-channel-messages (channel thunk)
+  "Payloads THUNK sends on CHANNEL, in order."
+  (let ((sent '()))
+    (let ((original (symbol-function 'cl-pnet-ssh::ssh-channel-send)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'cl-pnet-ssh::ssh-channel-send)
+                   (lambda (channel payload)
+                     (declare (ignore channel))
+                     (push payload sent)
+                     t))
+             (funcall thunk))
+        (setf (symbol-function 'cl-pnet-ssh::ssh-channel-send) original)))
+    (nreverse sent)))
+
+(defun channel-request-parts (payload)
+  "TYPE, REMOTE-ID, REQUEST, WANT-REPLY and the remaining text fields."
+  (let ((reader (ssh-make-reader payload)))
+    (values (ssh-read-u8 reader)
+            (ssh-read-u32 reader)
+            (ssh-read-text reader)
+            (ssh-read-boolean reader)
+            (iter (while (plusp (ssh-reader-remaining reader)))
+              (collect (ssh-read-text reader))))))
+
+(test channel-env-precedes-a-queued-exec
+  (let ((channel (cl-pnet-ssh::%make-ssh-channel
+                  :client (cl-pnet-ssh::%make-ssh-client)
+                  :remote-id 7 :state :opening)))
+    (ssh-channel-env channel "GIT_PROTOCOL" "version=2")
+    (ssh-channel-exec channel "git-upload-pack 'repo'")
+    (let* ((confirmation (concatenated
+                          (ssh-uint32-octets 7)
+                          (ssh-uint32-octets 1048576)
+                          (ssh-uint32-octets 32768)))
+           (messages
+             (captured-channel-messages
+              channel
+              (lambda ()
+                (cl-pnet-ssh::ssh-channel-handle-open-confirmation
+                 channel (ssh-make-reader confirmation))))))
+      (is (= 2 (length messages)))
+      (multiple-value-bind (type remote request reply fields)
+          (channel-request-parts (first messages))
+        (is (= type cl-pnet-ssh::+ssh-msg-channel-request+))
+        (is (= remote 7))
+        (is (string= request "env"))
+        (is (not reply))
+        (is (equal fields '("GIT_PROTOCOL" "version=2"))))
+      (multiple-value-bind (type remote request reply fields)
+          (channel-request-parts (second messages))
+        (is (= type cl-pnet-ssh::+ssh-msg-channel-request+))
+        (is (= remote 7))
+        (is (string= request "exec"))
+        (is (eq t reply))
+        (is (equal fields '("git-upload-pack 'repo'")))))))
+
+;;; ---- ssh-agent ----
+
+(defun agent-identities-response (entries)
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer cl-pnet-ssh::+ssh-agent-identities-answer+)
+    (ssh-write-u32 writer (length entries))
+    (dolist (entry entries)
+      (ssh-write-string writer (car entry))
+      (ssh-write-text writer (cdr entry)))
+    (ssh-writer-output writer)))
+
+(test agent-identities-parse
+  (let* ((blob (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
+         (entries (cl-pnet-ssh::ssh-agent-parse-identities
+                   (agent-identities-response (list (cons blob "laptop"))))))
+    (is (= 1 (length entries)))
+    (is (equalp blob (caar entries)))
+    (is (string= "laptop" (cdar entries)))))
+
+(test agent-sign-parse
+  (let ((signature (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 64)))
+        (writer (ssh-writer)))
+    (ssh-write-u8 writer cl-pnet-ssh::+ssh-agent-sign-response+)
+    (ssh-write-string writer signature)
+    (is (equalp signature
+                (cl-pnet-ssh::ssh-agent-parse-sign (ssh-writer-output writer)))))
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer cl-pnet-ssh::+ssh-agent-failure+)
+    (signals ssh-authentication-error
+      (cl-pnet-ssh::ssh-agent-parse-sign (ssh-writer-output writer)))))
+
+;;; A fake agent on a Unix socket, driven by the same non-blocking loop as
+;;; the client.  It serves exactly one request, then closes.
+
+(defstruct (fake-agent (:constructor %make-fake-agent))
+  listener
+  listener-watcher
+  connection
+  connection-watcher
+  (incoming (make-array 0 :element-type '(unsigned-byte 8)
+                          :adjustable t :fill-pointer 0))
+  responder)
+
+(defun fake-agent-close (agent)
+  (when (fake-agent-connection-watcher agent)
+    (cl-pnet:fd-unwatch (fake-agent-connection-watcher agent))
+    (setf (fake-agent-connection-watcher agent) nil))
+  (when (fake-agent-connection agent)
+    (cl-pnet-sockets:close-open-fd (fake-agent-connection agent))
+    (setf (fake-agent-connection agent) nil))
+  (when (fake-agent-listener-watcher agent)
+    (cl-pnet:fd-unwatch (fake-agent-listener-watcher agent))
+    (setf (fake-agent-listener-watcher agent) nil))
+  (when (fake-agent-listener agent)
+    (cl-pnet-sockets:close-open-fd (fake-agent-listener agent))
+    (setf (fake-agent-listener agent) nil)))
+
+(defun fake-agent-send (agent octets)
+  (cl-pnet-sockets:send-octets (fake-agent-connection agent) octets))
+
+(defun fake-agent-respond (agent)
+  (let* ((incoming (fake-agent-incoming agent))
+         (length (ssh-octets-uint32 incoming))
+         (payload (subseq incoming 4 (+ 4 length)))
+         (response (funcall (fake-agent-responder agent) payload)))
+    (fake-agent-send
+     agent (ssh-concat (ssh-uint32-octets (length response)) response))
+    (fake-agent-close agent)))
+
+(defun fake-agent-read (agent)
+  (multiple-value-bind (octets count)
+      (cl-pnet-sockets:receive-octets (fake-agent-connection agent) 4096)
+    (when (plusp count)
+      (loop for octet across octets
+            do (vector-push-extend octet (fake-agent-incoming agent)))
+      (let ((incoming (fake-agent-incoming agent)))
+        (when (and (>= (fill-pointer incoming) 4)
+                   (>= (fill-pointer incoming)
+                       (+ 4 (ssh-octets-uint32 incoming))))
+          (fake-agent-respond agent))))))
+
+(defun fake-agent-accept (agent)
+  (when (fake-agent-listener-watcher agent)
+    (cl-pnet:fd-unwatch (fake-agent-listener-watcher agent))
+    (setf (fake-agent-listener-watcher agent) nil))
+  (let ((connection (cl-pnet-sockets:accept-socket
+                     (fake-agent-listener agent))))
+    (cl-pnet-sockets:close-open-fd (fake-agent-listener agent))
+    (setf (fake-agent-listener agent) nil)
+    (when connection
+      (setf (fake-agent-connection agent) connection)
+      (setf (fake-agent-connection-watcher agent)
+            (cl-pnet:fd-watch
+             connection :on-readable
+             (lambda (watcher)
+               (declare (ignore watcher))
+               (fake-agent-read agent)))))))
+
+(defun fake-agent-open (path respond)
+  (ignore-errors (delete-file path))
+  (let ((listener (cl-pnet-sockets:listen-unix path :backlog 4))
+        (agent nil))
+    (setf agent (%make-fake-agent :listener listener :responder respond))
+    (setf (fake-agent-listener-watcher agent)
+          (cl-pnet:fd-watch
+           listener :on-readable
+           (lambda (watcher)
+             (declare (ignore watcher))
+             (fake-agent-accept agent))))
+    agent))
+
+(defun run-agent-call (path respond start)
+  "Run START against a fake agent; return its result when the call ends."
+  (let ((agent (fake-agent-open path respond))
+        (result nil)
+        (done nil)
+        (turns 0))
+    (unwind-protect
+         (progn
+           (funcall start
+                    (lambda (value)
+                      (setf result value done t))
+                    (lambda (condition)
+                      (setf result condition done t)))
+           (loop until (or done (> turns 10000))
+                 do (cl-pnet:event-loop-run-once)
+                    (incf turns))
+           (is (not (null done)) "the agent call did not finish")
+           result)
+      (fake-agent-close agent))))
+
+(test agent-missing-socket-reports-error
+  (let ((condition nil))
+    (cl-pnet-ssh:ssh-agent-identities
+     :path "/nonexistent/cl-pnet-ssh-agent.sock"
+     :on-identities (lambda (entries) (declare (ignore entries)))
+     :on-error (lambda (reported) (setf condition reported)))
+    (is (typep condition 'ssh-authentication-error))
+    (is (search "cannot connect"
+                (ssh-error-detail condition)))))
+
+(test agent-identities-over-a-unix-socket
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-i"))
+         (path (namestring (merge-pathnames "agent.sock" directory)))
+         (blob (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
+         (response (agent-identities-response (list (cons blob "from-agent")))))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let ((entries
+                 (run-agent-call
+                  path
+                  (lambda (payload)
+                    (is (= (aref payload 0)
+                           cl-pnet-ssh::+ssh-agentc-request-identities+))
+                    response)
+                  (lambda (on-result on-error)
+                    (ssh-agent-identities :path path
+                                          :on-identities on-result
+                                          :on-error on-error)))))
+           (is (equalp blob (caar entries)))
+           (is (string= "from-agent" (cdar entries))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test agent-sign-over-a-unix-socket
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-s"))
+         (path (namestring (merge-pathnames "agent.sock" directory)))
+         (blob (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
+         (data (octets-ascii "sign this"))
+         (signature (ssh-make-public-key-blob "ssh-ed25519"
+                                              (ssh-random-octets 64)))
+         (response (let ((writer (ssh-writer)))
+                     (ssh-write-u8 writer cl-pnet-ssh::+ssh-agent-sign-response+)
+                     (ssh-write-string writer signature)
+                     (ssh-writer-output writer))))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let ((received
+                 (run-agent-call
+                  path
+                  (lambda (payload)
+                    (let ((reader (ssh-make-reader payload)))
+                      (is (= (ssh-read-u8 reader)
+                             cl-pnet-ssh::+ssh-agentc-sign-request+))
+                      (is (equalp blob (ssh-read-string reader)))
+                      (is (equalp data (ssh-read-string reader)))
+                      (is (zerop (ssh-read-u32 reader))))
+                    response)
+                  (lambda (on-result on-error)
+                    (ssh-agent-sign blob data :path path
+                                    :on-signature on-result
+                                    :on-error on-error)))))
+           (is (equalp signature received)))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+;;; ---- Server role: a loopback around both halves of this library ----
+
+(defun ssh-test-run-command (channel command)
+  "Run COMMAND, then report its output and status on CHANNEL."
+  (multiple-value-bind (stdout stderr status)
+      (uiop:run-program (list "/bin/sh" "-c" command)
+                        :output :string :error-output :string
+                        :ignore-error-status t)
+    (when (plusp (length stdout))
+      (ssh-server-channel-write channel stdout))
+    (when (plusp (length stderr))
+      (ssh-server-channel-write-stderr channel stderr))
+    (ssh-server-channel-exit channel (or status 0))
+    (ssh-server-channel-close channel)))
+
+(defun ssh-test-write-authorized-keys (public-key-file authorized-file)
+  "Copy the one public key in PUBLIC-KEY-FILE into AUTHORIZED-FILE."
+  (with-open-file (output authorized-file :direction :output
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create)
+    (with-open-file (input public-key-file)
+      (write-line (string-trim '(#\Space #\Return #\Newline) (read-line input))
+                  output))))
+
+(defun ssh-test-loopback-handle-data (stdout stderr)
+  "A channel data callback that splits stdout from stderr."
+  (lambda (channel data kind)
+    (declare (ignore channel))
+    (write-string (ssh-octets-string data)
+                  (ecase kind (:stdout stdout) (:stderr stderr)))))
+
+(defun ssh-test-loopback-start (client stdout stderr state)
+  "Open one session, run the test command, and record its exit in STATE.
+
+STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
+  (let ((channel
+          (ssh-open-session
+           client
+           :on-data (ssh-test-loopback-handle-data stdout stderr)
+           :on-exit (lambda (channel value)
+                      (declare (ignore channel))
+                      (setf (first state) value))
+           :on-close (lambda (channel value)
+                       (declare (ignore channel value))
+                       (ssh-client-close client)
+                       (cl-pnet:event-loop-stop))
+           :on-error (lambda (channel condition)
+                       (declare (ignore channel))
+                       (setf (second state) condition)
+                       (cl-pnet:event-loop-stop)))))
+    (ssh-channel-exec channel "printf hello; printf oops >&2; exit 3")))
+
+(defun ssh-test-loopback-run (server client-key known-hosts stdout stderr)
+  "Start a client against SERVER and return the command's exit status."
+  (let ((state (list :none nil))
+        (timeout nil))
+    (unwind-protect
+         (progn
+           (setf timeout
+                 (cl-pnet:timer-start
+                  10 0
+                  (lambda ()
+                    (setf (second state) :timed-out)
+                    (cl-pnet:event-loop-stop))))
+           (make-ssh-client
+            "127.0.0.1"
+            :port (ssh-server-port server)
+            :user "tester"
+            :private-key client-key
+            :known-hosts known-hosts
+            :host-key-policy :accept-new
+            :on-open (lambda (client)
+                       (ssh-test-loopback-start client stdout stderr state))
+            :on-error (lambda (client condition)
+                        (declare (ignore client))
+                        (setf (second state) condition)
+                        (cl-pnet:event-loop-stop))
+            :on-close (lambda (client reason)
+                        (declare (ignore client reason))
+                        (cl-pnet:event-loop-stop)))
+           (cl-pnet:event-loop-run)
+           (when (second state)
+             (error "loopback: ~A" (second state)))
+           (first state))
+      (when timeout (cl-pnet:timer-stop timeout)))))
+
+(defun ssh-test-loopback-result ()
+  "Run one exec through a server and client in this process.
+Returns (VALUES STDOUT STDERR STATUS)."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop"))
+         (server-key (merge-pathnames "host_key" directory))
+         (client-key (merge-pathnames "client_key" directory))
+         (authorized (merge-pathnames "authorized_keys" directory))
+         (known-hosts (merge-pathnames "known_hosts" directory))
+         (stdout (make-string-output-stream))
+         (stderr (make-string-output-stream))
+         (server nil))
+    (ensure-directories-exist server-key)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring server-key)))
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring client-key)))
+           (ssh-test-write-authorized-keys
+            (merge-pathnames "client_key.pub" directory) authorized)
+           (setf server
+                 (make-ssh-server
+                  "127.0.0.1" 0
+                  :host-key server-key
+                  :authorized-keys authorized
+                  :on-channel
+                  (lambda (channel)
+                    (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                          (lambda (channel command)
+                            (ssh-test-run-command channel command))))))
+           (let ((status (ssh-test-loopback-run
+                          server client-key known-hosts stdout stderr)))
+             (values (get-output-stream-string stdout)
+                     (get-output-stream-string stderr)
+                     status)))
+      (when server (ssh-server-close server))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test server-loopback-exec
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status) (ssh-test-loopback-result)
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))

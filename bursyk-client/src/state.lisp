@@ -5,6 +5,7 @@
 
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
+  connect-host
   (port 22)
   (user nil)
   (connection nil)
@@ -27,7 +28,8 @@
   (ignore-next-kex-packet nil)
   (keys-sent nil)
   (keys-received nil)
-  (private-key nil)
+  (signers nil)
+  (auth-index 0)
   (known-hosts nil)
   (host-key-policy :strict)
   (host-key-callback nil)
@@ -57,6 +59,7 @@
                              :adjustable t :fill-pointer 0))
   (write-callbacks nil)
   (pending-exec nil)
+  (pending-env nil)
   (want-eof nil)
   (sent-eof nil)
   (want-close nil)
@@ -91,8 +94,10 @@
   (zerop (fill-pointer (ssh-client-incoming client))))
 
 (defun ssh-client-close-connection (client)
+  ;; CL-PNET:CLOSE-CONNECTION is idempotent, so there is nothing expected to
+  ;; ignore here; swallowing every error would only hide a real bug.
   (when (ssh-client-connection client)
-    (ignore-errors (cl-pnet:close-connection (ssh-client-connection client)))))
+    (cl-pnet:close-connection (ssh-client-connection client))))
 
 (defun ssh-client-finish (client reason kind)
   "Close CLIENT once, reporting REASON through the callback KIND selects."
