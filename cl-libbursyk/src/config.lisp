@@ -22,6 +22,10 @@
 (defstruct (ssh-config-line (:constructor %make-ssh-config-line))
   (keyword nil)
   (args nil)
+  ;; The arguments as they were written, after the keyword.  ProxyCommand
+  ;; needs this: OpenSSH hands the rest of the line to the shell verbatim, so
+  ;; quotes and internal spacing have to survive tokenization.
+  (raw nil)
   (path nil)
   (number nil))
 
@@ -133,6 +137,26 @@ or whitespace, exactly like OpenSSH's argv splitter."
                   (setf started t))))
       (emit-token))
     (nreverse tokens)))
+
+(defun ssh-config-line-remainder (text)
+  "TEXT after its first token, with the original quotes and spacing kept.
+
+The keyword is TEXT's first token; whatever follows the whitespace or '='
+that separates it is returned verbatim, because OpenSSH passes a
+ProxyCommand's arguments to the shell exactly as written."
+  (let* ((length (length text))
+         (start (position-if-not #'ssh-config-whitespace-p text))
+         (end (and start
+                   (position-if (lambda (character)
+                                  (or (ssh-config-whitespace-p character)
+                                      (char= character #\=)))
+                                text :start start))))
+    (if end
+        (string-trim '(#\Space #\Tab #\Return)
+                     (subseq text (if (char= (char text end) #\=)
+                                      (1+ end)
+                                      end)))
+        "")))
 
 ;;; ---- Globs ----
 
@@ -337,6 +361,7 @@ the caller can treat the '[' literally."
                          (push (%make-ssh-config-line
                                 :keyword keyword
                                 :args (rest tokens)
+                                :raw (ssh-config-line-remainder line)
                                 :path path
                                 :number number)
                                directives)))))))
@@ -348,6 +373,65 @@ the caller can treat the '[' literally."
     (when (probe-file path)
       (%make-ssh-config :path path
                         :directives (ssh-config-read-directives path 0)))))
+
+;;; ---- Command-line -o options ----
+
+(defun ssh-config-option-line (option)
+  "One -o OPTION as an SSH-CONFIG-LINE.
+
+OPTION is the text ssh itself accepts after -o, either \"Keyword value\" or
+\"Keyword=value\", or a cons of a keyword and its argument (or arguments).
+Every keyword the file understands works here too, including HostName."
+  (flet ((line (keyword args &optional raw)
+           (unless (plusp (length keyword))
+             (error 'ssh-config-error :detail "an -o option has no keyword"))
+           (%make-ssh-config-line
+            :keyword (string-downcase keyword)
+            :args (mapcar (lambda (arg) (princ-to-string arg)) args)
+            :raw (or raw
+                     (format nil "~{~A~^ ~}"
+                             (mapcar (lambda (arg) (princ-to-string arg))
+                                     args))))))
+    (etypecase option
+      (string
+       (let ((tokens (ssh-config-tokenize option)))
+         (unless tokens
+           (error 'ssh-config-error
+                  :detail (format nil "empty -o option ~S" option)))
+         (line (first tokens) (rest tokens)
+               (ssh-config-line-remainder option))))
+      (cons
+       (let ((keyword (etypecase (car option)
+                        (string (car option))
+                        (symbol (symbol-name (car option)))))
+             (args (cdr option)))
+         (line keyword
+               (cond
+                 ((null args) nil)
+                 ((listp args)
+                  (if (and (null (rest args)) (listp (first args)))
+                      (first args)
+                      args))
+                 ((stringp args) (list args))
+                 (t (list args)))))))))
+
+(defun ssh-config-option-lines (options)
+  "OPTIONS as a list of SSH-CONFIG-LINE, in the order given."
+  (mapcar #'ssh-config-option-line options))
+
+(defun ssh-config-add-options (config options)
+  "CONFIG with the command-line OPTIONS applied before its own directives.
+
+OpenSSH gives -o options the first value on every keyword, exactly as if
+they were the first lines of the file; prepending them to the parsed stream
+does that without a temporary file."
+  (let ((lines (ssh-config-option-lines options)))
+    (if (null lines)
+        config
+        (%make-ssh-config
+         :path (and config (ssh-config-path config))
+         :directives (append lines
+                             (and config (ssh-config-directives config)))))))
 
 ;;; ---- Values ----
 
@@ -403,8 +487,8 @@ the caller can treat the '[' literally."
                      ((member character '(#\d #\D)) (flush 86400))
                      ((member character '(#\w #\W)) (flush 604800))
                      (t (error (ssh-config-line-error line
-                                                      "invalid time ~S" value))))))
-        (when (plusp digits) (flush 1))
+                                                      "invalid time ~S" value)))))
+          (when (plusp digits) (flush 1)))
         total)))
 
 (defun ssh-config-split-list (value)
@@ -685,7 +769,10 @@ enough.  Commas in a pattern are separators, as in ssh_config."
         ((string= keyword "proxyjump")
          (setf (ssh-config-options-proxy-jump options) value))
         ((string= keyword "proxycommand")
-         (setf (ssh-config-options-proxy-command options) value))
+         (ssh-config-arg line)
+         (setf (ssh-config-options-proxy-command options)
+               (let ((raw (ssh-config-line-raw line)))
+                 (if (and raw (plusp (length raw))) raw value))))
         ((string= keyword "bindaddress")
          (setf (ssh-config-options-bind-address options) value))
         ((string= keyword "serveraliveinterval")
@@ -908,3 +995,19 @@ Returns CONFIG."
              (error (condition) (report condition)))))
       (advance 0 t))
     config))
+
+;;; ---- ProxyCommand ----
+
+(defun ssh-proxy-command-value (command)
+  "COMMAND as a ProxyCommand string, or NIL for none.
+
+OpenSSH's \"ProxyCommand none\" turns the proxy off, so an empty or NONE
+answer means the direct path rather than a helper named none."
+  (when command
+    (let ((text (if (stringp command)
+                    (string-trim '(#\Space #\Tab) command)
+                    command)))
+      (unless (and (stringp text)
+                   (or (zerop (length text))
+                       (string-equal text "none")))
+        text))))

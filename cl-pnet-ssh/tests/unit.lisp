@@ -402,6 +402,104 @@
   #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-remember-host-key client blob)
   #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-remember-host-key client blob))
 
+(defun client-host-spec-for (client)
+  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-host-spec client)
+  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-host-spec client))
+
+(defun client-accept-unknown-host-key-for (client blob fingerprint)
+  #+ssh-backend-ffi
+  (cl-pnet-ssh::ssh-plibssh-accept-unknown-host-key client blob fingerprint)
+  #-ssh-backend-ffi
+  (cl-pnet-ssh::ssh-client-accept-unknown-host-key client blob fingerprint))
+
+(test client-known-hosts-uses-the-host-name-for-an-alias
+  "A config alias is checked and recorded under its HostName.
+
+OpenSSH treats \"Host gh / HostName github.com\" as a connection to
+github.com for known_hosts: an existing github.com entry must match the
+alias, and trust-on-first-use must write github.com, not gh."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-alias"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "gh" :connect-host "github.com"
+                  :host-key-host "github.com"
+                  :port 22
+                  :known-hosts (list file))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (is (string= "github.com" (client-host-spec-for client)))
+           (ssh-remember-known-host file "github.com" "ssh-ed25519" blob)
+           (is (eq :match (client-known-host-status-for client blob))
+               "the entry under the HostName was not found")
+           ;; Without the override the alias is what gets looked up, so
+           ;; nothing is found for the alias.
+           (let ((alias-only (cl-pnet-ssh::%make-ssh-client
+                              :host "gh" :connect-host "github.com"
+                              :port 22 :known-hosts (list file))))
+             (is (eq :unknown (client-known-host-status-for alias-only blob)))
+             ;; Trust-on-first-use records the HostName too.
+             (let ((trusted (ssh-test-known-host-blob)))
+               (client-remember-host-key-for client trusted)
+               (is (eq :match (ssh-known-host-status file "github.com"
+                                                     trusted)))
+               (is (eq :unknown (ssh-known-host-status file "gh" trusted))))
+             ;; An entry under the alias does not satisfy the override
+             ;; client, which looks under the HostName; the alias-only
+             ;; client does see it.
+             (let ((fresh (ssh-test-known-host-blob)))
+               (ssh-remember-known-host file "gh" "ssh-ed25519" fresh)
+               (is (eq :mismatch (client-known-host-status-for client fresh))
+                   "the alias entry was consulted instead of the HostName's")
+               (is (eq :match (client-known-host-status-for alias-only fresh))))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test client-rejected-host-key-signals
+  "A policy callback that declines an unknown key must refuse the connection.
+
+Returning false is the answer \"no\" to the host-key prompt; silently
+connecting without recording the key would be the opposite of what the
+caller asked for."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-reject"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (fingerprint (ssh-key-fingerprint blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy (lambda (client fingerprint key)
+                                     (declare (ignore client fingerprint key))
+                                     nil))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (signals ssh-host-key-error
+             (client-accept-unknown-host-key-for client blob fingerprint))
+           (is (eq :unknown (client-known-host-status-for client blob))
+               "a rejected key was recorded anyway"))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test client-accepted-host-key-is-recorded
+  "A policy callback that accepts an unknown key records it and does not
+signal, so the override still works."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-accept"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy (lambda (client fingerprint key)
+                                     (declare (ignore client fingerprint key))
+                                     t))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (client-accept-unknown-host-key-for client blob
+                                               (ssh-key-fingerprint blob))
+           (is (eq :match (client-known-host-status-for client blob))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
 (test client-known-hosts-checks-every-file
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khm"))
          (first-file (merge-pathnames "user_known_hosts" directory))
@@ -761,6 +859,10 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
             :private-key client-key
             :known-hosts known-hosts
             :host-key-policy :accept-new
+            ;; Exercise the timer wiring too: both timers must start with
+            ;; numeric repeat values or the backend rejects them.
+            :connect-timeout 10
+            :server-alive-interval 1
             :on-open (lambda (client)
                        (ssh-test-loopback-start client stdout stderr state))
             :on-error (lambda (client condition)
@@ -821,3 +923,537 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+(defun ssh-test-loopback-outcome (policy)
+  "Run one client handshake against a loopback server with POLICY.
+
+Returns (VALUES OPENED ERROR): OPENED is true once authentication completed,
+ERROR is the condition the client reported, if any."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-policy"))
+         (server-key (merge-pathnames "host_key" directory))
+         (client-key (merge-pathnames "client_key" directory))
+         (authorized (merge-pathnames "authorized_keys" directory))
+         (known-hosts (merge-pathnames "known_hosts" directory))
+         (opened nil)
+         (error nil)
+         (server nil)
+         (timeout nil))
+    (ensure-directories-exist server-key)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring server-key)))
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring client-key)))
+           (ssh-test-write-authorized-keys
+            (merge-pathnames "client_key.pub" directory) authorized)
+           (setf server (make-ssh-server "127.0.0.1" 0
+                                         :host-key server-key
+                                         :authorized-keys authorized))
+           (setf timeout
+                 (cl-pnet:timer-start
+                  10 0
+                  (lambda ()
+                    (setf error :timed-out)
+                    (cl-pnet:event-loop-stop))))
+           (make-ssh-client
+            "127.0.0.1"
+            :port (ssh-server-port server)
+            :user "tester"
+            :private-key client-key
+            :known-hosts known-hosts
+            :host-key-policy policy
+            :on-open (lambda (client)
+                       (declare (ignore client))
+                       (setf opened t)
+                       (cl-pnet:event-loop-stop))
+            :on-error (lambda (client condition)
+                        (declare (ignore client))
+                        (setf error condition)
+                        (cl-pnet:event-loop-stop))
+            :on-close (lambda (client reason)
+                        (declare (ignore client reason))
+                        (cl-pnet:event-loop-stop)))
+           (cl-pnet:event-loop-run)
+           (values opened error))
+      (when timeout (cl-pnet:timer-stop timeout))
+      (when server (ssh-server-close server))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test server-loopback-declined-host-key-does-not-connect
+  "Answering \"no\" to an unknown host key must end the handshake.
+
+The callback is the prompt; returning false has to refuse the host rather
+than connect and quietly skip the known_hosts record."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             nil))
+        (is (null opened) "the client authenticated after the key was declined")
+        (is (typep error 'ssh-host-key-error)))))
+
+;;; ---- ssh_config client policy ----
+;;;
+;;; MAKE-SSH-CLIENT-FROM-CONFIG is the library version of what a command
+;;; line used to do by hand: turn resolved options into client arguments.
+;;; These pin the mapping itself, which is what a caller like fold depends
+;;; on rather than reimplementing.
+
+(defun facade-options (initargs)
+  "An SSH-CONFIG-OPTIONS carrying INITARGS."
+  (apply #'cl-pnet-ssh::%make-ssh-config-options initargs))
+
+(test facade-jump-list-understands-none-and-commas
+  (is (null (cl-pnet-ssh::ssh-config-jump-list nil)))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list "none")))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list " NONE ")))
+  (is (null (cl-pnet-ssh::ssh-config-jump-list "")))
+  (is (equal '("jump.example")
+             (cl-pnet-ssh::ssh-config-jump-list "jump.example")))
+  (is (equal '("one" "user@two:2222" "three")
+             (cl-pnet-ssh::ssh-config-jump-list "one, user@two:2222,three")))
+  ;; An already split list passes through.
+  (is (equal '("one" "two") (cl-pnet-ssh::ssh-config-jump-list '("one" "two")))))
+
+(test facade-split-host-port-brackets-ipv6
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "example.org")
+    (is (equal "example.org" host))
+    (is (null port)))
+  (multiple-value-bind (host port)
+      (cl-pnet-ssh::ssh-config-split-host-port "example.org:2200")
+    (is (equal "example.org" host))
+    (is (equal "2200" port)))
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "[::1]:2222")
+    (is (equal "::1" host))
+    (is (equal "2222" port)))
+  (multiple-value-bind (host port) (cl-pnet-ssh::ssh-config-split-host-port "[::1]")
+    (is (equal "::1" host))
+    (is (null port)))
+  (is (= 2222 (cl-pnet-ssh::ssh-config-port-number "2222")))
+  (is (null (cl-pnet-ssh::ssh-config-port-number "22x")))
+  (is (null (cl-pnet-ssh::ssh-config-port-number "2222-with"))))
+
+(test ssh-config-seconds-parses-bare-and-suffixed-times
+  ;; A bare number has no suffix, so the final flush runs after the loop; a
+  ;; missing flush there leaves the value at zero without diagnosing it.
+  (is (= 5 (cl-pnet-ssh::ssh-config-seconds nil "5")))
+  (is (= 30 (cl-pnet-ssh::ssh-config-seconds nil "30s")))
+  (is (= 90 (cl-pnet-ssh::ssh-config-seconds nil "1m30s")))
+  (is (= 7200 (cl-pnet-ssh::ssh-config-seconds nil "2h")))
+  (is (= 604800 (cl-pnet-ssh::ssh-config-seconds nil "1w")))
+  (is (eq :none (cl-pnet-ssh::ssh-config-seconds nil "none"))))
+
+(test facade-jump-descriptor-reads-user-and-port
+  (let ((hop (cl-pnet-ssh::ssh-config-jump-descriptor "alice@other:2201")))
+    (is (equal "other" (getf hop :host)))
+    (is (equal "alice" (getf hop :user)))
+    (is (= 2201 (getf hop :port))))
+  (let ((hop (cl-pnet-ssh::ssh-config-jump-descriptor "plain")))
+    (is (equal "plain" (getf hop :host)))
+    (is (null (getf hop :user)))
+    (is (null (getf hop :port)))))
+
+(test facade-client-policy-reads-strict-host-key-checking
+  (is (eq :insecure
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "no")))))
+  (is (eq :insecure
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "off")))))
+  (is (eq :accept-new
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "accept-new")))))
+  (is (eq :strict
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "yes")))))
+  (is (eq :strict (cl-pnet-ssh::ssh-config-client-policy (facade-options nil)))))
+
+(test facade-client-agent-understands-none-and-the-environment
+  (is (eq t (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identity-agent :environment)) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identity-agent :none)) nil)))
+  ;; An explicit command-line answer wins over the file.
+  (is (string= "/tmp/explicit.sock"
+               (cl-pnet-ssh::ssh-config-client-agent
+                (facade-options '(:identity-agent "/tmp/config.sock"))
+                "/tmp/explicit.sock")))
+  ;; "none" and SSH_AUTH_SOCK from -o mean what they do in the file.
+  (is (null (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "none")))
+  (is (eq t (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "SSH_AUTH_SOCK")))
+  ;; IdentitiesOnly turns the environment's agent off.
+  (is (null (cl-pnet-ssh::ssh-config-client-agent
+             (facade-options '(:identities-only t)) nil))))
+
+(test facade-client-identities-keep-the-file-order
+  (let ((options (facade-options
+                  (list :identity-files (list "second" "first")))))
+    ;; The parser pushes, so the facade reverses back into file order.
+    (is (equal '("first" "second")
+               (cl-pnet-ssh::ssh-config-client-identities options nil))))
+  (is (equal '("given")
+             (cl-pnet-ssh::ssh-config-client-identities (facade-options nil) '("given")))))
+
+(test facade-client-known-hosts-put-the-user-file-first
+  (let ((known (cl-pnet-ssh::ssh-config-client-known-hosts
+                (facade-options (list :known-hosts (list #p"/u/known")
+                                      :global-known-hosts (list #p"/e/known")))
+                nil)))
+    (is (equal '("/u/known" "/e/known")
+               (mapcar #'namestring known))))
+  (is (null (cl-pnet-ssh::ssh-config-client-known-hosts (facade-options nil) nil)))
+  (is (equal '("/given")
+             (mapcar #'namestring
+                     (cl-pnet-ssh::ssh-config-client-known-hosts
+                      (facade-options nil) '("/given"))))))
+
+(test facade-proxy-jumps-let-the-command-line-win
+  (let ((options (facade-options '(:proxy-jump "from-config.example"))))
+    (is (equal "from-config.example"
+               (getf (first (cl-pnet-ssh::ssh-config-proxy-jumps options nil)) :host)))
+    (is (equal "cli.example"
+               (getf (first (cl-pnet-ssh::ssh-config-proxy-jumps options "cli.example"))
+                     :host)))
+    (is (null (cl-pnet-ssh::ssh-config-proxy-jumps options "none")))))
+
+(test facade-carries-a-proxy-command
+  ;; A ProxyCommand is a transport, not a policy refusal: it reaches the
+  ;; parameters make-ssh-client is built from, and "none" turns it off.
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-config-proxy-command
+              (facade-options '(:proxy-command "nc %h %p")) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-proxy-command (facade-options nil) nil)))
+  (is (null (cl-pnet-ssh::ssh-config-proxy-command
+             (facade-options '(:proxy-command "none")) nil)))
+  (is (equal "manual %h"
+             (cl-pnet-ssh::ssh-config-proxy-command
+              (facade-options nil) "manual %h")))
+  (is (equal "nc %h %p"
+             (getf (cl-pnet-ssh::ssh-config-client-parameters
+                    "alias"
+                    (facade-options (list :hostname "real.example" :port 2222
+                                          :proxy-command "nc %h %p")))
+                   :proxy-command)))
+  ;; ProxyCommand wins over a ProxyJump: OpenSSH does not chain the two.
+  (let ((options (facade-options '(:proxy-command "nc %h %p"
+                                   :proxy-jump "jump.example"))))
+    (is (equal "nc %h %p"
+               (cl-pnet-ssh::ssh-config-proxy-command options nil)))))
+
+(test facade-client-parameters-carry-the-whole-config
+  (let* ((options (facade-options
+                   (list :hostname "real.example"
+                         :user "file-user"
+                         :port 2200
+                         :identity-files (list "second" "first")
+                         :known-hosts (list #p"/u/known")
+                         :global-known-hosts (list #p"/e/known")
+                         :strict-host-key-checking "accept-new"
+                         :identity-agent :none)))
+         (parameters
+           (cl-pnet-ssh::ssh-config-client-parameters "alias" options)))
+    (is (equal "alias" (getf parameters :host)))
+    (is (equal "real.example" (getf parameters :connect-host)))
+    (is (equal "real.example" (getf parameters :host-key-host))
+        "known_hosts must use the HostName, not the alias")
+    (is (= 2200 (getf parameters :port)))
+    (is (equal "file-user" (getf parameters :user)))
+    (is (equal '("first" "second") (getf parameters :private-key)))
+    (is (null (getf parameters :agent)))
+    (is (equal '("/u/known" "/e/known")
+               (mapcar #'namestring (getf parameters :known-hosts))))
+    (is (eq :accept-new (getf parameters :host-key-policy))))
+  ;; An explicit command-line answer still wins.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :user "file-user" :port 2200))
+           :user "cli-user" :port 2222)))
+    (is (equal "cli-user" (getf parameters :user)))
+    (is (= 2222 (getf parameters :port)))))
+
+;;; ---- Command-line -o options ----
+
+(test option-line-parses-ssh-syntax
+  (let ((line (cl-pnet-ssh::ssh-config-option-line "HostName real.example")))
+    (is (string= "hostname" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("real.example") (cl-pnet-ssh::ssh-config-line-args line))))
+  (let ((line (cl-pnet-ssh::ssh-config-option-line "Port=2222")))
+    (is (string= "port" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("2222") (cl-pnet-ssh::ssh-config-line-args line))))
+  ;; A keyword with several arguments keeps them all, as Ciphers needs.
+  (let ((line (cl-pnet-ssh::ssh-config-option-line
+               "Ciphers=aes128-ctr,aes256-ctr")))
+    (is (string= "ciphers" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("aes128-ctr,aes256-ctr") (cl-pnet-ssh::ssh-config-line-args line))))
+  ;; The cons form is accepted too, for callers that already split it.
+  (let ((line (cl-pnet-ssh::ssh-config-option-line '("ServerAliveInterval" . 30))))
+    (is (string= "serveraliveinterval" (cl-pnet-ssh::ssh-config-line-keyword line)))
+    (is (equal '("30") (cl-pnet-ssh::ssh-config-line-args line))))
+  (let ((line (cl-pnet-ssh::ssh-config-option-line '("Host" ("a" "b")))))
+    (is (equal '("a" "b") (cl-pnet-ssh::ssh-config-line-args line))))
+  (signals ssh-config-error
+    (cl-pnet-ssh::ssh-config-option-line "   ")))
+
+(test proxy-command-keeps-the-whole-shell-command
+  ;; OpenSSH hands the rest of the line to the shell as written, so quotes and
+  ;; internal spaces must survive -o parsing rather than becoming one token.
+  (is (equal "sh -c 'exec nc %h %p'"
+             (cl-pnet-ssh::ssh-config-line-raw
+              (cl-pnet-ssh::ssh-config-option-line
+               "ProxyCommand sh -c 'exec nc %h %p'"))))
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-config-line-raw
+              (cl-pnet-ssh::ssh-config-option-line "ProxyCommand=nc %h %p"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyCommand sh -c 'exec nc %h %p'"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "sh -c 'exec nc %h %p'"
+               (cl-pnet-ssh::ssh-config-options-proxy-command options)))))
+
+(test option-lines-win-over-the-config
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "HostName file.example")
+                  (cl-pnet-ssh::ssh-config-option-line "Port 2200"))))
+         (combined
+           (ssh-config-add-options
+            config '("HostName real.example" "Port=2222")))
+         (options nil))
+    (ssh-config-resolve combined "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "real.example" (ssh-config-options-hostname options)))
+    (is (= 2222 (ssh-config-options-port options)))
+    ;; Adding no options leaves the parsed config itself untouched.
+    (is (eq config (ssh-config-add-options config nil)))))
+
+(test client-source-applies-options-before-the-file
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-opt"))
+         (path (merge-pathnames "config" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output
+                                        :if-exists :supersede)
+             (format stream "HostName file.example~%Port 2200~%"))
+           (let ((options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::ssh-config-client-source
+               path '("HostName cli.example" "Port=2222"))
+              "alias"
+              :on-options (lambda (value) (setf options value)))
+             (is (equal "cli.example" (ssh-config-options-hostname options)))
+             (is (= 2222 (ssh-config-options-port options)))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test facade-client-parameters-carry-timeouts
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :connect-timeout 15
+                                 :server-alive-interval 30
+                                 :server-alive-count-max 2)))))
+    (is (= 15 (getf parameters :connect-timeout)))
+    (is (= 30 (getf parameters :server-alive-interval)))
+    (is (= 2 (getf parameters :server-alive-count-max))))
+  ;; "none" and 0 both mean the feature is off.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options (list :connect-timeout :none
+                                 :server-alive-interval 0)))))
+    (is (null (getf parameters :connect-timeout)))
+    (is (null (getf parameters :server-alive-interval)))))
+
+(test client-record-holds-timing-settings
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "example" :connect-host "example"
+                 :host-key-host "example" :port 22 :connect-port 22
+                 :user "tester"
+                 :connect-timeout 10
+                 :server-alive-interval 5
+                 :server-alive-count-max 2)))
+    (is (= 10 (cl-pnet-ssh::ssh-client-connect-timeout client)))
+    (is (= 5 (cl-pnet-ssh::ssh-client-server-alive-interval client)))
+    (is (= 2 (cl-pnet-ssh::ssh-client-server-alive-count-max client)))
+    (is (null (cl-pnet-ssh::ssh-client-connect-timer client)))
+    (is (null (cl-pnet-ssh::ssh-client-alive-timer client)))))
+
+(test proxy-command-none-means-direct
+  ;; "ProxyCommand none" is OpenSSH's way of turning a proxy off, so it must
+  ;; not try to run a helper called none.
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value nil)))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "none")))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "  NONE  ")))
+  (is (null (cl-pnet-ssh::ssh-proxy-command-value "   ")))
+  (is (equal "nc %h %p"
+             (cl-pnet-ssh::ssh-proxy-command-value " nc %h %p "))))
+
+#-ssh-backend-ffi
+(test proxy-command-expands-ssh-escapes
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "alias" :connect-host "real.example"
+                 :port 2222 :connect-port 2222 :user "alice")))
+    (is (equal "nc real.example 2222"
+               (cl-pnet-ssh::ssh-proxy-expand-command "nc %h %p" client)))
+    (is (equal "alias:alice:100%"
+               (cl-pnet-ssh::ssh-proxy-expand-command
+                "%n:%r:100%%" client)))
+    ;; An escape this client does not know stays literal rather than eaten.
+    (is (equal "%z and %" (cl-pnet-ssh::ssh-proxy-expand-command
+                           "%z and %" client)))))
+
+;;; ---- RSA and ECDSA host/user keys ----
+
+(test openssh-rsa-private-key-round-trip
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa"))
+             (path (merge-pathnames "id_rsa" directory)))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring path)))
+               (let* ((key (ssh-load-private-key path))
+                      (blob (ssh-public-key-blob-of key))
+                      (type (nth-value 0 (ssh-public-key-parts blob)))
+                      (message (octets-ascii "rsa signed data"))
+                      (signature (cl-pnet-ssh::ssh-private-key-signature-blob key message)))
+                 (is (string= "ssh-rsa" type))
+                 ;; The request names rsa-sha2-256 while the key stays ssh-rsa.
+                 (multiple-value-bind (algorithm bytes)
+                     (ssh-parse-signature-blob signature)
+                   (declare (ignore bytes))
+                   (is (string= "rsa-sha2-256" algorithm)))
+                 (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                            blob signature message)))
+                 (signals ssh-protocol-error
+                   (cl-pnet-ssh::ssh-verify-host-signature
+                    blob signature (octets-ascii "different data")))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test openssh-ecdsa-private-key-signs
+  ;; An ECDSA key file holds the scalar and the point; signing must produce
+  ;; the two mpints RFC 5656 wants, and the curve key type must survive.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (spec '(("id_ecdsa_256" "256" "ecdsa-sha2-nistp256")
+                      ("id_ecdsa_384" "384" "ecdsa-sha2-nistp384")
+                      ("id_ecdsa_521" "521" "ecdsa-sha2-nistp521")))
+        (destructuring-bind (name bits type) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-ecdsa-sign"))
+                 (path (merge-pathnames name directory)))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (progn
+                   (ssh-keygen (list "-q" "-t" "ecdsa" "-b" bits "-N" ""
+                                     "-f" (namestring path)))
+                   (let* ((key (ssh-load-private-key path))
+                          (blob (ssh-public-key-blob-of key))
+                          (message (octets-ascii (format nil "ecdsa ~A signed" bits)))
+                          (signature
+                            (cl-pnet-ssh::ssh-private-key-signature-blob
+                             key message)))
+                     (is (string= type (nth-value 0 (ssh-public-key-parts blob))))
+                     (multiple-value-bind (algorithm bytes)
+                         (ssh-parse-signature-blob signature)
+                       (declare (ignore bytes))
+                       (is (string= type algorithm)))
+                     (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                                blob signature message)))
+                     (signals ssh-protocol-error
+                       (cl-pnet-ssh::ssh-verify-host-signature
+                        blob signature (octets-ascii "different data")))))
+              (ignore-errors (delete-directory-tree directory :validate t))))))))
+
+(defun ssh-test-public-key-file-blob (private-key-path)
+  "The wire blob encoded in the .pub file beside PRIVATE-KEY-PATH."
+  (let* ((line (with-open-file (stream (concatenate 'string
+                                                    (namestring private-key-path)
+                                                    ".pub"))
+                 (read-line stream)))
+         (fields (uiop:split-string line :separator '(#\Space))))
+    (cl-base64:base64-string-to-usb8-array (second fields))))
+
+(test public-key-blobs-match-ssh-keygen
+  ;; ssh-keygen's .pub file holds the exact wire blob, so comparing against
+  ;; it catches a key blob that round-trips locally but cannot be sent: an
+  ;; ssh-rsa blob has two bare mpints, not one length-prefixed string.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (spec '(("id_ed25519" "ed25519" nil)
+                      ("id_rsa" "rsa" "2048")
+                      ("id_ecdsa_256" "ecdsa" "256")
+                      ("id_ecdsa_384" "ecdsa" "384")
+                      ("id_ecdsa_521" "ecdsa" "521")))
+        (destructuring-bind (name type bits) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-pub"))
+                 (path (merge-pathnames name directory)))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (progn
+                   (ssh-keygen
+                    (append (list "-q" "-t" type)
+                            (when bits (list "-b" bits))
+                            (list "-N" "" "-f" (namestring path))))
+                   (let ((key (ssh-load-private-key path)))
+                     (is (equalp (ssh-test-public-key-file-blob path)
+                                 (ssh-public-key-blob-of key))
+                         "~A uses the wire blob ssh-keygen wrote" name)))
+              (ignore-errors (delete-directory-tree directory :validate t))))))))
+
+(defun ssh-test-ecdsa-signature (raw)
+  "RAW r||s as the SSH signature value: string r then string s.
+
+An integer whose top bit is set gets the mpint leading zero, so the test
+also covers that the verifier trims it before padding to the curve width."
+  (let* ((middle (/ (length raw) 2))
+         (writer (ssh-writer)))
+    (ssh-write-mpint writer (ssh-mpint-integer (subseq raw 0 middle)))
+    (ssh-write-mpint writer (ssh-mpint-integer (subseq raw middle)))
+    (ssh-writer-output writer)))
+
+(test ecdsa-host-signatures-verify
+  ;; Every curve SSH names, with several signatures each so the leading-zero
+  ;; cases are actually exercised rather than left to chance.
+  (dolist (spec '(("nistp256" :secp256r1 :sha256 "ecdsa-sha2-nistp256")
+                  ("nistp384" :secp384r1 :sha384 "ecdsa-sha2-nistp384")
+                  ("nistp521" :secp521r1 :sha512 "ecdsa-sha2-nistp521")))
+    (destructuring-bind (curve-name curve digest-name type) spec
+      (multiple-value-bind (private public)
+          (ironclad-unsafe:generate-key-pair curve)
+        (let* ((point (getf (ironclad-unsafe:destructure-public-key public)
+                            :y))
+               (key-data (let ((writer (ssh-writer)))
+                           (ssh-write-text writer curve-name)
+                           (ssh-write-string writer point)
+                           (ssh-writer-output writer)))
+               (blob (ssh-make-public-key-blob type key-data)))
+          (dotimes (i 5)
+            (let* ((message
+                     (ssh-hash :sha256
+                               (octets-ascii
+                                (format nil "ecdsa-~A-~D" curve-name i))))
+                   (digest (ssh-hash digest-name message))
+                   (encoded (ssh-test-ecdsa-signature
+                             (ironclad-unsafe:sign-message private digest)))
+                   (signature (let ((writer (ssh-writer)))
+                                (ssh-write-text writer type)
+                                (ssh-write-string writer encoded)
+                                (ssh-writer-output writer))))
+              (is (cl-pnet-ssh::ssh-ecdsa-verify key-data encoded message))
+              (is (null (cl-pnet-ssh::ssh-verify-host-signature
+                         blob signature message)))
+              (is (not (cl-pnet-ssh::ssh-ecdsa-verify
+                        key-data encoded
+                        (ssh-hash :sha256 (octets-ascii "other"))))))))))))

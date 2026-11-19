@@ -41,6 +41,7 @@
 (defconstant +ssh-options-user+ 4)
 (defconstant +ssh-options-identity+ 6)
 (defconstant +ssh-options-known-hosts+ 8)
+(defconstant +ssh-options-proxy-command+ 19)
 (defconstant +ssh-options-global-known-hosts+ 35)
 (defconstant +ssh-options-strict-host-key-check+ 21)
 (defconstant +ssh-options-process-config+ 38)
@@ -110,6 +111,8 @@
   (session ssh-session))
 (cffi:defcfun ("ssh_set_auth_methods" ssh-set-auth-methods) :void
   (session ssh-session) (methods :int))
+(cffi:defcfun ("ssh_send_keepalive" ssh-send-keepalive) :int
+  (session ssh-session))
 
 ;;; ---- Host keys and known hosts ----
 

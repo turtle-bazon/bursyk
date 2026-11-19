@@ -11,9 +11,11 @@
 (defvar *status* nil
   "The exit status the remote command reported, or NIL before it does.")
 (defvar *channel* nil)
+(defvar *client* nil
+  "The connected client, kept so FINISH can shut it down before quitting.")
 (defvar *stdin-watcher* nil)
-(defvar *send-env* nil
-  "Environment names from ssh_config's SendEnv to forward per channel.")
+(defvar *finishing* nil
+  "True once FINISH is tearing down, so nested close callbacks do not quit early.")
 
 (defvar *options*
   '(:port nil :user nil :identity nil :config nil :known-hosts nil
@@ -115,138 +117,6 @@ itself never blocks: this matcher is what a caller supplies."
                                                  :error-output nil))))
     (error (condition) (funcall on-error condition))))
 
-(defun config-options (host)
-  "The ssh_config options that apply to HOST, or NIL."
-  (let ((path (or (getf *options* :config)
-                  (merge-pathnames ".ssh/config" (user-homedir-pathname))))
-        (result nil))
-    (let ((config (cl-pnet-ssh:ssh-config-load path)))
-      (when config
-        (cl-pnet-ssh:ssh-config-resolve
-         config host
-         :exec-matcher #'match-exec
-         :on-options (lambda (options) (setf result options))
-         :on-error (lambda (condition)
-                     (format *error-output* "burs: config: ~A~%" condition)))))
-    result))
-
-(defun config-agent (config)
-  "The IdentityAgent CONFIG names, in MAKE-SSH-CLIENT's terms.
-
-T means the environment's SSH_AUTH_SOCK, which is what the libssh backend
-uses in any case; a path is the pure backend's socket."
-  (let ((value (and config
-                    (cl-pnet-ssh:ssh-config-options-identity-agent config))))
-    (case value
-      ((nil :none) nil)
-      (:environment t)
-      (t value))))
-
-(defun config-known-hosts (config)
-  "Every known-hosts file CONFIG names, user's first, or NIL."
-  (when config
-    (append (cl-pnet-ssh:ssh-config-options-known-hosts config)
-            (cl-pnet-ssh:ssh-config-options-global-known-hosts config))))
-
-;;; ---- ProxyJump ----
-
-(defun split-jump-list (value)
-  "The comma-separated ProxyJump VALUE as a list of host strings.
-
-The literal NONE, and an empty value, mean a direct connection."
-  (let ((text (string-trim '(#\Space #\Tab) value)))
-    (if (or (zerop (length text)) (string-equal text "none"))
-        nil
-        (loop with start = 0
-              for comma = (position #\, text :start start)
-              collect (string-trim '(#\Space #\Tab)
-                                   (subseq text start comma))
-              while comma
-              do (setf start (1+ comma))))))
-
-(defun split-host-port (text)
-  "TEXT as (VALUES HOST PORT-STRING), bracketing IPv6 literals."
-  (if (and (plusp (length text)) (char= (char text 0) #\[))
-      (let ((close (position #\] text)))
-        (if close
-            (let ((rest (subseq text (1+ close))))
-              (values (subseq text 1 close)
-                      (and (> (length rest) 1)
-                           (char= (char rest 0) #\:)
-                           (subseq rest 1))))
-            (values text nil)))
-      (let ((colon (position #\: text :from-end t)))
-        (if colon
-            (values (subseq text 0 colon) (subseq text (1+ colon)))
-            (values text nil)))))
-
-(defun port-string (text)
-  "TEXT as a port number, or NIL unless it is all digits."
-  (when text
-    (multiple-value-bind (value end) (parse-integer text :junk-allowed t)
-      (when (and value (= end (length text))) value))))
-
-(defun jump-host (text)
-  "One ProxyJump entry as the plist MAKE-SSH-CLIENT needs for it.
-
-The jump host's own Host block supplies the connection details; the
-command line still wins for identity, agent and known-hosts, as it does
-for the destination."
-  (multiple-value-bind (destination user) (split-destination text)
-    (multiple-value-bind (host port-text) (split-host-port destination)
-      (let ((config (config-options host)))
-        (list :host host
-              :connect-host (or (and config
-                                     (cl-pnet-ssh:ssh-config-options-hostname
-                                      config))
-                                host)
-              :port (or (port-string port-text)
-                        (and config (cl-pnet-ssh:ssh-config-options-port config))
-                        22)
-              :user (or user
-                        (and config (cl-pnet-ssh:ssh-config-options-user config))
-                        (cl-pnet-ssh:ssh-default-user))
-              :identity (or (getf *options* :identity)
-                            (and config
-                                 (reverse
-                                  (cl-pnet-ssh:ssh-config-options-identity-files
-                                   config))))
-              :known-hosts (or (getf *options* :known-hosts)
-                               (config-known-hosts config))
-              :agent (or (getf *options* :agent) (config-agent config))
-              :policy (or (getf *options* :policy) (config-policy config)))))))
-
-(defun proxy-jumps (config)
-  "The jump host plists the config and command line ask for, in order."
-  (mapcar #'jump-host
-          (split-jump-list
-           (or (getf *options* :jump)
-               (and config (cl-pnet-ssh:ssh-config-options-proxy-jump config))
-               ""))))
-
-(defun reject-unsupported-proxy (config)
-  "Refuse a config that asks for a command this client cannot run.
-
-ProxyJump is handled with real forward channels; ProxyCommand would need a
-local process in place of the socket, and silently ignoring it would connect
-somewhere the user did not ask for."
-  (let ((command (or (getf *options* :proxy-command)
-                     (and config
-                          (cl-pnet-ssh:ssh-config-options-proxy-command
-                           config)))))
-    (when command
-      (fail "ProxyCommand is not supported (~A)" command))))
-
-(defun config-policy (config)
-  "The host-key policy CONFIG asks for, as the client understands it."
-  (let ((value (and config
-                    (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
-                     config))))
-    (cond ((null value) :strict)
-          ((member value '("no" "off") :test #'string=) :insecure)
-          ((string= value "accept-new") :accept-new)
-          (t :strict))))
-
 (defun command-line-option (name value)
   "Apply one -o NAME=VALUE to the parsed options."
   (cond
@@ -270,8 +140,12 @@ somewhere the user did not ask for."
     ;; keywords a newer client wrote.
     (t nil)))
 
+(defun command-line-option-list ()
+  "The -o options in the order they were written."
+  (reverse (getf *options* :options)))
+
 (defun apply-command-line-options ()
-  (dolist (option (nreverse (getf *options* :options)))
+  (dolist (option (command-line-option-list))
     (let ((equals (position #\= option)))
       (when equals
         (command-line-option (subseq option 0 equals)
@@ -314,10 +188,21 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
              (error () (stop-stdin)))))))
 
 (defun finish (status)
-  (stop-stdin)
-  (finish-output *standard-output*)
-  (finish-output *error-output*)
-  (uiop:quit (or status 255)))
+  ;; Closing the client below reports its open channels closed, whose
+  ;; callbacks call FINISH again; only the outermost call may quit, or the
+  ;; connection (and a ProxyCommand helper) would be left half torn down.
+  (unless *finishing*
+    (setf *finishing* t)
+    (stop-stdin)
+    ;; Close the client before leaving: a ProxyCommand's helper is a child
+    ;; process, and quitting without closing would leave it running.
+    (when *client*
+      (let ((client *client*))
+        (setf *client* nil)
+        (ignore-errors (cl-pnet-ssh:ssh-client-close client))))
+    (finish-output *standard-output*)
+    (finish-output *error-output*)
+    (uiop:quit (or status 255))))
 
 (defun session-error (channel condition)
   (declare (ignore channel))
@@ -340,7 +225,7 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
                      (declare (ignore channel status))
                      (finish *status*))
          :on-error #'session-error))
-  (dolist (name *send-env*)
+  (dolist (name (cl-pnet-ssh:ssh-client-send-env client))
     (let ((value (uiop:getenv name)))
       (when value
         (cl-pnet-ssh:ssh-channel-env *channel* name value))))
@@ -357,201 +242,45 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
       (format nil "~{~A~^ ~}" arguments)
       (remote-shell)))
 
-;;; ---- ProxyJump forwarding ----
-
-(defstruct (tunnel (:constructor %make-tunnel))
-  jump host port listener connection channel)
-
-(defvar *tunnels* nil
-  "Every live loopback forward, so a shutdown can close them all.")
-
-(defun tunnel-shut (tunnel)
-  "Close both ends of TUNNEL once, whichever end reported first."
-  (when (tunnel-listener tunnel)
-    (cl-pnet:close-listener (tunnel-listener tunnel))
-    (setf (tunnel-listener tunnel) nil))
-  (when (tunnel-connection tunnel)
-    (cl-pnet:close-connection (tunnel-connection tunnel))
-    (setf (tunnel-connection tunnel) nil))
-  (when (tunnel-channel tunnel)
-    (let ((channel (tunnel-channel tunnel)))
-      (setf (tunnel-channel tunnel) nil)
-      (cl-pnet-ssh:ssh-channel-close channel))))
-
-(defun tunnel-write (tunnel data)
-  "Target bytes from the jump channel back to the target client."
-  (when (tunnel-connection tunnel)
-    (cl-pnet:send-data (tunnel-connection tunnel) data)))
-
-(defun tunnel-accept (tunnel connection)
-  "The target client connected: open the forward through the jump host."
-  (setf (tunnel-connection tunnel) connection)
-  (when (tunnel-listener tunnel)
-    (cl-pnet:close-listener (tunnel-listener tunnel))
-    (setf (tunnel-listener tunnel) nil))
-  (setf (tunnel-channel tunnel)
-        (cl-pnet-ssh:ssh-open-direct-tcpip
-         (tunnel-jump tunnel) (tunnel-host tunnel) (tunnel-port tunnel)
-         :on-data (lambda (channel data kind)
-                    (declare (ignore channel kind))
-                    (tunnel-write tunnel data))
-         :on-eof (lambda (channel)
-                   (declare (ignore channel))
-                   (tunnel-shut tunnel))
-         :on-close (lambda (channel reason)
-                     (declare (ignore channel reason))
-                     (tunnel-shut tunnel))
-         :on-error (lambda (channel condition)
-                     (declare (ignore channel))
-                     (format *error-output* "burs: tunnel: ~A~%" condition)
-                     (tunnel-shut tunnel)))))
-
-(defun tunnel-read (tunnel data)
-  "Bytes from the target client, or NIL at its EOF."
-  (cond
-    ((and data (tunnel-channel tunnel))
-     (cl-pnet-ssh:ssh-channel-write (tunnel-channel tunnel) data))
-    ((and (null data) (tunnel-channel tunnel))
-     (cl-pnet-ssh:ssh-channel-eof (tunnel-channel tunnel)))
-    (t nil)))
-
-(defun start-tunnel (jump host port create-client)
-  "Forward HOST:PORT through JUMP and hand CREATE-CLIENT the loopback port.
-
-Only 127.0.0.1 is bound, one connection is accepted, and the listener closes
-as soon as the target client arrives; a fresh tunnel is made per jump hop."
-  (let* ((tunnel (%make-tunnel :jump jump :host host :port port))
-         (listener
-           (cl-pnet:make-tcp-listener
-            "127.0.0.1" 0
-            :on-accept (lambda (connection) (tunnel-accept tunnel connection))
-            :read-cb (lambda (connection data)
-                       (declare (ignore connection))
-                       (tunnel-read tunnel data))
-            :on-error (lambda (status)
-                        (declare (ignore status))
-                        (format *error-output*
-                                "burs: cannot listen for the tunnel~%")
-                        (finish 255)))))
-    (unless listener
-      (fail "cannot listen for the ProxyJump tunnel"))
-    (setf (tunnel-listener tunnel) listener)
-    (push tunnel *tunnels*)
-    (funcall create-client (cl-pnet:listener-port listener))))
-
 ;;; ---- The target client ----
 
-(defun client-parameters (host)
-  "Everything MAKE-SSH-CLIENT needs for HOST after config is applied."
-  (let ((config (config-options host)))
-    (list :host host
-          :config config
-          :user (or (getf *options* :user)
-                    (and config (cl-pnet-ssh:ssh-config-options-user config))
-                    (cl-pnet-ssh:ssh-default-user))
-          :port (or (and (getf *options* :port)
-                         (parse-integer (getf *options* :port)))
-                    (and config (cl-pnet-ssh:ssh-config-options-port config))
-                    22)
-          :connect-host (or (and config
-                                 (cl-pnet-ssh:ssh-config-options-hostname config))
-                            host)
-          :identity (or (getf *options* :identity)
-                        (and config
-                             (reverse
-                              (cl-pnet-ssh:ssh-config-options-identity-files
-                               config))))
-          :known-hosts (or (getf *options* :known-hosts)
-                           (config-known-hosts config))
-          :agent (let ((chosen (getf *options* :agent)))
-                   (if chosen chosen (config-agent config)))
-          :policy (or (getf *options* :policy) (config-policy config)))))
+(defun client-port ()
+  "The -p or -o Port value as a number, when the command line gave one."
+  (let ((value (getf *options* :port)))
+    (when value
+      (multiple-value-bind (port end) (parse-integer value :junk-allowed t)
+        (if (and port (= end (length value)))
+            port
+            (fail "invalid port ~A" value))))))
 
-(defun launch-client (parameters command connect-host connect-port)
-  "Connect the destination described by PARAMETERS and run COMMAND on it.
-
-CONNECT-HOST and CONNECT-PORT are NIL for a direct connection; a ProxyJump
-passes the loopback listener there while the host key is still checked under
-the destination's own name and port."
-  (let ((host (getf parameters :host)))
-    (cl-pnet-ssh:make-ssh-client
-     host
-     :connect-host (or connect-host (getf parameters :connect-host))
-     :connect-port (or connect-port (getf parameters :port))
-     :port (getf parameters :port)
-     :user (getf parameters :user)
-     :private-key (getf parameters :identity)
-     :agent (getf parameters :agent)
-     :known-hosts (getf parameters :known-hosts)
-     :host-key-policy (getf parameters :policy)
-     :on-open (lambda (client) (start-session client command))
-     :on-error (lambda (client condition)
-                 (declare (ignore client))
-                 (format *error-output* "burs: ~A~%" condition)
-                 (finish 255))
-     :on-close (lambda (client reason)
-                 (declare (ignore client reason))
-                 (finish *status*)))))
-
-(defun launch-jump (hop connect-host connect-port on-open)
-  "Connect one jump HOP and call ON-OPEN once it is authenticated."
-  (cl-pnet-ssh:make-ssh-client
-   (getf hop :host)
-   :connect-host connect-host
-   :connect-port connect-port
-   :port (getf hop :port)
-   :user (getf hop :user)
-   :private-key (getf hop :identity)
-   :agent (getf hop :agent)
-   :known-hosts (getf hop :known-hosts)
-   :host-key-policy (getf hop :policy)
-   :on-open (lambda (client) (funcall on-open client))
+(defun start-client (host command)
+  "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
+  (cl-pnet-ssh:make-ssh-client-from-config
+   host
+   :config (getf *options* :config)
+   :user (getf *options* :user)
+   :port (client-port)
+   :private-key (reverse (getf *options* :identity))
+   :agent (getf *options* :agent)
+   :known-hosts (getf *options* :known-hosts)
+   :host-key-policy (getf *options* :policy)
+   :proxy-jump (getf *options* :jump)
+   :proxy-command (getf *options* :proxy-command)
+   ;; Every -o keyword reaches the same resolver the file uses, so facts the
+   ;; command line has no dedicated flag for (HostName, ConnectTimeout,
+   ;; ServerAliveInterval, ...) work too.
+   :options (command-line-option-list)
+   :exec-matcher #'match-exec
+   :on-client (lambda (client) (setf *client* client))
+   :on-config-error (lambda (condition) (fail "~A" condition))
+   :on-open (lambda (client) (start-session client command))
    :on-error (lambda (client condition)
                (declare (ignore client))
-               (format *error-output* "burs: jump host: ~A~%" condition)
+               (format *error-output* "burs: ~A~%" condition)
                (finish 255))
    :on-close (lambda (client reason)
                (declare (ignore client reason))
-               ;; The destination's own callbacks decide the exit status.
-               nil)))
-
-(defun start-jump-chain (hops target-host target-port launch)
-  "Reach TARGET-HOST:TARGET-PORT through HOPS, then call LAUNCH with a port.
-
-Each hop is reached through the tunnel the previous hop opens, which is the
-same thing a comma-separated ProxyJump means in SSH."
-  (labels ((link (remaining connect-host connect-port)
-             (let ((hop (first remaining)))
-               (launch-jump
-                hop connect-host connect-port
-                (lambda (client)
-                  (if (rest remaining)
-                      (let ((next (second remaining)))
-                        (start-tunnel
-                         client
-                         (getf next :connect-host) (getf next :port)
-                         (lambda (local-port)
-                           (link (rest remaining) "127.0.0.1" local-port))))
-                      (start-tunnel
-                       client target-host target-port
-                       (lambda (local-port)
-                         (funcall launch "127.0.0.1" local-port)))))))))
-    (let ((first-hop (first hops)))
-      (link hops (getf first-hop :connect-host) (getf first-hop :port)))))
-
-(defun start-client (host command)
-  (let* ((parameters (client-parameters host))
-         (config (getf parameters :config))
-         (jumps (proxy-jumps config)))
-    (reject-unsupported-proxy config)
-    (setf *send-env* (and config
-                          (cl-pnet-ssh:ssh-config-options-send-env config)))
-    (if jumps
-        (start-jump-chain
-         jumps (getf parameters :connect-host) (getf parameters :port)
-         (lambda (connect-host connect-port)
-           (launch-client parameters command connect-host connect-port)))
-        (launch-client parameters command nil nil))))
+               (finish *status*))))
 
 (defun main ()
   "Entry point for the BURS program."

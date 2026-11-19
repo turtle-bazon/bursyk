@@ -11,6 +11,10 @@
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
   connect-host
+  ;; The name known_hosts is checked and recorded under when it differs from
+  ;; HOST, as with "Host gh / HostName github.com": OpenSSH looks up the
+  ;; HostName, not the alias the user typed.  NIL means HOST.
+  host-key-host
   (port 22)
   connect-port
   (user nil)
@@ -28,6 +32,17 @@
   (host-key-policy :strict)
   host-key-blob
   server-version
+  ;; A helper program carrying the stream, or NIL to dial directly.  libssh
+  ;; runs it itself and expands %h, %p and %r before starting it.
+  proxy-command
+  ;; Connection timing, from ConnectTimeout and ServerAlive* in ssh_config.
+  ;; A NIL timeout or interval means the feature is off.
+  connect-timeout
+  server-alive-interval
+  (server-alive-count-max 3)
+  connect-timer
+  alive-timer
+  (alive-misses 0)
   (key-handles nil)
   (key-index 0)
   (auth-key nil)
@@ -35,6 +50,8 @@
   on-open
   on-error
   on-close
+  ;; The resolved ssh_config this client was built from, if any.
+  config-options
   (closed nil)
   close-reason)
 
@@ -213,6 +230,47 @@ libssh exports the blob as base64, the same text a public key file holds."
              (ssh-base64-octets
               (cffi:foreign-string-to-lisp base64))
           (ssh-string-free-char base64))))))
+
+;;; ---- Connect timeout and server-alive keepalives ----
+
+(defun ssh-plibssh-cancel-timer (timer)
+  "Stop TIMER when it is set, answering NIL for the caller to store."
+  (when timer
+    (cl-pnet:timer-stop timer))
+  nil)
+
+(defun ssh-plibssh-stop-timers (client)
+  "Disarm CLIENT's connect timeout and keepalive timer, once."
+  (setf (ssh-client-connect-timer client)
+        (ssh-plibssh-cancel-timer (ssh-client-connect-timer client))
+        (ssh-client-alive-timer client)
+        (ssh-plibssh-cancel-timer (ssh-client-alive-timer client))))
+
+(defun ssh-plibssh-start-connect-timer (client)
+  "Fail CLIENT when ConnectTimeout seconds pass before authentication."
+  (when (and (ssh-client-connect-timeout client)
+             (plusp (ssh-client-connect-timeout client))
+             (not (ssh-client-connect-timer client)))
+    (setf (ssh-client-connect-timer client)
+          (cl-pnet:timer-start
+           (ssh-client-connect-timeout client) 0
+           (lambda ()
+             (setf (ssh-client-connect-timer client) nil)
+             (unless (ssh-client-closed client)
+               (ssh-client-fail
+                client
+                (make-condition
+                 'ssh-connection-error
+                 :detail (format nil "connecting to ~A:~D timed out after ~D seconds"
+                                 (ssh-client-connect-host client)
+                                 (or (ssh-client-connect-port client)
+                                     (ssh-client-port client))
+                                 (ssh-client-connect-timeout client))))))))))
+
+(defun ssh-plibssh-cancel-connect-timer (client)
+  "The handshake is far enough along that ConnectTimeout no longer applies."
+  (setf (ssh-client-connect-timer client)
+        (ssh-plibssh-cancel-timer (ssh-client-connect-timer client))))
 
 ;;; ---- Event-loop watchers ----
 

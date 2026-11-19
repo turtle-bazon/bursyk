@@ -64,6 +64,9 @@ line, and NIL while the line is still incomplete."
 
 (defun ssh-client-handle-payload (client payload)
   "Dispatch one decrypted protocol message."
+  ;; Any traffic from the peer answers a keepalive, as OpenSSH counts it:
+  ;; even an unrelated packet proves the server is still there.
+  (setf (ssh-client-alive-misses client) 0)
   (when (ssh-client-ignore-next-kex-packet client)
     (setf (ssh-client-ignore-next-kex-packet client) nil)
     (when (<= +ssh-msg-kex-ecdh-init+ (aref payload 0)
@@ -195,15 +198,23 @@ its KEXINIT when the connection came up."
              (ssh-client-keys-received client)
              (eq (ssh-client-phase client) :kex))
     (setf (ssh-client-phase client) :auth)
+    ;; ConnectTimeout keeps running through authentication, as it does in
+    ;; OpenSSH: a server that completes the key exchange and then stalls
+    ;; must not hang the caller forever.
     (ssh-client-send-service-request client)))
 
 ;;; ---- Host key policy ----
 
 (defun ssh-client-host-spec (client)
-  "The host as known_hosts spells it: bracketed on a non-default port."
-  (if (= (ssh-client-port client) 22)
-      (ssh-client-host client)
-      (format nil "[~A]:~D" (ssh-client-host client) (ssh-client-port client))))
+  "The host as known_hosts spells it: bracketed on a non-default port.
+
+HOST-KEY-HOST names the HostName a config alias resolved to, so a
+\"Host gh / HostName github.com\" connection is checked against github.com
+as OpenSSH does, not against the alias."
+  (let ((host (or (ssh-client-host-key-host client) (ssh-client-host client))))
+    (if (= (ssh-client-port client) 22)
+        host
+        (format nil "[~A]:~D" host (ssh-client-port client)))))
 
 (defun ssh-client-known-hosts-files (client)
   "The known-hosts files CLIENT checks, in order.
@@ -266,8 +277,12 @@ be listed in both the user's file and the system-wide one."
               :detail "the host key is not in known_hosts"
               :fingerprint fingerprint))
       ((functionp policy)
-       (when (funcall policy client fingerprint host-key)
-         (ssh-client-remember-host-key client host-key)))
+       (if (funcall policy client fingerprint host-key)
+           (ssh-client-remember-host-key client host-key)
+           (error 'ssh-host-key-error
+                  :detail (format nil "the host key for ~A was rejected"
+                                  (ssh-client-host-spec client))
+                  :fingerprint fingerprint)))
       (t (error 'ssh-host-key-error
                 :detail (format nil "unknown host key policy ~S" policy)
                 :fingerprint fingerprint)))))
@@ -341,6 +356,8 @@ request goes out from the callback rather than from this function's tail."
 (defun ssh-client-handle-auth-success (client)
   "Authenticated: let the queued channel work start."
   (setf (ssh-client-phase client) :ready)
+  (ssh-client-cancel-connect-timer client)
+  (ssh-client-start-alive-timer client)
   (let ((actions (nreverse (ssh-client-pending-actions client))))
     (setf (ssh-client-pending-actions client) nil)
     (when (ssh-client-on-open client)

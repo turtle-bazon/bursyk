@@ -4,10 +4,23 @@
 ;;;; driven, like cl-pnet-tls: MAKE-SSH-CLIENT returns at once and ON-OPEN
 ;;;; runs when the session is authenticated and ready for channels.
 
+(defparameter +ssh-default-identity-names+
+  '("id_ed25519" "id_ecdsa" "id_rsa")
+  "Identity files OpenSSH would try, in the order offered here.
+
+ed25519 comes first because it is what OpenSSH generates by default; ECDSA
+and RSA follow because many existing accounts still have only one of those.")
+
+(defun ssh-default-private-keys ()
+  "The default identity files that exist, or NIL."
+  (iter (for name in +ssh-default-identity-names+)
+    (let ((path (merge-pathnames (format nil ".ssh/~A" name)
+                                 (user-homedir-pathname))))
+      (when (probe-file path) (collect path)))))
+
 (defun ssh-default-private-key ()
-  "~/.ssh/id_ed25519 when it exists, else NIL."
-  (let ((path (merge-pathnames ".ssh/id_ed25519" (user-homedir-pathname))))
-    (when (probe-file path) path)))
+  "The first default identity file that exists, or NIL."
+  (first (ssh-default-private-keys)))
 
 (defun ssh-load-key-signer (private-key passphrase)
   "PRIVATE-KEY, already loaded or a path, as a signer."
@@ -21,44 +34,76 @@
   (mapcar (lambda (key) (ssh-load-key-signer key passphrase))
           (if (listp private-keys) private-keys (list private-keys))))
 
+(defun ssh-default-key-sources (private-key)
+  "PRIVATE-KEY when given, else every default identity file that exists."
+  (if private-key
+      private-key
+      (ssh-default-private-keys)))
+
+(defun ssh-no-key-condition ()
+  "The error to report when no agent or key file is available."
+  (make-condition 'ssh-authentication-error
+                  :detail (concatenate
+                           'string
+                           "no key given: pass PRIVATE-KEY or use :AGENT, "
+                           "or create ~/.ssh/id_ed25519, id_ecdsa or id_rsa")))
+
+(defun ssh-report-key-signers (keys passphrase on-signers on-error)
+  "Load KEY files and deliver their signers, or report why not."
+  (handler-case
+      (funcall on-signers (ssh-load-key-signers keys passphrase))
+    (error (condition) (funcall on-error condition))))
+
+(defun ssh-report-agent-keys (agent keys passphrase on-signers on-error)
+  "Deliver the agent's signers followed by KEY files, tolerating either."
+  (ssh-agent-signers
+   :path agent
+   :on-signers (lambda (signers)
+                 (handler-case
+                     (funcall on-signers
+                              (append signers
+                                      (ssh-load-key-signers keys passphrase)))
+                   (error (condition) (funcall on-error condition))))
+   ;; An agent that cannot answer is not fatal while a file remains.
+   :on-error (lambda (condition)
+               (declare (ignore condition))
+               (ssh-report-key-signers
+                keys passphrase on-signers on-error))))
+
+(defun ssh-report-agent-signers (agent on-signers on-error)
+  "Deliver the agent's signers, or say that it holds no usable key."
+  (ssh-agent-signers
+   :path agent
+   :on-signers
+   (lambda (signers)
+     (if signers
+         (funcall on-signers signers)
+         (funcall on-error
+                  (ssh-agent-error
+                   "the ssh-agent holds no supported keys"))))
+   :on-error on-error))
+
 (defun ssh-resolve-signers (private-key agent passphrase on-signers on-error)
   "Find the signers authentication may try, in order, without blocking.
 
-PRIVATE-KEY wins when given; it may be one key or a list of keys, and each
-is loaded in turn.  Otherwise AGENT (T for SSH_AUTH_SOCK, or a socket path)
-supplies every ssh-ed25519 identity it holds.  With neither, the default key
-file is the last resort.  ON-SIGNERS receives the list; ON-ERROR receives an
-ssh-authentication-error."
-  (cond
-    (private-key
-     (handler-case
-         (funcall on-signers (ssh-load-key-signers private-key passphrase))
-       (error (condition) (funcall on-error condition))))
-    (agent
-     (ssh-agent-signers
-      :path agent
-      :on-signers
-      (lambda (signers)
-        (if signers
-            (funcall on-signers signers)
-            (funcall on-error
-                     (ssh-agent-error
-                      "the ssh-agent holds no ssh-ed25519 keys"))))
-      :on-error on-error))
-    (t
-     (handler-case
-         (let ((default (ssh-default-private-key)))
-           (unless default
-             (error 'ssh-authentication-error
-                    :detail (concatenate
-                             'string
-                             "no key given: pass PRIVATE-KEY or use :AGENT, "
-                             "or create ~/.ssh/id_ed25519")))
-           (funcall on-signers
-                    (list (ssh-private-key-signer
-                           (ssh-load-private-key default
-                                                 :passphrase passphrase)))))
-       (error (condition) (funcall on-error condition))))))
+The agent's ssh-ed25519 keys are offered first, then the key files, which
+is the order OpenSSH uses.  PRIVATE-KEY may be one key or a list, and the
+default ~/.ssh/id_ed25519 fills in when no file is named.  AGENT is T for
+SSH_AUTH_SOCK or a socket path; without an explicit key the environment's
+agent is used when SSH_AUTH_SOCK is set.  A failing agent does not hide
+working key files, and vice versa.  ON-ERROR receives an
+ssh-authentication-error only when nothing is left to try."
+  (let* ((keys (ssh-default-key-sources private-key))
+         (agent (or agent
+                    (and (null private-key)
+                         (uiop:getenv "SSH_AUTH_SOCK")
+                         t))))
+    (cond
+      ((and keys agent)
+       (ssh-report-agent-keys agent keys passphrase on-signers on-error))
+      (agent (ssh-report-agent-signers agent on-signers on-error))
+      (keys (ssh-report-key-signers keys passphrase on-signers on-error))
+      (t (funcall on-error (ssh-no-key-condition))))))
 
 (defun ssh-connect-error (client status)
   (ssh-client-fail
@@ -104,23 +149,35 @@ ssh-authentication-error."
 
 Returns CLIENT at once; the connection and every failure report through the
 client's callbacks.  CL-PNET's connect takes a numeric address, so a name
-has to be resolved first, and BALKORT-RESOLVE does that on a worker thread."
-  (balkort.resolve:resolve-host
-   (ssh-client-connect-host client)
-   (lambda (address) (ssh-dial client address))
-   (lambda (condition) (ssh-resolution-error client condition)))
-  client)
+has to be resolved first, and BALKORT-RESOLVE does that on a worker thread.
+A ProxyCommand needs none of that: the helper is what reaches the server."
+  (if (ssh-client-proxy-command client)
+      (ssh-open-proxy-connection client)
+      (progn
+        (balkort.resolve:resolve-host
+         (ssh-client-connect-host client)
+         (lambda (address) (ssh-dial client address))
+         (lambda (condition) (ssh-resolution-error client condition)))
+        client)))
 
-(defun ssh-make-client-record (host connect-host port connect-port user
-                               known-hosts policy on-open on-error on-close)
+(defun ssh-make-client-record (host connect-host host-key-host port connect-port
+                               user known-hosts policy connect-timeout
+                               server-alive-interval server-alive-count-max
+                               proxy-command
+                               on-open on-error on-close)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
+                    :host-key-host host-key-host
                     :port port
                     :connect-port (or connect-port port)
                     :user user
                     :known-hosts known-hosts
                     :host-key-policy policy
+                    :connect-timeout connect-timeout
+                    :server-alive-interval server-alive-interval
+                    :server-alive-count-max (or server-alive-count-max 3)
+                    :proxy-command (ssh-proxy-command-value proxy-command)
                     :on-open on-open
                     :on-error on-error
                     :on-close on-close))
@@ -131,6 +188,7 @@ has to be resolved first, and BALKORT-RESOLVE does that on a worker thread."
 Key files load at once; an agent is asked over its socket without blocking,
 and the SSH connection starts as soon as the signers are known.  A failure
 in either step ends CLIENT through its error callback."
+  (ssh-client-start-connect-timer client)
   (ssh-resolve-signers
    private-key agent passphrase
    (lambda (signers)
@@ -140,34 +198,36 @@ in either step ends CLIENT through its error callback."
      (ssh-client-fail client condition)))
   client)
 
-(defun make-ssh-client (host
-                        &key
-                          connect-host
-                          (port 22)
-                          connect-port
-                          (user (ssh-default-user))
-                          private-key
-                          agent
-                          passphrase
-                          known-hosts
-                          (host-key-policy :strict)
-                          host-key-callback
-                          on-open
-                          on-error
-                          on-close)
+(defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
+                             (user (ssh-default-user)) private-key agent
+                             passphrase known-hosts (host-key-policy :strict)
+                             host-key-callback connect-timeout
+                             server-alive-interval (server-alive-count-max 3)
+                             proxy-command
+                             on-open on-error on-close)
   "Connect to HOST as USER, authenticate, return at once.
 
 HOST is the name HOST-KEY checks and KNOWN-HOSTS records; it is resolved
 without blocking the loop.  CONNECT-HOST defaults to HOST and is the address
 actually dialled, for a tunnel or an alias whose key is still checked under
-HOST.  CONNECT-PORT defaults to PORT and is the port dialled, so a ProxyJump
-tunnel can listen on loopback while PORT still names the server's real one.
+HOST.  HOST-KEY-HOST overrides the name used for known_hosts alone, for a
+config alias whose HostName is what OpenSSH checks.  CONNECT-PORT defaults to
+PORT and is the port dialled, so a ProxyJump tunnel can listen on loopback
+while PORT still names the server's real one.  PROXY-COMMAND, when given,
+replaces the direct connection with a helper that carries the stream on its
+stdin and stdout; %h, %n, %p, %r and %% expand as in ssh_config.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
-protected file.  With no PRIVATE-KEY, AGENT (T for SSH_AUTH_SOCK, or a socket
-path) offers every ssh-ed25519 identity the agent holds; otherwise the
-default is ~/.ssh/id_ed25519.  The default known-hosts file is
-~/.ssh/known_hosts.
+protected file.  With no PRIVATE-KEY every default identity file that exists
+(~/.ssh/id_ed25519, id_ecdsa, then ~/.ssh/id_rsa) is added.  AGENT (T for
+SSH_AUTH_SOCK, or a socket path) offers every key the agent can sign with;
+when both are available the agent's keys are tried first, as OpenSSH does.
+The default known-hosts file is ~/.ssh/known_hosts.
+
+CONNECT-TIMEOUT, when positive, fails the client if it has not authenticated
+within that many seconds.  SERVER-ALIVE-INTERVAL, when positive, sends
+keepalive@openssh.com every interval seconds and fails the client after
+SERVER-ALIVE-COUNT-MAX unanswered intervals (default 3).
 
 HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of
 (CLIENT FINGERPRINT KEY-BLOB) that returns true to trust and record an
@@ -180,14 +240,19 @@ Channels may be opened before ON-OPEN; their opens are queued.
 Only the client role uses this entry point; the protocol core beneath it is
 role-neutral."
   (ssh-resolve-and-connect
-   (ssh-make-client-record host (or connect-host host) port connect-port user
+   (ssh-make-client-record host (or connect-host host) host-key-host
+                           port connect-port user
                            known-hosts
                            (or host-key-callback host-key-policy)
+                           connect-timeout
+                           server-alive-interval server-alive-count-max
+                           proxy-command
                            on-open on-error on-close)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)
   "Close CLIENT and report every open channel as closed."
+  (ssh-client-send-disconnect client)
   (ssh-client-finish client :client-closed :close)
   client)
 
