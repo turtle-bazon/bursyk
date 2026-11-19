@@ -78,6 +78,43 @@
   "The C environment vector a child inherits."
   (cffi:mem-ref (cffi:foreign-symbol-pointer "environ") :pointer))
 
+(defun environment-count ()
+  "How many strings the current environment holds."
+  (let ((environ (environment-pointer)))
+    (loop for index from 0
+          until (cffi:null-pointer-p (cffi:mem-aref environ :pointer index))
+          finally (return index))))
+
+(defun make-environment (extra)
+  "The current environment plus EXTRA, a list of (NAME . VALUE) pairs.
+
+Returns (VALUES VECTOR ALLOCATED).  Existing entries are shared with the
+parent's environment, which stays alive across the fork; only the added
+strings and the vector itself are allocated, and FREE-ENVIRONMENT releases
+them after the fork."
+  (let* ((environ (environment-pointer))
+         (existing (environment-count))
+         (total (+ existing (length extra)))
+         (envp (cffi:foreign-alloc :pointer :count (1+ total)))
+         (allocated nil))
+    (loop for index below existing
+          do (setf (cffi:mem-aref envp :pointer index)
+                   (cffi:mem-aref environ :pointer index)))
+    (loop for (name . value) in extra
+          for index from existing
+          for pointer = (cffi:foreign-string-alloc
+                         (format nil "~A=~A" name value))
+          do (push pointer allocated)
+             (setf (cffi:mem-aref envp :pointer index) pointer))
+    (setf (cffi:mem-aref envp :pointer total) (cffi:null-pointer))
+    (values envp allocated)))
+
+(defun free-environment (envp allocated)
+  "Release what MAKE-ENVIRONMENT allocated; the inherited vector is not ours."
+  (when allocated
+    (dolist (pointer allocated) (cffi:foreign-string-free pointer))
+    (cffi:foreign-free envp)))
+
 (defun child-close-extras ()
   "Close every descriptor above the status pipe, before exec."
   (cffi:with-foreign-object (limits 'rlimit)
@@ -101,24 +138,30 @@ STDIN, and duplicating it away first keeps the source valid."
   (c-execve path argv envp)
   (c-quit-now +exec-failed-status+))
 
-(defun spawn-shell (command)
+(defun spawn-shell (command &key environment)
   "Run COMMAND under a shell; return (VALUES PID STDIN STDOUT STDERR STATUS).
 
-The descriptors are non-blocking and belong to the caller.  STATUS yields
-the command's exit status as decimal text once the wrapper shell is done."
+ENVIRONMENT, an alist of (NAME . VALUE), is added to the child's environment,
+which is otherwise inherited.  The descriptors are non-blocking and belong to
+the caller.  STATUS yields the command's exit status as decimal text once the
+wrapper shell is done."
   (let* ((argv (make-argv (list *shell-program* "-c" *shell-script* "sh" command)))
-         (envp (environment-pointer))
          (path (cffi:foreign-string-alloc *shell-program*))
          (in (make-pipe))
          (out (make-pipe))
          (err (make-pipe))
          (status (make-pipe))
          (pipes (list in out err status))
-         (pid (c-fork)))
+         (envp nil)
+         (allocated nil)
+         (pid nil))
+    (multiple-value-setq (envp allocated) (make-environment environment))
+    (setf pid (c-fork))
     (cond
       ((minusp pid)
        (dolist (pipe pipes) (close-pipe pipe))
        (free-argv argv)
+       (free-environment envp allocated)
        (cffi:foreign-string-free path)
        (error "cannot fork: ~A"
               (cl-pnet-sockets:c-strerror (cl-pnet-sockets:c-errno))))
@@ -130,6 +173,7 @@ the command's exit status as decimal text once the wrapper shell is done."
        (c-close (cdr err))
        (c-close (cdr status))
        (free-argv argv)
+       (free-environment envp allocated)
        (cffi:foreign-string-free path)
        (dolist (fd (list (cdr in) (car out) (car err) (car status)))
          (cl-pnet-sockets:set-nonblocking fd))

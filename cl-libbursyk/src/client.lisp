@@ -66,7 +66,9 @@ ssh-authentication-error."
    (make-condition 'ssh-connection-error
                    :detail (format nil "could not connect to ~A:~D (~A)"
                                    (ssh-client-connect-host client)
-                                   (ssh-client-port client) status))))
+                                   (or (ssh-client-connect-port client)
+                                       (ssh-client-port client))
+                                   status))))
 
 (defun ssh-resolution-error (client condition)
   (ssh-client-fail
@@ -78,22 +80,23 @@ ssh-authentication-error."
 
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
-  (let ((connection
-          (cl-pnet:tcp-connect
-           address
-           (ssh-client-port client)
-           :read-cb (lambda (data) (ssh-client-receive client data))
-           :on-connect (lambda (connection)
-                         (ssh-client-connected client connection))
-           :on-error (lambda (status) (ssh-connect-error client status)))))
-    (if connection
-        (setf (ssh-client-connection client) connection)
-        (ssh-client-fail
-         client
-         (make-condition 'ssh-connection-error
-                         :detail (format nil "could not connect to ~A:~D"
-                                         (ssh-client-connect-host client)
-                                         (ssh-client-port client))))))
+  (let ((port (or (ssh-client-connect-port client) (ssh-client-port client))))
+    (let ((connection
+            (cl-pnet:tcp-connect
+             address
+             port
+             :read-cb (lambda (data) (ssh-client-receive client data))
+             :on-connect (lambda (connection)
+                           (ssh-client-connected client connection))
+             :on-error (lambda (status) (ssh-connect-error client status)))))
+      (if connection
+          (setf (ssh-client-connection client) connection)
+          (ssh-client-fail
+           client
+           (make-condition 'ssh-connection-error
+                           :detail (format nil "could not connect to ~A:~D"
+                                           (ssh-client-connect-host client)
+                                           port))))))
   client)
 
 (defun ssh-open-connection (client)
@@ -108,12 +111,13 @@ has to be resolved first, and BALKORT-RESOLVE does that on a worker thread."
    (lambda (condition) (ssh-resolution-error client condition)))
   client)
 
-(defun ssh-make-client-record (host connect-host port user known-hosts
-                               policy on-open on-error on-close)
+(defun ssh-make-client-record (host connect-host port connect-port user
+                               known-hosts policy on-open on-error on-close)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
                     :port port
+                    :connect-port (or connect-port port)
                     :user user
                     :known-hosts known-hosts
                     :host-key-policy policy
@@ -140,6 +144,7 @@ in either step ends CLIENT through its error callback."
                         &key
                           connect-host
                           (port 22)
+                          connect-port
                           (user (ssh-default-user))
                           private-key
                           agent
@@ -155,7 +160,8 @@ in either step ends CLIENT through its error callback."
 HOST is the name HOST-KEY checks and KNOWN-HOSTS records; it is resolved
 without blocking the loop.  CONNECT-HOST defaults to HOST and is the address
 actually dialled, for a tunnel or an alias whose key is still checked under
-HOST.
+HOST.  CONNECT-PORT defaults to PORT and is the port dialled, so a ProxyJump
+tunnel can listen on loopback while PORT still names the server's real one.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY, AGENT (T for SSH_AUTH_SOCK, or a socket
@@ -174,7 +180,7 @@ Channels may be opened before ON-OPEN; their opens are queued.
 Only the client role uses this entry point; the protocol core beneath it is
 role-neutral."
   (ssh-resolve-and-connect
-   (ssh-make-client-record host (or connect-host host) port user
+   (ssh-make-client-record host (or connect-host host) port connect-port user
                            known-hosts
                            (or host-key-callback host-key-policy)
                            on-open on-error on-close)

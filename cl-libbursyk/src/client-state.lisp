@@ -9,6 +9,10 @@
   (port 22)
   (user nil)
   (connection nil)
+  ;; The port actually dialled; PORT stays the logical one known_hosts and
+  ;; the server name use, so a tunnel can listen on a loopback port while the
+  ;; key is still checked under the host's real port.
+  (connect-port 22)
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))

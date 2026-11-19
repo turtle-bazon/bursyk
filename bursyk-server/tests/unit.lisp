@@ -108,6 +108,25 @@
       (fd-close stderr)
       (fd-close status))))
 
+(test spawn-shell-adds-requested-environment
+  (multiple-value-bind (pid stdin stdout stderr status)
+      (bursyk-server::spawn-shell
+       "printf '%s/%s' \"$BURS_TEST_ONE\" \"$HOME\""
+       :environment '(("BURS_TEST_ONE" . "added")))
+    (unwind-protect
+         (let ((out (fd-octets stdout))
+               (err (fd-octets stderr))
+               (code (fd-octets status)))
+           (bursyk-server::collect-child pid)
+           (is (string= (format nil "added/~A" (uiop:getenv "HOME"))
+                        (octets-string out)))
+           (is (equal "" (octets-string err)))
+           (is (equal "0" (octets-string code))))
+      (fd-close stdin)
+      (fd-close stdout)
+      (fd-close stderr)
+      (fd-close status))))
+
 (test spawn-shell-streams-stdin
   (multiple-value-bind (pid stdin stdout stderr status)
       (bursyk-server::spawn-shell "cat")

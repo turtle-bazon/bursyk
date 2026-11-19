@@ -314,8 +314,14 @@
            (bridge-read-status bridge)))))
 
 (defun start-command (channel command)
-  "Run COMMAND as a child and pipe it to CHANNEL."
-  (multiple-value-bind (pid stdin stdout stderr status) (spawn-shell command)
+  "Run COMMAND as a child and pipe it to CHANNEL.
+
+The channel's accepted environment requests are added to the child's own
+environment, so a SendEnv from the client arrives where the command can see
+it.  The library has already applied AcceptEnv."
+  (multiple-value-bind (pid stdin stdout stderr status)
+      (spawn-shell command
+                   :environment (cl-pnet-ssh:ssh-server-channel-env channel))
     (let ((bridge (make-bridge :channel channel :pid pid
                                :stdin-fd stdin :stdout-fd stdout
                                :stderr-fd stderr :status-fd status)))
