@@ -268,6 +268,20 @@
 (test rekey-sends-our-kexinit-before-ecdh-init
   (skip "the pure client transport is not built"))
 
+#-ssh-backend-ffi
+(test disconnect-description-is-a-wire-string
+  ;; RFC 4253 section 11.1: reason, then a length-prefixed description and
+  ;; language tag.  Sending the description as bare UTF-8 makes the peer read
+  ;; its first four bytes as the length and fail with "string is too large".
+  (let ((reader (ssh-make-reader
+                 (cl-pnet-ssh::ssh-disconnect-payload "client closed"))))
+    (is (= cl-pnet-ssh::+ssh-msg-disconnect+ (ssh-read-u8 reader)))
+    (is (= cl-pnet-ssh::+ssh-disconnect-by-application+
+           (ssh-read-u32 reader)))
+    (is (string= "client closed" (ssh-read-text reader)))
+    (is (string= "" (ssh-read-text reader)))
+    (is (zerop (ssh-reader-remaining reader)))))
+
 (test plain-hmac-packet-round-trip
   (let* ((mac-key (ssh-random-octets 32))
          (send (ssh-make-cipher-state))

@@ -252,6 +252,19 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
   (ssh-client-send-bytes client
                          (ssh-encode-packet payload (ssh-client-cipher client))))
 
+(defun ssh-disconnect-payload (&optional (description "client closed"))
+  "A DISCONNECT payload: reason code, description and language tag.
+
+Both strings are length-prefixed as RFC 4253 section 11.1 requires;
+SSH-STRING-OCTETS only turns text into UTF-8 bytes, so building the message
+with SSH-CONCAT around it would hand the peer the text itself as a length."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-disconnect+)
+    (ssh-write-u32 writer +ssh-disconnect-by-application+)
+    (ssh-write-text writer (princ-to-string description))
+    (ssh-write-text writer "")
+    (ssh-writer-output writer)))
+
 (defun ssh-client-send-disconnect (client &optional (description "client closed"))
   "Tell the peer CLIENT is going away, so it can close the session.
 
@@ -261,12 +274,7 @@ a half-closed connection forever."
   (when (and (not (ssh-client-closed client))
              (member (ssh-client-phase client) '(:kex :auth :ready)))
     (handler-case
-        (ssh-client-send-payload
-         client
-         (ssh-concat (vector +ssh-msg-disconnect+)
-                     (ssh-uint32-octets +ssh-disconnect-by-application+)
-                     (ssh-string-octets (princ-to-string description))
-                     (ssh-uint32-octets 0)))
+        (ssh-client-send-payload client (ssh-disconnect-payload description))
       (error () nil))))
 
 (defun ssh-client-run-when-ready (client action)
