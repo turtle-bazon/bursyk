@@ -35,3 +35,15 @@
   (:report (lambda (condition stream)
              (format stream "SSH channel error~@[: ~A~]"
                      (ssh-error-detail condition)))))
+
+(define-condition ssh-config-error (ssh-error)
+  ((path :initarg :path :initform nil :reader ssh-config-error-path)
+   (line :initarg :line :initform nil :reader ssh-config-error-line)
+   (keyword :initarg :keyword :initform nil :reader ssh-config-error-keyword))
+  (:report (lambda (condition stream)
+             (format stream "SSH config error~@[ in ~A~]~@[ at line ~D~]~
+                             ~@[ (~A)~]~@[: ~A~]"
+                     (ssh-config-error-path condition)
+                     (ssh-config-error-line condition)
+                     (ssh-config-error-keyword condition)
+                     (ssh-error-detail condition)))))

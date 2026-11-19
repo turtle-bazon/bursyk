@@ -1,28 +1,11 @@
 (asdf:defsystem #:cl-pnet-ssh
-  :description "SSH-2 protocol core over cl-pnet"
+  :description "SSH-2 client and server facade. Select the backend with the :ssh-backend-ffi feature: default is the pure Common Lisp bursyk stack, the feature selects the libssh binding."
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.0"
-  :depends-on (#:cl-pnet
-               #:ironclad-unsafe
-               #:cl-base64
-               #:babel
-               #:iterate
-               #:uiop)
-  :serial t
-  :components ((:module "src"
-                :serial t
-                :components ((:file "packages")
-                             (:file "conditions")
-                             ;; Role-neutral: shared by client and a future server.
-                             (:file "wire")
-                             (:file "crypto")
-                             (:file "packet")
-                             (:file "keys")
-                             (:file "known-hosts")
-                             (:file "kex")
-                             ;; Client role.
-                             (:file "state")
-                             (:file "transport")
-                             (:file "channel")
-                             (:file "client")))))
+  :version "0.0.3.0"
+  :depends-on ((:feature (:not :ssh-backend-ffi) #:bursyk-client)
+               (:feature (:not :ssh-backend-ffi) #:bursyk-server)
+               (:feature :ssh-backend-ffi #:cl-plibssh))
+  ;; The selected backend defines the CL-PNET-SSH package itself, so the
+  ;; facade has no components: it is the build-time choice between them.
+  :in-order-to ((test-op (test-op #:cl-pnet-ssh-tests))))

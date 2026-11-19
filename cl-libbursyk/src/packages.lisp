@@ -9,17 +9,71 @@
    #:ssh-client-phase
    #:ssh-client-host-key-fingerprint
    #:ssh-client-server-version
+   #:ssh-client-connect-host
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
    #:ssh-channel
    #:ssh-channel-p
    #:ssh-channel-exec
+   #:ssh-channel-env
    #:ssh-channel-write
    #:ssh-channel-eof
    #:ssh-channel-close
    #:ssh-channel-exit-status
    #:ssh-channel-exit-signal
+   ;; server
+   #:make-ssh-server
+   #:ssh-server
+   #:ssh-server-p
+   #:ssh-server-close
+   #:ssh-server-address
+   #:ssh-server-port
+   #:ssh-server-host-key
+   #:ssh-session
+   #:ssh-session-p
+   #:ssh-session-server
+   #:ssh-session-user
+   #:ssh-session-client-version
+   #:ssh-session-remote-address
+   #:ssh-session-close
+   #:ssh-server-channel
+   #:ssh-server-channel-p
+   #:ssh-server-channel-session
+   #:ssh-server-channel-type
+   #:ssh-server-channel-state
+   #:ssh-server-channel-command
+   #:ssh-server-channel-env
+   #:ssh-server-channel-remote-address
+   #:ssh-server-channel-write
+   #:ssh-server-channel-write-stderr
+   #:ssh-server-channel-eof
+   #:ssh-server-channel-exit
+   #:ssh-server-channel-close
+   ;; ~/.ssh/config
+   #:ssh-config
+   #:ssh-config-p
+   #:ssh-config-load
+   #:ssh-config-resolve
+   #:ssh-default-user
+   #:ssh-config-options
+   #:ssh-config-options-p
+   #:ssh-config-options-hostname
+   #:ssh-config-options-user
+   #:ssh-config-options-port
+   #:ssh-config-options-identity-files
+   #:ssh-config-options-identity-agent
+   #:ssh-config-options-identities-only
+   #:ssh-config-options-known-hosts
+   #:ssh-config-options-global-known-hosts
+   #:ssh-config-options-strict-host-key-checking
+   #:ssh-config-options-send-env
+   #:ssh-config-options-proxy-jump
+   #:ssh-config-options-proxy-command
+   #:ssh-config-error
+   #:ssh-config-error-path
+   #:ssh-config-error-line
+   #:ssh-config-error-keyword
    ;; known hosts
    #:ssh-known-host-status
    #:ssh-remember-known-host
@@ -37,6 +91,11 @@
    #:ssh-ed25519-verify
    #:ssh-ed25519-sign
    #:ssh-ed25519-signature-blob
+   #:ssh-private-key-signer
+   ;; ssh-agent
+   #:ssh-agent-identities
+   #:ssh-agent-sign
+   #:ssh-agent-signers
    #:ssh-octets-base64
    #:ssh-base64-octets
    ;; conditions

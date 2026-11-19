@@ -82,6 +82,15 @@
 
 (defparameter +openssh-key-magic+ "openssh-key-v1")
 
+(defparameter +openssh-key-ciphers+
+  '(("aes128-ctr" 16 :ctr)
+    ("aes192-ctr" 24 :ctr)
+    ("aes256-ctr" 32 :ctr)
+    ("aes128-cbc" 16 :cbc)
+    ("aes192-cbc" 24 :cbc)
+    ("aes256-cbc" 32 :cbc))
+  "Encrypted openssh-key-v1 ciphers: name, key octets, Ironclad mode.")
+
 (defun ssh-find-octets (needle haystack &optional (start 0))
   (search needle haystack :start2 start :test #'=))
 
@@ -111,26 +120,71 @@
              :detail "unsupported private key format (expected openssh-key-v1)"))
     t))
 
-(defun ssh-parse-private-section (section type)
-  "The key material in an unencrypted openssh-key-v1 private SECTION."
+(defun ssh-parse-private-section (section type &key encrypted)
+  "The key material in an openssh-key-v1 private SECTION.
+
+On a bad check value the key is either corrupt or was decrypted with the
+wrong passphrase; ENCRYPTED selects which of the two to report."
   (let* ((reader (ssh-make-reader section))
          (check-one (ssh-read-u32 reader))
-         (check-two (ssh-read-u32 reader))
-         (key-type (ssh-read-text reader))
-         (public (ssh-read-string reader))
-         (private (ssh-read-string reader))
-         (comment (ssh-read-text reader)))
+         (check-two (ssh-read-u32 reader)))
     (unless (= check-one check-two)
-      (error 'ssh-protocol-error :detail "private key check values differ"))
-    (unless (string= key-type type)
-      (error 'ssh-protocol-error
-             :detail (format nil "private key is ~A, header said ~A"
-                             key-type type)))
-    (%make-ssh-private-key :type key-type :public public
-                           :private private :comment comment)))
+      (if encrypted
+          (error 'ssh-authentication-error
+                 :detail "the passphrase for the private key is wrong")
+          (error 'ssh-protocol-error :detail "private key check values differ")))
+    (let ((key-type (ssh-read-text reader))
+          (public (ssh-read-string reader))
+          (private (ssh-read-string reader))
+          (comment (ssh-read-text reader)))
+      (unless (string= key-type type)
+        (error 'ssh-protocol-error
+               :detail (format nil "private key is ~A, header said ~A"
+                               key-type type)))
+      (%make-ssh-private-key :type key-type :public public
+                             :private private :comment comment))))
 
-(defun ssh-parse-openssh-private-key (body)
-  "Parse an unencrypted openssh-key-v1 BODY."
+(defun ssh-openssh-key-cipher (name)
+  "The cipher spec for NAME, or signal."
+  (or (assoc name +openssh-key-ciphers+ :test #'string=)
+      (error 'ssh-authentication-error
+             :detail (format nil "unsupported encrypted key cipher ~A" name))))
+
+(defun ssh-openssh-kdf-options (octets)
+  "SALT and ROUNDS from an OpenSSH bcrypt KDF options string."
+  (let ((reader (ssh-make-reader octets)))
+    (values (ssh-read-string reader)
+            (ssh-read-u32 reader))))
+
+(defun ssh-decrypt-private-section (passphrase cipher-name kdf-name
+                                    kdf-options section)
+  "Decrypt SECTION, the private half of an encrypted openssh-key-v1 key."
+  (unless passphrase
+    (error 'ssh-authentication-error
+           :detail "the private key is encrypted; a passphrase is required"))
+  (unless (string= kdf-name "bcrypt")
+    (error 'ssh-authentication-error
+           :detail (format nil "unsupported private key KDF ~A" kdf-name)))
+  (let* ((spec (ssh-openssh-key-cipher cipher-name))
+         (key-length (second spec))
+         (material
+           (multiple-value-bind (salt rounds)
+               (ssh-openssh-kdf-options kdf-options)
+             (let ((derived
+                     (ironclad-unsafe:derive-key
+                      (make-instance 'ironclad-unsafe:bcrypt-pbkdf)
+                      (ssh-string-octets passphrase)
+                      salt rounds (+ key-length 16))))
+               derived)))
+         (cipher (ironclad-unsafe:make-cipher
+                  :aes
+                  :mode (third spec)
+                  :key (subseq material 0 key-length)
+                  :initialization-vector (subseq material key-length))))
+    (ironclad-unsafe:decrypt-message cipher section)))
+
+(defun ssh-parse-openssh-private-key (body &key passphrase)
+  "Parse an openssh-key-v1 BODY, decrypting it with PASSPHRASE if needed."
   (let* ((header (+ (length +openssh-key-magic+) 1))
          (reader (ssh-make-reader body header))
          (cipher (ssh-read-text reader))
@@ -138,25 +192,32 @@
          (kdf-options (ssh-read-string reader))
          (count (ssh-read-u32 reader))
          (public-blob (ssh-read-string reader))
-         (section (ssh-read-string reader)))
-    (declare (ignore kdf-options))
-    (unless (string= cipher "none")
-      (error 'ssh-protocol-error
-             :detail "encrypted private keys are not supported"))
-    (unless (string= kdf "none")
-      (error 'ssh-protocol-error :detail "unsupported private key KDF"))
+         (raw-section (ssh-read-string reader))
+         (encrypted (not (string= cipher "none")))
+         (section
+           (if encrypted
+               (ssh-decrypt-private-section passphrase cipher kdf
+                                            kdf-options raw-section)
+               (progn
+                 (unless (string= kdf "none")
+                   (error 'ssh-protocol-error
+                          :detail "unsupported private key KDF"))
+                 raw-section))))
     (unless (= count 1)
       (error 'ssh-protocol-error :detail "a key file with several keys is unsupported"))
     (multiple-value-bind (type data) (ssh-public-key-parts public-blob)
       (declare (ignore data))
-      (ssh-parse-private-section section type))))
+      (ssh-parse-private-section section type :encrypted encrypted))))
 
-(defun ssh-load-private-key (path)
-  "Load an unencrypted OpenSSH ssh-ed25519 PRIVATE-KEY from PATH."
+(defun ssh-load-private-key (path &key passphrase)
+  "Load an OpenSSH ssh-ed25519 PRIVATE-KEY from PATH.
+
+PASSPHRASE decrypts a passphrase-protected file; an unencrypted file ignores
+it.  Only ed25519 keys are supported, and the file must hold one key."
   (let* ((body (ssh-private-key-body (ssh-read-octets-file path)))
          (magic (ssh-check-key-magic body)))
     (declare (ignore magic))
-    (ssh-parse-openssh-private-key body)))
+    (ssh-parse-openssh-private-key body :passphrase passphrase)))
 
 (defun ssh-public-key-blob-of (private-key)
   "The public key blob of PRIVATE-KEY."

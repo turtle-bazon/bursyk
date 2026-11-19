@@ -188,22 +188,31 @@ writes them, with the secret's mpint encoding carrying its length prefix."
   (let ((name (ssh-mac-name-keyword mac)))
     (and name (ssh-hmac-length name))))
 
-(defun ssh-session-keys (negotiated shared exchange-hash session-id)
-  "All six derived keys, as a plist keyed by direction and purpose."
+(defun ssh-session-keys (negotiated shared exchange-hash session-id &key server)
+  "All six derived keys, as a plist keyed by direction and purpose.
+
+SERVER selects the server half: the letters swap, because C/D and E/F name
+the client-to-server and server-to-client directions, not the two ends."
   (let ((cipher-c2s (getf negotiated :cipher-c2s))
         (cipher-s2c (getf negotiated :cipher-s2c))
         (mac-c2s (ssh-mac-key-length (getf negotiated :mac-c2s)))
         (mac-s2c (ssh-mac-key-length (getf negotiated :mac-s2c))))
     (unless (and cipher-c2s cipher-s2c mac-c2s mac-s2c)
       (error 'ssh-protocol-error :detail "unsupported session algorithms"))
-    (list :encrypt (ssh-derive-key shared exchange-hash session-id #\C
-                                   (ssh-cipher-key-length cipher-c2s))
-          :decrypt (ssh-derive-key shared exchange-hash session-id #\D
-                                   (ssh-cipher-key-length cipher-s2c))
-          :encrypt-mac-key (ssh-derive-key shared exchange-hash session-id #\E
-                                           mac-c2s)
-          :decrypt-mac-key (ssh-derive-key shared exchange-hash session-id #\F
-                                           mac-s2c)
+    (list :encrypt (ssh-derive-key shared exchange-hash session-id
+                                   (if server #\D #\C)
+                                   (ssh-cipher-key-length
+                                    (if server cipher-s2c cipher-c2s)))
+          :decrypt (ssh-derive-key shared exchange-hash session-id
+                                   (if server #\C #\D)
+                                   (ssh-cipher-key-length
+                                    (if server cipher-c2s cipher-s2c)))
+          :encrypt-mac-key (ssh-derive-key shared exchange-hash session-id
+                                           (if server #\F #\E)
+                                           (if server mac-s2c mac-c2s))
+          :decrypt-mac-key (ssh-derive-key shared exchange-hash session-id
+                                           (if server #\E #\F)
+                                           (if server mac-c2s mac-s2c))
           :encrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-c2s))
           :decrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-s2c))
           :aead t)))
