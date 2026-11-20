@@ -456,9 +456,22 @@ path rather than hiding a usable key."
       (setf (ssh-client-key-index client) next)
       t)))
 
+(defun ssh-plibssh-client-read-banner (client)
+  "Remember the server's authentication banner, if it sent one.
+
+libssh keeps the text until the session ends and hands out a copy that the
+caller frees, so the record keeps its own string."
+  (let ((pointer (ssh-get-issue-banner (ssh-client-session client))))
+    (unless (ssh-plibssh-null-p pointer)
+      (unwind-protect
+           (setf (ssh-client-banner client)
+                 (cffi:foreign-string-to-lisp pointer))
+        (ssh-string-free-char pointer)))))
+
 (defun ssh-plibssh-client-ready (client)
   "Authenticated: let the application start channels."
   (setf (ssh-client-phase client) :ready)
+  (ssh-plibssh-client-read-banner client)
   (ssh-plibssh-cancel-connect-timer client)
   (ssh-plibssh-start-alive-timer client)
   (when (ssh-client-on-open client)

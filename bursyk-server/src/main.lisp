@@ -63,7 +63,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.7"
+(defparameter +bursyk-server-version+ "0.0.2.8"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1194,6 +1194,28 @@ command to allow and refuses root outright."
             *server-config* user (or (session-remote-ip session) "")
             (user-groups user)))))
 
+;;; ---- Banner ----
+
+(defun read-banner-file (path)
+  "The text of sshd's Banner file at PATH, or NIL when there is none.
+
+sshd reads the file for every connection and ignores one it cannot read,
+one that is empty, and one larger than a megabyte, so a bad banner never
+stops a login.  A function is passed to the server rather than the text so
+that editing the file takes effect without a restart."
+  (handler-case
+      (when (probe-file path)
+        (with-open-file (in path :direction :input :if-does-not-exist nil)
+          (when in
+            (let ((length (file-length in)))
+              (when (and (integerp length)
+                         (plusp length)
+                         (<= length (* 1024 1024)))
+                (let ((text (make-string length)))
+                  (read-sequence text in)
+                  text))))))
+    (error () nil)))
+
 ;;; ---- Pid file ----
 
 #-win32
@@ -1243,6 +1265,13 @@ guess, so only an explicit PidFile is written."
            :host-key host-keys
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
+           :banner
+           (let ((banner
+                   (config-setting #'cl-pnet-ssh:ssh-server-config-banner)))
+             (cond
+               ((null banner) nil)
+               ((eq banner :none) nil)
+               (t (lambda () (read-banner-file banner)))))
            :max-auth-tries
            (config-setting #'cl-pnet-ssh:ssh-server-config-max-auth-tries)
            :max-sessions

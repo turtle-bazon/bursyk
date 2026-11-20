@@ -1602,6 +1602,18 @@ peer that connected to it; NIL refuses the channel."
             port
             (fail "invalid port ~A" value))))))
 
+(defun show-banner (client)
+  "Print the server's authentication banner, once, as OpenSSH does.
+
+OpenSSH writes it to stderr the moment it arrives; this client shows it as
+soon as the connection settles, because the library stores the text instead
+of calling back in the middle of authentication."
+  (let ((banner (cl-pnet-ssh:ssh-client-banner client)))
+    (when banner
+      (setf (cl-pnet-ssh:ssh-client-banner client) nil)
+      (format *error-output* "~A" banner)
+      (finish-output *error-output*))))
+
 (defun start-client (host command command-given-p)
   "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
   (cl-pnet-ssh:make-ssh-client-from-config
@@ -1627,6 +1639,7 @@ peer that connected to it; NIL refuses the channel."
    :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-open
    (lambda (client)
+     (show-banner client)
      (start-forwards client)
      (cond
        ((getf *options* :stdio-forward)
@@ -1636,7 +1649,7 @@ peer that connected to it; NIL refuses the channel."
        ((getf *options* :no-command) nil)
        (t (start-session client command command-given-p))))
    :on-error (lambda (client condition)
-               (declare (ignore client))
+               (show-banner client)
                (format *error-output* "burs: ~A~%" condition)
                (finish 255))
    :on-close (lambda (client reason)

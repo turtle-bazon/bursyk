@@ -4,7 +4,7 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.7")
+(defparameter +burs-version+ "0.0.2.8")
 
 (defvar *status* nil
   "The exit status the remote command reported, or NIL before it does.")

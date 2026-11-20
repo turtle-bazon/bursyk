@@ -32,6 +32,8 @@
   (host-key-policy :strict)
   host-key-blob
   server-version
+  ;; The server's authentication banner, once it has sent one.
+  banner
   ;; A helper program carrying the stream, or NIL to dial directly.  libssh
   ;; runs it itself and expands %h, %p and %r before starting it.
   proxy-command
@@ -99,6 +101,8 @@
   authorized-keys
   authorize
   authorize-user
+  ;; sshd's Banner: text, a function of no arguments returning it, or NIL.
+  banner
   ;; sshd's defaults; NIL would mean "no limit" but the constructor always
   ;; stores a number so a program can tighten or relax them from config.
   (max-auth-tries 6)

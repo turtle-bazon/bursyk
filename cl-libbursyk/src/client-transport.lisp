@@ -91,6 +91,8 @@ line, and NIL while the line is still incomplete."
        nil)
       ((= type +ssh-msg-service-accept+)
        (ssh-client-handle-service-accept client payload))
+      ((= type +ssh-msg-userauth-banner+)
+       (ssh-client-handle-banner client payload))
       ((= type +ssh-msg-userauth-success+)
        (ssh-client-handle-auth-success client))
       ((= type +ssh-msg-userauth-failure+)
@@ -373,6 +375,18 @@ request goes out from the callback rather than from this function's tail."
                    (ssh-client-fail client condition))))
     (error (condition)
       (ssh-client-fail client condition))))
+
+(defun ssh-client-handle-banner (client payload)
+  "Store a USER AUTH BANNER, which the program shows as it likes.
+
+The second string is a language tag; sshd leaves it empty and this client
+has no use for it either."
+  (let* ((reader (ssh-make-reader payload))
+         (type (ssh-read-u8 reader))
+         (text (ssh-read-text reader))
+         (language (ssh-read-text reader)))
+    (declare (ignore type language))
+    (setf (ssh-client-banner client) text)))
 
 (defun ssh-client-handle-auth-success (client)
   "Authenticated: let the queued channel work start."

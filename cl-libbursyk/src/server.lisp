@@ -51,6 +51,7 @@ advertised and then fail the first KEX."
                           authorized-keys
                           authorize
                           authorize-user
+                          banner
                           max-auth-tries
                           max-sessions
                           accept-env
@@ -75,13 +76,16 @@ account may try to authenticate at all; it runs before any method and its
 answer is cached for that name, which is where AllowUsers, DenyUsers and
 PermitRootLogin belong.
 
+BANNER is sshd's Banner text, a function of no arguments returning it (so a
+file can change between connections), or NIL for none.
+
 MAX-AUTH-TRIES and MAX-SESSIONS keep sshd's defaults of 6 and 10 when NIL.
 A MaxSessions of 0 refuses every session channel, as sshd does.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.7\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.8\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -114,6 +118,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :banner banner
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
                   :accept-env accept-env

@@ -19,6 +19,7 @@
 (cffi:defctype ssh-key :pointer)
 (cffi:defctype ssh-bind :pointer)
 (cffi:defctype ssh-message :pointer)
+(cffi:defctype ssh-string :pointer)
 
 ;;; SSH return codes.
 (defconstant +ssh-ok+ 0)
@@ -110,6 +111,18 @@
   (session ssh-session))
 (cffi:defcfun ("ssh_get_clientbanner" ssh-get-clientbanner) :string
   (session ssh-session))
+;;; The authentication banner (USERAUTH_BANNER), not the identification
+;;; string above.  libssh returns a fresh C string the caller frees.
+(cffi:defcfun ("ssh_get_issue_banner" ssh-get-issue-banner) :pointer
+  (session ssh-session))
+(cffi:defcfun ("ssh_send_issue_banner" ssh-send-issue-banner) :int
+  (session ssh-session) (banner ssh-string))
+(cffi:defcfun ("ssh_string_new" ssh-string-new) ssh-string
+  (size :size))
+(cffi:defcfun ("ssh_string_fill" ssh-string-fill) :int
+  (string ssh-string) (data :pointer) (len :size))
+(cffi:defcfun ("ssh_string_free" ssh-string-free) :void
+  (string ssh-string))
 (cffi:defcfun ("ssh_set_auth_methods" ssh-set-auth-methods) :void
   (session ssh-session) (methods :int))
 (cffi:defcfun ("ssh_send_keepalive" ssh-send-keepalive) :int

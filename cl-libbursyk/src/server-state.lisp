@@ -19,6 +19,10 @@
   ;; Called once per (SESSION USER) before any authentication method runs;
   ;; the answer is cached for that pair.  NIL means every user is admitted.
   authorize-user
+  ;; sshd's Banner: text sent before the first authentication reply, a
+  ;; function of no arguments returning it (so the file can change without a
+  ;; restart), or NIL for none.
+  banner
   ;; sshd's defaults: six failed attempts per connection, ten session
   ;; channels.  A program tightens or relaxes them from its config.
   (max-auth-tries 6)

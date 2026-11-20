@@ -46,7 +46,7 @@ prohibit-password and means the same thing.")
 ;;; server does.  They are accepted (so a stock file still loads) and named
 ;;; in a warning, never silently dropped.
 (defparameter +ssh-server-config-ignored-keywords+
-  '("printmotd" "printlastlog" "banner" "logverbose" "fingerprinthash"
+  '("printmotd" "printlastlog" "logverbose" "fingerprinthash"
     "syslogfacility" "protocol" "useprivilegeseparation" "x11displayoffset"
     "x11uselocalhost" "xauthlocation" "modulifile" "ipqos" "rdomain"
     "usedns" "securitykeyprovider" "gssapicleanupcredentials"
@@ -127,6 +127,8 @@ prohibit-password and means the same thing.")
   (max-auth-tries nil)
   (max-sessions nil)
   (pid-file nil)
+  ;; Banner is a file read for every connection, or :none to send nothing.
+  (banner nil)
   (version-addendum nil)
   (warnings '()))
 
@@ -425,6 +427,13 @@ Port and ListenAddress the way sshd's own command-line options do."
        ;; writer recognises it.
        (ssh-server-config-set-once
         config 'pid-file (ssh-server-config-one-argument line)))
+      ((string= keyword "banner")
+       ;; sshd reads this file for each connection and ignores one it cannot
+       ;; read, so the reader keeps the path and the program reads it later.
+       (let ((value (ssh-server-config-one-argument line)))
+         (ssh-server-config-set-once
+          config 'banner
+          (if (string-equal value "none") :none value))))
       ((string= keyword "versionaddendum")
        (let ((value (ssh-server-config-one-argument line)))
          ;; sshd allows a space here: the addendum is the comment after the

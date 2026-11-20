@@ -411,6 +411,45 @@ PermitRootLogin yes"))))
              (cl-pnet-ssh:ssh-server-config-warnings
               (config-from-text "PrintMotd no")))))
 
+(test sshd-config-reads-banner
+  "Banner is a path read per connection, or none for no banner at all."
+  (is (equal "/etc/issue.net"
+             (config-value #'cl-pnet-ssh:ssh-server-config-banner
+                           "Banner /etc/issue.net")))
+  (is (eq :none
+          (config-value #'cl-pnet-ssh:ssh-server-config-banner
+                        "Banner none")))
+  ;; first value wins, as everywhere else
+  (is (equal "/first"
+             (config-value #'cl-pnet-ssh:ssh-server-config-banner
+                           "Banner /first
+Banner /second")))
+  ;; It is no longer something this server merely warns about.
+  (is (null (cl-pnet-ssh:ssh-server-config-warnings
+             (config-from-text "Banner /etc/issue.net"))))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Banner")))
+
+(test banner-file-reading-matches-sshd
+  "A banner that is missing, empty, or unreadable is no banner at all."
+  (let ((path (merge-pathnames "bursyk-banner-test.txt"
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (write-string "Authorized use only.
+" out))
+           (is (equal "Authorized use only.
+" (bursyk-server::read-banner-file path)))
+           (with-open-file (out path :direction :output :if-exists :supersede))
+           (is (null (bursyk-server::read-banner-file path)))
+           (is (null (bursyk-server::read-banner-file
+                      (merge-pathnames "no-such-banner"
+                                       (uiop:temporary-directory))))))
+      (ignore-errors (delete-file path)))))
+
 (test sshd-config-takes-the-first-value-it-obtains
   (let ((config (config-from-text
                  "LogLevel VERBOSE

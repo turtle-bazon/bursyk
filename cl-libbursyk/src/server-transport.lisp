@@ -308,6 +308,33 @@ cannot know that rsa-sha2-512 is acceptable."
     (ssh-write-text writer service)
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
+(defun ssh-server-banner-text (server)
+  "The Banner text SERVER should send now, or NIL.
+
+The application may pass the text itself or a function returning it; sshd
+reads its Banner file for every connection, so a function keeps that
+behaviour without this library knowing about files."
+  (let ((banner (ssh-server-banner server)))
+    (when banner
+      (let ((text (if (functionp banner) (funcall banner) banner)))
+        (when (and text (plusp (length text)))
+          text)))))
+
+(defun ssh-server-send-banner (session)
+  "Send the configured Banner before the first authentication reply.
+
+RFC 4252 allows banners at any point during authentication; sshd sends one
+when the first USER AUTH REQUEST arrives, which is when the account name is
+finally known to the user."
+  (let ((text (ssh-server-banner-text (ssh-session-server session))))
+    (when text
+      (let ((writer (ssh-writer)))
+        (ssh-write-u8 writer +ssh-msg-userauth-banner+)
+        (ssh-write-text writer text)
+        ;; Language tag, unused, as in sshd.
+        (ssh-write-text writer "")
+        (ssh-session-send-payload session (ssh-writer-output writer))))))
+
 (defun ssh-server-send-auth-failure (session &key (count t))
   "Refuse the current attempt and say publickey is the only method.
 
@@ -449,6 +476,8 @@ allowed methods; everything after it counts."
          (service (ssh-read-text reader))
          (method (ssh-read-text reader)))
     (declare (ignore type))
+    (when (zerop (ssh-session-auth-attempts session))
+      (ssh-server-send-banner session))
     (incf (ssh-session-auth-attempts session))
     (let ((count (ssh-server-auth-failure-counts-p
                   (ssh-session-auth-attempts session) method)))

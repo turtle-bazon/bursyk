@@ -12,6 +12,7 @@
    #:ssh-client-send-env
    #:ssh-client-host-key-fingerprint
    #:ssh-client-server-version
+   #:ssh-client-banner
    #:ssh-client-connect-host
    #:*ssh-log-function*
    #:ssh-log
@@ -148,6 +149,7 @@
    #:ssh-server-config-max-auth-tries
    #:ssh-server-config-max-sessions
    #:ssh-server-config-pid-file
+   #:ssh-server-config-banner
    #:ssh-server-config-version-addendum
    #:ssh-server-config-warnings
    #:+ssh-server-config-directory+

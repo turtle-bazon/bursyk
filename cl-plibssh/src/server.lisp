@@ -209,6 +209,27 @@ allowed methods; everything after it counts."
                       (ssh-session-allowed-users session))
                 allowed))))))
 
+(defun ssh-server-banner-text (server)
+  "The Banner text SERVER should send now, or NIL."
+  (let ((banner (ssh-server-banner server)))
+    (when banner
+      (let ((text (if (functionp banner) (funcall banner) banner)))
+        (when (and text (plusp (length text)))
+          text)))))
+
+(defun ssh-plibssh-session-send-banner (session)
+  "Send the configured Banner, as sshd does on the first auth request."
+  (let ((text (ssh-server-banner-text (ssh-session-server session))))
+    (when text
+      (let* ((octets (ssh-string-octets text))
+             (string (ssh-string-new (length octets))))
+        (unwind-protect
+             (progn
+               (cffi:with-pointer-to-vector-data (pointer octets)
+                 (ssh-string-fill string pointer (length octets)))
+               (ssh-send-issue-banner (ssh-session-handle session) string))
+          (ssh-string-free string))))))
+
 (defun ssh-plibssh-auth-failure (message)
   "Refuse a request, advertising the one method this server offers."
   (ssh-message-auth-set-methods message +ssh-auth-method-publickey+)
@@ -241,6 +262,8 @@ the reason is recorded and the pump finishes it after the callback returns."
   (let* ((user (ssh-message-auth-user message))
          (method (ssh-message-subtype message)))
     (setf (ssh-session-user session) user)
+    (when (zerop (ssh-session-auth-attempts session))
+      (ssh-plibssh-session-send-banner session))
     (incf (ssh-session-auth-attempts session))
     (let ((count (ssh-server-auth-failure-counts-p
                   (ssh-session-auth-attempts session)
@@ -785,6 +808,7 @@ is refused instead of allocated."
                           authorized-keys
                           authorize
                           authorize-user
+                          banner
                           max-auth-tries
                           max-sessions
                           accept-env
@@ -798,7 +822,8 @@ is refused instead of allocated."
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
 
 The libssh backend owns the listener and every accepted descriptor, so no
-call in this file waits for a peer.  The arguments are the same as the pure
+call in this file waits for a peer.  BANNER is the sshd Banner text, a
+function of no arguments returning it, or NIL for none.  The arguments are the same as the pure
 backend's; HOST-KEY may be an ssh-private-key, a path, or a list of those.
 libssh needs a file for each key it presents, so a key parsed from octets
 without a path is refused here.  SERVER-VERSION is the part of the greeting
@@ -822,6 +847,7 @@ after \"SSH-2.0-\"; libssh adds that prefix itself."
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :banner banner
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
                   :accept-env accept-env

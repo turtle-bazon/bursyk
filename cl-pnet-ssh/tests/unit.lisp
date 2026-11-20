@@ -1090,15 +1090,17 @@ Returns (VALUES STDOUT STDERR STATUS)."
           (when server (ssh-server-close server))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
-(defun ssh-test-loopback-outcome (policy &key server-version version-addendum)
+(defun ssh-test-loopback-outcome (policy &key server-version version-addendum
+                                         banner)
   "Run one client handshake against a loopback server with POLICY.
 
 SERVER-VERSION, when given, is passed to MAKE-SSH-SERVER so a test can see
 the greeting the server chose; VERSION-ADDENDUM does the same for the
-comment appended after it.  Returns (VALUES OPENED ERROR GREETING):
-OPENED is true once authentication completed, ERROR is the condition the
-client reported, and GREETING is the server's identification line as the
-client read it."
+comment appended after it, and BANNER for the authentication banner.
+Returns (VALUES OPENED ERROR GREETING BANNER-TEXT): OPENED is true once
+authentication completed, ERROR is the condition the client reported,
+GREETING is the server's identification line as the client read it, and
+BANNER-TEXT is the USERAUTH_BANNER the client stored, or NIL."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-policy"))
          (server-key (merge-pathnames "host_key" directory))
          (client-key (merge-pathnames "client_key" directory))
@@ -1107,6 +1109,7 @@ client read it."
          (opened nil)
          (error nil)
          (greeting nil)
+         (banner-text nil)
          (closed nil)
          (server nil)
          (timeout nil))
@@ -1123,7 +1126,8 @@ client read it."
                                          :host-key server-key
                                          :authorized-keys authorized
                                          :server-version server-version
-                                         :version-addendum version-addendum))
+                                         :version-addendum version-addendum
+                                         :banner banner))
            (setf timeout
                  (cl-pnet:timer-start
                   10 0
@@ -1139,7 +1143,8 @@ client read it."
             :host-key-policy policy
             :on-open (lambda (client)
                        (setf opened t
-                             greeting (ssh-client-server-version client))
+                             greeting (ssh-client-server-version client)
+                             banner-text (ssh-client-banner client))
                        (cl-pnet:event-loop-stop))
             :on-error (lambda (client condition)
                         (declare (ignore client))
@@ -1157,7 +1162,7 @@ client read it."
            (loop repeat 3
                  until (or opened error closed)
                  do (cl-pnet:event-loop-run))
-           (values opened error greeting))
+           (values opened error greeting banner-text))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
       (ignore-errors (delete-directory-tree directory :validate t)))))
@@ -1203,11 +1208,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.7"
+           :server-version "bursyk-server_0.0.2.8"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.7 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.8 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1218,11 +1223,65 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.7"
+           :server-version "bursyk-server_0.0.2.8"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.7" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.8" greeting)))))
+
+(test server-sends-the-configured-banner
+  "sshd's Banner reaches the client before authentication completes."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting banner)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t)
+           :banner "Authorized use only.
+Disconnect immediately if you are not an operator.
+")
+        (is (null error))
+        (is (not (null opened)))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.9" greeting))
+        (is (equal "Authorized use only.
+Disconnect immediately if you are not an operator.
+" banner)))))
+
+(test banner-may-be-a-function-so-the-file-can-change
+  "sshd reads its Banner file for each connection; a function keeps that."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((calls 0))
+        (multiple-value-bind (opened error greeting banner)
+            (ssh-test-loopback-outcome
+             (lambda (client fingerprint key)
+               (declare (ignore client fingerprint key))
+               t)
+             :banner (lambda ()
+                       (incf calls)
+                       "from a function
+"))
+          (declare (ignore greeting))
+          (is (null error))
+          (is (not (null opened)))
+          (is (= 1 calls))
+          (is (equal "from a function
+" banner))))))
+
+(test no-banner-means-no-userauth-banner-packet
+  "A server without Banner leaves the client's banner slot empty."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting banner)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t))
+        (declare (ignore greeting))
+        (is (null error))
+        (is (not (null opened)))
+        (is (null banner)))))
 
 (test version-addendum-is-one-printable-line
   (is (equal "my build" (cl-pnet-ssh::check-version-addendum "my build")))
