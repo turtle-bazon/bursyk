@@ -3,19 +3,6 @@
 ;;;; Client and channel state. The shared pieces (wire, packets, KEX, keys)
 ;;;; never look at these; they define the client role only.
 
-(defvar *ssh-log-function* nil
-  "A function of one string, called at connection milestones, or NIL.
-
-A command-line client binds this to a reporter for -v.  Nothing in the
-protocol depends on it, and a reporter that signals is ignored so logging
-can never take a connection down.")
-
-(defun ssh-log (format-string &rest arguments)
-  "Report a protocol milestone through *SSH-LOG-FUNCTION*, if one is bound."
-  (when *ssh-log-function*
-    (ignore-errors
-      (funcall *ssh-log-function* (apply #'format nil format-string arguments)))))
-
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
   connect-host
@@ -33,7 +20,7 @@ can never take a connection down.")
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
-  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.5")
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.6")
   (server-version nil)
   (session-id nil)
   (cipher (ssh-make-cipher-state))

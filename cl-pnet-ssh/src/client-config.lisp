@@ -25,19 +25,23 @@ first value each keyword obtains; combining them in that order gives the
 same answers, so a user setting wins over a system default.  An explicit
 CONFIG (-F) replaces both, as it does in ssh.
 
-OPTIONS are the command-line -o answers; they are applied as if they came
-before the files, so every keyword they name wins over them the way ssh
+A caller may pass \"none\" to read no configuration at all, as ssh -F none
+does.  OPTIONS are the command-line -o answers; they are applied as if they
+came before the files, so every keyword they name wins over them the way ssh
 itself orders them."
   (let ((source
           (typecase config
             (ssh-config config)
             (null (ssh-config-combine
-                   (ssh-config-load (ssh-config-user-file))
-                   (ssh-config-load +ssh-system-config-file+)))
-            (t (or (ssh-config-load config)
-                   (error 'ssh-config-error
-                          :path (namestring (pathname config))
-                          :detail "cannot read the ssh config"))))))
+                   (ssh-config-load (ssh-config-user-file) :user-config t)
+                   (ssh-config-load +ssh-system-config-file+
+                                    :user-config nil)))
+            (t (if (and (stringp config) (string-equal config "none"))
+                   (ssh-config-combine)
+                   (or (ssh-config-load config :user-config t)
+                       (error 'ssh-config-error
+                              :path (namestring (pathname config))
+                              :detail "cannot read the ssh config")))))))
     (if options
         (ssh-config-add-options source options)
         source)))

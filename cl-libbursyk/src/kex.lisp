@@ -41,7 +41,7 @@
 
 ;;; ---- Identification and disconnection ----
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.5"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.6"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;

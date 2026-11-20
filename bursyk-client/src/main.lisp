@@ -297,7 +297,10 @@ the order the old push-based parser kept them in."
             (cond ((flag :request-tty-no) :no)
                   ((flag :request-tty-force) :force)
                   (t (value :request-tty)))
-            (getf *options* :forward-agent) (flag :forward-agent)
+            (getf *options* :forward-agent)
+            (cond ((flag :forward-agent) t)
+                  ((flag :no-forward-agent) :no)
+                  (t nil))
             (getf *options* :gateway-ports) (flag :gateway-ports)
             (getf *options* :no-command) (flag :no-command)
             (getf *options* :stdin-null) (flag :stdin-null)
@@ -418,7 +421,7 @@ algorithms still have to exist here, because the set is fixed at build time."
     (unsupported "-X" "X11 forwarding is not implemented"))
   (when (eq (getf *options* :x11-forward) :trust)
     (unsupported "-Y" "X11 forwarding is not implemented"))
-  (when (getf *options* :forward-agent)
+  (when (eq (getf *options* :forward-agent) t)
     (unsupported "-A" "agent forwarding is not implemented"))
   (when (getf *options* :compression)
     (unsupported "-C" "only uncompressed streams are implemented"))
@@ -450,6 +453,27 @@ algorithms still have to exist here, because the set is fixed at build time."
         (mapcar #'parse-dynamic-forward
                 (reverse (getf *options* :dynamic-forward))))
   (values))
+
+(defun check-config-supported (client)
+  "Fail when CLIENT's resolved config asks for a feature this build lacks.
+
+The command line is checked before connecting, but ForwardAgent,
+Compression and X11 forwarding can arrive from ~/.ssh/config too.  Dropping
+them silently would leave the user believing they are on, so they are
+refused with the same message the matching flag gets.  An explicit -a or -x
+still disables the feature and therefore silences the refusal."
+  (let ((options (and client (cl-pnet-ssh:ssh-client-config-options client))))
+    (when options
+      (when (and (cl-pnet-ssh:ssh-config-options-forward-agent options)
+                 (not (eq (getf *options* :forward-agent) :no)))
+        (unsupported "ForwardAgent" "agent forwarding is not implemented"))
+      (when (cl-pnet-ssh:ssh-config-options-compression options)
+        (unsupported "Compression" "only uncompressed streams are implemented"))
+      (when (and (or (cl-pnet-ssh:ssh-config-options-forward-x11 options)
+                     (cl-pnet-ssh:ssh-config-options-forward-x11-trusted
+                      options))
+                 (not (eq (getf *options* :x11-forward) :no)))
+        (unsupported "ForwardX11" "X11 forwarding is not implemented")))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -1596,7 +1620,9 @@ peer that connected to it; NIL refuses the channel."
    ;; ServerAliveInterval, ...) work too.
    :options (command-line-option-list)
    :exec-matcher #'match-exec
-   :on-client (lambda (client) (setf *client* client))
+   :on-client (lambda (client)
+                (setf *client* client)
+                (check-config-supported client))
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-open

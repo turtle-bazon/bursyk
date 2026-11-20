@@ -106,11 +106,46 @@
    #:ssh-config-options-remote-forwards
    #:ssh-config-options-dynamic-forwards
    #:ssh-config-options-request-tty
+   #:ssh-config-options-forward-agent
+   #:ssh-config-options-compression
+   #:ssh-config-options-forward-x11
+   #:ssh-config-options-forward-x11-trusted
    #:ssh-config-client-source
    #:ssh-config-error
    #:ssh-config-error-path
    #:ssh-config-error-line
    #:ssh-config-error-keyword
+   ;; sshd_config
+   #:ssh-server-config
+   #:ssh-server-config-p
+   #:ssh-server-config-load
+   #:ssh-server-config-apply-option-line
+   #:ssh-server-config-path
+   #:ssh-server-config-directives
+   #:ssh-server-config-ports
+   #:ssh-server-config-listen-addresses
+   #:ssh-server-config-address-family
+   #:ssh-server-config-host-key-files
+   #:ssh-server-config-authorized-keys-files
+   #:ssh-server-config-accept-env
+   #:ssh-server-config-permit-open
+   #:ssh-server-config-gateway-ports
+   #:ssh-server-config-allow-tcp-forwarding
+   #:ssh-server-config-disable-forwarding
+   #:ssh-server-config-subsystems
+   #:ssh-server-config-log-level
+   #:ssh-server-config-warnings
+   #:+ssh-server-config-directory+
+   #:+ssh-server-config-default-file+
+   #:+ssh-server-config-default-authorized-keys-files+
+   #:ssh-server-config-error
+   #:ssh-server-config-error-path
+   #:ssh-server-config-error-line
+   #:ssh-server-config-error-keyword
+   ;; authorized_keys and AcceptEnv policy
+   #:ssh-match-pattern
+   #:ssh-server-env-allowed-p
+   #:ssh-authorized-key-blob-p
    ;; known hosts
    #:ssh-known-host-status
    #:ssh-remember-known-host

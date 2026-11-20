@@ -1178,10 +1178,10 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.3.0")
+           :server-version "bursyk-server_0.0.2.5")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.3.0" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.5" greeting)))))
 
 (test server-version-is-checked-before-it-reaches-the-wire
   (is (equal "burst_1.2.3"
@@ -1705,3 +1705,65 @@ also covers that the verifier trims it before padding to the curve width."
               (is (not (cl-pnet-ssh::ssh-ecdsa-verify
                         key-data encoded
                         (ssh-hash :sha256 (octets-ascii "other"))))))))))))
+
+;;; ---- sshd_config include anchors and AcceptEnv globbing ----
+
+(test ssh-config-include-base-follows-the-config-kind
+  ;; A system ssh_config anchors a relative Include at /etc/ssh, while a user
+  ;; one anchors it at ~/.ssh, matching OpenSSH.
+  (is (equal "/etc/ssh/conf.d/extra.conf"
+             (namestring (cl-pnet-ssh::ssh-config-include-path
+                          "conf.d/extra.conf" :user-config nil))))
+  (is (equal (namestring (merge-pathnames
+                          ".ssh/conf.d/extra.conf"
+                          (user-homedir-pathname)))
+             (namestring (cl-pnet-ssh::ssh-config-include-path
+                          "conf.d/extra.conf" :user-config t))))
+  (is (equal "/absolute/ssh_config"
+             (namestring (cl-pnet-ssh::ssh-config-include-path
+                          "/absolute/ssh_config" :user-config nil)))))
+
+(test ssh-match-pattern-uses-only-star-and-question
+  (is (cl-pnet-ssh:ssh-match-pattern "LANG" "LANG"))
+  (is (not (cl-pnet-ssh:ssh-match-pattern "LANG" "LANGUAGE")))
+  (is (cl-pnet-ssh:ssh-match-pattern "LC_*" "LC_ALL"))
+  (is (cl-pnet-ssh:ssh-match-pattern "LC_*" "LC_"))
+  (is (not (cl-pnet-ssh:ssh-match-pattern "LC_*" "LANG")))
+  (is (cl-pnet-ssh:ssh-match-pattern "A?C" "ABC"))
+  (is (not (cl-pnet-ssh:ssh-match-pattern "A?C" "AC")))
+  ;; Brackets are literal in sshd's matcher, unlike a shell glob.
+  (is (not (cl-pnet-ssh:ssh-match-pattern "[AB]" "A")))
+  (is (cl-pnet-ssh:ssh-match-pattern "[AB]" "[AB]")))
+
+(test ssh-match-pattern-is-not-case-folding
+  (is (not (cl-pnet-ssh:ssh-match-pattern "LANG" "lang")))
+  (is (not (cl-pnet-ssh:ssh-match-pattern "LC_*" "lc_all"))))
+
+(test ssh-config-carries-the-features-the-caller-must-refuse
+  ;; Agent, X11 and compression wishes can come from the file.  The parser
+  ;; records them so a client can refuse a feature it lacks instead of
+  ;; silently dropping the option.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "ForwardAgent yes")
+                  (cl-pnet-ssh::ssh-config-option-line "ForwardX11 yes")
+                  (cl-pnet-ssh::ssh-config-option-line "ForwardX11Trusted no")
+                  (cl-pnet-ssh::ssh-config-option-line "Compression yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (cl-pnet-ssh:ssh-config-options-forward-agent options)))
+    (is (eq t (cl-pnet-ssh:ssh-config-options-forward-x11 options)))
+    (is (null (cl-pnet-ssh:ssh-config-options-forward-x11-trusted options)))
+    (is (eq t (cl-pnet-ssh:ssh-config-options-compression options)))))
+
+(test -F-none-disables-the-config-files-but-not-o
+  (let ((source (cl-pnet-ssh::ssh-config-client-source "none")))
+    (is (null (cl-pnet-ssh::ssh-config-directives source))))
+  (let ((options nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::ssh-config-client-source "none" '("Port=2200"))
+     "alias"
+     :on-options (lambda (value) (setf options value)))
+    (is (= 2200 (cl-pnet-ssh:ssh-config-options-port options)))))

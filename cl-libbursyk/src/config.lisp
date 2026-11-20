@@ -13,7 +13,11 @@
 (defparameter +ssh-config-max-depth+ 16
   "Include nesting limit, matching OpenSSH's own guard.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.5")
+(defparameter +ssh-config-directory+ #p"/etc/ssh/"
+  "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
+relative Include is anchored here.")
+
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.6")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
@@ -69,6 +73,8 @@
   (proxy-command nil)
   (rekey-limit nil)
   (forward-agent nil)
+  (forward-x11 nil)
+  (forward-x11-trusted nil)
   (gateway-ports nil)
   (local-forwards nil)
   (remote-forwards nil)
@@ -310,13 +316,19 @@ the caller can treat the '[' literally."
           (pathname value)
           (merge-pathnames value (user-homedir-pathname))))))
 
-(defun ssh-config-include-path (argument)
-  "An Include argument as a pathname, relative ones under ~/.ssh."
+(defun ssh-config-include-path (argument &key (user-config t))
+  "An Include argument as a pathname, relative ones anchored like OpenSSH.
+
+A user configuration resolves a relative Include under ~/.ssh and a system
+configuration under /etc/ssh."
   (let ((value (ssh-config-expand-home argument)))
     (if (ssh-config-absolute-path-p value)
         (pathname value)
-        (merge-pathnames value (merge-pathnames ".ssh/"
-                                                (user-homedir-pathname))))))
+        (merge-pathnames value
+                         (if user-config
+                             (merge-pathnames ".ssh/"
+                                              (user-homedir-pathname))
+                             +ssh-config-directory+)))))
 
 (defun ssh-config-include-files (path)
   "The existing files PATH names, expanding wildcards in its last component."
@@ -334,8 +346,11 @@ the caller can treat the '[' literally."
       ((probe-file path) (list (probe-file path)))
       (t nil))))
 
-(defun ssh-config-read-directives (path depth)
-  "Read PATH into directives, expanding Include lines as they appear."
+(defun ssh-config-read-directives (path depth &key (user-config t))
+  "Read PATH into directives, expanding Include lines as they appear.
+
+USER-CONFIG says whether PATH is a user configuration, which decides where a
+relative Include is anchored and whether ~ is allowed in one."
   (when (> depth +ssh-config-max-depth+)
     (error 'ssh-config-error
            :path (namestring path)
@@ -355,12 +370,24 @@ the caller can treat the '[' literally."
                    (let ((keyword (string-downcase (first tokens))))
                      (if (string= keyword "include")
                          (dolist (argument (rest tokens))
+                           (when (and (not user-config)
+                                      (plusp (length argument))
+                                      (char= (char argument 0) #\~))
+                             (error 'ssh-config-error
+                                    :path (namestring path)
+                                    :line number
+                                    :keyword "include"
+                                    :detail
+                                    (format nil "a system configuration may not include ~A"
+                                            argument)))
                            (dolist (file (ssh-config-include-files
-                                          (ssh-config-include-path argument)))
+                                          (ssh-config-include-path
+                                           argument :user-config user-config)))
                              (setf directives
                                    (nconc directives
                                           (ssh-config-read-directives
-                                           file (1+ depth))))))
+                                           file (1+ depth)
+                                           :user-config user-config)))))
                          (push (%make-ssh-config-line
                                 :keyword keyword
                                 :args (rest tokens)
@@ -370,8 +397,11 @@ the caller can treat the '[' literally."
                                directives)))))))
     (nreverse directives)))
 
-(defun ssh-config-load (path)
-  "Parse the ssh_config file at PATH into an SSH-CONFIG, or NIL if absent."
+(defun ssh-config-load (path &key (user-config t))
+  "Parse the ssh_config file at PATH into an SSH-CONFIG, or NIL if absent.
+
+USER-CONFIG selects user-configuration Include anchoring, as OpenSSH does for
+~/.ssh/config and for a -F file; NIL is the system ssh_config."
   (let ((path (pathname (ssh-config-expand-home (namestring path)))))
     (when (probe-file path)
       (%make-ssh-config :path path
@@ -817,6 +847,10 @@ enough.  Commas in a pattern are separators, as in ssh_config."
                (integer :minimum 0)))
         ((string= keyword "forwardagent")
          (setf (ssh-config-options-forward-agent options) (boolean)))
+        ((string= keyword "forwardx11")
+         (setf (ssh-config-options-forward-x11 options) (boolean)))
+        ((string= keyword "forwardx11trusted")
+         (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
         ((string= keyword "requesttty")
@@ -859,7 +893,8 @@ enough.  Commas in a pattern are separators, as in ssh_config."
        (ssh-config-apply-algorithms line options seen))
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
-                         "forwardagent" "gatewayports" "requesttty" "tag"
+                         "forwardagent" "forwardx11" "forwardx11trusted"
+                         "gatewayports" "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
                          "preferredauthentications" "pubkeyauthentication"
                          "passwordauthentication"

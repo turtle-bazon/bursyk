@@ -337,3 +337,277 @@ that ends the stream too."
            (is (equal "7" code)))
       (fd-close master)
       (fd-close status))))
+
+;;; ---- sshd_config ----
+
+(defun config-from-text (text)
+  "An SSH-SERVER-CONFIG parsed from TEXT, as a file on disk."
+  (let ((path (merge-pathnames
+               (format nil "bursyk-server-config-~D.conf" (random 1000000))
+               (uiop:temporary-directory))))
+    (with-open-file (out path :direction :output :if-exists :supersede)
+      (write-string text out))
+    (unwind-protect
+         (cl-pnet-ssh:ssh-server-config-load path)
+      (ignore-errors (delete-file path)))))
+
+(defun config-value (accessor text)
+  (funcall accessor (config-from-text text)))
+
+(test sshd-config-supplies-the-settings-the-command-line-omits
+  (let ((config (config-from-text
+                 (format nil "Port 2200~%~
+                              ListenAddress 127.0.0.1~%~
+                              HostKey /tmp/host_ed25519~%~
+                              HostKey /tmp/host_rsa~%~
+                              AuthorizedKeysFile %h/.ssh/authorized_keys~%~
+                              AcceptEnv LANG LC_*~%~
+                              PermitOpen db:5432 *.example.com:443~%~
+                              GatewayPorts clientspecified~%~
+                              AllowTcpForwarding local~%~
+                              Subsystem sftp /usr/lib/openssh/sftp-server~%~
+                              LogLevel VERBOSE~%"))))
+    (is (equal '(2200)
+               (cl-pnet-ssh:ssh-server-config-ports config)))
+    (is (equal '(("127.0.0.1"))
+               (cl-pnet-ssh:ssh-server-config-listen-addresses config)))
+    (is (equal '("/tmp/host_ed25519" "/tmp/host_rsa")
+               (cl-pnet-ssh:ssh-server-config-host-key-files config)))
+    (is (equal '("%h/.ssh/authorized_keys")
+               (cl-pnet-ssh:ssh-server-config-authorized-keys-files config)))
+    (is (equal '("LANG" "LC_*")
+               (cl-pnet-ssh:ssh-server-config-accept-env config)))
+    (is (equal '("db:5432" "*.example.com:443")
+               (cl-pnet-ssh:ssh-server-config-permit-open config)))
+    (is (eq :clientspecified
+            (cl-pnet-ssh:ssh-server-config-gateway-ports config)))
+    (is (eq :local
+            (cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding config)))
+    (is (equal '(("sftp" . "/usr/lib/openssh/sftp-server"))
+               (cl-pnet-ssh:ssh-server-config-subsystems config)))
+    (is (eq :verbose (cl-pnet-ssh:ssh-server-config-log-level config)))))
+
+(test sshd-config-refuses-what-this-server-cannot-honour
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User root"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PermitRootLogin no"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PasswordAuthentication yes"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "NotAKeyword yes"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Port 1
+Port 2"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AddressFamily inet6")))
+
+(test sshd-config-accepts-what-describes-this-server
+  (is (null (cl-pnet-ssh:ssh-server-config-warnings
+             (config-from-text
+              "PasswordAuthentication no
+PermitRootLogin yes"))))
+  (is (equal '("ignoring printmotd; this server has nothing for it to configure")
+             (cl-pnet-ssh:ssh-server-config-warnings
+              (config-from-text "PrintMotd no")))))
+
+(test sshd-config-takes-the-first-value-it-obtains
+  (let ((config (config-from-text
+                 "LogLevel VERBOSE
+LogLevel DEBUG
+Port 2200
+Port 2200")))
+    (is (equal '(2200) (cl-pnet-ssh:ssh-server-config-ports config)))
+    (is (eq :verbose (cl-pnet-ssh:ssh-server-config-log-level config))))
+  ;; This server listens on one port, so two different Port lines cannot both
+  ;; be honoured and are refused rather than one being silently dropped.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Port 2200
+Port 2201")))
+
+(test sshd-config-authorizes-per-user-paths
+  (let ((config (config-from-text "AuthorizedKeysFile none")))
+    (is (equal '("none")
+               (cl-pnet-ssh:ssh-server-config-authorized-keys-files config))))
+  (let ((config (config-from-text
+                 "AuthorizedKeysFile none %h/keys/%u %h/.ssh/authorized_keys")))
+    ;; sshd skips "none" rather than refusing to mix it with real files.
+    (is (equal '("none" "%h/keys/%u" "%h/.ssh/authorized_keys")
+               (cl-pnet-ssh:ssh-server-config-authorized-keys-files config))))
+  (is (equal '("%h/.ssh/authorized_keys" "%h/.ssh/authorized_keys2")
+             cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
+
+(test server-port-comes-from-p-then-listen-address-then-port-then-22
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config* nil))
+    (is (= 22 (bursyk-server::server-port)))
+    (is (equal "0.0.0.0" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* (list :port "2299"))
+        (bursyk-server::*server-config*
+          (config-from-text "Port 2200
+ListenAddress 127.0.0.2")))
+    (is (= 2299 (bursyk-server::server-port)))
+    (is (equal "127.0.0.2" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "Port 2200
+ListenAddress 127.0.0.2:2201")))
+    (is (= 2201 (bursyk-server::server-port)))
+    (is (equal "127.0.0.2" (bursyk-server::server-address)))))
+
+(test -f-none-reads-no-config-file
+  (let ((bursyk-server::*options* (list :config-file "none")))
+    (is (null (bursyk-server::config-file-path))))
+  (let ((bursyk-server::*options* nil))
+    (is (equal cl-pnet-ssh:+ssh-server-config-default-file+
+               (bursyk-server::config-file-path)))))
+
+(test -o-lines-win-over-the-config-file
+  (let ((path (merge-pathnames "bursyk-server-option-test.conf"
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output :if-exists :supersede)
+             (write-line "Port 2200" out)
+             (write-line "ListenAddress 127.0.0.9" out)
+             (write-line "LogLevel VERBOSE" out)
+             (write-line "PermitOpen db:5432" out))
+           (let ((config (cl-pnet-ssh:ssh-server-config-load
+                          path :options '("LogLevel=DEBUG" "PermitOpen=none"
+                                          "Port=2210"
+                                          "ListenAddress=127.0.0.8"))))
+             (is (equal '(2210)
+                        (cl-pnet-ssh:ssh-server-config-ports config)))
+             (is (equal '(("127.0.0.8"))
+                        (cl-pnet-ssh:ssh-server-config-listen-addresses
+                         config)))
+             (is (eq :debug
+                     (cl-pnet-ssh:ssh-server-config-log-level config)))
+             (is (equal '("none")
+                        (cl-pnet-ssh:ssh-server-config-permit-open config)))))
+      (ignore-errors (delete-file path)))))
+
+(test relative-include-is-anchored-at-etc-ssh
+  (is (equal "/etc/ssh/conf.d/extra.conf"
+             (namestring (cl-pnet-ssh::ssh-server-config-include-path
+                          "conf.d/extra.conf"))))
+  (is (equal "/absolute/ssh_config"
+             (namestring (cl-pnet-ssh::ssh-server-config-include-path
+                          "/absolute/ssh_config")))))
+
+(test authorized-keys-patterns-expand-sshd-tokens
+  (is (equal "/home/alice/.ssh/authorized_keys"
+             (bursyk-server::expand-authorized-keys-path
+              "%h/.ssh/authorized_keys" "alice" "/home/alice" "1000")))
+  (is (equal "/home/alice/keys/alice/1000"
+             (bursyk-server::expand-authorized-keys-path
+              "keys/%u/%U" "alice" "/home/alice" "1000")))
+  ;; %% is a literal %, and the h after it is not a token.
+  (is (equal "/home/alice/%h"
+             (bursyk-server::expand-authorized-keys-path
+              "%%h" "alice" "/home/alice" "1000"))))
+
+(test accept-env-patterns-use-sshd-globbing
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :accept-env '("LANG" "LC_*"))))
+    (is (cl-pnet-ssh:ssh-server-env-allowed-p server "LANG" "en_US.UTF-8"))
+    (is (cl-pnet-ssh:ssh-server-env-allowed-p server "LC_ALL" "C"))
+    (is (cl-pnet-ssh:ssh-server-env-allowed-p server "LC_CTYPE" "C"))
+    (is (not (cl-pnet-ssh:ssh-server-env-allowed-p server "LANGUAGE" "en")))
+    (is (not (cl-pnet-ssh:ssh-server-env-allowed-p server "HOME" "/tmp")))))
+
+(test logging-levels-gate-what-is-printed
+  (let ((bursyk-server::*log-level* :quiet))
+    (is (not (bursyk-server::log-allowed-p :error))))
+  (let ((bursyk-server::*log-level* :info))
+    (is (bursyk-server::log-allowed-p :info))
+    (is (bursyk-server::log-allowed-p :error))
+    (is (not (bursyk-server::log-allowed-p :verbose))))
+  (let ((bursyk-server::*log-level* :verbose))
+    (is (bursyk-server::log-allowed-p :verbose))
+    (is (not (bursyk-server::log-allowed-p :debug)))))
+
+(test verbosity-and-quiet-flags-select-a-level
+  (let ((bursyk-server::*options* (list :config-file "none" :verbose 2))
+        (bursyk-server::*server-config* nil)
+        (bursyk-server::*log-level* :info))
+    (bursyk-server::load-server-config)
+    (is (eq :debug bursyk-server::*log-level*)))
+  (let ((bursyk-server::*options* (list :config-file "none" :quiet t))
+        (bursyk-server::*server-config* nil)
+        (bursyk-server::*log-level* :info))
+    (bursyk-server::load-server-config)
+    (is (eq :quiet bursyk-server::*log-level*)))
+  (let ((bursyk-server::*options* (list :config-file "none"))
+        (bursyk-server::*server-config* nil)
+        (bursyk-server::*log-level* :info))
+    (bursyk-server::load-server-config)
+    (is (eq :info bursyk-server::*log-level*))))
+
+;;; ---- sshd_config feeding policy ----
+
+(test host-keys-come-from-h-then-the-config
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "HostKey /tmp/host_a
+HostKey /tmp/host_b")))
+    (is (equal '("/tmp/host_a" "/tmp/host_b")
+               (mapcar #'namestring (bursyk-server::host-key-files)))))
+  (let ((bursyk-server::*options* (list :host-key '("/tmp/only")))
+        (bursyk-server::*server-config*
+          (config-from-text "HostKey /tmp/host_a")))
+    (is (equal '("/tmp/only")
+               (mapcar #'namestring (bursyk-server::host-key-files))))))
+
+(test config-forwarding-policy-drives-the-decisions
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text
+           "AllowTcpForwarding local
+GatewayPorts clientspecified
+PermitOpen db:5432")))
+    (is (bursyk-server::tcpip-allowed-p "db" 5432))
+    (is (not (bursyk-server::tcpip-allowed-p "web" 443)))
+    (is (not (bursyk-server::remote-forwarding-allowed-p)))
+    (is (equal "0.0.0.0" (bursyk-server::remote-bind-address "*")))
+    (is (equal "10.0.0.5"
+               (bursyk-server::remote-bind-address "10.0.0.5"))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "PermitOpen none")))
+    (is (not (bursyk-server::tcpip-allowed-p "anything" 22))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config* nil))
+    ;; Without a config file the defaults stay permissive.
+    (is (bursyk-server::tcpip-allowed-p "anything" 22))
+    (is (bursyk-server::remote-forwarding-allowed-p))
+    (is (equal "127.0.0.1" (bursyk-server::remote-bind-address "*")))))
+
+(test accept-env-comes-from-the-config-when-e-is-absent
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "AcceptEnv LANG LC_*")))
+    (is (equal '("LANG" "LC_*") (bursyk-server::accept-env-names))))
+  (let ((bursyk-server::*options* (list :accept-env '("TWO" "ONE")))
+        (bursyk-server::*server-config*
+          (config-from-text "AcceptEnv LANG LC_*")))
+    (is (equal '("ONE" "TWO") (bursyk-server::accept-env-names)))))
+
+#-win32
+(test user-home-and-uid-reads-the-passwd-file
+  (let ((user (uiop:getenv "USER")))
+    (when user
+      (multiple-value-bind (home uid)
+          (bursyk-server::user-home-and-uid user)
+        (is (stringp home))
+        (is (plusp (length home)))
+        (is (stringp uid))
+        (is (every #'digit-char-p uid)))))
+  (is (null (bursyk-server::user-home-and-uid "no-such-user-here"))))
+
+(test two-command-line-ports-are-refused
+  ;; This server still listens on one port, so two different -o Port answers
+  ;; cannot both be honoured and are reported instead of one silently winning.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (cl-pnet-ssh:ssh-server-config-load
+     nil :options '("Port=2200" "Port=2201"))))

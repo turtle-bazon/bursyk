@@ -47,3 +47,16 @@
                      (ssh-config-error-line condition)
                      (ssh-config-error-keyword condition)
                      (ssh-error-detail condition)))))
+
+(define-condition ssh-server-config-error (ssh-error)
+  ((path :initarg :path :initform nil :reader ssh-server-config-error-path)
+   (line :initarg :line :initform nil :reader ssh-server-config-error-line)
+   (keyword :initarg :keyword :initform nil
+            :reader ssh-server-config-error-keyword))
+  (:report (lambda (condition stream)
+             (format stream "sshd config error~@[ in ~A~]~@[ at line ~D~]~
+                             ~@[ (~A)~]~@[: ~A~]"
+                     (ssh-server-config-error-path condition)
+                     (ssh-server-config-error-line condition)
+                     (ssh-server-config-error-keyword condition)
+                     (ssh-error-detail condition)))))

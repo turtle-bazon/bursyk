@@ -102,11 +102,12 @@ CLI's decision and at the plist it filled."
     (is (equal '("/tmp/key") (getf options :identity)))))
 
 (test short-options-keep-ssh-meanings
-  ;; -a disables agent forwarding; the agent picker is --agent.
+  ;; -a disables agent forwarding; the agent picker is --agent.  It is kept
+  ;; distinct from "not asked" so a config file's ForwardAgent cannot win.
   (multiple-value-bind (destination command options)
       (parse '("-a" "host"))
     (declare (ignore destination command))
-    (is (null (getf options :forward-agent))))
+    (is (eq :no (getf options :forward-agent))))
   (multiple-value-bind (destination command options)
       (parse '("-A" "host"))
     (declare (ignore destination command))

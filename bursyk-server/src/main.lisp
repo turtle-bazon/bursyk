@@ -6,11 +6,45 @@
 ;;;; child pipe are watched descriptors.
 
 (defvar *options*
-  '(:address "0.0.0.0" :port "2222" :host-key nil :authorized-keys nil
+  '(:address nil :port nil :host-key nil :authorized-keys nil
     :accept-env nil :allow nil :subsystem nil
     :no-tcp-forwarding nil :permit-open nil
-    :no-remote-forwarding nil :gateway-ports nil)
-  "The command line as parsed.")
+    :no-remote-forwarding nil :gateway-ports nil
+    :config-file nil :option nil :verbose 0 :quiet nil)
+  "The command line as parsed.
+
+A NIL value means the option was not given, so an sshd_config setting can
+supply it; anything named here wins over the file, as sshd's command line
+does.")
+
+(defvar *server-config* nil
+  "The sshd_config settings in force, or NIL when no config file is used.")
+
+(defvar *log-level* :info
+  "How much to report: sshd's LogLevel names, or what -q and -v selected.")
+
+(defparameter +log-levels+
+  '((:quiet . 0) (:fatal . 1) (:error . 2) (:info . 3)
+    (:verbose . 4) (:debug . 5) (:debug1 . 5) (:debug2 . 6) (:debug3 . 7))
+  "LogLevel names from least to most talkative.")
+
+(defun log-number (level)
+  (or (cdr (assoc level +log-levels+)) (cdr (assoc :info +log-levels+))))
+
+(defun log-allowed-p (level)
+  "Whether a message at LEVEL is wanted at the current *LOG-LEVEL*.
+
+sshd's level is the most talkative message to print, so a message prints
+when it is no more talkative than that; QUIET prints nothing at all."
+  (let ((threshold (log-number *log-level*)))
+    (and (plusp threshold)
+         (<= (log-number level) threshold))))
+
+(defun log-at (level control &rest arguments)
+  (when (log-allowed-p level)
+    (format *error-output* "bursyk-server: ~?~%" control arguments)
+    (finish-output *error-output*)))
+
 
 (defvar *server* nil)
 (defvar *signal* nil)
@@ -28,7 +62,7 @@
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.3.0"
+(defparameter +bursyk-server-version+ "0.0.2.5"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -39,11 +73,15 @@ version rather than a generic library string.")
 
 (defun usage ()
   (format *error-output*
-          "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY...~%~
-           ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%~
-           ~15@T[-S NAME=PATH]... [--no-tcp-forwarding]~%~
+          "usage: bursyk-server [-a ADDRESS] [-p PORT] [-f SSHD_CONFIG]~%~
+           ~15@T[-H HOST_KEY]... [-A AUTHORIZED_KEYS] [-e NAME]...~%~
+           ~15@T[-c PREFIX]... [-S NAME=PATH]... [-o KEYWORD=VALUE]...~%~
+           ~15@T[-v]... [-q] [--no-tcp-forwarding]~%~
            ~15@T[--allow-tcpip HOST:PORT]... [--no-remote-forwarding]~%~
-           ~15@T[--gateway-ports] [-V]~%")
+           ~15@T[--gateway-ports] [-V]~%~
+           ~15@T-f none reads no config; the default is ~A~%~
+           ~15@T-p defaults to 22, or the Port in the config file~%"
+          cl-pnet-ssh:+ssh-server-config-default-file+)
   (finish-output *error-output*))
 
 (defun print-version ()
@@ -65,11 +103,17 @@ version rather than a generic library string.")
         ((member name '("-e" "--accept-env") :test #'string=) :accept-env)
         ((member name '("-c" "--command") :test #'string=) :allow)
         ((member name '("-S" "--subsystem") :test #'string=) :subsystem)
-        ((string= name "--no-tcp-forwarding") :no-tcp-forwarding)
-        ((string= name "--no-remote-forwarding") :no-remote-forwarding)
-        ((string= name "--gateway-ports") :gateway-ports)
+        ((member name '("--no-tcp-forwarding") :test #'string=)
+         :no-tcp-forwarding)
+        ((member name '("--no-remote-forwarding") :test #'string=)
+         :no-remote-forwarding)
+        ((member name '("--gateway-ports") :test #'string=) :gateway-ports)
         ((member name '("--allow-tcpip" "--permit-open") :test #'string=)
          :permit-open)
+        ((member name '("-f" "--config") :test #'string=) :config-file)
+        ((member name '("-o" "--option") :test #'string=) :option)
+        ((member name '("-v" "--verbose") :test #'string=) :verbose)
+        ((member name '("-q" "--quiet") :test #'string=) :quiet)
         (t nil)))
 
 (defun split-host-port (text)
@@ -94,8 +138,12 @@ version rather than a generic library string.")
 
 (defun record-option (key value)
   (case key
-    ((:accept-env :allow :subsystem :host-key)
+    ((:accept-env :allow :subsystem :host-key :option)
      (push value (getf *options* key)))
+    (:verbose
+     (incf (getf *options* :verbose 0)))
+    (:quiet
+     (setf (getf *options* :quiet) t))
     (:permit-open
      (multiple-value-bind (host port) (split-host-port value)
        (unless (and host (valid-permit-port-p port))
@@ -111,7 +159,7 @@ version rather than a generic library string.")
         ((option-key argument)
          (let ((key (option-key argument)))
            (if (member key '(:no-tcp-forwarding :no-remote-forwarding
-                             :gateway-ports))
+                             :gateway-ports :quiet :verbose))
                (progn
                  (record-option key t)
                  (setf arguments (cdr arguments)))
@@ -123,11 +171,15 @@ version rather than a generic library string.")
          (fail "unknown option ~A" argument))
         (t (fail "unexpected argument ~A" argument))))))
 
-(defun port-option ()
-  "The port number the command line asked for."
-  (handler-case (parse-integer (getf *options* :port))
-    (parse-error ()
-      (fail "not a port number: ~A" (getf *options* :port)))))
+(defun command-line-port ()
+  "The -p port as a number, or NIL when -p was not given."
+  (let ((value (getf *options* :port)))
+    (when value
+      (let ((port (handler-case (parse-integer value)
+                    (parse-error () nil))))
+        (unless (and port (<= 1 port 65535))
+          (fail "not a port number: ~A" value))
+        port))))
 
 (defun command-allowed-p (command)
   "Whether COMMAND starts with one of the --command prefixes."
@@ -169,24 +221,133 @@ version rather than a generic library string.")
           do (incf p))
     (= p pattern-length)))
 
+;;; ---- sshd_config and the values it supplies ----
+
+(defun config-setting (accessor)
+  "ACCESSOR applied to *SERVER-CONFIG*, or NIL without a config file."
+  (and *server-config* (funcall accessor *server-config*)))
+
+(defun config-file-path ()
+  "The sshd_config to read, or NIL for none.
+
+Without -f this is /etc/ssh/sshd_config when it exists; a missing default is
+not an error, so the program still runs for an unprivileged user.  An
+explicit -f that does not exist is an error, as in sshd."
+  (let ((value (getf *options* :config-file)))
+    (cond
+      ((null value)
+       (let ((default cl-pnet-ssh:+ssh-server-config-default-file+))
+         (and (probe-file default) default)))
+      ((string-equal value "none") nil)
+      ((probe-file value) value)
+      (t (fail "cannot read the config file ~A" value)))))
+
+(defun load-server-config ()
+  "Read the sshd_config, then let -q and -v adjust its LogLevel."
+  (let ((path (config-file-path))
+        (options (reverse (getf *options* :option))))
+    (setf *server-config*
+          (cond
+            (path (cl-pnet-ssh:ssh-server-config-load path :options options))
+            (options (cl-pnet-ssh:ssh-server-config-load nil :options options))
+            (t nil)))
+    (when (config-setting #'cl-pnet-ssh:ssh-server-config-log-level)
+      (setf *log-level*
+            (config-setting #'cl-pnet-ssh:ssh-server-config-log-level)))
+    (cond
+      ((getf *options* :quiet)
+       (setf *log-level* :quiet))
+      ((plusp (or (getf *options* :verbose) 0))
+       (setf *log-level*
+             (nth (min (1- (getf *options* :verbose)) 3)
+                  '(:verbose :debug :debug2 :debug3)))))
+    (when *server-config*
+      (dolist (warning (cl-pnet-ssh:ssh-server-config-warnings
+                        *server-config*))
+        (log-at :info "warning: ~A" warning)))
+    ;; Library milestones are only worth printing at VERBOSE and above.
+    (setf cl-pnet-ssh:*ssh-log-function*
+          (when (log-allowed-p :verbose)
+            (lambda (message) (log-at :debug "~A" message))))
+    *server-config*))
+
+(defun config-listen-address ()
+  (first (config-setting
+          #'cl-pnet-ssh:ssh-server-config-listen-addresses)))
+
+(defun server-address ()
+  "The address to bind: -a, then ListenAddress, then every IPv4 address."
+  (or (getf *options* :address)
+      (let ((listen (config-listen-address)))
+        (and listen (if (string= (car listen) "*")
+                        "0.0.0.0"
+                        (car listen))))
+      "0.0.0.0"))
+
+(defun server-port ()
+  "The port to bind: -p, then ListenAddress's port, then Port, then 22."
+  (or (command-line-port)
+      (cdr (config-listen-address))
+      (first (config-setting #'cl-pnet-ssh:ssh-server-config-ports))
+      22))
+
+(defun accept-env-names ()
+  "The -e names, or the empty list meaning AcceptEnv's answer."
+  (or (and (getf *options* :accept-env)
+           (reverse (getf *options* :accept-env)))
+      (config-setting #'cl-pnet-ssh:ssh-server-config-accept-env)))
+
+(defun permit-open-rules ()
+  (or (and (getf *options* :permit-open)
+           (reverse (getf *options* :permit-open)))
+      (config-setting #'cl-pnet-ssh:ssh-server-config-permit-open)))
+
+(defun forwarding-disabled-p ()
+  (config-setting #'cl-pnet-ssh:ssh-server-config-disable-forwarding))
+
+(defun tcp-forwarding-mode ()
+  (config-setting #'cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding))
+
+(defun direct-tcpip-allowed-p ()
+  "Whether locally forwarded connections may be opened."
+  (and (not (getf *options* :no-tcp-forwarding))
+       (not (forwarding-disabled-p))
+       (not (member (tcp-forwarding-mode) '(:no :remote)))))
+
+(defun remote-forwarding-allowed-p ()
+  "Whether the client may ask this server to listen for it."
+  (and (not (getf *options* :no-remote-forwarding))
+       (not (forwarding-disabled-p))
+       (not (member (tcp-forwarding-mode) '(:no :local)))))
+
+(defun gateway-ports-p ()
+  (or (getf *options* :gateway-ports)
+      (member (config-setting #'cl-pnet-ssh:ssh-server-config-gateway-ports)
+              '(:yes :clientspecified))))
+
 (defun tcpip-allowed-p (host port)
   "Whether a direct-tcpip connection to HOST:PORT may be opened.
 
 As sshd does by default, every destination is allowed.  Each --allow-tcpip
-narrows that set, and --no-tcp-forwarding refuses them all."
-  (and (not (getf *options* :no-tcp-forwarding))
-       (let ((rules (reverse (getf *options* :permit-open))))
-         (or (null rules)
-             (some (lambda (rule)
-                     (multiple-value-bind (rule-host rule-port)
-                         (split-host-port rule)
-                       (and rule-host
-                            rule-port
-                            (host-pattern-match-p rule-host host)
-                            (or (string= rule-port "*")
-                                (string= rule-port
-                                         (princ-to-string port))))))
-                   rules)))))
+or PermitOpen narrows that set, PermitOpen none refuses them all, and either
+one of --no-tcp-forwarding and AllowTcpForwarding no refuses everything."
+  (and (direct-tcpip-allowed-p)
+       (let ((rules (permit-open-rules)))
+         (cond
+           ((null rules) t)
+           ((member "none" rules :test #'string-equal) nil)
+           ((member "any" rules :test #'string-equal) t)
+           (t
+            (some (lambda (rule)
+                    (multiple-value-bind (rule-host rule-port)
+                        (split-host-port rule)
+                      (and rule-host
+                           rule-port
+                           (host-pattern-match-p rule-host host)
+                           (or (string= rule-port "*")
+                               (string= rule-port
+                                        (princ-to-string port))))))
+                  rules))))))
 
 ;;; ---- Remote forwarding (tcpip-forward) ----
 ;;;
@@ -210,15 +371,15 @@ narrows that set, and --no-tcp-forwarding refuses them all."
   "The address to bind for a tcpip-forward request, or NIL to refuse.
 
 Empty means loopback, as in sshd.  Any other non-loopback address is refused
-unless --gateway-ports was given: binding a LAN-wide port is a policy change
-a client should not make by itself."
+unless GatewayPorts allowed it: binding a LAN-wide port is a policy change a
+client should not make by itself."
   (cond
     ((or (null requested) (zerop (length requested)))
      "127.0.0.1")
     ((string= requested "*")
-     (if (getf *options* :gateway-ports) "0.0.0.0" "127.0.0.1"))
+     (if (gateway-ports-p) "0.0.0.0" "127.0.0.1"))
     ((loopback-bind-address-p requested) "127.0.0.1")
-    ((getf *options* :gateway-ports) requested)
+    ((gateway-ports-p) requested)
     (t nil)))
 
 (defun remote-forward-for (session bind-address bind-port)
@@ -319,14 +480,13 @@ client can half-close its target, and the reply can still come back."
 
 (defun start-remote-forward (session bind-address bind-port)
   "Listener for a client's tcpip-forward request; returns the bound port."
-  (when (getf *options* :no-remote-forwarding)
-    (format *error-output*
-            "bursyk-server: remote forwarding refused by --no-remote-forwarding~%")
+  (unless (remote-forwarding-allowed-p)
+    (log-at :error "remote forwarding refused by policy")
     (return-from start-remote-forward nil))
   (let ((address (remote-bind-address bind-address)))
     (unless address
-      (format *error-output*
-              "bursyk-server: refusing a remote forward bound to ~A; use --gateway-ports~%"
+      (log-at :error
+              "refusing a remote forward bound to ~A; set GatewayPorts to allow it"
               bind-address)
       (return-from start-remote-forward nil))
     (let* ((forward (%make-remote-forward
@@ -346,8 +506,7 @@ client can half-close its target, and the reply can still come back."
                               (remote-forward-close forward)))
                (error () nil))))
       (unless listener
-        (format *error-output*
-                "bursyk-server: remote forward could not listen on ~A:~D~%"
+        (log-at :error "remote forward could not listen on ~A:~D"
                 address bind-port)
         (return-from start-remote-forward nil))
       (setf (remote-forward-bind-port forward)
@@ -387,13 +546,16 @@ client can half-close its target, and the reply can still come back."
       (fail "not NAME=PATH: ~A" text))
     (cons (subseq text 0 equals) (subseq text (1+ equals)))))
 
+(defun configured-subsystems ()
+  "Subsystem (NAME . PROGRAM) pairs from -S, else from the sshd_config."
+  (or (and (getf *options* :subsystem)
+           (mapcar #'split-subsystem
+                   (reverse (getf *options* :subsystem))))
+      (config-setting #'cl-pnet-ssh:ssh-server-config-subsystems)))
+
 (defun subsystem-path (name)
   "The program for subsystem NAME, or NIL when nothing serves it."
-  (let ((configured
-          (assoc name
-                 (mapcar #'split-subsystem
-                         (reverse (getf *options* :subsystem)))
-                 :test #'string=)))
+  (let ((configured (assoc name (configured-subsystems) :test #'string=)))
     (cond
       (configured (cdr configured))
       (t (let ((default (assoc name *default-subsystems* :test #'string=)))
@@ -855,38 +1017,139 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 (defun home-file (name)
   (merge-pathnames name (user-homedir-pathname)))
 
+;;; ---- authorized_keys ----
+;;;
+;;; AUTHORIZED-KEYS (-A) names one file for every user.  Without it, sshd's
+;;; AuthorizedKeysFile is used, and its %h/%u/%U tokens are expanded for the
+;;; user who is trying to log in.
+
+#-win32
+(defun user-home-and-uid (user)
+  "HOME and UID for USER from /etc/passwd, or NIL when it names no one.
+
+sshd asks the C library, which also sees NSS users; this server reads the
+local file, so a directory-service account falls back to the global key file
+at authentication time."
+  (when (and user (plusp (length user)))
+    (with-open-file (stream "/etc/passwd" :direction :input
+                            :if-does-not-exist nil)
+      (when stream
+        (loop for line = (read-line stream nil nil)
+              while line
+              do (let ((fields (uiop:split-string line :separator ":")))
+                   (when (and (>= (length fields) 7)
+                              (string= (first fields) user))
+                     (return (values (nth 5 fields) (nth 2 fields))))))))))
+
+#+win32
+(defun user-home-and-uid (user)
+  (declare (ignore user))
+  nil)
+
+(defun expand-authorized-keys-path (pattern user home uid)
+  "PATTERN with sshd's %h, %u, %U and %% expanded, anchored at HOME.
+
+A relative result is relative to the user's home, as
+expand_authorized_keys() makes it."
+  (let ((value
+          (with-output-to-string (out)
+            (loop with length = (length pattern)
+                  for index from 0 below length
+                  for character = (char pattern index)
+                  do (if (and (char= character #\%)
+                              (< (1+ index) length))
+                         (case (char pattern (1+ index))
+                           (#\h (write-string home out) (incf index))
+                           (#\u (write-string user out) (incf index))
+                           (#\U (write-string uid out) (incf index))
+                           (#\% (write-char #\% out) (incf index))
+                           (t (write-char character out)))
+                         (write-char character out))))))
+    (if (and (plusp (length value)) (char= (char value 0) #\/))
+        value
+        (concatenate 'string home "/" value))))
+
+(defparameter +default-host-key-candidates+
+  '("/etc/ssh/ssh_host_ed25519_key"
+    "/etc/ssh/ssh_host_ecdsa_key"
+    "/etc/ssh/ssh_host_rsa_key")
+  "sshd's host keys when a config file names none, strongest first.")
+
 (defun host-key-files ()
-  "The -H keys in command-line order, or the default identity.
+  "The -H keys in command-line order, then the config's, then the default.
 
 A server may present several key types; a client picks the strongest one
-they share, so an RSA-only client still connects to an ed25519-first host."
+they share, so an RSA-only client still connects to an ed25519-first host.
+A config file takes on sshd's defaults: /etc/ssh/ssh_host_* .  With no
+config file at all, the account's own ~/.ssh/id_ed25519 keeps an
+unprivileged run simple."
   (or (reverse (getf *options* :host-key))
-      (list (home-file ".ssh/id_ed25519"))))
+      (config-setting #'cl-pnet-ssh:ssh-server-config-host-key-files)
+      (if *server-config*
+          (let ((found (remove-if-not #'probe-file +default-host-key-candidates+)))
+            (unless found
+              (fail "the config ~A names no HostKey and no /etc/ssh/ssh_host_* key exists"
+                    (cl-pnet-ssh:ssh-server-config-path *server-config*)))
+            found)
+          (list (home-file ".ssh/id_ed25519")))))
+
+(defun authorized-keys-p (user key-blob)
+  "Whether KEY-BLOB may log in as USER.
+
+-A names one file for every user.  Otherwise AuthorizedKeysFile decides,
+with its %h/%u/%U tokens expanded for USER; when the user has no local
+passwd entry, the single key file of the account running the server is used,
+so an unprivileged or Windows setup keeps working."
+  (let ((global (getf *options* :authorized-keys)))
+    (if global
+        (cl-pnet-ssh:ssh-authorized-key-blob-p global key-blob)
+        (multiple-value-bind (home uid) (user-home-and-uid user)
+          (if (null home)
+              (cl-pnet-ssh:ssh-authorized-key-blob-p
+               (home-file ".ssh/authorized_keys") key-blob)
+              (let ((patterns
+                      (or (config-setting
+                           #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
+                          cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
+                (some (lambda (pattern)
+                        (unless (string-equal pattern "none")
+                          (cl-pnet-ssh:ssh-authorized-key-blob-p
+                           (expand-authorized-keys-path
+                            pattern user home uid)
+                           key-blob)))
+                      patterns)))))))
 
 (defun start-server ()
-  (let* ((host-keys (host-key-files))
-         (authorized (or (getf *options* :authorized-keys)
-                         (home-file ".ssh/authorized_keys"))))
+  (load-server-config)
+  (let ((host-keys (host-key-files)))
     (dolist (host-key host-keys)
       (unless (probe-file host-key)
         (fail "host key not found: ~A" host-key)))
-    (unless (probe-file authorized)
-      (format *error-output* "bursyk-server: warning: ~A not found~%"
-              authorized))
+    (let ((global (getf *options* :authorized-keys)))
+      (when (and global (not (probe-file global)))
+        (log-at :info "warning: ~A not found" global)))
     (setf *server*
           (cl-pnet-ssh:make-ssh-server
-           (getf *options* :address)
-           (port-option)
+           (server-address)
+           (server-port)
            :host-key host-keys
-           :authorized-keys authorized
+           :authorize #'authorized-keys-p
            :server-version (format nil "bursyk-server_~A"
                                    +bursyk-server-version+)
-           :accept-env (reverse (getf *options* :accept-env))
+           :accept-env (accept-env-names)
            :on-channel #'install-channel-handlers
+           :on-session (lambda (session)
+                         (log-at :info "accepted ~A from ~A"
+                                 (cl-pnet-ssh:ssh-session-user session)
+                                 (cl-pnet-ssh:ssh-session-remote-address
+                                  session)))
            :on-direct-tcpip
            (lambda (session host port origin origin-port)
              (declare (ignore session origin origin-port))
-             (tcpip-allowed-p host port))
+             (let ((allowed (tcpip-allowed-p host port)))
+               (log-at :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
+                       host port allowed)
+               allowed))
            :on-tcpip-forward
            (lambda (session bind-address bind-port)
              (start-remote-forward session bind-address bind-port))
@@ -895,16 +1158,16 @@ they share, so an RSA-only client still connects to an ed25519-first host."
              (cancel-remote-forward session bind-address bind-port))
            :on-close (lambda (session reason)
                        (declare (ignore reason))
+                       (log-at :info "closed session for ~A"
+                               (cl-pnet-ssh:ssh-session-user session))
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session
                          (close-remote-forwards session))
-                       (format *error-output* "bursyk-server: ~A~%" condition)
-                       (finish-output *error-output*))))
-    (format t "bursyk-server: listening on ~A:~D~%"
+                       (log-at :error "~A" condition))))
+    (log-at :info "listening on ~A:~D"
             (cl-pnet-ssh:ssh-server-address *server*)
             (cl-pnet-ssh:ssh-server-port *server*))
-    (finish-output)
     *server*))
 
 (defun close-server ()

@@ -68,11 +68,32 @@
 
 ;;; ---- AcceptEnv ----
 
+(defun ssh-match-pattern (pattern text)
+  "Whether TEXT matches PATTERN, with sshd's match_pattern(3) semantics.
+
+Only * and ? are special; a * matches any run of characters, a ? exactly one,
+and nothing else is quoted.  This is what AcceptEnv uses, which is narrower
+than the bracket classes an ssh_config Host pattern allows."
+  (cond
+    ((zerop (length pattern)) (zerop (length text)))
+    ((char= (char pattern 0) #\*)
+     (let ((rest (string-left-trim "*" pattern)))
+       (if (zerop (length rest))
+           t
+           (loop for index from 0 to (length text)
+                 thereis (ssh-match-pattern rest (subseq text index))))))
+    ((zerop (length text)) nil)
+    ((or (char= (char pattern 0) #\?)
+         (char= (char pattern 0) (char text 0)))
+     (ssh-match-pattern (subseq pattern 1) (subseq text 1)))
+    (t nil)))
+
 (defun ssh-server-env-allowed-p (server name value)
   "Whether SERVER's AcceptEnv policy admits NAME=VALUE."
   (let ((policy (ssh-server-accept-env server)))
     (cond
       ((eq policy t) t)
       ((functionp policy) (funcall policy name value))
-      ((listp policy) (member name policy :test #'string=))
+      ((listp policy)
+       (some (lambda (pattern) (ssh-match-pattern pattern name)) policy))
       (t nil))))
