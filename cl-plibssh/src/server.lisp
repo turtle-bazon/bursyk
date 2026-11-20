@@ -394,12 +394,18 @@ is refused instead of allocated."
     (if (null channel)
         (ssh-message-reply-default message)
         (case (ssh-message-subtype message)
+          (#.+ssh-channel-request-pty+
+           (ssh-plibssh-session-handle-pty channel message))
           (#.+ssh-channel-request-env+
            (ssh-plibssh-session-handle-env channel message))
+          (#.+ssh-channel-request-shell+
+           (ssh-plibssh-session-handle-shell channel message))
           (#.+ssh-channel-request-exec+
            (ssh-plibssh-session-handle-exec channel message))
+          (#.+ssh-channel-request-subsystem+
+           (ssh-plibssh-session-handle-subsystem channel message))
           (#.+ssh-channel-request-window-change+
-           (ssh-message-reply-default message))
+           (ssh-plibssh-session-handle-window-change channel message))
           (t (ssh-message-reply-default message))))))
 
 (defun ssh-plibssh-session-handle-env (channel message)
@@ -413,13 +419,76 @@ is refused instead of allocated."
           (ssh-message-channel-request-reply-success message))
         (ssh-message-reply-default message))))
 
+(defun ssh-plibssh-session-handle-pty (channel message)
+  "Remember the peer's terminal, as the pure backend does.
+
+The application's ON-PTY predicate decides whether the request succeeds.
+libssh does not expose the encoded mode list, so it is passed as NIL; the
+terminal name and both sizes are kept."
+  (let* ((term (ssh-message-channel-request-pty-term message))
+         (columns (ssh-message-channel-request-pty-width message))
+         (rows (ssh-message-channel-request-pty-height message))
+         (width (ssh-message-channel-request-pty-pxwidth message))
+         (height (ssh-message-channel-request-pty-pxheight message))
+         (handler (ssh-server-channel-on-pty channel))
+         (ok (and handler
+                  (funcall handler channel term columns rows width height
+                           nil))))
+    (when ok
+      (setf (ssh-server-channel-pty-p channel) t
+            (ssh-server-channel-pty-term channel) term
+            (ssh-server-channel-pty-columns channel) columns
+            (ssh-server-channel-pty-rows channel) rows))
+    (if ok
+        (ssh-message-channel-request-reply-success message)
+        (ssh-message-reply-default message))))
+
 (defun ssh-plibssh-session-handle-exec (channel message)
   "Run the command in MESSAGE through the application's handler."
-  (let ((command (ssh-message-channel-request-command message)))
+  (let ((command (ssh-message-channel-request-command message))
+        (handler (ssh-server-channel-on-exec channel)))
     (setf (ssh-server-channel-command channel) command)
-    (ssh-message-channel-request-reply-success message)
-    (when (ssh-server-channel-on-exec channel)
-      (funcall (ssh-server-channel-on-exec channel) channel command))))
+    (if handler
+        (progn
+          (ssh-message-channel-request-reply-success message)
+          (funcall handler channel command))
+        (ssh-message-reply-default message))))
+
+(defun ssh-plibssh-session-handle-shell (channel message)
+  "Ask the application for the login shell thunk, then answer and run it."
+  (let* ((handler (ssh-server-channel-on-shell channel))
+         (start (and handler (funcall handler channel))))
+    (if start
+        (progn
+          (ssh-message-channel-request-reply-success message)
+          (funcall start))
+        (ssh-message-reply-default message))))
+
+(defun ssh-plibssh-session-handle-subsystem (channel message)
+  "Ask the application to start the named subsystem, then run its thunk."
+  (let* ((name (ssh-message-channel-request-subsystem message))
+         (handler (ssh-server-channel-on-subsystem channel))
+         (start (and handler (funcall handler channel name))))
+    (when start
+      (setf (ssh-server-channel-subsystem channel) name))
+    (if start
+        (progn
+          (ssh-message-channel-request-reply-success message)
+          (funcall start))
+        (ssh-message-reply-default message))))
+
+(defun ssh-plibssh-session-handle-window-change (channel message)
+  "Store the peer's new terminal size and tell the application."
+  (let ((columns (ssh-message-channel-request-pty-width message))
+        (rows (ssh-message-channel-request-pty-height message)))
+    (setf (ssh-server-channel-pty-columns channel) columns
+          (ssh-server-channel-pty-rows channel) rows)
+    (when (ssh-server-channel-on-window-change channel)
+      (funcall (ssh-server-channel-on-window-change channel)
+               channel columns rows))
+    ;; RFC 4254 says a window-change never wants a reply, and libssh's
+    ;; success reply sends nothing when the peer did not ask for one.
+    (ssh-message-channel-request-reply-success message)))
 
 ;;; ---- Channel data and flow control ----
 

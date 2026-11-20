@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.10"
+(defparameter +bursyk-server-version+ "0.0.2.11"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -975,6 +975,12 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 
 ;;; ---- Server ----
 
+(defun close-reason-text (reason)
+  "REASON as the log should show it: keywords without their colon."
+  (if (stringp reason)
+      reason
+      (string-downcase (string reason))))
+
 (defun session-failure (channel control-string &rest arguments)
   "Tell the client why its session could not start, then close it."
   (cl-pnet-ssh:ssh-server-channel-write-stderr
@@ -1327,16 +1333,24 @@ guess, so only an explicit PidFile is written."
                (log-at :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
                        host port allowed)
                allowed))
+           ;; The libssh backend has no forwarded-tcpip channels yet, so it
+           ;; must not be handed these hooks: its MAKE-SSH-SERVER does not
+           ;; take them, and libssh refuses a client's tcpip-forward request
+           ;; itself instead of the request being accepted and then dropped.
+           #-ssh-backend-ffi
            :on-tcpip-forward
+           #-ssh-backend-ffi
            (lambda (session bind-address bind-port)
              (start-remote-forward session bind-address bind-port))
+           #-ssh-backend-ffi
            :on-cancel-tcpip-forward
+           #-ssh-backend-ffi
            (lambda (session bind-address bind-port)
              (cancel-remote-forward session bind-address bind-port))
            :on-close (lambda (session reason)
                        (log-at :info "closed session for ~A: ~A"
                                (cl-pnet-ssh:ssh-session-user session)
-                               reason)
+                               (close-reason-text reason))
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session
@@ -1345,6 +1359,12 @@ guess, so only an explicit PidFile is written."
     (log-at :info "listening on ~A:~D"
             (cl-pnet-ssh:ssh-server-address *server*)
             (cl-pnet-ssh:ssh-server-port *server*))
+    ;; Say it once at startup rather than let a client's -R fail with no
+    ;; explanation from this side: the libssh backend refuses forwarded-tcpip.
+    #+ssh-backend-ffi
+    (log-at :error
+            "the libssh backend does not support remote forwarding; ~
+             a client's -R or RemoteForward will be refused")
     (write-pid-file)
     *server*))
 

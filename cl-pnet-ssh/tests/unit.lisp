@@ -980,6 +980,130 @@ Returns (VALUES STDOUT STDERR STATUS)."
       (when server (ssh-server-close server))
       (ignore-errors (delete-directory-tree directory :validate t)))))
 
+#-ssh-backend-ffi
+(defun ssh-test-loopback-pty-shell-result ()
+  "Run one pty and shell session through a loopback server and client.
+
+Returns (VALUES STDOUT PTY WINDOW-CHANGE STATUS).  PTY is the (TERM COLUMNS
+ROWS) the server recorded from the pty request, WINDOW-CHANGE the (COLUMNS
+ROWS) it saw afterwards, and STATUS the command's exit status.  Both backends
+share the test, so each must dispatch the same channel requests."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-pty"))
+         (server-key (merge-pathnames "host_key" directory))
+         (client-key (merge-pathnames "client_key" directory))
+         (authorized (merge-pathnames "authorized_keys" directory))
+         (known-hosts (merge-pathnames "known_hosts" directory))
+         (stdout (make-string-output-stream))
+         (stderr (make-string-output-stream))
+         (status :none)
+         (error nil)
+         (pty nil)
+         (window-change nil)
+         (server nil)
+         (timeout nil))
+    (ensure-directories-exist server-key)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring server-key)))
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring client-key)))
+           (ssh-test-write-authorized-keys
+            (merge-pathnames "client_key.pub" directory) authorized)
+           (setf server
+                 (make-ssh-server
+                  "127.0.0.1" 0
+                  :host-key server-key
+                  :authorized-keys authorized
+                  :on-channel
+                  (lambda (channel)
+                    (setf (ssh-server-channel-on-pty channel)
+                          (lambda (channel term columns rows width height modes)
+                            (declare (ignore channel width height modes))
+                            (setf pty (list term columns rows))
+                            t)
+                          (ssh-server-channel-on-window-change channel)
+                          (lambda (channel columns rows)
+                            (declare (ignore channel))
+                            (setf window-change (list columns rows)))
+                          (ssh-server-channel-on-shell channel)
+                          (lambda (channel)
+                            (lambda ()
+                              (ssh-test-run-command
+                               channel "printf pty-shell; exit 7")))))))
+           (setf timeout
+                 (cl-pnet:timer-start
+                  10 0
+                  (lambda ()
+                    (setf error :timed-out)
+                    (cl-pnet:event-loop-stop))))
+           (make-ssh-client
+            "127.0.0.1"
+            :port (ssh-server-port server)
+            :user "tester"
+            :private-key client-key
+            :known-hosts known-hosts
+            :host-key-policy :accept-new
+            :on-open
+            (lambda (client)
+              (cl-pnet-ssh::ssh-open-channel
+               client "session"
+               :on-data (ssh-test-loopback-handle-data stdout stderr)
+               :on-open
+               (lambda (channel)
+                 (flet ((request (name want-reply fields)
+                          (cl-pnet-ssh::ssh-channel-send-message
+                           channel cl-pnet-ssh::+ssh-msg-channel-request+
+                           :fields
+                           (lambda (writer)
+                             (cl-pnet-ssh::ssh-write-text writer name)
+                             (cl-pnet-ssh::ssh-write-boolean writer want-reply)
+                             (funcall fields writer)))))
+                   (request
+                    "pty-req" t
+                    (lambda (writer)
+                      (cl-pnet-ssh::ssh-write-text writer "xterm-test")
+                      (cl-pnet-ssh::ssh-write-u32 writer 90)
+                      (cl-pnet-ssh::ssh-write-u32 writer 24)
+                      (cl-pnet-ssh::ssh-write-u32 writer 0)
+                      (cl-pnet-ssh::ssh-write-u32 writer 0)
+                      (cl-pnet-ssh::ssh-write-string
+                       writer
+                       (make-array 0 :element-type '(unsigned-byte 8)))))
+                   (request
+                    "window-change" nil
+                    (lambda (writer)
+                      (cl-pnet-ssh::ssh-write-u32 writer 100)
+                      (cl-pnet-ssh::ssh-write-u32 writer 50)
+                      (cl-pnet-ssh::ssh-write-u32 writer 0)
+                      (cl-pnet-ssh::ssh-write-u32 writer 0)))
+                   (request "shell" t
+                            (lambda (writer) (declare (ignore writer))))))
+               :on-exit (lambda (channel value)
+                          (declare (ignore channel))
+                          (setf status value))
+               :on-close (lambda (channel value)
+                           (declare (ignore channel value))
+                           (ssh-client-close client)
+                           (cl-pnet:event-loop-stop))
+               :on-error (lambda (channel condition)
+                           (declare (ignore channel))
+                           (setf error condition)
+                           (cl-pnet:event-loop-stop))))
+            :on-error (lambda (client condition)
+                        (declare (ignore client))
+                        (setf error condition)
+                        (cl-pnet:event-loop-stop)))
+           (cl-pnet:event-loop-run)
+           (when error (error "loopback: ~A" error))
+           (values (get-output-stream-string stdout)
+                   pty
+                   window-change
+                   status))
+      (when timeout (cl-pnet:timer-stop timeout))
+      (when server (ssh-server-close server))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
 (test server-loopback-exec
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -999,6 +1123,23 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+#-ssh-backend-ffi
+(test server-loopback-pty-shell
+  ;; A pty request must be answered, its metadata kept, a window change applied,
+  ;; and a shell request must start the application's command after the reply.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout pty window-change status)
+          (ssh-test-loopback-pty-shell-result)
+        (is (equal "pty-shell" stdout))
+        (is (equal '("xterm-test" 90 24) pty))
+        (is (equal '(100 50) window-change))
+        (is (eql 7 status)))))
+
+#+ssh-backend-ffi
+(test server-loopback-pty-shell
+  (skip "the pure client transport is not built"))
 
 (test server-loopback-exec-ecdsa-host-key
   (if (not (ssh-keygen-available-p))
@@ -1222,11 +1363,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.10"
+           :server-version "bursyk-server_0.0.2.11"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.10 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.11 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1237,11 +1378,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.10"
+           :server-version "bursyk-server_0.0.2.11"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.10" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.11" greeting)))))
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
@@ -1257,7 +1398,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.11" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.12" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))

@@ -170,6 +170,12 @@
   remote-address
   target
   (command nil)
+  (subsystem nil)
+  ;; The pty the peer asked for, kept for the shell or command that follows.
+  (pty-p nil)
+  (pty-term nil)
+  (pty-columns 0)
+  (pty-rows 0)
   (env nil)
   (write-queue (make-array 0 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
@@ -188,6 +194,10 @@
   on-data
   on-eof
   on-exec
+  on-pty
+  on-shell
+  on-subsystem
+  on-window-change
   on-close
   on-error)
 

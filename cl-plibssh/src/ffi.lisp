@@ -242,6 +242,21 @@
 (cffi:defcfun ("ssh_message_channel_request_channel"
           ssh-message-channel-request-channel) ssh-channel
   (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_pty_term"
+          ssh-message-channel-request-pty-term) :string
+  (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_pty_width"
+          ssh-message-channel-request-pty-width) :int
+  (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_pty_height"
+          ssh-message-channel-request-pty-height) :int
+  (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_pty_pxwidth"
+          ssh-message-channel-request-pty-pxwidth) :int
+  (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_pty_pxheight"
+          ssh-message-channel-request-pty-pxheight) :int
+  (message ssh-message))
 (cffi:defcfun ("ssh_message_channel_request_command"
           ssh-message-channel-request-command) :string
   (message ssh-message))
