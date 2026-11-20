@@ -63,7 +63,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.8"
+(defparameter +bursyk-server-version+ "0.0.2.9"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1137,30 +1137,35 @@ unprivileged run simple."
           (list (home-file ".ssh/id_ed25519")))))
 
 (defun authorized-keys-p (user key-blob)
-  "Whether KEY-BLOB may log in as USER.
+  "Whether KEY-BLOB may log in as USER, and the environment it carries.
 
 -A names one file for every user.  Otherwise AuthorizedKeysFile decides,
 with its %h/%u/%U tokens expanded for USER; when the user has no local
 passwd entry, the single key file of the account running the server is used,
-so an unprivileged or Windows setup keeps working."
+so an unprivileged or Windows setup keeps working.  The second value is the
+environment= options of the line that matched, which
+PermitUserEnvironment decides whether to apply."
   (let ((global (getf *options* :authorized-keys)))
     (if global
-        (cl-pnet-ssh:ssh-authorized-key-blob-p global key-blob)
+        (cl-pnet-ssh:ssh-authorized-key-blob-match global key-blob)
         (multiple-value-bind (home uid) (user-home-and-uid user)
           (if (null home)
-              (cl-pnet-ssh:ssh-authorized-key-blob-p
+              (cl-pnet-ssh:ssh-authorized-key-blob-match
                (home-file ".ssh/authorized_keys") key-blob)
               (let ((patterns
                       (or (config-setting
                            #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
                           cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
-                (some (lambda (pattern)
-                        (unless (string-equal pattern "none")
-                          (cl-pnet-ssh:ssh-authorized-key-blob-p
-                           (expand-authorized-keys-path
-                            pattern user home uid)
-                           key-blob)))
-                      patterns)))))))
+                (dolist (pattern patterns (values nil nil))
+                  (unless (string-equal pattern "none")
+                    (multiple-value-bind (matched key-env)
+                        (cl-pnet-ssh:ssh-authorized-key-blob-match
+                         (expand-authorized-keys-path
+                          pattern user home uid)
+                         key-blob)
+                      (when matched
+                        (return-from authorized-keys-p
+                          (values t key-env))))))))))))
 
 ;;; ---- Account policy ----
 ;;;
@@ -1265,6 +1270,10 @@ guess, so only an explicit PidFile is written."
            :host-key host-keys
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
+           :permit-user-environment
+           (config-setting
+            #'cl-pnet-ssh:ssh-server-config-permit-user-environment)
+           :set-env (config-setting #'cl-pnet-ssh:ssh-server-config-set-env)
            :banner
            (let ((banner
                    (config-setting #'cl-pnet-ssh:ssh-server-config-banner)))

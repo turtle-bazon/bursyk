@@ -103,6 +103,11 @@
   authorize-user
   ;; sshd's Banner: text, a function of no arguments returning it, or NIL.
   banner
+  ;; PermitUserEnvironment: NIL and :NO permit nothing, :YES anything, and a
+  ;; list of patterns is sshd's allowlist.
+  (permit-user-environment nil)
+  ;; SetEnv assignments from the config, applied after the user's own.
+  (set-env '())
   ;; sshd's defaults; NIL would mean "no limit" but the constructor always
   ;; stores a number so a program can tighten or relax them from config.
   (max-auth-tries 6)
@@ -131,6 +136,9 @@
   (client-version nil)
   (user nil)
   (authenticated nil)
+  ;; The environment= options of the authorized_keys line that authenticated
+  ;; the user, applied only when PermitUserEnvironment allows them.
+  (key-env '())
   ;; Userauth bookkeeping, as in the pure backend: sshd exempts the first
   ;; "none" probe and counts every refusal after it.
   (auth-attempts 0)

@@ -17,7 +17,7 @@
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.9")
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.10")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
@@ -100,9 +100,13 @@ relative Include is anchored here.")
 (defun ssh-config-tokenize (line)
   "LINE as config tokens.
 
-Whitespace and an unquoted '=' separate tokens; single or double quotes group
-a value and are removed.  A backslash drops only before a quote, a backslash
-or whitespace, exactly like OpenSSH's argv splitter."
+Whitespace and, around the keyword only, an unquoted '=' separate tokens;
+single or double quotes group a value and are removed.  A backslash drops
+only before a quote, a backslash or whitespace, exactly like OpenSSH's argv
+splitter.
+
+Only the keyword may use Keyword=value: an argument keeps every '=' it has,
+so \"SetEnv LANG=en_US.UTF-8\" is one assignment and not two tokens."
   (let ((tokens '())
         (token (make-string-output-stream))
         (started nil)
@@ -130,7 +134,10 @@ or whitespace, exactly like OpenSSH's argv splitter."
                      (write-char character token)
                      (setf started t))))
                  ((or (ssh-config-whitespace-p character)
-                      (char= character #\=))
+                      ;; A '=' after the keyword has begun a second token is
+                      ;; part of that value.
+                      (and (char= character #\=)
+                           (or (null tokens) (not started))))
                   (emit-token))
                  ((or (char= character #\') (char= character #\"))
                   (setf quote character started t))

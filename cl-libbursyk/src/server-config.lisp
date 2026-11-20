@@ -71,7 +71,6 @@ prohibit-password and means the same thing.")
     ("hostbasedauthentication" . "no")
     ("gssapiauthentication" . "no")
     ("kerberosauthentication" . "no")
-    ("permituserenvironment" . "no")
     ("strictmodes" . "no")
     ("ignorerhosts" . "yes")
     ("permittty" . "yes")
@@ -95,7 +94,7 @@ prohibit-password and means the same thing.")
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "requiredrsasize" "hostkeyagent"
     "permitlisten" "streamlocalbindmask" "streamlocalbindunlink"
-    "exposeauthinfo" "setenv"))
+    "exposeauthinfo"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -126,6 +125,11 @@ prohibit-password and means the same thing.")
   ;; Limits and identity.  NIL means the server keeps its own default.
   (max-auth-tries nil)
   (max-sessions nil)
+  ;; PermitUserEnvironment: NIL (unset, means no), :YES, :NO, or a list of
+  ;; patterns naming the variables a user may set.
+  (permit-user-environment nil)
+  ;; SetEnv assignments, "NAME=VALUE", in the order they were read.
+  (set-env '())
   (pid-file nil)
   ;; Banner is a file read for every connection, or :none to send nothing.
   (banner nil)
@@ -159,6 +163,19 @@ prohibit-password and means the same thing.")
                                      (ssh-config-line-keyword line)
                                      (length arguments)))
       (t (first arguments)))))
+
+(defun ssh-server-config-env-name-p (name)
+  "Whether NAME is usable as an environment variable name.
+
+sshd's valid_env_name allows letters, digits and underscores only; a name
+carrying = or a space cannot be passed to execve safely."
+  (and (plusp (length name))
+       (every (lambda (character)
+                (or (char<= #\a character #\z)
+                    (char<= #\A character #\Z)
+                    (char<= #\0 character #\9)
+                    (char= character #\_)))
+              name)))
 
 (defun ssh-server-config-flag (line argument)
   "ARGUMENT as a sshd boolean; anything but yes or no is an error."
@@ -342,6 +359,41 @@ Port and ListenAddress the way sshd's own command-line options do."
            (ssh-server-config-line-error
             line "invalid environment name ~A" argument))
          (push argument (ssh-server-config-accept-env config))))
+      ((string= keyword "setenv")
+       ;; sshd honours only the first SetEnv directive; a later one is
+       ;; ignored entirely, because the first is the value it obtains.
+       (unless (ssh-server-config-set-env config)
+         (when (null arguments)
+           (ssh-server-config-line-error line "SetEnv needs an argument"))
+         (dolist (argument arguments)
+           (unless (and (plusp (length argument))
+                        (find #\= argument))
+             (ssh-server-config-line-error
+              line "invalid SetEnv assignment ~A" argument))
+           ;; A repeated name on the same line is ignored too.
+           (let* ((equals (position #\= argument))
+                  (name (subseq argument 0 equals)))
+             (unless (find name (ssh-server-config-set-env config)
+                           :key (lambda (assignment)
+                                  (subseq assignment 0 (position #\= assignment)))
+                           :test #'string=)
+               (setf (ssh-server-config-set-env config)
+                     (append (ssh-server-config-set-env config)
+                             (list argument))))))))
+      ((string= keyword "permituserenvironment")
+       (let ((value (ssh-server-config-one-argument line)))
+         (ssh-server-config-set-once
+          config 'permit-user-environment
+          (cond
+            ((string-equal value "yes") :yes)
+            ((string-equal value "no") :no)
+            (t
+             ;; Anything else is a pattern list of the names a user may set.
+             (let ((patterns (uiop:split-string value :separator ",")))
+               (when (some #'zerop (mapcar #'length patterns))
+                 (ssh-server-config-line-error
+                  line "empty PermitUserEnvironment pattern"))
+               patterns))))))
       ;; ---- forwarding policy ----
       ((string= keyword "permitopen")
        (when (null (ssh-server-config-permit-open config))

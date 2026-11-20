@@ -247,10 +247,15 @@ the reason is recorded and the pump finishes it after the callback returns."
       (setf (ssh-session-pending-close session) :auth-failures)))
   (ssh-plibssh-auth-failure message))
 
-(defun ssh-plibssh-session-complete-auth (session message user key-blob)
-  "Accept USER for SESSION, then let the application run."
+(defun ssh-plibssh-session-complete-auth (session message user key-blob
+                                          &optional key-env)
+  "Accept USER for SESSION, then let the application run.
+
+KEY-ENV holds the environment= assignments from the authorized_keys line
+that admitted the key."
   (declare (ignore key-blob))
   (setf (ssh-session-user session) user
+        (ssh-session-key-env session) key-env
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
   (ssh-message-auth-reply-success message 0)
@@ -286,17 +291,19 @@ authentication attempt."
   (let* ((key (ssh-message-auth-pubkey message))
          (state (ssh-message-auth-publickey-state message))
          (blob (and key (ssh-plibssh-public-key-blob key)))
-         (authorized
-           (and blob
-                (ssh-server-authorized-key-p
-                 (ssh-session-server session) user blob))))
+         (authorized nil)
+         (key-env nil))
+    (when blob
+      (multiple-value-setq (authorized key-env)
+        (ssh-server-authorized-key-p
+         (ssh-session-server session) user blob)))
     (cond
       ((null key) (ssh-plibssh-session-auth-failure session message
                                                     :count count))
       ((and authorized (= state +ssh-publickey-state-none+))
        (ssh-message-auth-reply-pk-ok-simple message))
       ((and authorized (= state +ssh-publickey-state-valid+))
-       (ssh-plibssh-session-complete-auth session message user blob))
+       (ssh-plibssh-session-complete-auth session message user blob key-env))
       (t (ssh-plibssh-session-auth-failure session message :count count)))))
 
 ;;; ---- Channel opens ----
@@ -809,6 +816,8 @@ is refused instead of allocated."
                           authorize
                           authorize-user
                           banner
+                          permit-user-environment
+                          set-env
                           max-auth-tries
                           max-sessions
                           accept-env
@@ -827,7 +836,10 @@ function of no arguments returning it, or NIL for none.  The arguments are the s
 backend's; HOST-KEY may be an ssh-private-key, a path, or a list of those.
 libssh needs a file for each key it presents, so a key parsed from octets
 without a path is refused here.  SERVER-VERSION is the part of the greeting
-after \"SSH-2.0-\"; libssh adds that prefix itself."
+after \"SSH-2.0-\"; libssh adds that prefix itself.
+
+PERMIT-USER-ENVIRONMENT and SET-ENV carry sshd's same-named settings; they
+reach the child through the application, which reads the session record."
   (let* ((keys (mapcar (lambda (value)
                          (if (typep value 'ssh-private-key)
                              value
@@ -848,6 +860,8 @@ after \"SSH-2.0-\"; libssh adds that prefix itself."
                   :authorize authorize
                   :authorize-user authorize-user
                   :banner banner
+                  :permit-user-environment permit-user-environment
+                  :set-env set-env
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
                   :accept-env accept-env

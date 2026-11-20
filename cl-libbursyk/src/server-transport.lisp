@@ -409,10 +409,15 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
                    (ssh-server-signed-data session user algorithm key-blob))))
          (error () nil))))
 
-(defun ssh-server-complete-auth (session user key-blob)
-  "Accept SESSION's authenticated user, then let the application run."
+(defun ssh-server-complete-auth (session user key-blob &optional key-env)
+  "Accept SESSION's authenticated user, then let the application run.
+
+KEY-ENV holds the environment= assignments from the authorized_keys line
+that admitted the key; the application applies them under
+PermitUserEnvironment."
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
+        (ssh-session-key-env session) key-env
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
   (ssh-server-send-auth-success session)
@@ -422,10 +427,13 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
 (defun ssh-server-handle-signed-key (session user algorithm key-blob reader
                                     &key (count t))
   (let ((signature (ssh-read-string reader)))
-    (if (and (ssh-server-verify-signature session user algorithm key-blob signature)
-             (ssh-server-authorized-key-p (ssh-session-server session)
-                                          user key-blob))
-        (ssh-server-complete-auth session user key-blob)
+    (if (ssh-server-verify-signature session user algorithm key-blob signature)
+        (multiple-value-bind (authorized key-env)
+            (ssh-server-authorized-key-p (ssh-session-server session)
+                                         user key-blob)
+          (if authorized
+              (ssh-server-complete-auth session user key-blob key-env)
+              (ssh-server-send-auth-failure session :count count)))
         (ssh-server-send-auth-failure session :count count))))
 
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader

@@ -52,6 +52,8 @@ advertised and then fail the first KEX."
                           authorize
                           authorize-user
                           banner
+                          permit-user-environment
+                          set-env
                           max-auth-tries
                           max-sessions
                           accept-env
@@ -79,13 +81,18 @@ PermitRootLogin belong.
 BANNER is sshd's Banner text, a function of no arguments returning it (so a
 file can change between connections), or NIL for none.
 
+PERMIT-USER-ENVIRONMENT is sshd's PermitUserEnvironment: NIL and :NO permit
+nothing, :YES lets a user set any variable, and a list of patterns is an
+allowlist.  SET-ENV is the config's SetEnv assignments (\"NAME=VALUE\"), which
+override the user's own environment.
+
 MAX-AUTH-TRIES and MAX-SESSIONS keep sshd's defaults of 6 and 10 when NIL.
 A MaxSessions of 0 refuses every session channel, as sshd does.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.8\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.9\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -119,6 +126,8 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :authorize authorize
                   :authorize-user authorize-user
                   :banner banner
+                  :permit-user-environment permit-user-environment
+                  :set-env set-env
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
                   :accept-env accept-env

@@ -858,14 +858,19 @@ signal, so the override still works."
     (ssh-server-channel-exit channel (or status 0))
     (ssh-server-channel-close channel)))
 
-(defun ssh-test-write-authorized-keys (public-key-file authorized-file)
-  "Copy the one public key in PUBLIC-KEY-FILE into AUTHORIZED-FILE."
+(defun ssh-test-write-authorized-keys (public-key-file authorized-file
+                                       &key prefix)
+  "Copy the one public key in PUBLIC-KEY-FILE into AUTHORIZED-FILE.
+
+PREFIX, when given, is an authorized_keys options string placed before the
+key on the line."
   (with-open-file (output authorized-file :direction :output
                                       :if-exists :supersede
                                       :if-does-not-exist :create)
     (with-open-file (input public-key-file)
-      (write-line (string-trim '(#\Space #\Return #\Newline) (read-line input))
-                  output))))
+      (format output "~@[~A ~]~A~%"
+              prefix
+              (string-trim '(#\Space #\Return #\Newline) (read-line input))))))
 
 (defun ssh-test-loopback-handle-data (stdout stderr)
   "A channel data callback that splits stdout from stderr."
@@ -1091,16 +1096,18 @@ Returns (VALUES STDOUT STDERR STATUS)."
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
 (defun ssh-test-loopback-outcome (policy &key server-version version-addendum
-                                         banner)
+                                         banner authorized-options)
   "Run one client handshake against a loopback server with POLICY.
 
 SERVER-VERSION, when given, is passed to MAKE-SSH-SERVER so a test can see
 the greeting the server chose; VERSION-ADDENDUM does the same for the
 comment appended after it, and BANNER for the authentication banner.
-Returns (VALUES OPENED ERROR GREETING BANNER-TEXT): OPENED is true once
-authentication completed, ERROR is the condition the client reported,
-GREETING is the server's identification line as the client read it, and
-BANNER-TEXT is the USERAUTH_BANNER the client stored, or NIL."
+AUTHORIZED-OPTIONS is placed before the client's key in authorized_keys.
+Returns (VALUES OPENED ERROR GREETING BANNER-TEXT KEY-ENV): OPENED is true
+once authentication completed, ERROR is the condition the client reported,
+GREETING is the server's identification line as the client read it,
+BANNER-TEXT is the USERAUTH_BANNER the client stored, and KEY-ENV is the
+environment= list the server recorded for the authenticated key."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-policy"))
          (server-key (merge-pathnames "host_key" directory))
          (client-key (merge-pathnames "client_key" directory))
@@ -1110,6 +1117,7 @@ BANNER-TEXT is the USERAUTH_BANNER the client stored, or NIL."
          (error nil)
          (greeting nil)
          (banner-text nil)
+         (key-env nil)
          (closed nil)
          (server nil)
          (timeout nil))
@@ -1121,13 +1129,19 @@ BANNER-TEXT is the USERAUTH_BANNER the client stored, or NIL."
            (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
                              "-f" (namestring client-key)))
            (ssh-test-write-authorized-keys
-            (merge-pathnames "client_key.pub" directory) authorized)
+            (merge-pathnames "client_key.pub" directory) authorized
+            :prefix authorized-options)
            (setf server (make-ssh-server "127.0.0.1" 0
                                          :host-key server-key
                                          :authorized-keys authorized
                                          :server-version server-version
                                          :version-addendum version-addendum
-                                         :banner banner))
+                                         :banner banner
+                                         :on-session
+                                         (lambda (session)
+                                           (setf key-env
+                                                 (ssh-session-key-env
+                                                  session)))))
            (setf timeout
                  (cl-pnet:timer-start
                   10 0
@@ -1162,7 +1176,7 @@ BANNER-TEXT is the USERAUTH_BANNER the client stored, or NIL."
            (loop repeat 3
                  until (or opened error closed)
                  do (cl-pnet:event-loop-run))
-           (values opened error greeting banner-text))
+           (values opened error greeting banner-text key-env))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
       (ignore-errors (delete-directory-tree directory :validate t)))))
@@ -1208,11 +1222,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.8"
+           :server-version "bursyk-server_0.0.2.9"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.8 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.9 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1223,11 +1237,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.8"
+           :server-version "bursyk-server_0.0.2.9"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.8" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.9" greeting)))))
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
@@ -1243,7 +1257,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.9" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.10" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))
@@ -1844,6 +1858,71 @@ also covers that the verifier trims it before padding to the curve width."
 (test ssh-match-pattern-is-not-case-folding
   (is (not (cl-pnet-ssh:ssh-match-pattern "LANG" "lang")))
   (is (not (cl-pnet-ssh:ssh-match-pattern "LC_*" "lc_all"))))
+
+(defparameter +test-authorized-key-blob+
+  "AAAAB3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+  "A well-formed ed25519 public key blob for the authorized_keys tests.")
+
+(test authorized-keys-options-carry-environment
+  ;; sshd reads environment="NAME=VALUE" options on the key line and applies
+  ;; them under PermitUserEnvironment.  The options precede the key type and
+  ;; may hold quoted commas and spaces.
+  (let ((line (format nil
+                      "environment=\"LANG=en_US.UTF-8\",environment=\"GREETING=hello, world\" ssh-ed25519 ~A comment"
+                      +test-authorized-key-blob+)))
+    (is (equal '("LANG=en_US.UTF-8" "GREETING=hello, world")
+               (cl-pnet-ssh:ssh-authorized-key-line-environments line)))
+    ;; The options do not stop the key from being recognised.
+    (is (cl-pnet-ssh:ssh-authorized-key-line-blob line)))
+  ;; A variable name sshd would refuse makes it skip the whole line.
+  (is (null (cl-pnet-ssh:ssh-authorized-key-line-environments
+             (format nil "environment=\"BAD-NAME=x\" ssh-ed25519 ~A"
+                     +test-authorized-key-blob+))))
+  (is (null (cl-pnet-ssh:ssh-authorized-key-line-blob
+             (format nil "environment=\"BAD-NAME=x\" ssh-ed25519 ~A"
+                     +test-authorized-key-blob+))))
+  (is (null (cl-pnet-ssh:ssh-authorized-key-line-environments
+             (format nil "ssh-ed25519 ~A" +test-authorized-key-blob+)))))
+
+(test authorized-key-blob-match-returns-the-first-lines-environment
+  "The line that authenticates the user supplies its environment= options."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-key-env"))
+         (authorized (merge-pathnames "authorized_keys" directory)))
+    (ensure-directories-exist authorized)
+    (unwind-protect
+         (progn
+           (with-open-file (stream authorized :direction :output
+                                             :if-exists :supersede
+                                             :if-does-not-exist :create)
+             (format stream "environment=\"FROM=first\" ssh-ed25519 ~A one~%"
+                     +test-authorized-key-blob+)
+             (format stream "environment=\"FROM=second\" ssh-ed25519 ~A two~%"
+                     +test-authorized-key-blob+))
+           (multiple-value-bind (blob options)
+               (cl-pnet-ssh:ssh-authorized-key-line-parts
+                (format nil "ssh-ed25519 ~A" +test-authorized-key-blob+))
+             (declare (ignore options))
+             (multiple-value-bind (matched environment)
+                 (cl-pnet-ssh:ssh-authorized-key-blob-match authorized blob)
+               (is (not (null matched)))
+               (is (equal '("FROM=first") environment)))))
+      (ignore-errors (delete-directory-tree directory :validate t)))))
+
+(test server-records-authorized-key-environment
+  "A successful publickey login keeps the environment= options it carried."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting banner key-env)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t)
+           :authorized-options
+           "environment=\"LANG=en_US.UTF-8\",environment=\"TZ=UTC\"")
+        (declare (ignore greeting banner))
+        (is (null error))
+        (is (not (null opened)))
+        (is (equal '("LANG=en_US.UTF-8" "TZ=UTC") key-env)))))
 
 (test ssh-config-carries-the-features-the-caller-must-refuse
   ;; Agent, X11 and compression wishes can come from the file.  The parser

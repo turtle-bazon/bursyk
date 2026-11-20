@@ -23,6 +23,12 @@
   ;; function of no arguments returning it (so the file can change without a
   ;; restart), or NIL for none.
   banner
+  ;; PermitUserEnvironment: NIL and :NO permit nothing, :YES lets a user set
+  ;; any variable, and a list of patterns is sshd's allowlist.
+  (permit-user-environment nil)
+  ;; SetEnv assignments from the config, applied after the user's own
+  ;; environment so an administrator's value wins.
+  (set-env '())
   ;; sshd's defaults: six failed attempts per connection, ten session
   ;; channels.  A program tightens or relaxes them from its config.
   (max-auth-tries 6)
@@ -77,6 +83,9 @@ only want to describe it."
   (authenticated nil)
   (user nil)
   (authorized-key nil)
+  ;; The environment= options of the authorized_keys line that authenticated
+  ;; the user, applied only when PermitUserEnvironment allows them.
+  (key-env '())
   ;; Userauth bookkeeping: a fresh connection starts at zero, and the first
   ;; "none" probe is exempt from the failure count, as in sshd.
   (auth-attempts 0)

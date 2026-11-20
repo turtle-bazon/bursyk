@@ -450,6 +450,108 @@ Banner /second")))
                                        (uiop:temporary-directory))))))
       (ignore-errors (delete-file path)))))
 
+(test sshd-config-reads-environment-policy
+  "SetEnv and PermitUserEnvironment carry sshd's first-value rules."
+  (let ((config (config-from-text
+                 "SetEnv LANG=en_US.UTF-8
+SetEnv IGNORED=yes
+PermitUserEnvironment LANG,LC_*")))
+    (is (equal '("LANG=en_US.UTF-8")
+               (cl-pnet-ssh:ssh-server-config-set-env config)))
+    (is (equal '("LANG" "LC_*")
+               (cl-pnet-ssh:ssh-server-config-permit-user-environment config))))
+  (is (eq :yes (config-value
+                #'cl-pnet-ssh:ssh-server-config-permit-user-environment
+                "PermitUserEnvironment yes")))
+  (is (eq :no (config-value
+               #'cl-pnet-ssh:ssh-server-config-permit-user-environment
+               "PermitUserEnvironment no")))
+  ;; Everything on the first SetEnv line is kept, a repeated name is not,
+  ;; and a later SetEnv line is ignored entirely, as sshd does.
+  (is (equal '("A=1" "B=2")
+             (config-value #'cl-pnet-ssh:ssh-server-config-set-env
+                           "SetEnv A=1 B=2 A=3
+SetEnv C=4")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "SetEnv NOEQUALS"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "SetEnv")))
+
+(test permit-user-environment-controls-names
+  (let ((allowlist (cl-pnet-ssh::%make-ssh-server
+                    :permit-user-environment '("LANG" "LC_*")))
+        (everything (cl-pnet-ssh::%make-ssh-server
+                     :permit-user-environment :yes))
+        (nothing (cl-pnet-ssh::%make-ssh-server
+                  :permit-user-environment :no)))
+    (is (cl-pnet-ssh:ssh-server-permit-user-environment-p allowlist "LANG"))
+    (is (cl-pnet-ssh:ssh-server-permit-user-environment-p allowlist "LC_ALL"))
+    (is (not (cl-pnet-ssh:ssh-server-permit-user-environment-p
+              allowlist "PATH")))
+    (is (cl-pnet-ssh:ssh-server-permit-user-environment-p everything "PATH"))
+    (is (not (cl-pnet-ssh:ssh-server-permit-user-environment-p
+              nothing "LANG")))
+    (is (not (cl-pnet-ssh:ssh-server-permit-user-environment-p
+              (cl-pnet-ssh::%make-ssh-server) "LANG")))))
+
+(test user-environment-file-is-filtered-by-the-allowlist
+  "~/.ssh/environment is read only for variables PermitUserEnvironment allows."
+  (let ((path (merge-pathnames "bursyk-user-environment-test"
+                               (uiop:temporary-directory)))
+        (server (cl-pnet-ssh::%make-ssh-server
+                 :permit-user-environment '("LANG" "LC_*"))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (format out "  LANG=en_US.UTF-8~%
+# a comment~%
+~%
+SECRET=no~%
+BROKEN~%
+LC_ALL=C~%"))
+           (let ((environment
+                   (bursyk-server::read-user-environment-file
+                    path server '(("LANG" . "client")))))
+             (is (equal "en_US.UTF-8"
+                        (cdr (assoc "LANG" environment :test #'string=))))
+             (is (equal "C"
+                        (cdr (assoc "LC_ALL" environment :test #'string=))))
+             (is (null (assoc "SECRET" environment :test #'string=)))
+             (is (null (assoc "BROKEN" environment :test #'string=)))))
+      (ignore-errors (delete-file path)))))
+
+#-ssh-backend-ffi
+(test session-environment-follows-sshd-precedence
+  "SetEnv beats ~/.ssh/environment, which beats the key options and client."
+  (let* ((server (cl-pnet-ssh::%make-ssh-server
+                  :permit-user-environment :yes
+                  :set-env '("LANG=admin" "PATH=/admin/bin")))
+         ;; An account that /etc/passwd will not know, so no real environment
+         ;; file is read and the key's options are the only user source.
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :user "bursyk-test-user-with-no-passwd-entry"
+                   :key-env '("LANG=key" "TZ=UTC")))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session
+                   :env '(("LANG" . "client")
+                          ("TERM" . "vt100")
+                          ("LC_ALL" . "client")))))
+    (let ((environment (bursyk-server::session-environment channel)))
+      ;; SetEnv wins over the key option.
+      (is (equal "admin" (cdr (assoc "LANG" environment :test #'string=))))
+      (is (equal "/admin/bin"
+                 (cdr (assoc "PATH" environment :test #'string=))))
+      ;; A key option with no SetEnv counterpart survives.
+      (is (equal "UTC" (cdr (assoc "TZ" environment :test #'string=))))
+      ;; Accepted client variables that nothing overrides survive.
+      (is (equal "client"
+                 (cdr (assoc "LC_ALL" environment :test #'string=))))
+      ;; There is one entry per name.
+      (is (= 1 (count "LANG" environment :key #'car :test #'string=))))))
+
 (test sshd-config-takes-the-first-value-it-obtains
   (let ((config (config-from-text
                  "LogLevel VERBOSE
