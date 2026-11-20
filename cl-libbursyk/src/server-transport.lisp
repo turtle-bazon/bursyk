@@ -12,17 +12,40 @@
     "ext-info-s")
   "Server KEX offers.  The markers are negotiation signals, not algorithms.")
 
+(defun ssh-server-kex-offer (session)
+  "The KEX list SESSION advertises, with the server markers appended.
+
+KexAlgorithms chooses the methods; the strict-KEX and EXT_INFO markers are
+never selectable and ride along with every offer, so an administrator naming
+only curve25519 does not turn off either extension."
+  (let ((result (copy-list
+                 (ssh-session-algorithm-list
+                  session #'ssh-server-config-kex-algorithms
+                  +ssh-kex-real-algorithms+))))
+    (dolist (marker '("kex-strict-s-v00@openssh.com" "ext-info-s")
+             result)
+      (unless (member marker result :test #'string=)
+        (setf result (append result (list marker)))))))
+
+(defun ssh-server-host-key-algorithms-for (session)
+  "The host key algorithms SESSION can present, in configured order."
+  (ssh-server-host-key-algorithms
+   (ssh-session-host-keys session)
+   (ssh-session-setting session #'ssh-server-config-host-key-algorithms)))
+
 (defun ssh-server-make-kexinit-payload (session)
-  "A fresh server SSH_MSG_KEXINIT advertising the keys SESSION's server holds."
-  (let ((host-keys (ssh-server-host-keys
-                    (ssh-session-server session)))
-        (writer (ssh-writer)))
+  "A fresh server SSH_MSG_KEXINIT advertising SESSION's configured offers."
+  (let* ((ciphers (ssh-session-algorithm-list
+                   session #'ssh-server-config-ciphers +ssh-ciphers+))
+         (macs (ssh-session-algorithm-list
+                session #'ssh-server-config-macs +ssh-macs+))
+         (writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-kexinit+)
     (ssh-write-octets writer (ssh-random-octets 16))
-    (iter (for list in (list +ssh-server-kex-algorithms+
-                             (ssh-server-host-key-algorithms host-keys)
-                             +ssh-ciphers+ +ssh-ciphers+
-                             +ssh-macs+ +ssh-macs+
+    (iter (for list in (list (ssh-server-kex-offer session)
+                             (ssh-server-host-key-algorithms-for session)
+                             ciphers ciphers
+                             macs macs
                              +ssh-compressions+ +ssh-compressions+
                              '() '()))
       (ssh-write-name-list writer list))
@@ -131,19 +154,23 @@ and NIL while the line is still incomplete."
 The host key offer is built from SESSION's loaded keys, so every algorithm
 advertised can be signed with."
   (let* ((kex (ssh-choose-algorithm
-               (remove-if #'ssh-kex-marker-p +ssh-server-kex-algorithms+)
+               (remove-if #'ssh-kex-marker-p
+                          (ssh-server-kex-offer session))
                (getf client-kexinit :kex)))
          (host-key (ssh-choose-algorithm
-                    (ssh-server-host-key-algorithms
-                     (ssh-server-host-keys (ssh-session-server session)))
+                    (ssh-server-host-key-algorithms-for session)
                     (getf client-kexinit :host-keys)))
-         (cipher-c2s (ssh-choose-algorithm +ssh-ciphers+
+         (ciphers (ssh-session-algorithm-list
+                   session #'ssh-server-config-ciphers +ssh-ciphers+))
+         (macs (ssh-session-algorithm-list
+                session #'ssh-server-config-macs +ssh-macs+))
+         (cipher-c2s (ssh-choose-algorithm ciphers
                                            (getf client-kexinit :ciphers-c2s)))
-         (cipher-s2c (ssh-choose-algorithm +ssh-ciphers+
+         (cipher-s2c (ssh-choose-algorithm ciphers
                                            (getf client-kexinit :ciphers-s2c)))
-         (mac-c2s (ssh-choose-algorithm +ssh-macs+
+         (mac-c2s (ssh-choose-algorithm macs
                                         (getf client-kexinit :macs-c2s)))
-         (mac-s2c (ssh-choose-algorithm +ssh-macs+
+         (mac-s2c (ssh-choose-algorithm macs
                                         (getf client-kexinit :macs-s2c)))
          (compression (ssh-choose-algorithm +ssh-compressions+
                                             (getf client-kexinit
@@ -195,7 +222,7 @@ came up."
          (algorithm (getf (ssh-session-negotiated session) :host-key))
          (host-key (and algorithm
                         (ssh-server-host-key-for
-                         (ssh-server-host-keys (ssh-session-server session))
+                         (ssh-session-host-keys session)
                          algorithm)))
          (private nil)
          (server-public nil)
@@ -401,7 +428,8 @@ SSH-WRITE-STRING; writing its raw octets would shift every later field."
 
 The request's ALGORITHM and the signature blob's own name must agree, so an
 rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
-  (and (ssh-server-user-key-algorithm-p key-blob algorithm)
+  (and (ssh-session-user-key-algorithm-p session key-blob algorithm)
+       (ssh-session-user-key-length-p session key-blob)
        (handler-case
            (multiple-value-bind (signature-algorithm signature-bytes)
                (ssh-parse-signature-blob signature)
@@ -454,7 +482,8 @@ which the transport enforces for pty and forwarding requests."
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader
                                     has-signature &key (count t))
   "Handle one publickey attempt, signed or merely offered."
-  (if (and (ssh-server-user-key-algorithm-p key-blob algorithm)
+  (if (and (ssh-session-user-key-algorithm-p session key-blob algorithm)
+           (ssh-session-user-key-length-p session key-blob)
            (ssh-server-authorized-key-p
             (ssh-session-server session) user key-blob
             :address (ssh-session-remote-ip session)

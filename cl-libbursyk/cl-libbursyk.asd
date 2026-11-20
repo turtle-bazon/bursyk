@@ -2,7 +2,7 @@
   :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.17"
+  :version "0.0.1.18"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
@@ -20,6 +20,11 @@
                              ;; report milestones through the same hook.
                              (:file "log")
                              (:file "config")
+                             ;; Algorithm names, the lists this build offers,
+                             ;; and the + / - / ^ syntax sshd and ssh share.
+                             ;; Early, because sshd_config is validated as it
+                             ;; is read.
+                             (:file "algorithms")
                              ;; sshd_config, parsed with the same tokenizer
                              ;; and the same Include rules as ssh_config.
                              (:file "server-config")

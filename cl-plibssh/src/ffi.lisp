@@ -53,7 +53,15 @@
 (defconstant +ssh-bind-options-bind-port+ 1)
 (defconstant +ssh-bind-options-host-key+ 3)
 (defconstant +ssh-bind-options-banner+ 6)
-(defconstant +ssh-bind-options-process-config+ 20)
+(defconstant +ssh-bind-options-key-exchange+ 11)
+(defconstant +ssh-bind-options-ciphers-c-s+ 12)
+(defconstant +ssh-bind-options-ciphers-s-c+ 13)
+(defconstant +ssh-bind-options-hmac-c-s+ 14)
+(defconstant +ssh-bind-options-hmac-s-c+ 15)
+(defconstant +ssh-bind-options-pubkey-accepted-key-types+ 17)
+(defconstant +ssh-bind-options-hostkey-algorithms+ 18)
+(defconstant +ssh-bind-options-process-config+ 19)
+(defconstant +ssh-bind-options-rsa-min-size+ 21)
 
 ;;; enum ssh_requests_e
 (defconstant +ssh-request-auth+ 1)

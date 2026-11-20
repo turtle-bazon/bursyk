@@ -79,9 +79,9 @@
 (defun ssh-server-host-key (server)
   "The first host key SERVER presents.
 
-A server may hold several; this returns the preferred one, for callers that
-only want to describe it."
-  (first (ssh-server-host-keys server)))
+A server may hold several; this returns the preferred one it can actually
+present after RequiredRSASize, for callers that only want to describe it."
+  (first (ssh-server-presentable-host-keys server)))
 
 (defstruct (ssh-session (:constructor %make-ssh-session))
   server

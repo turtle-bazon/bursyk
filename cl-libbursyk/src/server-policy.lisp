@@ -514,18 +514,6 @@ restriction we do not implement stays a restriction."
   (let ((options (nth-value 2 (ssh-authorized-key-line-parts line))))
     (and options (ssh-authorization-options-environments options))))
 
-(defparameter +ssh-server-user-key-algorithms+
-  '("ssh-ed25519"
-    "ecdsa-sha2-nistp256"
-    "ecdsa-sha2-nistp384"
-    "ecdsa-sha2-nistp521"
-    "rsa-sha2-512"
-    "rsa-sha2-256")
-  "Public-key signature algorithms the server accepts for user auth.
-
-This is what EXT_INFO's server-sig-algs names.  SHA-1 ssh-rsa is accepted
-for old clients but not advertised, matching modern OpenSSH defaults.")
-
 (defun ssh-server-user-key-algorithm-p (key-blob algorithm)
   "Whether KEY-BLOB may sign as ALGORITHM in a userauth request.
 
@@ -547,6 +535,80 @@ A blob that does not parse is never acceptable."
            (string= algorithm type))
           (t nil)))
     (error () nil)))
+
+(defun ssh-session-user-key-algorithm-p (session key-blob algorithm)
+  "Whether SESSION accepts KEY-BLOB signing as ALGORITHM.
+
+This is SSH-SERVER-USER-KEY-ALGORITHM-P plus the connection's
+PubkeyAcceptedAlgorithms choice.  Without the directive the server keeps
+accepting SHA-1 ssh-rsa for old clients even though it does not advertise it;
+naming the directive makes its resolved list the whole answer."
+  (and (ssh-server-user-key-algorithm-p key-blob algorithm)
+       (let ((configured
+               (ssh-session-setting
+                session #'ssh-server-config-pubkey-accepted-algorithms)))
+         (or (null configured)
+             (member algorithm configured :test #'string=)))))
+
+(defun ssh-session-required-rsa-size (session)
+  "SESSION's RequiredRSASize, or NIL when the directive is absent."
+  (ssh-session-setting session #'ssh-server-config-required-rsa-size))
+
+(defun ssh-session-user-key-length-p (session key-blob)
+  "Whether KEY-BLOB is long enough for SESSION's RequiredRSASize."
+  (ssh-key-rsa-size-allowed-p key-blob
+                              (ssh-session-required-rsa-size session)))
+
+(defun ssh-server-host-key-required-rsa-size (server)
+  "The RequiredRSASize SERVER applied to its host keys when it loaded them.
+
+sshd filters host keys at startup from the global setting; a Match block's
+RequiredRSASize governs user keys only, so a lower per-connection value must
+not bring a skipped host key back."
+  (let ((config (ssh-server-sshd-config server)))
+    (and config (ssh-server-config-required-rsa-size config))))
+
+(defun ssh-server-presentable-host-keys (server)
+  "SERVER's host keys that RequiredRSASize allows it to present.
+
+sshd skips an RSA key that is too short while loading, logging the error and
+carrying on with the rest, so one bad file never stops the listener."
+  (let ((size (ssh-server-host-key-required-rsa-size server)))
+    (remove-if-not (lambda (key)
+                     (ssh-key-rsa-size-allowed-p
+                      (ssh-public-key-blob-of key) size))
+                   (ssh-server-host-keys server))))
+
+(defun ssh-server-check-host-keys (keys required-rsa-size)
+  "Signal unless KEYS, when supplied, holds a key REQUIRED-RSA-SIZE allows.
+
+sshd exits when every configured HostKey is rejected, rather than listening
+with no key it could present.  A NIL KEYS list is the caller's own choice and
+stays an error left to the transport."
+  (when (and keys
+             (null (remove-if-not
+                    (lambda (key)
+                      (ssh-key-rsa-size-allowed-p
+                       (ssh-public-key-blob-of key) required-rsa-size))
+                    keys)))
+    (error 'ssh-connection-error
+           :detail
+           (format nil "no host key is at least ~D bits"
+                   (or required-rsa-size
+                       +ssh-rsa-minimum-modulus-size+))))
+  keys)
+
+(defun ssh-session-host-keys (session)
+  "SESSION's host keys that RequiredRSASize allows it to present."
+  (ssh-server-presentable-host-keys (ssh-session-server session)))
+
+(defun ssh-session-algorithm-list (session accessor default)
+  "SESSION's list from ACCESSOR, or DEFAULT.
+
+Ciphers, MACs, KexAlgorithms and HostKeyAlgorithms are global directives, so
+before the account name is known SESSION's effective config is the server's
+base config, which is the same value sshd uses to build KEXINIT."
+  (or (ssh-session-setting session accessor) default))
 
 (defun ssh-authorized-key-file-entries (path)
   "Every well-formed (BLOB OPTIONS) in the file at PATH."
@@ -772,33 +834,40 @@ applies."
     (and (ssh-authorization-options-permit-port-forwarding-p options)
          (ssh-authorization-options-permit-open-p options host port))))
 
+(defun ssh-server-permit-listen-allows-p (rules host port)
+  "Whether sshd_config PermitListen RULES allow a listener on HOST:PORT.
+
+RULES is the directive's value: NIL or \"any\" permits every listen address,
+\"none\" refuses them all, and each HOST:PORT entry matches the requested host
+with match_pattern, lower-cased first, and the port exactly unless the entry
+says *.  A bare port was stored as *:PORT while the config was read."
+  (cond
+    ((null rules) t)
+    ((member "none" rules :test #'string-equal) nil)
+    ((member "any" rules :test #'string-equal) t)
+    (t
+     (let ((wanted-host (string-downcase (or host ""))))
+       (some (lambda (rule)
+               (multiple-value-bind (rule-host rule-port valid)
+                   (ssh-authorized-key-split-permit rule nil)
+                 (and valid
+                      (ssh-authorization-permit-entry-port-p rule-port port)
+                      (ssh-match-pattern rule-host wanted-host))))
+             rules)))))
+
 (defun ssh-session-permits-tcpip-forward-p (session host port)
-  "Whether SESSION may ask the server to listen on HOST:PORT."
+  "Whether SESSION may ask the server to listen on HOST:PORT.
+
+Both restrictions apply, as in sshd: the key's permitlisten= options and the
+administrator's PermitListen, if either names one."
   (let ((options (ssh-session-authorization session)))
     (and (ssh-authorization-options-permit-port-forwarding-p options)
-         (ssh-authorization-options-permit-listen-p options host port))))
+         (ssh-authorization-options-permit-listen-p options host port)
+         (ssh-server-permit-listen-allows-p
+          (ssh-session-setting session #'ssh-server-config-permit-listen)
+          host port))))
 
 ;;; ---- AcceptEnv ----
-
-(defun ssh-match-pattern (pattern text)
-  "Whether TEXT matches PATTERN, with sshd's match_pattern(3) semantics.
-
-Only * and ? are special; a * matches any run of characters, a ? exactly one,
-and nothing else is quoted.  This is what AcceptEnv uses, which is narrower
-than the bracket classes an ssh_config Host pattern allows."
-  (cond
-    ((zerop (length pattern)) (zerop (length text)))
-    ((char= (char pattern 0) #\*)
-     (let ((rest (string-left-trim "*" pattern)))
-       (if (zerop (length rest))
-           t
-           (loop for index from 0 to (length text)
-                 thereis (ssh-match-pattern rest (subseq text index))))))
-    ((zerop (length text)) nil)
-    ((or (char= (char pattern 0) #\?)
-         (char= (char pattern 0) (char text 0)))
-     (ssh-match-pattern (subseq pattern 1) (subseq text 1)))
-    (t nil)))
 
 (defun ssh-match-pattern-list-state (patterns text)
   "TEXT against PATTERNS as sshd's match_pattern_list(3): :DENIED, :MATCHED or NIL.

@@ -1034,6 +1034,18 @@ terminal name and both sizes are kept."
 
 ;;; ---- Public entry points ----
 
+(defun ssh-plibssh-bind-algorithm-option (bind code option value)
+  "Set bind algorithm list VALUE (a list of names) for OPTION.
+A NIL VALUE leaves libssh's own default in place.  A value libssh refuses is
+this program's error, because a configured list is meant exactly as written."
+  (when value
+    (when (minusp (ssh-plibssh-bind-string-option
+                   bind code (format nil "~{~A~^,~}" value)))
+      (let ((detail (ssh-plibssh-error bind)))
+        (ssh-bind-free bind)
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected ~A: ~A" option detail))))))
+
 (defun make-ssh-server (address port
                         &key
                           host-key
@@ -1083,11 +1095,23 @@ sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
 MAX-STARTUPS, PER-SOURCE-MAX-STARTUPS, PER-SOURCE-NET-BLOCK-SIZE,
 UNUSED-CONNECTION-TIMEOUT and TCP-KEEP-ALIVE are the pure backend's, with
 the same meanings and defaults."
-  (let* ((keys (mapcar (lambda (value)
+  (let* ((required-rsa-size
+           (and sshd-config
+                (ssh-server-config-required-rsa-size sshd-config)))
+         (keys (mapcar (lambda (value)
                          (if (typep value 'ssh-private-key)
                              value
                              (ssh-load-private-key value)))
                        (if (listp host-key) host-key (list host-key))))
+         ;; sshd loads each HostKey and skips an RSA one that RequiredRSASize
+         ;; rejects; the smallest allowed size (1024) applies even when the
+         ;; directive is absent or lower.  Filtering here keeps libssh from
+         ;; aborting startup over one bad file.
+         (keys (remove-if-not
+                (lambda (key)
+                  (ssh-key-rsa-size-allowed-p
+                   (ssh-public-key-blob-of key) required-rsa-size))
+                keys))
          (version (if server-version
                       (check-server-version server-version)
                       (subseq +ssh-server-version+
@@ -1160,9 +1184,57 @@ the same meanings and defaults."
         (error 'ssh-connection-error
                :detail (format nil "libssh rejected the config flag: ~A"
                                detail))))
+    ;; The configured algorithm lists replace libssh's own defaults only when
+    ;; the directive was present; an unset directive leaves the backend's
+    ;; defaults, as it did before these options existed.  libssh appends the
+    ;; strict-KEX and EXT_INFO markers itself, so KexAlgorithms is the plain
+    ;; method list.  RequiredRSASize is set before the host keys so libssh
+    ;; applies it to them as well as to user keys.
+    (when sshd-config
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-key-exchange+ "KexAlgorithms"
+       (ssh-server-config-kex-algorithms sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-ciphers-c-s+ "Ciphers"
+       (ssh-server-config-ciphers sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-ciphers-s-c+ "Ciphers"
+       (ssh-server-config-ciphers sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-hmac-c-s+ "MACs"
+       (ssh-server-config-macs sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-hmac-s-c+ "MACs"
+       (ssh-server-config-macs sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-hostkey-algorithms+ "HostKeyAlgorithms"
+       (ssh-server-config-host-key-algorithms sshd-config))
+      (ssh-plibssh-bind-algorithm-option
+       bind +ssh-bind-options-pubkey-accepted-key-types+
+       "PubkeyAcceptedAlgorithms"
+       (ssh-server-config-pubkey-accepted-algorithms sshd-config))
+      ;; libssh rejects a value between 1 and 767 and then applies its own
+      ;; 1024-bit floor (2048 under FIPS).  sshd likewise lets its 1024-bit
+      ;; floor win over any smaller RequiredRSASize, so a smaller value is
+      ;; simply left unset rather than handed to libssh as an error.
+      (when (and required-rsa-size
+                 (>= required-rsa-size +ssh-rsa-minimum-modulus-size+))
+        (when (minusp (ssh-plibssh-bind-int-option
+                       bind +ssh-bind-options-rsa-min-size+
+                       required-rsa-size))
+          (let ((detail (ssh-plibssh-error bind)))
+            (ssh-bind-free bind)
+            (error 'ssh-connection-error
+                   :detail (format nil "libssh rejected RequiredRSASize: ~A"
+                                   detail))))))
     (unless keys
       (ssh-bind-free bind)
-      (error 'ssh-connection-error :detail "no host key given"))
+      (error 'ssh-connection-error
+             :detail (if host-key
+                         (format nil "no host key is at least ~D bits"
+                                 (or required-rsa-size
+                                     +ssh-rsa-minimum-modulus-size+))
+                         "no host key given")))
     (dolist (key keys)
       (let ((path (or (ssh-private-key-path key)
                       (progn

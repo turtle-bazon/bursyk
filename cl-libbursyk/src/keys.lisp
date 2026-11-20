@@ -54,6 +54,32 @@ reads them as the protocol lays them out."
                 (ssh-read-string reader)
                 (ssh-read-octets reader (ssh-reader-remaining reader))))))
 
+(defun ssh-rsa-public-key-bits (key-blob)
+  "The modulus bit length of an ssh-rsa KEY-BLOB, or NIL for another type."
+  (handler-case
+      (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+        (when (string= type "ssh-rsa")
+          (let ((reader (ssh-make-reader data)))
+            ;; The wire order is e, then n.
+            (ssh-read-mpint reader)
+            (integer-length (ssh-read-mpint reader)))))
+    (error () nil)))
+
+(defun ssh-key-rsa-size-allowed-p (key-blob minimum)
+  "Whether KEY-BLOB satisfies sshd's RSA minimum and the configured MINIMUM.
+
+Only RSA keys have a size floor: sshd rejects any RSA modulus below its
+SSH_RSA_MINIMUM_MODULUS_SIZE (1024) even when RequiredRSASize is lower, and
+rejects one below MINIMUM when that directive set a stricter size.  A NIL or
+non-positive MINIMUM leaves only the built-in floor.  Every other key type
+passes, as sshkey_check_rsa_length does."
+  (let ((bits (ssh-rsa-public-key-bits key-blob)))
+    (or (null bits)
+        (and (>= bits +ssh-rsa-minimum-modulus-size+)
+             (or (not (integerp minimum))
+                 (<= minimum 0)
+                 (>= bits minimum))))))
+
 (defun ssh-make-public-key-blob (type data)
   "A public key blob from TYPE and its type-specific DATA.
 

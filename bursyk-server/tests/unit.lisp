@@ -431,6 +431,88 @@ PermitRootLogin yes"))))
              (cl-pnet-ssh:ssh-server-config-warnings
               (config-from-text "PrintMotd no")))))
 
+(test sshd-config-reads-algorithm-policy
+  (let ((config (config-from-text
+                 "Ciphers +chacha20-poly1305@openssh.com
+MACs -hmac-sha2-256
+KexAlgorithms +curve25519-sha256@libssh.org
+HostKeyAlgorithms ssh-ed25519
+PubkeyAcceptedAlgorithms rsa-sha2-512,ssh-ed25519
+RequiredRSASize 2048
+PermitListen 8080 127.0.0.1:9000")))
+    (is (equal '("chacha20-poly1305@openssh.com")
+               (cl-pnet-ssh:ssh-server-config-ciphers config)))
+    ;; "-name" removes from the build's list and leaves the rest in order.
+    (is (equal '("hmac-sha2-512")
+               (cl-pnet-ssh:ssh-server-config-macs config)))
+    (is (equal '("curve25519-sha256" "curve25519-sha256@libssh.org")
+               (cl-pnet-ssh:ssh-server-config-kex-algorithms config)))
+    ;; A plain list replaces the default outright.
+    (is (equal '("ssh-ed25519")
+               (cl-pnet-ssh:ssh-server-config-host-key-algorithms config)))
+    (is (equal '("rsa-sha2-512" "ssh-ed25519")
+               (cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
+                config)))
+    (is (eql 2048
+           (cl-pnet-ssh:ssh-server-config-required-rsa-size config)))
+    ;; A bare port is "*:PORT", as sshd expands PermitListen.
+    (is (equal '("*:8080" "127.0.0.1:9000")
+               (cl-pnet-ssh:ssh-server-config-permit-listen config))))
+  ;; PubkeyAcceptedKeyTypes is the obsolete spelling of the same directive,
+  ;; and the first of either name wins.
+  (is (equal '("ssh-ed25519")
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
+              "PubkeyAcceptedKeyTypes ssh-ed25519")))
+  (is (equal '("ssh-ed25519")
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
+              "PubkeyAcceptedAlgorithms ssh-ed25519
+PubkeyAcceptedKeyTypes rsa-sha2-512")))
+  ;; An algorithm this build cannot offer is an error, not a quiet drop.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Ciphers aes128-ctr"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "KexAlgorithms no-such-kex"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "HostKeyAlgorithms ssh-dss"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RequiredRSASize -1"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PermitListen not-a-port"))
+  ;; Ciphers, MACs, KexAlgorithms and HostKeyAlgorithms are global only.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+  Ciphers chacha20-poly1305@openssh.com")))
+
+(test match-blocks-read-per-connection-algorithm-policy
+  (let* ((config (config-from-text
+                  "PermitListen *:22
+RequiredRSASize 1024
+PubkeyAcceptedAlgorithms ssh-ed25519
+Match User alice
+  PermitListen localhost:8080
+  RequiredRSASize 3072
+  PubkeyAcceptedAlgorithms rsa-sha2-512"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal '("localhost:8080")
+               (cl-pnet-ssh:ssh-server-config-permit-listen alice)))
+    (is (eql 3072
+           (cl-pnet-ssh:ssh-server-config-required-rsa-size alice)))
+    (is (equal '("rsa-sha2-512")
+               (cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
+                alice)))
+    (is (equal '("*:22")
+               (cl-pnet-ssh:ssh-server-config-permit-listen bob)))
+    (is (eql 1024
+           (cl-pnet-ssh:ssh-server-config-required-rsa-size bob)))
+    (is (equal '("ssh-ed25519")
+               (cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
+                bob)))))
+
 (test sshd-config-reads-banner
   "Banner is a path read per connection, or none for no banner at all."
   (is (equal "/etc/issue.net"

@@ -143,7 +143,7 @@
 
 (defun ssh-server-host-key (server)
   "The first host key SERVER presents."
-  (first (ssh-server-host-keys server)))
+  (first (ssh-server-presentable-host-keys server)))
 
 (defstruct (ssh-session (:constructor %make-ssh-session))
   server

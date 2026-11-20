@@ -46,7 +46,7 @@ disconnect rather than a plain application one.")
 
 ;;; ---- Identification and disconnection ----
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.17"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.18"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -98,46 +98,7 @@ with SSH-CONCAT around it would hand the peer the text itself as a length."
     (ssh-writer-output writer)))
 
 
-;;; ---- Algorithm preferences ----
-
-(defparameter +ssh-kex-real-algorithms+
-  '("curve25519-sha256"
-    "curve25519-sha256@libssh.org")
-  "The key-exchange methods themselves, without the protocol markers.")
-
-(defparameter +ssh-kex-algorithms+
-  (append +ssh-kex-real-algorithms+
-          ;; Not algorithms: markers asking the peer to answer EXT_INFO and
-          ;; to reset packet sequence numbers at NEWKEYS (OpenSSH's strict
-          ;; KEX).  They ride along with whatever KexAlgorithms selects.
-          '("ext-info-c"
-            "kex-strict-c-v00@openssh.com")))
-
-(defparameter +ssh-host-key-algorithms+
-  '("ssh-ed25519"
-    "ecdsa-sha2-nistp256"
-    "ecdsa-sha2-nistp384"
-    "ecdsa-sha2-nistp521"
-    ;; RSA host keys keep the ssh-rsa key format while rsa-sha2 names the
-    ;; signature; SHA-1 ssh-rsa stays last for servers that never learned
-    ;; the newer names.
-    "rsa-sha2-512"
-    "rsa-sha2-256"
-    "ssh-rsa")
-  "Host key algorithms offered to a server, in preference order.")
-
-(defparameter +ssh-server-host-key-preference+
-  '("ssh-ed25519"
-    "ecdsa-sha2-nistp256"
-    "ecdsa-sha2-nistp384"
-    "ecdsa-sha2-nistp521"
-    "rsa-sha2-512"
-    "rsa-sha2-256"
-    "ssh-rsa")
-  "Host key algorithms a server can present, in preference order.
-
-A server advertises only those its loaded keys can actually sign with, so a
-client never selects an algorithm that would fail at KEX_ECDH_REPLY.")
+;;; ---- Host key selection ----
 
 (defun ssh-server-host-key-algorithm-p (key algorithm)
   "Whether private KEY can sign with host key ALGORITHM."
@@ -152,14 +113,18 @@ client never selects an algorithm that would fail at KEX_ECDH_REPLY.")
            (t
             (string= type algorithm))))))
 
-(defun ssh-server-host-key-algorithms (keys)
-  "The host key algorithms KEYS can present, in preference order."
+(defun ssh-server-host-key-algorithms (keys &optional allowed)
+  "The host key algorithms KEYS can present, in preference order.
+
+ALLOWED, when given, is the configured HostKeyAlgorithms list and replaces
+the default preference order; the result still holds only algorithms a
+loaded key can sign with."
   (remove-if-not
    (lambda (algorithm)
      (some (lambda (key)
              (ssh-server-host-key-algorithm-p key algorithm))
            keys))
-   +ssh-server-host-key-preference+))
+   (or allowed +ssh-server-host-key-preference+)))
 
 (defun ssh-server-host-key-for (keys algorithm)
   "The first of KEYS able to sign with host key ALGORITHM, or NIL."
@@ -179,87 +144,6 @@ rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa."
        (ssh-ed25519-signature-blob key message))
       (t (ssh-ecdsa-signature-blob key message)))))
 
-
-(defparameter +ssh-ciphers+ '("chacha20-poly1305@openssh.com"))
-
-;; chacha20-poly1305@openssh.com is an AEAD and ignores the MAC, but RFC 4253
-;; still negotiates one of these, and OpenSSH expects a common choice.
-(defparameter +ssh-macs+ '("hmac-sha2-256" "hmac-sha2-512"))
-
-(defparameter +ssh-compressions+ '("none"))
-
-(defun ssh-choose-algorithm (ours theirs)
-  "The first of OURS that is also in THEIRS, or NIL."
-  (iter (for candidate in ours)
-    (when (member candidate theirs :test #'string=)
-      (leave candidate))))
-
-(defun ssh-algorithm-pattern-matches (pattern supported option)
-  "SUPPORTED names matching the glob PATTERN, in SUPPORTED order."
-  (when (and (plusp (length pattern)) (char= (char pattern 0) #\!))
-    (error 'ssh-config-error
-           :keyword option
-           :detail (format nil "negated pattern ~A is not allowed here"
-                           pattern)))
-  (let ((matches (remove-if-not (lambda (name)
-                                  (ssh-match-pattern pattern name))
-                                supported)))
-    (unless matches
-      (error 'ssh-config-error
-             :keyword option
-             :detail (format nil "~A matches no algorithm this build offers (~{~A~^, ~})"
-                             pattern supported)))
-    matches))
-
-(defun ssh-resolve-algorithm-list (names supported option)
-  "NAMES, a configured algorithm list, as the ordered list this build offers.
-
-NAMES is the comma-separated list ssh_config or a command-line flag gave,
-split into strings.  ssh's prefixes apply: a leading + appends to SUPPORTED,
-- removes from it, and ^ puts the named algorithms first.  A plain list
-replaces SUPPORTED outright, so an algorithm absent from this build is an
-error instead of being silently dropped."
-  (let* ((text (format nil "~{~A~^,~}" (remove "" names :test #'string=)))
-         (head (and (plusp (length text)) (char text 0)))
-         (mode (cond ((null head) :replace)
-                     ((char= head #\+) :append)
-                     ((char= head #\-) :remove)
-                     ((char= head #\^) :prepend)
-                     (t :replace)))
-         (patterns (if (eq mode :replace) text (subseq text 1))))
-    (flet ((expand ()
-             (let ((result '()))
-               (dolist (pattern (uiop:split-string patterns :separator ",")
-                        (nreverse result))
-                 (dolist (name (ssh-algorithm-pattern-matches
-                                pattern supported option))
-                   (pushnew name result :test #'string=))))))
-      (ecase mode
-        (:replace
-         (expand))
-        (:append
-         (let ((result (copy-list supported)))
-           (dolist (name (expand) result)
-             (unless (member name result :test #'string=)
-               (setf result (append result (list name)))))))
-        (:prepend
-         (let ((result (expand)))
-           (dolist (name supported result)
-             (unless (member name result :test #'string=)
-               (setf result (append result (list name)))))))
-        (:remove
-         (let ((kept (remove-if (lambda (name)
-                                  (some (lambda (pattern)
-                                          (ssh-match-pattern pattern name))
-                                        (uiop:split-string
-                                         patterns :separator ",")))
-                                supported)))
-           (unless kept
-             (error 'ssh-config-error
-                    :keyword option
-                    :detail (format nil "~A removes every algorithm this build offers"
-                                    text)))
-           kept))))))
 
 (defun ssh-kex-with-markers (kex)
   "KEX with the EXT_INFO and strict-KEX markers this client always offers."

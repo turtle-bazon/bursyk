@@ -144,11 +144,9 @@ socket address and has no routing domains.")
     "trustedusercakeys" "revokedkeys" "hostcertificate"
     "authenticationmethods"
     "channeltimeout"
-    "ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
-    "pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
-    "pubkeyauthoptions" "requiredrsasize" "hostkeyagent"
-    "permitlisten" "streamlocalbindmask" "streamlocalbindunlink"
+    "pubkeyauthoptions" "hostkeyagent"
+    "streamlocalbindmask" "streamlocalbindunlink"
     "exposeauthinfo"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
@@ -165,6 +163,17 @@ socket address and has no routing domains.")
   (authorized-keys-files nil)
   (accept-env '())
   (permit-open '())
+  (permit-listen '())
+  ;; Algorithm choices.  NIL means this build's default; a list is the exact
+  ;; order the directive chose, already resolved from sshd's + / - / ^ form.
+  ;; Ciphers, MACs, KexAlgorithms and HostKeyAlgorithms are global-only;
+  ;; PubkeyAcceptedAlgorithms and RequiredRSASize may come from a Match block.
+  (ciphers nil)
+  (macs nil)
+  (kex-algorithms nil)
+  (host-key-algorithms nil)
+  (pubkey-accepted-algorithms nil)
+  (required-rsa-size nil)
   (gateway-ports nil)
   (allow-tcp-forwarding nil)
   (disable-forwarding nil)
@@ -300,6 +309,18 @@ carrying = or a space cannot be passed to execve safely."
      line "~A must be a non-negative number, not ~A"
      (ssh-config-line-keyword line) argument))
   (parse-integer argument))
+
+(defun ssh-server-config-resolve-algorithms (line names supported option
+                                             &key all)
+  "NAMES resolved by SSH-RESOLVE-ALGORITHM-LIST, as a config error on LINE.
+
+The shared resolver reports an ssh_config error, whose detail names the
+algorithm and the option; re-signalling it as an sshd_config error keeps the
+file and line number an operator needs."
+  (handler-case
+      (ssh-resolve-algorithm-list names supported option :all (or all supported))
+    (ssh-config-error (condition)
+      (ssh-server-config-line-error line "~A" (ssh-error-detail condition)))))
 
 (defun ssh-parse-time (value)
   "VALUE as sshd's convtime reads a time, in seconds, or NIL.
@@ -579,6 +600,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
   '(permit-root-login max-auth-tries max-sessions
     client-alive-interval client-alive-count-max
     force-command banner authorized-keys-files accept-env permit-open
+    permit-listen pubkey-accepted-algorithms required-rsa-size
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     unused-connection-timeout
     allow-users deny-users allow-groups deny-groups)
@@ -706,6 +728,49 @@ cannot apply per connection."
             ;; authenticating, so "none" may sit beside real files.
             (setf (ssh-server-config-authorized-keys-files config)
                   (mapcar #'ssh-config-expand-home arguments))))))
+      ;; ---- algorithms ----
+      ;; sshd resolves these with kex_assemble_names: the configured text may
+      ;; replace the default list or adjust it with + - ^.  Resolving here
+      ;; means a typo stops the server at startup instead of narrowing the
+      ;; offer silently, and the stored list is the exact order KEXINIT uses.
+      ((string= keyword "ciphers")
+       (ssh-server-config-set-once
+        config 'ciphers
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-ciphers+ "Ciphers")))
+      ((string= keyword "macs")
+       (ssh-server-config-set-once
+        config 'macs
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-macs+ "MACs")))
+      ((string= keyword "kexalgorithms")
+       (ssh-server-config-set-once
+        config 'kex-algorithms
+        ;; The strict-KEX and EXT_INFO markers are not negotiable methods;
+        ;; they are added to every offer after this list is chosen.
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-kex-real-algorithms+ "KexAlgorithms")))
+      ((string= keyword "hostkeyalgorithms")
+       (ssh-server-config-set-once
+        config 'host-key-algorithms
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-server-host-key-preference+
+         "HostKeyAlgorithms")))
+      ((or (string= keyword "pubkeyacceptedalgorithms")
+           (string= keyword "pubkeyacceptedkeytypes"))
+       ;; PubkeyAcceptedKeyTypes is the obsolete name for the same field;
+       ;; sshd keeps whichever line it reads first.
+       (ssh-server-config-set-once
+        config 'pubkey-accepted-algorithms
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-server-user-key-algorithms+
+         (ssh-config-line-keyword line)
+         :all +ssh-server-user-key-all-algorithms+)))
+      ((string= keyword "requiredrsasize")
+       (ssh-server-config-set-once
+        config 'required-rsa-size
+        (ssh-server-config-count
+         line (ssh-server-config-one-argument line))))
       ;; ---- environment ----
       ((string= keyword "acceptenv")
        (dolist (argument arguments)
@@ -774,6 +839,40 @@ cannot apply per connection."
                         line "bad PermitOpen ~A" argument))
                      (push argument
                            (ssh-server-config-permit-open config))))))))
+      ((string= keyword "permitlisten")
+       ;; PermitListen is PermitOpen's remote-forwarding counterpart.  sshd
+       ;; treats a bare port as "*:port", because a client that asks for a
+       ;; port without a host means every address.
+       (when (null (ssh-server-config-permit-listen config))
+         (if (and (cdr arguments)
+                  (member (string-downcase (first arguments))
+                          '("any" "none") :test #'string=))
+             (ssh-server-config-line-error
+              line "PermitListen ~A takes no other argument"
+              (first arguments))
+             (if (and (= (length arguments) 1)
+                      (member (string-downcase (first arguments))
+                              '("any" "none") :test #'string=))
+                 (setf (ssh-server-config-permit-listen config)
+                       (list (string-downcase (first arguments))))
+                 (dolist (argument arguments)
+                   (if (not (find #\: argument))
+                       (let ((port (ssh-server-config-port-string argument)))
+                         (unless port
+                           (ssh-server-config-line-error
+                            line "bad PermitListen ~A" argument))
+                         (push (format nil "*:~A" argument)
+                               (ssh-server-config-permit-listen config)))
+                       (multiple-value-bind (host port)
+                           (ssh-server-config-split-host-port line argument)
+                         (unless (and (plusp (length host))
+                                      port
+                                      (or (string= port "*")
+                                          (ssh-server-config-port-string port)))
+                           (ssh-server-config-line-error
+                            line "bad PermitListen ~A" argument))
+                         (push argument
+                               (ssh-server-config-permit-listen config)))))))))
       ((string= keyword "gatewayports")
        (ssh-server-config-set-once
         config 'gateway-ports
@@ -1100,6 +1199,7 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-host-key-files)
     (reverse-slot ssh-server-config-accept-env)
     (reverse-slot ssh-server-config-permit-open)
+    (reverse-slot ssh-server-config-permit-listen)
     (reverse-slot ssh-server-config-allow-users)
     (reverse-slot ssh-server-config-deny-users)
     (reverse-slot ssh-server-config-allow-groups)

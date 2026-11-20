@@ -171,6 +171,13 @@
    #:ssh-server-config-authorized-keys-files
    #:ssh-server-config-accept-env
    #:ssh-server-config-permit-open
+   #:ssh-server-config-permit-listen
+   #:ssh-server-config-ciphers
+   #:ssh-server-config-macs
+   #:ssh-server-config-kex-algorithms
+   #:ssh-server-config-host-key-algorithms
+   #:ssh-server-config-pubkey-accepted-algorithms
+   #:ssh-server-config-required-rsa-size
    #:ssh-server-config-gateway-ports
    #:ssh-server-config-allow-tcp-forwarding
    #:ssh-server-config-disable-forwarding

@@ -1218,6 +1218,244 @@ share the test, so each must dispatch the same channel requests."
                           keys "rsa-sha2-512")))))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
+;;; ---- algorithm choices from sshd_config ----
+;;
+;;; The pure backend builds KEXINIT from these choices.  The libssh backend
+;;; passes the same lists to ssh_bind_options_set, so its own checks are in
+;;; CL-PLIBSSH and not exercised here.
+
+#-ssh-backend-ffi
+(defun test-server-algorithm-keys (directory)
+  "Generate ed25519 and 2048-bit RSA keys under DIRECTORY, as a list."
+  (let ((ed25519 (merge-pathnames "ed25519" directory))
+        (rsa (merge-pathnames "rsa-2048" directory)))
+    (ensure-directories-exist ed25519)
+    (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                      "-f" (namestring ed25519)))
+    (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                      "-f" (namestring rsa)))
+    (list (ssh-load-private-key ed25519)
+          (ssh-load-private-key rsa))))
+
+#-ssh-backend-ffi
+(test server-kexinit-honours-configured-algorithms
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((directory (ssh-test-directory "cl-pnet-ssh-algos")))
+        (unwind-protect
+             (let* ((keys (test-server-algorithm-keys directory))
+                    (config
+                      (ssh-server-config-load
+                       nil
+                       :options
+                       '("Ciphers chacha20-poly1305@openssh.com"
+                         "MACs hmac-sha2-512"
+                         "KexAlgorithms curve25519-sha256@libssh.org"
+                         "HostKeyAlgorithms rsa-sha2-512")))
+                    (server (cl-pnet-ssh::%make-ssh-server
+                             :host-keys keys :sshd-config config))
+                    (session (cl-pnet-ssh::%make-ssh-session :server server))
+                    (offer
+                      (ssh-parse-kexinit-payload
+                       (cl-pnet-ssh::ssh-server-make-kexinit-payload
+                        session))))
+               ;; The chosen method, then the markers a KexAlgorithms value
+               ;; must never remove.
+               (is (equal '("curve25519-sha256@libssh.org"
+                            "kex-strict-s-v00@openssh.com"
+                            "ext-info-s")
+                          (getf offer :kex)))
+               ;; Only rsa-sha2-512 was chosen and the RSA key can sign it.
+               (is (equal '("rsa-sha2-512") (getf offer :host-keys)))
+               (is (equal '("chacha20-poly1305@openssh.com")
+                          (getf offer :ciphers-c2s)))
+               (is (equal '("hmac-sha2-512") (getf offer :macs-c2s)))
+               ;; Negotiation must pick from the same restricted lists, not
+               ;; merely advertise them.
+               (let ((negotiated
+                       (cl-pnet-ssh::ssh-server-negotiate
+                        session
+                        '(:kex ("curve25519-sha256"
+                                "curve25519-sha256@libssh.org")
+                          :host-keys ("ssh-ed25519" "rsa-sha2-512")
+                          :ciphers-c2s ("chacha20-poly1305@openssh.com")
+                          :ciphers-s2c ("chacha20-poly1305@openssh.com")
+                          :macs-c2s ("hmac-sha2-256" "hmac-sha2-512")
+                          :macs-s2c ("hmac-sha2-256" "hmac-sha2-512")
+                          :compressions-c2s ("none")))))
+                 (is (equal "curve25519-sha256@libssh.org"
+                            (getf negotiated :kex)))
+                 (is (equal "rsa-sha2-512" (getf negotiated :host-key)))
+                 (is (equal "hmac-sha2-512"
+                            (getf negotiated :mac-c2s)))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+#-ssh-backend-ffi
+(test server-host-keys-obey-required-rsa-size
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((directory (ssh-test-directory "cl-pnet-ssh-rsasize")))
+        (unwind-protect
+             (let* ((short (merge-pathnames "rsa-1024" directory))
+                    (long (merge-pathnames "rsa-2048" directory))
+                    (ed25519 (merge-pathnames "ed25519" directory)))
+               (ensure-directories-exist short)
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "1024" "-N" ""
+                                 "-f" (namestring short)))
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring long)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ed25519)))
+               (let* ((short-key (ssh-load-private-key short))
+                      (long-key (ssh-load-private-key long))
+                      (ed-key (ssh-load-private-key ed25519))
+                      (restricted
+                        (ssh-server-config-load
+                         nil :options '("RequiredRSASize 2048")))
+                      (default (ssh-server-config-load nil))
+                      (session-for
+                        (lambda (config)
+                          (let ((server (cl-pnet-ssh::%make-ssh-server
+                                         :host-keys (list short-key long-key
+                                                          ed-key)
+                                         :sshd-config config)))
+                            (cl-pnet-ssh::%make-ssh-session
+                             :server server)))))
+                 ;; 2048 is the minimum, so the 1024-bit key is skipped and
+                 ;; the other two are still presentable.
+                 (let ((keys (cl-pnet-ssh::ssh-session-host-keys
+                              (funcall session-for restricted))))
+                   (is (= 2 (length keys)))
+                   (is (not (member short-key keys :test #'eq)))
+                   (is (member long-key keys :test #'eq))
+                   (is (member ed-key keys :test #'eq))
+                   ;; Only the remaining keys' algorithms are advertised.
+                   (is (equal '("ssh-ed25519" "rsa-sha2-512" "rsa-sha2-256"
+                                "ssh-rsa")
+                              (cl-pnet-ssh::ssh-server-host-key-algorithms-for
+                               (funcall session-for restricted)))))
+                 ;; Without the directive sshd still enforces its own 1024-bit
+                 ;; floor, which the short key meets.
+                 (is (= 3
+                        (length (cl-pnet-ssh::ssh-session-host-keys
+                                 (funcall session-for default)))))
+                 ;; Host keys are filtered once at startup from the global
+                 ;; directive; a Match block that lowers RequiredRSASize must
+                 ;; not bring a key sshd already skipped back into KEXINIT.
+                 (let ((session
+                         (cl-pnet-ssh::%make-ssh-session
+                          :server (cl-pnet-ssh::%make-ssh-server
+                                   :host-keys (list short-key long-key ed-key)
+                                   :sshd-config restricted)
+                          :config
+                          (ssh-server-config-load
+                           nil :options '("RequiredRSASize 1024")))))
+                   (is (= 2 (length (cl-pnet-ssh::ssh-session-host-keys
+                                     session))))
+                   (is (not (member short-key
+                                    (cl-pnet-ssh::ssh-session-host-keys session)
+                                    :test #'eq))))
+                 ;; sshd refuses to start rather than listen with no usable
+                 ;; host key; the caller's own NIL list is left alone.
+                 (signals ssh-connection-error
+                   (cl-pnet-ssh::ssh-server-check-host-keys
+                    (list short-key) 2048))
+                 (is (equal (list short-key)
+                            (cl-pnet-ssh::ssh-server-check-host-keys
+                             (list short-key) nil)))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+#-ssh-backend-ffi
+(test server-user-key-policy-follows-config
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((directory (ssh-test-directory "cl-pnet-ssh-userkey")))
+        (unwind-protect
+             (let* ((short (merge-pathnames "rsa-1024" directory))
+                    (ed25519 (merge-pathnames "ed25519" directory)))
+               (ensure-directories-exist short)
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "1024" "-N" ""
+                                 "-f" (namestring short)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ed25519)))
+               (let* ((rsa-blob (ssh-public-key-blob-of
+                                 (ssh-load-private-key short)))
+                      (ed-blob (ssh-public-key-blob-of
+                                (ssh-load-private-key ed25519)))
+                      (restricted
+                        (ssh-server-config-load
+                         nil
+                         :options
+                         '("PubkeyAcceptedAlgorithms rsa-sha2-512"
+                           "RequiredRSASize 2048")))
+                      (default (ssh-server-config-load nil))
+                      (session-for
+                        (lambda (config)
+                          (let ((server (cl-pnet-ssh::%make-ssh-server
+                                         :host-keys nil :sshd-config config)))
+                            (cl-pnet-ssh::%make-ssh-session
+                             :server server)))))
+                 (let ((session (funcall session-for restricted)))
+                   ;; The configured list replaces the default, so an
+                   ;; ed25519 signature and SHA-1 ssh-rsa are both refused.
+                   (is (not (cl-pnet-ssh::ssh-session-user-key-algorithm-p
+                             session ed-blob "ssh-ed25519")))
+                   (is (cl-pnet-ssh::ssh-session-user-key-algorithm-p
+                        session rsa-blob "rsa-sha2-512"))
+                   (is (not (cl-pnet-ssh::ssh-session-user-key-algorithm-p
+                             session rsa-blob "ssh-rsa")))
+                   ;; RequiredRSASize 2048 rejects the 1024-bit key.
+                   (is (not (cl-pnet-ssh::ssh-session-user-key-length-p
+                             session rsa-blob)))
+                   (is (cl-pnet-ssh::ssh-session-user-key-length-p
+                        session ed-blob)))
+                 ;; Without the directives, the old SHA-1 name stays usable
+                 ;; for old clients and the built-in 1024-bit floor passes.
+                 (let ((session (funcall session-for default)))
+                   (is (cl-pnet-ssh::ssh-session-user-key-algorithm-p
+                        session rsa-blob "ssh-rsa"))
+                   (is (cl-pnet-ssh::ssh-session-user-key-length-p
+                        session rsa-blob)))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+#-ssh-backend-ffi
+(test server-permit-listen-restricts-remote-forwards
+  (let* ((config
+           (ssh-server-config-load
+            nil
+            :options '("PermitListen 8080 localhost:9000")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :authorization
+                   (cl-pnet-ssh::%make-ssh-authorization-options))))
+    ;; A bare port is a wildcard host.
+    (is (ssh-session-permits-tcpip-forward-p session "" 8080))
+    (is (ssh-session-permits-tcpip-forward-p session "example.com" 8080))
+    ;; A named host matches case-insensitively and only that host.
+    (is (ssh-session-permits-tcpip-forward-p session "localhost" 9000))
+    (is (ssh-session-permits-tcpip-forward-p session "LOCALHOST" 9000))
+    (is (not (ssh-session-permits-tcpip-forward-p session "" 9000)))
+    (is (not (ssh-session-permits-tcpip-forward-p session "example.com" 9000)))
+    (is (not (ssh-session-permits-tcpip-forward-p session "localhost" 8081)))
+    ;; PermitListen none refuses every listener.
+    (let* ((none (ssh-server-config-load
+                  nil :options '("PermitListen none")))
+           (session (cl-pnet-ssh::%make-ssh-session
+                     :server (cl-pnet-ssh::%make-ssh-server :sshd-config none)
+                     :authorization
+                     (cl-pnet-ssh::%make-ssh-authorization-options))))
+      (is (not (ssh-session-permits-tcpip-forward-p session "" 8080))))
+    ;; The key's own permitlisten= narrows the administrator's list further.
+    (let ((session (cl-pnet-ssh::%make-ssh-session
+                    :server server
+                    :authorization
+                    (cl-pnet-ssh::%make-ssh-authorization-options
+                     :permit-listen '(("localhost" . 8080))))))
+      (is (ssh-session-permits-tcpip-forward-p session "localhost" 8080))
+      (is (not (ssh-session-permits-tcpip-forward-p
+                session "example.com" 8080))))))
+
 (test server-loopback-exec-multiple-host-keys
   ;; The server advertises several key types and the client picks the one it
   ;; prefers; the KEX must succeed whichever key is chosen.
@@ -1426,7 +1664,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.17" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.18" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))
