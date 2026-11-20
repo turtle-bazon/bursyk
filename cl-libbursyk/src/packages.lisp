@@ -35,6 +35,7 @@
    #:ssh-server-close
    #:ssh-server-address
    #:ssh-server-port
+   #:ssh-server-version
    #:ssh-server-host-key
    #:ssh-session
    #:ssh-session-p
@@ -51,6 +52,12 @@
    #:ssh-server-channel-command
    #:ssh-server-channel-env
    #:ssh-server-channel-remote-address
+   #:ssh-server-channel-pty-p
+   #:ssh-server-channel-pty-term
+   #:ssh-server-channel-pty-columns
+   #:ssh-server-channel-pty-rows
+   #:ssh-server-channel-pty-modes
+   #:ssh-server-channel-subsystem
    #:ssh-server-channel-write
    #:ssh-server-channel-write-stderr
    #:ssh-server-channel-eof
@@ -60,6 +67,10 @@
    #:ssh-server-channel-on-data
    #:ssh-server-channel-on-eof
    #:ssh-server-channel-on-exec
+   #:ssh-server-channel-on-pty
+   #:ssh-server-channel-on-shell
+   #:ssh-server-channel-on-subsystem
+   #:ssh-server-channel-on-window-change
    #:ssh-server-channel-on-close
    #:ssh-server-channel-on-error
    ;; ~/.ssh/config

@@ -25,6 +25,29 @@
 (cffi:defcfun ("kill" c-kill) :int (pid :int) (signal :int))
 (cffi:defcfun ("getrlimit" c-getrlimit) :int
   (resource :int) (limits :pointer))
+(cffi:defcfun ("posix_openpt" c-posix-openpt) :int (flags :int))
+(cffi:defcfun ("grantpt" c-grantpt) :int (fd :int))
+(cffi:defcfun ("unlockpt" c-unlockpt) :int (fd :int))
+(cffi:defcfun ("ptsname" c-ptsname) :string (fd :int))
+(cffi:defcfun ("open" c-open) :int
+  (path :string) (flags :int) (mode :int))
+(cffi:defcfun ("setsid" c-setsid) :int)
+(cffi:defcfun ("ioctl" c-ioctl) :int
+  (fd :int) (request :unsigned-long) (argument :pointer))
+
+(cffi:defcstruct winsize
+  (rows :unsigned-short)
+  (columns :unsigned-short)
+  (x-pixels :unsigned-short)
+  (y-pixels :unsigned-short))
+
+;; Linux values.  BURSYK-SERVER is a Linux sshd; the constants are not
+;; abstracted because no other platform runs this binary today.
+(defconstant +o-rdwr+ 2)
+(defconstant +o-noctty+ #o400)
+(defconstant +tiocsctty+ #x540E)
+(defconstant +tiocswinsz+ #x5414)
+(defconstant +sighup+ 1)
 
 (cffi:defcstruct rlimit
   (current :unsigned-long)
@@ -42,6 +65,18 @@
   ;; needs no quoting.  The inner shell is waited for by this one, which then
   ;; reports its status on descriptor 3; that survives an EXIT in the command.
   "/bin/sh -c \"$1\" ; printf '%d' \"$?\" >&3")
+
+(defparameter *program-script*
+  "\"$@\" ; printf '%d' \"$?\" >&3"
+  "Runs a named program and its arguments, then reports the status on 3.")
+
+(defparameter *pty-shell-script*
+  "if [ -n \"$2\" ]; then \"$1\" -c \"$2\"; else \"$1\" -l; fi; printf '%d' \"$?\" >&3"
+  "Runs the user's shell on the allocated pty and reports the status on 3.
+
+$1 is the shell and $2 the command, empty for a login session.  The shell
+is a child of this wrapper, which survives to write the status after the
+shell exits.")
 
 (defun make-pipe ()
   "One (READ . WRITE) descriptor pair."
@@ -138,15 +173,12 @@ STDIN, and duplicating it away first keeps the source valid."
   (c-execve path argv envp)
   (c-quit-now +exec-failed-status+))
 
-(defun spawn-shell (command &key environment)
-  "Run COMMAND under a shell; return (VALUES PID STDIN STDOUT STDERR STATUS).
+(defun spawn-with-pipes (argv environment)
+  "Fork a child running ARGV with pipes on its three standard streams.
 
-ENVIRONMENT, an alist of (NAME . VALUE), is added to the child's environment,
-which is otherwise inherited.  The descriptors are non-blocking and belong to
-the caller.  STATUS yields the command's exit status as decimal text once the
-wrapper shell is done."
-  (let* ((argv (make-argv (list *shell-program* "-c" *shell-script* "sh" command)))
-         (path (cffi:foreign-string-alloc *shell-program*))
+Returns (VALUES PID STDIN STDOUT STDERR STATUS); STATUS is a fourth pipe on
+which the wrapper writes the exit code as decimal text."
+  (let* ((path (cffi:foreign-string-alloc *shell-program*))
          (in (make-pipe))
          (out (make-pipe))
          (err (make-pipe))
@@ -179,6 +211,133 @@ wrapper shell is done."
          (cl-pnet-sockets:set-nonblocking fd))
        (values pid (cdr in) (car out) (car err) (car status))))))
 
+(defun spawn-shell (command &key environment)
+  "Run COMMAND under a shell; return (VALUES PID STDIN STDOUT STDERR STATUS).
+
+ENVIRONMENT, an alist of (NAME . VALUE), is added to the child's environment,
+which is otherwise inherited.  The descriptors are non-blocking and belong to
+the caller.  STATUS yields the command's exit status as decimal text once the
+wrapper shell is done."
+  (spawn-with-pipes
+   (make-argv (list *shell-program* "-c" *shell-script* "sh" command))
+   environment))
+
+(defun spawn-program (program arguments &key environment)
+  "Run PROGRAM with ARGUMENTS, no shell expansion, and report its status.
+
+The same four pipes as SPAWN-SHELL come back, so a subsystem and a command
+share one bridge."
+  (spawn-with-pipes
+   (make-argv (append (list *shell-program* "-c" *program-script* "sh" program)
+                      arguments))
+   environment))
+
+;;; ---- pseudo-terminals ----
+
+(defun make-pty ()
+  "Allocate a pty; return (VALUES MASTER SLAVE).
+The slave is opened without becoming this process's controlling terminal."
+  (let ((master (c-posix-openpt (logior +o-rdwr+ +o-noctty+))))
+    (when (minusp master)
+      (error "cannot allocate a pty: ~A"
+             (cl-pnet-sockets:c-strerror (cl-pnet-sockets:c-errno))))
+    (when (or (minusp (c-grantpt master)) (minusp (c-unlockpt master)))
+      (c-close master)
+      (error "cannot open a pty pair: ~A"
+             (cl-pnet-sockets:c-strerror (cl-pnet-sockets:c-errno))))
+    (let ((slave (c-open (c-ptsname master)
+                         (logior +o-rdwr+ +o-noctty+) 0)))
+      (if (minusp slave)
+          (progn
+            (c-close master)
+            (error "cannot open the pty slave: ~A"
+                   (cl-pnet-sockets:c-strerror
+                    (cl-pnet-sockets:c-errno))))
+          (values master slave)))))
+
+(defun set-pty-size (master rows columns)
+  "Set MASTER's terminal size, which the slave inherits and SIGWINCHs on."
+  (cffi:with-foreign-object (size 'winsize)
+    (setf (cffi:foreign-slot-value size 'winsize 'rows) (max 0 rows)
+          (cffi:foreign-slot-value size 'winsize 'columns) (max 0 columns)
+          (cffi:foreign-slot-value size 'winsize 'x-pixels) 0
+          (cffi:foreign-slot-value size 'winsize 'y-pixels) 0)
+    (c-ioctl master +tiocswinsz+ size)))
+
+(defun child-exec-pty (path argv envp slave status)
+  "Become PATH on the pty SLAVE, with the status pipe on descriptor 3.
+
+SETSID makes the child a session and process-group leader, and TIOCSCTTY
+makes the slave its controlling terminal, so the shell gets job control and
+the kernel delivers SIGWINCH when the master is resized."
+  (c-setsid)
+  (c-ioctl slave +tiocsctty+ (cffi:null-pointer))
+  (c-dup2 slave 0)
+  (c-dup2 slave 1)
+  (c-dup2 slave 2)
+  (c-dup2 status +status-descriptor+)
+  (child-close-extras)
+  (c-execve path argv envp)
+  (c-quit-now +exec-failed-status+))
+
+(defun spawn-pty (argv environment rows columns)
+  "Fork ARGV on a new pty; return (VALUES PID MASTER STATUS).
+
+The child's stdin, stdout and stderr all refer to the slave, so the peer
+sees one merged terminal stream, while STATUS still reports the exit code on
+a pipe the terminal protocol cannot corrupt."
+  (multiple-value-bind (master slave) (make-pty)
+    (set-pty-size master rows columns)
+    (let* ((path (cffi:foreign-string-alloc *shell-program*))
+           (status (make-pipe))
+           (envp nil)
+           (allocated nil)
+           (pid nil))
+      (multiple-value-setq (envp allocated) (make-environment environment))
+      (setf pid (c-fork))
+      (cond
+        ((minusp pid)
+         (c-close master)
+         (c-close slave)
+         (close-pipe status)
+         (free-argv argv)
+         (free-environment envp allocated)
+         (cffi:foreign-string-free path)
+         (error "cannot fork: ~A"
+                (cl-pnet-sockets:c-strerror (cl-pnet-sockets:c-errno))))
+        ((zerop pid)
+         (child-exec-pty path argv envp slave (cdr status)))
+        (t
+         (c-close slave)
+         (c-close (cdr status))
+         (free-argv argv)
+         (free-environment envp allocated)
+         (cffi:foreign-string-free path)
+         (cl-pnet-sockets:set-nonblocking master)
+         (cl-pnet-sockets:set-nonblocking (car status))
+         (values pid master (car status)))))))
+
+(defun spawn-pty-shell (command shell &key environment rows columns)
+  "Run the user's login shell or COMMAND on a pty.
+
+The login shell runs when COMMAND is NIL or empty; otherwise SHELL -c runs
+COMMAND.  The returned master is both the pty's input and its output."
+  (spawn-pty
+   (make-argv (list *shell-program* "-c" *pty-shell-script* "sh"
+                    (or shell *shell-program*) (or command "")))
+   environment (or rows 24) (or columns 80)))
+
+(defun spawn-pty-program (program arguments &key environment rows columns)
+  "Run PROGRAM with ARGUMENTS on a pty, for a subsystem that wants one."
+  (spawn-pty
+   (make-argv (append (list *shell-program* "-c" *program-script* "sh" program)
+                      arguments))
+   environment (or rows 24) (or columns 80)))
+
+(defun set-child-window (master rows columns)
+  "Resize MASTER; the kernel sends SIGWINCH to the child's terminal group."
+  (set-pty-size master rows columns))
+
 (defun collect-child (pid)
   "Reap PID, which has already exited, without waiting for anything."
   (cffi:with-foreign-object (status :int)
@@ -189,3 +348,14 @@ wrapper shell is done."
   "Terminate PID and reap it."
   (c-kill pid +sigkill+)
   (collect-child pid))
+
+(defun kill-child-group (pid)
+  "Terminate PID and every process in its session, then reap the leader.
+
+A pty child called SETSID, so it is the process-group leader and -PID names
+the whole group; the shell it launched must go with it rather than outlive
+the channel."
+  (when (plusp pid)
+    (c-kill (- pid) +sighup+)
+    (c-kill (- pid) +sigkill+)
+    (collect-child pid)))

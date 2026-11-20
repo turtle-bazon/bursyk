@@ -7,19 +7,40 @@
 
 (defvar *options*
   '(:address "0.0.0.0" :port "2222" :host-key nil :authorized-keys nil
-    :accept-env nil :allow nil)
+    :accept-env nil :allow nil :subsystem nil)
   "The command line as parsed.")
 
 (defvar *server* nil)
 (defvar *signal* nil)
+
+(defparameter *default-subsystems*
+  #+win32
+  (list (cons "sftp"
+              (format nil "~A/System32/OpenSSH/sftp-server.exe"
+                      (or (uiop:getenv "WINDIR") "C:\\Windows"))))
+  #-win32
+  '(("sftp" . "/usr/lib/openssh/sftp-server"))
+  "Subsystem names and programs, unless --subsystem replaces them.")
+
+(defparameter +bursyk-server-version+ "0.0.3.0"
+  "The program's own version, also sent in the SSH identification string.
+
+Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
+the value through MAKE-SSH-SERVER, so peers see the server's real name and
+version rather than a generic library string.")
 
 ;;; ---- Command line ----
 
 (defun usage ()
   (format *error-output*
           "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY~%~
-           ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%")
+           ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%~
+           ~15@T[-S NAME=PATH]... [-V]~%")
   (finish-output *error-output*))
+
+(defun print-version ()
+  (format t "bursyk-server ~A~%" +bursyk-server-version+)
+  (finish-output))
 
 (defun fail (format-string &rest arguments)
   (format *error-output* "bursyk-server: ~?~%" format-string arguments)
@@ -35,11 +56,12 @@
          :authorized-keys)
         ((member name '("-e" "--accept-env") :test #'string=) :accept-env)
         ((member name '("-c" "--command") :test #'string=) :allow)
+        ((member name '("-S" "--subsystem") :test #'string=) :subsystem)
         (t nil)))
 
 (defun record-option (key value)
   (case key
-    ((:accept-env :allow) (push value (getf *options* key)))
+    ((:accept-env :allow :subsystem) (push value (getf *options* key)))
     (t (setf (getf *options* key) value))))
 
 (defun parse-arguments (arguments)
@@ -71,19 +93,45 @@
                      (string= prefix command :end2 (length prefix))))
               prefixes))))
 
+(defun split-subsystem (text)
+  "NAME=PATH from one --subsystem argument, as (NAME . PATH)."
+  (let ((equals (position #\= text)))
+    (unless (and equals (plusp equals) (< (1+ equals) (length text)))
+      (fail "not NAME=PATH: ~A" text))
+    (cons (subseq text 0 equals) (subseq text (1+ equals)))))
+
+(defun subsystem-path (name)
+  "The program for subsystem NAME, or NIL when nothing serves it."
+  (let ((configured
+          (assoc name
+                 (mapcar #'split-subsystem
+                         (reverse (getf *options* :subsystem)))
+                 :test #'string=)))
+    (cond
+      (configured (cdr configured))
+      (t (let ((default (assoc name *default-subsystems* :test #'string=)))
+           (and default
+                (probe-file (cdr default))
+                (cdr default)))))))
+
 ;;; ---- Child process bridge ----
 
-(defstruct bridge
+#-win32
+(progn
+  (defstruct bridge
   channel
   pid
   (stdin-fd nil)
   (stdout-fd nil)
   (stderr-fd nil)
   (status-fd nil)
+  (master-fd nil)
+  (pty nil)
   stdin-watcher
   stdout-watcher
   stderr-watcher
   status-watcher
+  master-watcher
   (pending (make-array 0 :element-type '(unsigned-byte 8)
                          :adjustable t :fill-pointer 0))
   (status-data (make-array 0 :element-type '(unsigned-byte 8)
@@ -98,6 +146,14 @@
 
 (defun channel-usable-p (channel)
   (not (eq (cl-pnet-ssh:ssh-server-channel-state channel) :closed)))
+
+(defun bridge-input-fd (bridge)
+  "Where client input goes: the pty master, or the child's stdin pipe."
+  (or (bridge-stdin-fd bridge) (bridge-master-fd bridge)))
+
+(defun bridge-output-fd (bridge)
+  "Where child output comes from: the pty master, or the stdout pipe."
+  (or (bridge-stdout-fd bridge) (bridge-master-fd bridge)))
 
 (defun bridge-drop-pending (bridge count)
   (let ((pending (bridge-pending bridge)))
@@ -116,10 +172,13 @@
     (setf (bridge-stderr-watcher bridge) nil))
   (when (bridge-status-watcher bridge)
     (cl-pnet:fd-unwatch (bridge-status-watcher bridge))
-    (setf (bridge-status-watcher bridge) nil)))
+    (setf (bridge-status-watcher bridge) nil))
+  (when (bridge-master-watcher bridge)
+    (cl-pnet:fd-unwatch (bridge-master-watcher bridge))
+    (setf (bridge-master-watcher bridge) nil)))
 
 (defun bridge-close-fds (bridge)
-  "Release the four pipe descriptors, once each."
+  "Release the descriptors the bridge owns, once each."
   (when (bridge-stdin-fd bridge)
     (c-close (bridge-stdin-fd bridge))
     (setf (bridge-stdin-fd bridge) nil))
@@ -131,7 +190,10 @@
     (setf (bridge-stderr-fd bridge) nil))
   (when (bridge-status-fd bridge)
     (c-close (bridge-status-fd bridge))
-    (setf (bridge-status-fd bridge) nil)))
+    (setf (bridge-status-fd bridge) nil))
+  (when (bridge-master-fd bridge)
+    (c-close (bridge-master-fd bridge))
+    (setf (bridge-master-fd bridge) nil)))
 
 (defun bridge-cleanup (bridge)
   "Stop every watcher and release the child's pipes, once."
@@ -144,7 +206,9 @@
   "End the child because its channel went away."
   (unless (bridge-finished bridge)
     (unless (bridge-status-known bridge)
-      (kill-child (bridge-pid bridge)))
+      (if (bridge-pty bridge)
+          (kill-child-group (bridge-pid bridge))
+          (kill-child (bridge-pid bridge))))
     (bridge-cleanup bridge)))
 
 (defun bridge-finish (bridge)
@@ -191,19 +255,23 @@
       (t nil))))
 
 (defun bridge-output (bridge fd stderr-p)
-  "Move whatever the child wrote on FD to the channel."
+  "Move whatever the child wrote on FD to the channel.
+
+A positive count is output; zero is end of file.  Reading a pty master after
+every slave descriptor has closed reports EIO rather than zero, so a read
+error that is not EAGAIN ends the stream too instead of leaving the watcher
+to spin on it."
   (unless (channel-usable-p (bridge-channel bridge))
     (return-from bridge-output (bridge-abort bridge)))
   (multiple-value-bind (octets count error)
       (cl-pnet-sockets:read-octets fd (* 64 1024))
-    (declare (ignore error))
     (cond
       ((plusp count)
        (let ((channel (bridge-channel bridge)))
          (if stderr-p
              (cl-pnet-ssh:ssh-server-channel-write-stderr channel octets)
              (cl-pnet-ssh:ssh-server-channel-write channel octets))))
-      ((zerop count)
+      ((or (zerop count) (not (eql error 11)))
        (if stderr-p
            (setf (bridge-stderr-eof bridge) t)
            (setf (bridge-stdout-eof bridge) t))
@@ -214,51 +282,109 @@
            (when (bridge-stdout-watcher bridge)
              (cl-pnet:fd-unwatch (bridge-stdout-watcher bridge))
              (setf (bridge-stdout-watcher bridge) nil)))
+       (when (and (bridge-pty bridge) (not stderr-p))
+         ;; The master is also the input descriptor, and its watcher may be
+         ;; the combined read/write one.  Unwatch both so no callback keeps
+         ;; firing on a terminal that reported end of file.
+         (when (bridge-master-watcher bridge)
+           (cl-pnet:fd-unwatch (bridge-master-watcher bridge))
+           (setf (bridge-master-watcher bridge) nil))
+         (when (bridge-stdin-watcher bridge)
+           (cl-pnet:fd-unwatch (bridge-stdin-watcher bridge))
+           (setf (bridge-stdin-watcher bridge) nil)))
        (bridge-maybe-finish bridge))
       (t nil))))
 
+(defun bridge-watch-master (bridge)
+  "Watch the pty master for output; input writes are folded in on demand."
+  (setf (bridge-master-watcher bridge)
+        (cl-pnet:fd-watch
+         (bridge-master-fd bridge)
+         :on-readable
+         (lambda (watcher)
+           (declare (ignore watcher))
+           (bridge-output bridge (bridge-master-fd bridge) nil)))))
+
 (defun bridge-arm-input (bridge)
   (unless (bridge-stdin-watcher bridge)
-    (setf (bridge-stdin-watcher bridge)
-          (cl-pnet:fd-watch
-           (bridge-stdin-fd bridge)
-           :on-writable
-           (lambda (watcher)
-             (declare (ignore watcher))
-             (bridge-flush-input bridge))))))
+    (if (bridge-pty bridge)
+        (progn
+          ;; Every backend keeps one watcher per descriptor, so the write
+          ;; interest is folded into the master's read watcher.  It is
+          ;; removed again as soon as the queue drains.
+          (when (bridge-master-watcher bridge)
+            (cl-pnet:fd-unwatch (bridge-master-watcher bridge))
+            (setf (bridge-master-watcher bridge) nil))
+          (setf (bridge-stdin-watcher bridge)
+                (cl-pnet:fd-watch
+                 (bridge-master-fd bridge)
+                 :on-readable
+                 (lambda (watcher)
+                   (declare (ignore watcher))
+                   (bridge-output bridge (bridge-master-fd bridge) nil))
+                 :on-writable
+                 (lambda (watcher)
+                   (declare (ignore watcher))
+                   (bridge-flush-input bridge)))))
+        (setf (bridge-stdin-watcher bridge)
+              (cl-pnet:fd-watch
+               (bridge-input-fd bridge)
+               :on-writable
+               (lambda (watcher)
+                 (declare (ignore watcher))
+                 (bridge-flush-input bridge)))))))
 
 (defun bridge-disarm-input (bridge)
   (when (bridge-stdin-watcher bridge)
     (cl-pnet:fd-unwatch (bridge-stdin-watcher bridge))
-    (setf (bridge-stdin-watcher bridge) nil)))
+    (setf (bridge-stdin-watcher bridge) nil)
+    (when (and (bridge-pty bridge) (bridge-master-fd bridge)
+               (not (bridge-stdout-eof bridge)))
+      (bridge-watch-master bridge))))
 
 (defun bridge-close-input (bridge)
   (when (bridge-input-open bridge)
     (setf (bridge-input-open bridge) nil)
     (bridge-disarm-input bridge)
-    (when (bridge-stdin-fd bridge)
-      (c-close (bridge-stdin-fd bridge))
-      (setf (bridge-stdin-fd bridge) nil))))
+    (cond
+      ((bridge-pty bridge)
+       ;; A pty has no half-close, so send the terminal EOF character.  The
+       ;; master stays open because the child's output still travels on it.
+       (ignore-errors
+        (cl-pnet-sockets:write-octets (bridge-master-fd bridge) #(4))))
+      ((bridge-stdin-fd bridge)
+       (c-close (bridge-stdin-fd bridge))
+       (setf (bridge-stdin-fd bridge) nil)))))
 
 (defun bridge-flush-input (bridge)
   "Write as much pending stdin as the child accepts without blocking."
   (unless (bridge-input-open bridge)
     (return-from bridge-flush-input nil))
-  (let ((pending (bridge-pending bridge)))
+  (let ((pending (bridge-pending bridge))
+        (fd (bridge-input-fd bridge))
+        (dead nil))
     (loop while (plusp (fill-pointer pending))
           do (multiple-value-bind (count error)
-                 (cl-pnet-sockets:write-octets
-                  (bridge-stdin-fd bridge) pending)
-               (declare (ignore error))
-               (if (plusp count)
-                   (bridge-drop-pending bridge count)
-                   (return))))
-    (if (plusp (fill-pointer pending))
-        (bridge-arm-input bridge)
-        (progn
-          (bridge-disarm-input bridge)
-          (when (bridge-input-eof bridge)
-            (bridge-close-input bridge))))))
+                 (cl-pnet-sockets:write-octets fd pending)
+               (cond
+                 ((plusp count) (bridge-drop-pending bridge count))
+                 ((and (minusp count) (member error '(5 32)))
+                  ;; The child closed the terminal or its stdin; re-arming
+                  ;; the writer would only spin on the same error.
+                  (setf dead t)
+                  (return))
+                 (t (return)))))
+    (cond
+      (dead
+       (setf (fill-pointer pending) 0)
+       (setf (bridge-input-open bridge) nil)
+       (bridge-disarm-input bridge))
+      ((plusp (fill-pointer pending))
+       (bridge-arm-input bridge))
+      (t
+       (bridge-disarm-input bridge)
+       (when (bridge-input-eof bridge)
+         (bridge-close-input bridge))))))
 
 (defun bridge-on-data (bridge octets)
   "Queue OCTETS for the child and try to hand them over at once."
@@ -290,63 +416,154 @@
             (bridge-abort bridge)))))
 
 (defun bridge-watch (bridge)
-  "Watch the child's three reporting pipes."
-  (setf (bridge-stdout-watcher bridge)
-        (cl-pnet:fd-watch
-         (bridge-stdout-fd bridge)
-         :on-readable
-         (lambda (watcher)
-           (declare (ignore watcher))
-           (bridge-output bridge (bridge-stdout-fd bridge) nil))))
-  (setf (bridge-stderr-watcher bridge)
-        (cl-pnet:fd-watch
-         (bridge-stderr-fd bridge)
-         :on-readable
-         (lambda (watcher)
-           (declare (ignore watcher))
-           (bridge-output bridge (bridge-stderr-fd bridge) t))))
+  "Watch the child's output and status descriptor."
+  (if (bridge-pty bridge)
+      (bridge-watch-master bridge)
+      (progn
+        (setf (bridge-stdout-watcher bridge)
+              (cl-pnet:fd-watch
+               (bridge-stdout-fd bridge)
+               :on-readable
+               (lambda (watcher)
+                 (declare (ignore watcher))
+                 (bridge-output bridge (bridge-stdout-fd bridge) nil))))
+        (setf (bridge-stderr-watcher bridge)
+              (cl-pnet:fd-watch
+               (bridge-stderr-fd bridge)
+               :on-readable
+               (lambda (watcher)
+                 (declare (ignore watcher))
+                 (bridge-output bridge (bridge-stderr-fd bridge) t))))))
   (setf (bridge-status-watcher bridge)
         (cl-pnet:fd-watch
          (bridge-status-fd bridge)
          :on-readable
          (lambda (watcher)
            (declare (ignore watcher))
-           (bridge-read-status bridge)))))
+           (bridge-read-status bridge))))))
+
+#-win32
+(progn
+(defun attach-bridge (channel bridge)
+  (bridge-attach bridge)
+  (bridge-watch bridge)
+  bridge)
 
 (defun start-command (channel command)
-  "Run COMMAND as a child and pipe it to CHANNEL.
+  "Run COMMAND as a child, on the pty the client asked for if there is one.
 
 The channel's accepted environment requests are added to the child's own
 environment, so a SendEnv from the client arrives where the command can see
 it.  The library has already applied AcceptEnv."
-  (multiple-value-bind (pid stdin stdout stderr status)
-      (spawn-shell command
-                   :environment (cl-pnet-ssh:ssh-server-channel-env channel))
-    (let ((bridge (make-bridge :channel channel :pid pid
-                               :stdin-fd stdin :stdout-fd stdout
-                               :stderr-fd stderr :status-fd status)))
-      (bridge-attach bridge)
-      (bridge-watch bridge)
-      bridge)))
+  (let ((environment (session-environment channel)))
+    (if (channel-pty-p channel)
+        (multiple-value-bind (pid master status)
+            (spawn-pty-shell command (user-shell)
+                             :environment environment
+                             :rows (channel-rows channel)
+                             :columns (channel-columns channel))
+          (attach-bridge
+           channel
+           (make-bridge :channel channel :pid pid
+                        :master-fd master :status-fd status
+                        :pty t :stderr-eof t)))
+        (multiple-value-bind (pid stdin stdout stderr status)
+            (spawn-shell command :environment environment)
+          (attach-bridge
+           channel
+           (make-bridge :channel channel :pid pid
+                        :stdin-fd stdin :stdout-fd stdout
+                        :stderr-fd stderr :status-fd status))))))
+
+(defun start-program (channel program arguments)
+  "Run PROGRAM with ARGUMENTS on CHANNEL, without shell expansion."
+  (let ((environment (session-environment channel)))
+    (if (channel-pty-p channel)
+        (multiple-value-bind (pid master status)
+            (spawn-pty-program program arguments
+                               :environment environment
+                               :rows (channel-rows channel)
+                               :columns (channel-columns channel))
+          (attach-bridge
+           channel
+           (make-bridge :channel channel :pid pid
+                        :master-fd master :status-fd status
+                        :pty t :stderr-eof t)))
+        (multiple-value-bind (pid stdin stdout stderr status)
+            (spawn-program program arguments :environment environment)
+          (attach-bridge
+           channel
+           (make-bridge :channel channel :pid pid
+                        :stdin-fd stdin :stdout-fd stdout
+                        :stderr-fd stderr :status-fd status))))))
+
+(defun start-login-shell (channel)
+  "Run the login shell, on the pty when one was requested.
+
+A non-pty login shell keeps its stdout and stderr separate, as sshd does for
+-T; a pty merges them, as a terminal does."
+  (if (channel-pty-p channel)
+      (start-command channel nil)
+      (start-program channel (user-shell) (list "-l"))))
+
+(defun bridge-resize (bridge columns rows)
+  "Resize BRIDGE's pty, if it has one."
+  (when (bridge-pty bridge)
+    (set-child-window (bridge-master-fd bridge) rows columns)))
+)
 
 ;;; ---- Server ----
 
-(defun exec-request (channel command)
-  (if (command-allowed-p command)
-      (handler-case (start-command channel command)
-        (error (condition)
-          (cl-pnet-ssh:ssh-server-channel-write-stderr
-           channel (format nil "~A~%" condition))
-          (cl-pnet-ssh:ssh-server-channel-exit channel 126)
-          (cl-pnet-ssh:ssh-server-channel-close channel)))
-      (progn
-        (cl-pnet-ssh:ssh-server-channel-write-stderr
-         channel (format nil "command not allowed: ~A~%" command))
-        (cl-pnet-ssh:ssh-server-channel-exit channel 126)
-        (cl-pnet-ssh:ssh-server-channel-close channel))))
+(defun session-failure (channel control-string &rest arguments)
+  "Tell the client why its session could not start, then close it."
+  (cl-pnet-ssh:ssh-server-channel-write-stderr
+   channel (format nil "~?~%" control-string arguments))
+  (cl-pnet-ssh:ssh-server-channel-exit channel 126)
+  (cl-pnet-ssh:ssh-server-channel-close channel))
 
 (defun install-channel-handlers (channel)
-  (setf (cl-pnet-ssh:ssh-server-channel-on-exec channel) #'exec-request))
+  "Attach the session policy and remember the bridge for window changes."
+  (let ((bridge nil))
+    (labels ((remember (new-bridge)
+               (setf bridge new-bridge))
+           (run-command (command)
+             (if (command-allowed-p command)
+                 (handler-case (remember (start-command channel command))
+                   (error (condition)
+                     (session-failure channel "~A" condition)))
+                 (session-failure channel "command not allowed: ~A" command)))
+           (run-shell ()
+             (handler-case (remember (start-login-shell channel))
+               (error (condition) (session-failure channel "~A" condition))))
+           (run-subsystem (path)
+             (handler-case (remember (start-program channel path nil))
+               (error (condition) (session-failure channel "~A" condition)))))
+      (setf (cl-pnet-ssh:ssh-server-channel-on-exec channel)
+            (lambda (channel command)
+              (declare (ignore channel))
+              (run-command command)))
+      (setf (cl-pnet-ssh:ssh-server-channel-on-pty channel)
+            (lambda (channel term columns rows width height modes)
+              (declare (ignore channel term columns rows width height modes))
+              ;; Every pty is accepted; the application's policy is which
+              ;; terminal metadata it keeps, and the library keeps it all.
+              t))
+      (setf (cl-pnet-ssh:ssh-server-channel-on-shell channel)
+            (lambda (channel)
+              (declare (ignore channel))
+              ;; Returning a thunk lets the library send the success reply
+              ;; before the shell can write its first prompt.
+              (lambda () (run-shell))))
+      (setf (cl-pnet-ssh:ssh-server-channel-on-subsystem channel)
+            (lambda (channel name)
+              (declare (ignore channel))
+              (let ((path (subsystem-path name)))
+                (and path (lambda () (run-subsystem path))))))
+      (setf (cl-pnet-ssh:ssh-server-channel-on-window-change channel)
+            (lambda (channel columns rows)
+              (declare (ignore channel))
+              (when bridge
+                (bridge-resize bridge columns rows)))))))
 
 (defun home-file (name)
   (merge-pathnames name (user-homedir-pathname)))
@@ -367,6 +584,8 @@ it.  The library has already applied AcceptEnv."
            (port-option)
            :host-key host-key
            :authorized-keys authorized
+           :server-version (format nil "bursyk-server_~A"
+                                   +bursyk-server-version+)
            :accept-env (reverse (getf *options* :accept-env))
            :on-channel #'install-channel-handlers
            :on-error (lambda (session condition)
@@ -395,9 +614,20 @@ it.  The library has already applied AcceptEnv."
         (when (member (first arguments) '("-h" "--help") :test #'string=)
           (usage)
           (uiop:quit 0))
+        (when (member (first arguments) '("-V" "--version") :test #'string=)
+          (print-version)
+          (uiop:quit 0))
         (parse-arguments arguments)
         (start-server)
-        (setf *signal* (cl-pnet:signal-start 2 (lambda () (shutdown))))
+        ;; Ctrl-C is a convenience, not a requirement: a backend that cannot
+        ;; watch signals on this platform must not stop the server listening.
+        (setf *signal*
+              (handler-case (cl-pnet:signal-start 2 (lambda () (shutdown)))
+                (error (condition)
+                  (format *error-output*
+                          "bursyk-server: no interrupt handler: ~A~%"
+                          condition)
+                  nil)))
         (cl-pnet:event-loop-run)
         (when *signal*
           (cl-pnet:signal-stop *signal*)

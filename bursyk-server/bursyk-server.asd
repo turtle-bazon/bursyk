@@ -3,12 +3,16 @@
   :author "pesekey"
   :license "GPL-3.0-or-later"
   :version "0.0.3.0"
-  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cffi #:uiop)
+  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cffi
+               #:bordeaux-threads #:uiop)
   :serial t
   :components ((:module "src"
                 :serial t
                 :components ((:file "packages")
-                             (:file "child")
+                             (:file "common")
+                             (:file "child" :if-feature (:not :win32))
+                             (:file "child-windows" :if-feature :win32)
+                             (:file "win32" :if-feature :win32)
                              (:file "main"))))
   :build-operation "program-op"
   :build-pathname "../_build/bursyk-server"

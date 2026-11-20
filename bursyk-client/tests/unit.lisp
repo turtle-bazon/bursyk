@@ -305,3 +305,10 @@ CLI's decision and at the plist it filled."
     ;; An invalid -p is a usage error; FAIL quits, so only exercise the
     ;; valid paths here and leave the exit to the live command-line tests.
     (is (= 22 (parse-integer "22x" :junk-allowed t)))))
+
+;;; ---- version ----
+
+(test version-constant-matches-the-system-definition
+  "The version BURS reports must be the version the system file declares."
+  (is (equal (asdf:component-version (asdf:find-system "bursyk-client"))
+             burs::+burs-version+)))

@@ -938,11 +938,14 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
 
-(defun ssh-test-loopback-outcome (policy)
+(defun ssh-test-loopback-outcome (policy &key server-version)
   "Run one client handshake against a loopback server with POLICY.
 
-Returns (VALUES OPENED ERROR): OPENED is true once authentication completed,
-ERROR is the condition the client reported, if any."
+SERVER-VERSION, when given, is passed to MAKE-SSH-SERVER so a test can see
+the greeting the server chose.  Returns (VALUES OPENED ERROR GREETING):
+OPENED is true once authentication completed, ERROR is the condition the
+client reported, and GREETING is the server's identification line as the
+client read it."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop-policy"))
          (server-key (merge-pathnames "host_key" directory))
          (client-key (merge-pathnames "client_key" directory))
@@ -950,6 +953,7 @@ ERROR is the condition the client reported, if any."
          (known-hosts (merge-pathnames "known_hosts" directory))
          (opened nil)
          (error nil)
+         (greeting nil)
          (server nil)
          (timeout nil))
     (ensure-directories-exist server-key)
@@ -963,7 +967,8 @@ ERROR is the condition the client reported, if any."
             (merge-pathnames "client_key.pub" directory) authorized)
            (setf server (make-ssh-server "127.0.0.1" 0
                                          :host-key server-key
-                                         :authorized-keys authorized))
+                                         :authorized-keys authorized
+                                         :server-version server-version))
            (setf timeout
                  (cl-pnet:timer-start
                   10 0
@@ -978,8 +983,8 @@ ERROR is the condition the client reported, if any."
             :known-hosts known-hosts
             :host-key-policy policy
             :on-open (lambda (client)
-                       (declare (ignore client))
-                       (setf opened t)
+                       (setf opened t
+                             greeting (ssh-client-server-version client))
                        (cl-pnet:event-loop-stop))
             :on-error (lambda (client condition)
                         (declare (ignore client))
@@ -989,7 +994,7 @@ ERROR is the condition the client reported, if any."
                         (declare (ignore client reason))
                         (cl-pnet:event-loop-stop)))
            (cl-pnet:event-loop-run)
-           (values opened error))
+           (values opened error greeting))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
       (ignore-errors (delete-directory-tree directory :validate t)))))
@@ -1008,6 +1013,31 @@ than connect and quietly skip the known_hosts record."
              nil))
         (is (null opened) "the client authenticated after the key was declined")
         (is (typep error 'ssh-host-key-error)))))
+
+(test server-version-names-the-program-that-embeds-it
+  "A library user like bursyk-server must be able to say who it is.
+
+The greeting is what a peer shows in its logs, so leaving it at the
+library's default string hides which program is actually serving."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t)
+           :server-version "bursyk-server_0.0.2.0")
+        (is (null error))
+        (is (not (null opened)))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.0" greeting)))))
+
+(test server-version-is-checked-before-it-reaches-the-wire
+  (is (equal "burst_1.2.3"
+             (cl-pnet-ssh::check-server-version "burst_1.2.3")))
+  (signals error (cl-pnet-ssh::check-server-version "has a space"))
+  (signals error (cl-pnet-ssh::check-server-version ""))
+  (signals error (cl-pnet-ssh::check-server-version "bad
+newline")))
 
 ;;; ---- ssh_config client policy ----
 ;;;

@@ -8,10 +8,15 @@
 ;;;; the peer: a request that needs work (an authorized-keys file, a command)
 ;;;; hands that work to the caller's callback and returns.
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.2.0")
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.0"
+  "The default SSH identification string a server sends.
+
+A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
+the library's own default is only for callers that do not name themselves.")
 
 (defstruct (ssh-server (:constructor %make-ssh-server))
   (address "0.0.0.0")
+  (version +ssh-server-version+)
   (port 22)
   listener
   host-key
@@ -78,6 +83,14 @@
   (pending-env nil)
   (env nil)
   (command nil)
+  (subsystem nil)
+  ;; PTY-REQ stores the peer's terminal here, so the application that starts
+  ;; the shell or command can size it before the first output.
+  (pty-p nil)
+  (pty-term nil)
+  (pty-columns 0)
+  (pty-rows 0)
+  (pty-modes nil)
   (want-eof nil)
   (sent-eof nil)
   (want-close nil)
@@ -88,6 +101,10 @@
   (on-data nil)
   (on-eof nil)
   (on-exec nil)
+  (on-pty nil)
+  (on-shell nil)
+  (on-subsystem nil)
+  (on-window-change nil)
   (on-close nil)
   (on-error nil))
 

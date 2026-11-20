@@ -15,11 +15,28 @@
   (let ((session (%make-ssh-session
                   :server server
                   :connection connection
+                  :server-version (ssh-server-version server)
                   :remote-address (cl-pnet:connection-peer-address connection))))
     (setf (gethash connection (ssh-server-connections server)) session
           (gethash session (ssh-server-sessions server)) session)
     (ssh-server-connected session connection)
     session))
+
+(defun check-server-version (version)
+  "Validate VERSION as the tail of the SSH identification string.
+
+RFC 4253 allows printable US-ASCII and forbids space, so a malformed value
+is refused here rather than corrupting the greeting on the wire."
+  (unless (and (stringp version)
+               (plusp (length version))
+               (<= (+ 10 (length version)) 255)
+               (every (lambda (character)
+                        (let ((code (char-code character)))
+                          (and (<= 32 code 126) (/= code 32))))
+                      version))
+    (error 'ssh-connection-error
+           :detail (format nil "invalid server version ~S" version)))
+  version)
 
 (defun make-ssh-server (address port
                         &key
@@ -27,6 +44,7 @@
                           authorized-keys
                           authorize
                           accept-env
+                          server-version
                           on-session
                           on-channel
                           on-direct-tcpip
@@ -39,18 +57,28 @@ ssh-ed25519 is implemented.  AUTHORIZED-KEYS is an authorized_keys file,
 a list of public key blobs, or NIL.  AUTHORIZE, when given, is a function
 of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
 
+SERVER-VERSION is the software version in the SSH identification string,
+the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
+program should pass its real name and version, such as
+\"bursyk-server_0.0.3.0\", so peers and logs identify it correctly.
+
 ACCEPT-ENV is T (accept every env request), a list of names, a function of
 (NAME VALUE), or NIL (refuse).  ON-SESSION runs once a client has
 authenticated.  ON-DIRECT-TCPIP is a function of
 (SESSION HOST PORT ORIGIN-ADDRESS ORIGIN-PORT) returning true to allow a
 forwarded connection.  ON-ERROR receives (SESSION CONDITION) (SESSION is NIL
 for listener errors), ON-CLOSE receives (SESSION REASON)."
-  (let* ((key (if (typep host-key 'ssh-private-key)
+  (let* ((software (if server-version
+                       (format nil "SSH-2.0-~A"
+                               (check-server-version server-version))
+                       +ssh-server-version+))
+         (key (if (typep host-key 'ssh-private-key)
                   host-key
                   (ssh-load-private-key host-key)))
          (server (%make-ssh-server
                   :address address
                   :port port
+                  :version software
                   :host-key key
                   :authorized-keys authorized-keys
                   :authorize authorize

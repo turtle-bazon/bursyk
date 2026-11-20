@@ -120,6 +120,67 @@
     (ssh-server-channel-send-message
      channel (if ok +ssh-msg-channel-success+ +ssh-msg-channel-failure+))))
 
+(defun ssh-server-handle-pty-request (channel reader want-reply)
+  "Remember the peer's terminal for the shell or command that follows.
+
+The application's ON-PTY predicate decides whether the request succeeds; a
+NIL predicate refuses it, as a server that cannot allocate a PTY should."
+  (let* ((term (ssh-read-text reader))
+         (columns (ssh-read-u32 reader))
+         (rows (ssh-read-u32 reader))
+         (width (ssh-read-u32 reader))
+         (height (ssh-read-u32 reader))
+         (modes (ssh-read-string reader))
+         (handler (ssh-server-channel-on-pty channel))
+         (ok (and handler
+                  (funcall handler channel term columns rows width height
+                           modes))))
+    (when ok
+      (setf (ssh-server-channel-pty-p channel) t
+            (ssh-server-channel-pty-term channel) term
+            (ssh-server-channel-pty-columns channel) columns
+            (ssh-server-channel-pty-rows channel) rows
+            (ssh-server-channel-pty-modes channel) modes))
+    (ssh-server-channel-reply channel (not (null ok)) want-reply)))
+
+(defun ssh-server-handle-shell-request (channel want-reply)
+  "Ask the application for the login shell thunk, then answer and run it.
+
+The thunk runs after the success reply, so output a shell writes cannot
+overtake the reply that opened it.  Returning NIL refuses the request."
+  (let* ((handler (ssh-server-channel-on-shell channel))
+         (start (and handler (funcall handler channel))))
+    (ssh-server-channel-reply channel (not (null start)) want-reply)
+    (when start (funcall start))))
+
+(defun ssh-server-handle-subsystem-request (channel reader want-reply)
+  "Ask the application to start the named subsystem, then run its thunk.
+
+The same reply-before-output rule as SHELL applies; an unknown subsystem
+returns NIL and is refused rather than accepted and abandoned."
+  (let* ((name (ssh-read-text reader))
+         (handler (ssh-server-channel-on-subsystem channel))
+         (start (and handler (funcall handler channel name))))
+    (when start
+      (setf (ssh-server-channel-subsystem channel) name))
+    (ssh-server-channel-reply channel (not (null start)) want-reply)
+    (when start (funcall start))))
+
+(defun ssh-server-handle-window-change (channel reader want-reply)
+  "Store the peer's new terminal size and tell the application."
+  (let ((columns (ssh-read-u32 reader))
+        (rows (ssh-read-u32 reader)))
+    (ssh-read-u32 reader)
+    (ssh-read-u32 reader)
+    (setf (ssh-server-channel-pty-columns channel) columns
+          (ssh-server-channel-pty-rows channel) rows)
+    (when (ssh-server-channel-on-window-change channel)
+      (funcall (ssh-server-channel-on-window-change channel)
+               channel columns rows))
+    ;; RFC 4254 says a window-change never wants a reply, but a peer that
+    ;; asks for one still deserves an answer rather than a silent channel.
+    (ssh-server-channel-reply channel t want-reply)))
+
 (defun ssh-server-handle-env-request (channel reader want-reply)
   (let* ((name (ssh-read-text reader))
          (value (ssh-read-text reader))
@@ -131,11 +192,12 @@
     (ssh-server-channel-reply channel ok want-reply)))
 
 (defun ssh-server-handle-exec-request (channel reader want-reply)
-  (let ((command (ssh-read-text reader)))
+  (let ((command (ssh-read-text reader))
+        (handler (ssh-server-channel-on-exec channel)))
     (setf (ssh-server-channel-command channel) command)
-    (ssh-server-channel-reply channel t want-reply)
-    (when (ssh-server-channel-on-exec channel)
-      (funcall (ssh-server-channel-on-exec channel) channel command))))
+    (ssh-server-channel-reply channel (not (null handler)) want-reply)
+    (when handler
+      (funcall handler channel command))))
 
 (defun ssh-server-handle-channel-request (session channel reader)
   "Dispatch one request addressed to CHANNEL."
@@ -146,11 +208,15 @@
        (ssh-server-handle-env-request channel reader want-reply))
       ((string= request "exec")
        (ssh-server-handle-exec-request channel reader want-reply))
+      ((string= request "pty-req")
+       (ssh-server-handle-pty-request channel reader want-reply))
+      ((string= request "shell")
+       (ssh-server-handle-shell-request channel want-reply))
+      ((string= request "subsystem")
+       (ssh-server-handle-subsystem-request channel reader want-reply))
       ((string= request "window-change")
-       (ssh-read-u32 reader) (ssh-read-u32 reader)
-       (ssh-read-u32 reader) (ssh-read-u32 reader))
-      ((member request '("pty-req" "shell" "subsystem" "auth-agent-req@openssh.com"
-                         "x11-req")
+       (ssh-server-handle-window-change channel reader want-reply))
+      ((member request '("auth-agent-req@openssh.com" "x11-req")
                :test #'string=)
        (ssh-server-channel-reply channel nil want-reply))
       (t (ssh-server-channel-reply channel nil want-reply)))))
