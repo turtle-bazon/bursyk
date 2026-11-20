@@ -42,9 +42,16 @@
 (defconstant +ssh-options-user+ 4)
 (defconstant +ssh-options-identity+ 6)
 (defconstant +ssh-options-known-hosts+ 8)
+(defconstant +ssh-options-ciphers-c-s+ 15)
+(defconstant +ssh-options-ciphers-s-c+ 16)
 (defconstant +ssh-options-proxy-command+ 19)
+(defconstant +ssh-options-key-exchange+ 24)
+(defconstant +ssh-options-hostkeys+ 25)
+(defconstant +ssh-options-hmac-c-s+ 29)
+(defconstant +ssh-options-hmac-s-c+ 30)
 (defconstant +ssh-options-global-known-hosts+ 35)
 (defconstant +ssh-options-strict-host-key-check+ 21)
+(defconstant +ssh-options-publickey-accepted-types+ 37)
 (defconstant +ssh-options-process-config+ 38)
 (defconstant +ssh-options-identity-agent+ 42)
 
@@ -158,6 +165,10 @@
 (cffi:defcfun ("ssh_pki_import_privkey_file" ssh-pki-import-privkey-file) :int
   (filename :string) (passphrase :string) (auth-function :pointer)
   (auth-data :pointer) (key (:pointer ssh-key)))
+(cffi:defcfun ("ssh_pki_import_cert_file" ssh-pki-import-cert-file) :int
+  (filename :string) (key (:pointer ssh-key)))
+(cffi:defcfun ("ssh_pki_copy_cert_to_privkey" ssh-pki-copy-cert-to-privkey) :int
+  (cert-key ssh-key) (private-key ssh-key))
 
 ;;; ---- Channels ----
 

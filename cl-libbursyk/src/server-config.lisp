@@ -109,8 +109,7 @@ socket address and has no routing domains.")
     "usedns" "securitykeyprovider" "gssapicleanupcredentials"
     "gssapistrictacceptorcheck" "kerberosorlocalpasswd"
     "kerberosticketcleanup" "kerberosgetafstoken"
-    "hostbasedusesnamefrompacketonly" "authorizedkeysfile2"
-    "casignaturealgorithms"))
+    "hostbasedusesnamefrompacketonly" "authorizedkeysfile2"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
@@ -139,9 +138,7 @@ socket address and has no routing domains.")
 (defparameter +ssh-server-config-unsupported-keywords+
   '("chrootdirectory"
     "authorizedkeyscommand" "authorizedkeyscommanduser"
-    "authorizedprincipalsfile" "authorizedprincipalscommand"
-    "authorizedprincipalscommanduser"
-    "trustedusercakeys" "revokedkeys" "hostcertificate"
+    "revokedkeys" "hostcertificate"
     "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
@@ -160,6 +157,16 @@ socket address and has no routing domains.")
   ;; NIL means the default; sshd's "none" entries are skipped, so a list of
   ;; only "none" disables public-key authentication.
   (authorized-keys-files nil)
+  ;; Certificate authentication.  TrustedUserCAKeys is a file of CA public
+  ;; keys; the principals file is a pattern expanded per user with %h/%u/%U.
+  ;; The command is sshd's AuthorizedPrincipalsCommand, run as the account it
+  ;; names, and the signature list is CASignatureAlgorithms after sshd's
+  ;; + / - / ^ resolution.
+  (trusted-user-ca-keys nil)
+  (authorized-principals-file nil)
+  (authorized-principals-command nil)
+  (authorized-principals-command-user nil)
+  (ca-signature-algorithms nil)
   (accept-env '())
   (permit-open '())
   (permit-listen '())
@@ -622,6 +629,9 @@ error, never an accidental no-match: sshd fatals in the same situation."
     permit-listen pubkey-accepted-algorithms required-rsa-size
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     unused-connection-timeout channel-timeouts
+    trusted-user-ca-keys authorized-principals-file
+    authorized-principals-command authorized-principals-command-user
+    ca-signature-algorithms
     allow-users deny-users allow-groups deny-groups)
   "The fields a matching Match block may override.
 
@@ -747,6 +757,41 @@ cannot apply per connection."
             ;; authenticating, so "none" may sit beside real files.
             (setf (ssh-server-config-authorized-keys-files config)
                   (mapcar #'ssh-config-expand-home arguments))))))
+      ((string= keyword "trustedusercakeys")
+       (let ((value (ssh-config-expand-home
+                     (ssh-server-config-one-argument line))))
+         (ssh-server-config-set-once
+          config 'trusted-user-ca-keys
+          (if (string-equal value "none") :none value))))
+      ((string= keyword "authorizedprincipalsfile")
+       ;; sshd keeps the pattern and expands %h/%u/%U for the account that is
+       ;; logging in, so the file is not opened while the config is read.
+       (let ((value (ssh-config-expand-home
+                     (ssh-server-config-one-argument line))))
+         (ssh-server-config-set-once
+          config 'authorized-principals-file
+          (if (string-equal value "none") :none value))))
+      ((string= keyword "authorizedprincipalscommand")
+       (let ((value (ssh-config-line-raw line)))
+         (when (zerop (length value))
+           (ssh-server-config-line-error
+            line "AuthorizedPrincipalsCommand needs a command"))
+         (ssh-server-config-set-once
+          config 'authorized-principals-command value)))
+      ((string= keyword "authorizedprincipalscommanduser")
+       (ssh-server-config-set-once
+        config 'authorized-principals-command-user
+        (ssh-server-config-one-argument line)))
+      ((string= keyword "casignaturealgorithms")
+       ;; Like PubkeyAcceptedAlgorithms this names signatures, not key types;
+       ;; a plain name this build cannot verify stops startup instead of
+       ;; quietly shrinking the set of certificates that would be accepted.
+       (ssh-server-config-set-once
+        config 'ca-signature-algorithms
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-server-ca-signature-algorithms+
+         "CASignatureAlgorithms"
+         :all +ssh-server-ca-signature-algorithm-names+)))
       ;; ---- algorithms ----
       ;; sshd resolves these with kex_assemble_names: the configured text may
       ;; replace the default list or adjust it with + - ^.  Resolving here

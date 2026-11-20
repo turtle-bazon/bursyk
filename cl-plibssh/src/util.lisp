@@ -37,6 +37,14 @@
   ;; A helper program carrying the stream, or NIL to dial directly.  libssh
   ;; runs it itself and expands %h, %p and %r before starting it.
   proxy-command
+  ;; Algorithm offers from ssh_config: Ciphers, MACs, KexAlgorithms,
+  ;; HostKeyAlgorithms and PubkeyAcceptedAlgorithms, already resolved against
+  ;; this build's lists.  NIL keeps libssh's own defaults.
+  kex-algorithms
+  host-key-algorithms
+  ciphers
+  macs
+  pubkey-accepted-algorithms
   ;; Connection timing, from ConnectTimeout and ServerAlive* in ssh_config.
   ;; A NIL timeout or interval means the feature is off.
   connect-timeout
@@ -52,6 +60,10 @@
   on-open
   on-error
   on-close
+  ;; The application's mapping from a server-initiated forwarded-tcpip
+  ;; channel to a local target.  Accepted for the same interface as the pure
+  ;; backend; forwarded channels themselves are not driven here yet.
+  on-forwarded-tcpip
   ;; The resolved ssh_config this client was built from, if any.
   config-options
   (closed nil)

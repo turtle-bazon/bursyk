@@ -81,16 +81,22 @@
             ((= rc +ssh-again+) (return))
             (t
              (pop (ssh-channel-requests channel))
-             (ssh-plibssh-channel-fail
-              channel
-              (make-condition 'ssh-channel-error
-                              :channel channel
-                              :detail (format nil "request ~A was refused: ~A"
-                                              (first request)
-                                              (ssh-plibssh-error
-                                               (ssh-client-session
-                                                (ssh-channel-client channel))))))
-             (return))))))))
+             (cond
+               ;; sshd refuses env names it does not accept.  OpenSSH treats
+               ;; that as an ordinary outcome and still runs the command, so
+               ;; the rest of the queue must go out.
+               ((eq (first request) :env) nil)
+               (t
+                (ssh-plibssh-channel-fail
+                 channel
+                 (make-condition 'ssh-channel-error
+                                 :channel channel
+                                 :detail (format nil "request ~A was refused: ~A"
+                                                 (first request)
+                                                 (ssh-plibssh-error
+                                                  (ssh-client-session
+                                                   (ssh-channel-client channel))))))
+                (return))))))))))
 
 (defun ssh-channel-queue-request (channel request)
   (setf (ssh-channel-requests channel)
@@ -237,10 +243,14 @@
                (ssh-channel-exit-status channel)))))
 
 (defun ssh-plibssh-channel-fail (channel condition)
-  "Report CONDITION and close CHANNEL."
-  (ssh-plibssh-finish-channel channel)
+  "Report CONDITION, then close CHANNEL.
+
+The error callback runs first, as in the pure backend: a program that ends
+the session from it must see the diagnostic before any close callback can
+exit without one."
   (when (ssh-channel-on-error channel)
-    (funcall (ssh-channel-on-error channel) channel condition)))
+    (funcall (ssh-channel-on-error channel) channel condition))
+  (ssh-plibssh-finish-channel channel))
 
 (defun ssh-plibssh-channel-report-exit (channel)
   (let ((status (ssh-channel-get-exit-status (ssh-channel-handle channel))))

@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.18"
+(defparameter +bursyk-server-version+ "0.0.2.19"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1165,6 +1165,30 @@ user simply has no groups, so an AllowGroups rule then denies the login."
   (declare (ignore user))
   nil)
 
+#-win32
+(cffi:defcfun ("getuid" c-getuid) :unsigned-int)
+
+#-win32
+(defun current-user-name ()
+  "The name of the account running this process, or NIL.
+
+AuthorizedPrincipalsCommandUser selects which account the command runs as;
+without privilege separation this server can only use its own."
+  (let ((uid (format nil "~D" (c-getuid))))
+    (with-open-file (stream "/etc/passwd" :direction :input
+                            :if-does-not-exist nil)
+      (when stream
+        (loop for line = (read-line stream nil nil)
+              while line
+              for fields = (uiop:split-string line :separator ":")
+              when (and (>= (length fields) 3)
+                        (string= (nth 2 fields) uid))
+                do (return (first fields)))))))
+
+#+win32
+(defun current-user-name ()
+  (uiop:getenv "USERNAME"))
+
 (defun expand-authorized-keys-path (pattern user home uid)
   "PATTERN with sshd's %h, %u, %U and %% expanded, anchored at HOME.
 
@@ -1217,6 +1241,187 @@ unprivileged run simple."
   (let ((uid (nth-value 1 (user-home-and-uid user))))
     (and uid (string= uid "0"))))
 
+;;; ---- Certificate authentication ----
+;;;
+;;; A certificate adds a CA signature and a principal list to an ordinary
+;;; key.  The CA is trusted through TrustedUserCAKeys or a cert-authority
+;;; line in authorized_keys, and the login name must be one of the
+;;; certificate's principals or appear in AuthorizedPrincipalsFile or the
+;;; output of AuthorizedPrincipalsCommand.  Those files are per user, so this
+;;; program expands and reads them; the library parses and verifies.
+
+(defun config-directive-value (value)
+  "VALUE with sshd's \"none\" read as NIL."
+  (and value
+       (not (eq value :none))
+       (not (and (stringp value) (string-equal value "none")))
+       value))
+
+(defun certificate-config-value (session accessor)
+  "ACCESSOR's per-connection value, or NIL when it is \"none\" or absent."
+  (config-directive-value (session-config-setting session accessor)))
+
+(defun split-command-arguments (text)
+  "TEXT split into arguments the way OpenSSH's argv_split does.
+
+Single and double quotes group words and a backslash quotes the next
+character.  An unmatched quote is an error rather than a silently different
+command."
+  (let ((arguments '())
+        (current (make-string-output-stream))
+        (started nil)
+        (quote nil)
+        (escape nil))
+    (loop for character across text
+          do (cond
+               (escape
+                (write-char character current)
+                (setf escape nil started t))
+               ((char= character #\\)
+                (setf escape t started t))
+               (quote
+                (if (char= character quote)
+                    (setf quote nil)
+                    (write-char character current)))
+               ((or (char= character #\") (char= character #\'))
+                (setf quote character started t))
+               ((member character '(#\Space #\Tab #\Return #\Newline))
+                (when started
+                  (push (get-output-stream-string current) arguments)
+                  (setf started nil)))
+               (t
+                (write-char character current)
+                (setf started t))))
+    (when quote
+      (error "unmatched ~C in command ~S" quote text))
+    (when escape
+      (write-char #\\ current)
+      (setf started t))
+    (when started
+      (push (get-output-stream-string current) arguments))
+    (nreverse arguments)))
+
+(defun expand-command-tokens (text substitutions)
+  "TEXT with %X tokens replaced from SUBSTITUTIONS, an alist of characters.
+
+An unknown token is left as it is, as OpenSSH's percent_expand does for a
+string that names no substitution."
+  (with-output-to-string (out)
+    (loop with length = (length text)
+          for index from 0 below length
+          for character = (char text index)
+          do (let ((pair (and (char= character #\%)
+                              (< (1+ index) length)
+                              (assoc (char text (1+ index)) substitutions))))
+               (if pair
+                   (progn
+                     (write-string (cdr pair) out)
+                     (incf index))
+                   (write-char character out))))))
+
+(defun authorized-principals-command-lines
+    (command command-user user home uid key-blob certificate)
+  "The lines AuthorizedPrincipalsCommand prints for CERTIFICATE, or NIL.
+
+The command is run as COMMAND-USER, which this build can only do when that
+is the account running the server: there is no privilege separation to switch
+users.  A command that cannot run is logged and authorizes nothing."
+  (let* ((arguments (split-command-arguments command))
+         (ca (cl-pnet-ssh:ssh-certificate-signature-key certificate))
+         (substitutions
+           (list
+            (cons #\% "%")
+            (cons #\U (or uid ""))
+            (cons #\u user)
+            (cons #\h (or home ""))
+            (cons #\t (cl-pnet-ssh:ssh-certificate-key-type certificate))
+            (cons #\T (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts ca)))
+            (cons #\f (cl-pnet-ssh:ssh-key-fingerprint key-blob))
+            (cons #\F (cl-pnet-ssh:ssh-key-fingerprint ca))
+            (cons #\k (cl-pnet-ssh:ssh-octets-base64 key-blob))
+            (cons #\K (cl-pnet-ssh:ssh-octets-base64 ca))
+            (cons #\i (cl-pnet-ssh:ssh-certificate-key-id certificate))
+            (cons #\s (format nil "~D"
+                              (cl-pnet-ssh:ssh-certificate-serial
+                               certificate))))
+           ))
+    (unless (and arguments (plusp (length arguments)))
+      (log-at :error "AuthorizedPrincipalsCommand names no program")
+      (return-from authorized-principals-command-lines nil))
+    (when (and command-user
+               (not (string= (expand-command-tokens command-user
+                                                    (list (cons #\u user)))
+                             (current-user-name))))
+      (log-at :error
+              "AuthorizedPrincipalsCommandUser ~A is not supported: this server cannot switch users"
+              command-user)
+      (return-from authorized-principals-command-lines nil))
+    (handler-case
+        (multiple-value-bind (output error-output status)
+            (uiop:run-program
+             (cons (first arguments)
+                   (mapcar (lambda (argument)
+                             (expand-command-tokens argument substitutions))
+                           (rest arguments)))
+             :output :string
+             :error-output :string
+             :ignore-error-status t)
+          (declare (ignore error-output))
+          (if (zerop status)
+              (uiop:split-string output :separator '(#\Newline))
+              (progn
+                (log-at :error
+                        "AuthorizedPrincipalsCommand exited with status ~D"
+                        status)
+                nil)))
+      (error (condition)
+        (log-at :error "AuthorizedPrincipalsCommand failed: ~A" condition)
+        nil))))
+
+(defun read-text-file (path)
+  "PATH's text, or an empty string when it cannot be read.
+
+An unreadable AuthorizedPrincipalsFile authorizes nobody, as sshd's
+match_principals_file finds no principals; treating it as empty is what keeps
+a configured file from silently falling back to the user name."
+  (handler-case
+      (if (probe-file path)
+          (uiop:read-file-string path)
+          "")
+    (error () "")))
+
+(defun certificate-principals-source (session user home uid key-blob
+                                      certificate)
+  "The principals source for CERTIFICATE, or NIL to match USER directly.
+
+AuthorizedPrincipalsFile's lines come first, then the command's, so a file
+that yields a principal wins and a command is consulted when it does not.
+NIL means neither is configured; a configured source that matches nothing
+denies the login rather than falling back to the user name."
+  (let ((file (certificate-config-value
+               session
+               #'cl-pnet-ssh:ssh-server-config-authorized-principals-file))
+        (command (certificate-config-value
+                  session
+                  #'cl-pnet-ssh:ssh-server-config-authorized-principals-command))
+        (command-user
+          (certificate-config-value
+           session
+           #'cl-pnet-ssh:ssh-server-config-authorized-principals-command-user)))
+    (cond
+      ((or file command)
+       (append
+        (when file
+          (uiop:split-string
+           (if home
+               (read-text-file (expand-authorized-keys-path file user home uid))
+               "")
+           :separator '(#\Newline)))
+        (when command
+          (authorized-principals-command-lines
+           command command-user user home uid key-blob certificate))))
+      (t nil))))
+
 (defun approved-authorized-key (session user key-env authorization)
   "The authorized-keys-p answer for a key that matched USER's file.
 
@@ -1244,39 +1449,83 @@ so an unprivileged or Windows setup keeps working.  The second value is the
 environment= options of the line that matched, which PermitUserEnvironment
 decides whether to apply; the third is the rest of the line's options,
 including from=, which ADDRESS is needed to check.  SESSION supplies the
-Match-resolved AuthorizedKeysFile and PermitRootLogin when it is present."
+Match-resolved AuthorizedKeysFile and PermitRootLogin when it is present.
+
+A certificate is first checked against cert-authority lines in the same
+files, then against TrustedUserCAKeys with AuthorizedPrincipalsFile or
+AuthorizedPrincipalsCommand deciding the principal."
   (labels ((approve (matched key-env authorization)
              (if matched
                  (approved-authorized-key session user key-env authorization)
-                 (values nil nil nil))))
-    (let ((global (getf *options* :authorized-keys)))
-      (if global
-          (multiple-value-bind (matched key-env authorization)
-              (cl-pnet-ssh:ssh-authorized-key-blob-match
-               global key-blob :address address)
-            (approve matched key-env authorization))
-          (multiple-value-bind (home uid) (user-home-and-uid user)
-            (if (null home)
-                (multiple-value-bind (matched key-env authorization)
-                    (cl-pnet-ssh:ssh-authorized-key-blob-match
-                     (home-file ".ssh/authorized_keys") key-blob
-                     :address address)
-                  (approve matched key-env authorization))
-                (let ((patterns
-                        (or (session-config-setting
-                             session
-                             #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
-                            cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
-                  (dolist (pattern patterns (values nil nil nil))
-                    (unless (string-equal pattern "none")
-                      (multiple-value-bind (matched key-env authorization)
-                          (cl-pnet-ssh:ssh-authorized-key-blob-match
-                           (expand-authorized-keys-path
-                            pattern user home uid)
-                           key-blob :address address)
-                        (when matched
-                          (return-from authorized-keys-p
-                            (approve matched key-env authorization)))))))))))))
+                 (values nil nil nil)))
+           (try-key-source (source certificate)
+             (if certificate
+                 (multiple-value-bind (matched key-env authorization)
+                     (cl-pnet-ssh:ssh-certificate-authorized-key-match
+                      source certificate user
+                      :address address
+                      :ca-signature-algorithms
+                      (session-config-setting
+                       session
+                       #'cl-pnet-ssh:ssh-server-config-ca-signature-algorithms))
+                   (when matched
+                     (return-from authorized-keys-p
+                       (approve matched key-env authorization))))
+                 (multiple-value-bind (matched key-env authorization)
+                     (cl-pnet-ssh:ssh-authorized-key-blob-match
+                      source key-blob :address address)
+                   (when matched
+                     (return-from authorized-keys-p
+                       (approve matched key-env authorization))))))
+           (try-trusted-ca (certificate)
+             (let ((ca-file
+                     (certificate-config-value
+                      session
+                      #'cl-pnet-ssh:ssh-server-config-trusted-user-ca-keys)))
+               (when ca-file
+                 (multiple-value-bind (home uid) (user-home-and-uid user)
+                   (multiple-value-bind (matched key-env authorization)
+                       (cl-pnet-ssh:ssh-certificate-user-authorized-p
+                        user key-blob
+                        :address address
+                        :ca-keys ca-file
+                        :principals-source
+                        (certificate-principals-source
+                         session user home uid key-blob certificate)
+                        :ca-signature-algorithms
+                        (session-config-setting
+                         session
+                         #'cl-pnet-ssh:ssh-server-config-ca-signature-algorithms))
+                     (when matched
+                       (return-from authorized-keys-p
+                         (approve matched key-env authorization)))))))))
+    (let* ((certificate-type (cl-pnet-ssh:ssh-certificate-blob-p key-blob))
+           (certificate
+             (and certificate-type
+                  (cl-pnet-ssh:ssh-certificate-parse key-blob))))
+      ;; A blob that claims to be a certificate but does not parse is never
+      ;; treated as the plain key it might wrap.
+      (when (and certificate-type (null certificate))
+        (return-from authorized-keys-p (values nil nil nil)))
+      (let ((global (getf *options* :authorized-keys)))
+        (if global
+            (try-key-source global certificate)
+            (multiple-value-bind (home uid) (user-home-and-uid user)
+              (if (null home)
+                  (try-key-source (home-file ".ssh/authorized_keys") certificate)
+                  (let ((patterns
+                          (or (session-config-setting
+                               session
+                               #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
+                              cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
+                    (dolist (pattern patterns)
+                      (unless (string-equal pattern "none")
+                        (try-key-source
+                         (expand-authorized-keys-path pattern user home uid)
+                         certificate))))))))
+      (when certificate
+        (try-trusted-ca certificate)))
+    (values nil nil nil)))
 
 ;;; ---- Account policy ----
 ;;;
@@ -1369,8 +1618,37 @@ guess, so only an explicit PidFile is written."
     (ignore-errors (delete-file *pid-file*))
     (setf *pid-file* nil)))
 
+(defun check-certificate-config ()
+  "Refuse certificate settings this server cannot honour.\n\nTrustedUserCAKeys must name a readable file, and AuthorizedPrincipalsCommand\nruns as AuthorizedPrincipalsCommandUser; without privilege separation only\nthe account running the server can be used, so a literal different name is a\nclear startup error rather than a login that quietly fails later.  A %u\ncommand user is checked per connection."
+  (let ((config *server-config*))
+    (when config
+      (let ((ca (config-directive-value
+                 (cl-pnet-ssh:ssh-server-config-trusted-user-ca-keys config))))
+        (when (and ca (not (probe-file ca)))
+          (fail "TrustedUserCAKeys file not found: ~A" ca)))
+      (let ((command
+              (config-directive-value
+               (cl-pnet-ssh:ssh-server-config-authorized-principals-command
+                config)))
+            (user
+              (config-directive-value
+               (cl-pnet-ssh:ssh-server-config-authorized-principals-command-user
+                config))))
+        (when command
+          (handler-case
+              (split-command-arguments command)
+            (error (condition)
+              (fail "AuthorizedPrincipalsCommand is invalid: ~A" condition)))
+          (unless user
+            (fail "AuthorizedPrincipalsCommand needs AuthorizedPrincipalsCommandUser"))
+          (when (and (not (find #\% user))
+                     (not (string= user (current-user-name))))
+            (fail "AuthorizedPrincipalsCommandUser ~A is not supported: this server cannot switch users"
+                  user)))))))
+
 (defun start-server ()
   (load-server-config)
+  (check-certificate-config)
   (let ((host-keys (host-key-files)))
     (dolist (host-key host-keys)
       (unless (probe-file host-key)

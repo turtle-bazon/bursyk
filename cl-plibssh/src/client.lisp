@@ -169,6 +169,22 @@ as OpenSSH does, not against the alias."
   (setf (ssh-client-fd client) fd)
   (ssh-plibssh-client-tcp-connected client))
 
+(defun ssh-plibssh-apply-algorithm-option (session code names option)
+  "Ask libssh to offer NAMES for OPTION, or keep its defaults when NIL.
+
+NAMES is already this build's resolved list, so libssh naming one it cannot
+use is a real mismatch: report it rather than let libssh quietly fall back
+to its wider default, which is exactly the silent widening ssh_config is
+meant to prevent."
+  (when names
+    (let ((text (format nil "~{~A~^,~}" names)))
+      (when (minusp (ssh-plibssh-set-string-option session code text))
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected ~A ~A: ~A"
+                               option text
+                               (ssh-plibssh-error session))))))
+  session)
+
 (defun ssh-plibssh-client-new-session (client &key fd proxy-command)
   "Make CLIENT's libssh session.
 
@@ -202,6 +218,26 @@ host is named but no descriptor is passed: libssh dials nothing itself."
     (when (ssh-client-user client)
       (ssh-plibssh-set-string-option session +ssh-options-user+
                                      (ssh-client-user client)))
+    ;; ssh_config's algorithm choices reach libssh here.  Each direction
+    ;; gets the same list, as OpenSSH uses one preference order both ways.
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-ciphers-c-s+ (ssh-client-ciphers client) "Ciphers")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-ciphers-s-c+ (ssh-client-ciphers client) "Ciphers")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-hmac-c-s+ (ssh-client-macs client) "MACs")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-hmac-s-c+ (ssh-client-macs client) "MACs")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-key-exchange+ (ssh-client-kex-algorithms client)
+     "KexAlgorithms")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-hostkeys+ (ssh-client-host-key-algorithms client)
+     "HostKeyAlgorithms")
+    (ssh-plibssh-apply-algorithm-option
+     session +ssh-options-publickey-accepted-types+
+     (ssh-client-pubkey-accepted-algorithms client)
+     "PubkeyAcceptedAlgorithms")
     (when (and (ssh-client-agent client)
                (not (eq (ssh-client-agent client) t)))
       (ssh-plibssh-set-string-option session +ssh-options-identity-agent+
@@ -349,6 +385,44 @@ socket in the interval as the proof of life OpenSSH looks for."
       (ssh-private-key-path key)
       key))
 
+(defun ssh-plibssh-attach-certificate (key path)
+  "Attach PATH's -cert.pub to the imported KEY when one exists.
+
+libssh offers whatever key it is given, so a certificate has to be copied
+onto the private key first.  The certificate is parsed here to check that it
+certifies KEY itself: libssh copies without that check, and pairing the wrong
+certificate would authenticate as its owner.  A mismatch is an error rather
+than a quiet fallback to the plain key, matching ssh."
+  (let ((certificate-path
+          (concatenate 'string (namestring path) "-cert.pub")))
+    (when (probe-file certificate-path)
+      (let* ((blob (ssh-public-key-file-blob certificate-path))
+             (certificate (and blob (ssh-certificate-parse blob))))
+        (unless (and certificate
+                     (ssh-octets= (ssh-certificate-plain-blob certificate)
+                                  (ssh-plibssh-public-key-blob key)))
+          (error 'ssh-authentication-error
+                 :detail
+                 (format nil
+                         "certificate ~A does not match private key ~A"
+                         certificate-path path)))
+        (cffi:with-foreign-object (pointer :pointer)
+          (if (zerop (ssh-pki-import-cert-file certificate-path pointer))
+              (let ((certificate-key (cffi:mem-ref pointer :pointer)))
+                (unwind-protect
+                     (unless (zerop (ssh-pki-copy-cert-to-privkey
+                                     certificate-key key))
+                       (error 'ssh-authentication-error
+                              :detail
+                              (format nil
+                                      "could not attach certificate ~A"
+                                      certificate-path)))
+                  (ssh-key-free certificate-key)))
+              (error 'ssh-authentication-error
+                     :detail (format nil "could not load certificate ~A"
+                                     certificate-path))))))
+    key))
+
 (defun ssh-plibssh-import-key (path passphrase)
   "Import the private key at PATH, using PASSPHRASE when it is encrypted."
   (cffi:with-foreign-object (pointer :pointer)
@@ -361,7 +435,8 @@ socket in the interval as the proof of life OpenSSH looks for."
                    (namestring path) (cffi:null-pointer)
                    (cffi:null-pointer) (cffi:null-pointer) pointer))))
       (if (zerop rc)
-          (cffi:mem-ref pointer :pointer)
+          (ssh-plibssh-attach-certificate
+           (cffi:mem-ref pointer :pointer) path)
           (error 'ssh-authentication-error
                  :detail (format nil "could not load ~A" path))))))
 
@@ -644,9 +719,15 @@ helper and hands back a socketpair to watch."
                           server-alive-interval
                           (server-alive-count-max 3)
                           proxy-command
+                          kex-algorithms
+                          host-key-algorithms
+                          ciphers
+                          macs
+                          pubkey-accepted-algorithms
                           on-open
                           on-error
-                          on-close)
+                          on-close
+                          on-forwarded-tcpip)
   "Connect to HOST as USER, authenticate, return at once.
 
 The libssh backend resolves HOST off the event loop and dials the address
@@ -673,9 +754,15 @@ stream on its pipes instead of dialling."
                  :server-alive-interval server-alive-interval
                  :server-alive-count-max (or server-alive-count-max 3)
                  :proxy-command (ssh-proxy-command-value proxy-command)
+                 :kex-algorithms kex-algorithms
+                 :host-key-algorithms host-key-algorithms
+                 :ciphers ciphers
+                 :macs macs
+                 :pubkey-accepted-algorithms pubkey-accepted-algorithms
                  :on-open on-open
                  :on-error on-error
-                 :on-close on-close)))
+                 :on-close on-close
+                 :on-forwarded-tcpip on-forwarded-tcpip)))
     (ssh-plibssh-start-client client passphrase)
     client))
 

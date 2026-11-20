@@ -63,10 +63,36 @@ ALGORITHMS+ is the set such a name resolves against.")
 (defparameter +ssh-server-user-key-all-algorithms+
   (append +ssh-server-user-key-algorithms+
           ;; Not advertised by default, but an administrator may name it, as
-          ;; OpenSSH's sshkey_alg_list does.  Certificate types are absent on
-          ;; purpose: this server has no certificate support to offer them.
-          '("ssh-rsa"))
+          ;; OpenSSH's sshkey_alg_list does.  Certificate type names are not
+          ;; advertised, but PubkeyAcceptedAlgorithms may still name them
+          ;; because a certificate logs in under its cert type name.
+          '("ssh-rsa"
+            "ssh-ed25519-cert-v01@openssh.com"
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+            "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+            "ssh-rsa-cert-v01@openssh.com"
+            "rsa-sha2-256-cert-v01@openssh.com"
+            "rsa-sha2-512-cert-v01@openssh.com"))
   "Every user public-key algorithm this server can enforce a choice from.")
+
+(defparameter +ssh-server-ca-signature-algorithms+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "rsa-sha2-512"
+    "rsa-sha2-256")
+  "CASignatureAlgorithms' default, without the security-key names this
+build cannot verify.  SHA-1 ssh-rsa is deliberately absent, as in sshd.")
+
+(defparameter +ssh-server-ca-signature-algorithm-names+
+  (append +ssh-server-ca-signature-algorithms+ '("ssh-rsa"))
+  "Every CA signature name a config may select.
+
+This is sshd's all-signatures set minus the security-key names: ssh-rsa is
+verifiable here, so an administrator may opt back into it, but it is not a
+default.")
 
 (defparameter +ssh-ciphers+ '("chacha20-poly1305@openssh.com"))
 

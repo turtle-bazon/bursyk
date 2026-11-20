@@ -57,7 +57,8 @@ reads them as the protocol lays them out."
 (defun ssh-rsa-public-key-bits (key-blob)
   "The modulus bit length of an ssh-rsa KEY-BLOB, or NIL for another type."
   (handler-case
-      (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+      (multiple-value-bind (type data)
+          (ssh-public-key-parts (ssh-key-plain-blob key-blob))
         (when (string= type "ssh-rsa")
           (let ((reader (ssh-make-reader data)))
             ;; The wire order is e, then n.
@@ -556,3 +557,194 @@ hold one key."
            (ssh-write-string writer (ssh-private-key-public private-key))
            (ssh-writer-output writer))
          (ssh-private-key-public private-key)))))
+
+;;;; ---- OpenSSH certificates ----
+;;;;
+;;;; A certificate is a normal public key blob whose type name gains
+;;;; "-cert-v01@openssh.com", followed by the plain key fields and the
+;;;; certificate body that a CA signed.  OpenSSH puts a nonce before the key
+;;;; fields, so the plain key is rebuilt here for signature verification.
+;;;; The certificate's own signature is over the whole blob except the final
+;;;; signature string; parsing deliberately does not check it, so a caller
+;;;; that trusts a certificate must also call SSH-CERTIFICATE-SIGNATURE-VALID-P.
+
+(defparameter +ssh-certificate-suffix+ "-cert-v01@openssh.com")
+
+(defparameter +ssh-unix-epoch+ 2208988800
+  "The universal time of 1970-01-01, which certificate times count from.")
+
+(defun ssh-unix-time (&optional (universal (get-universal-time)))
+  "UNIVERSAL, or now, as seconds since the Unix epoch."
+  (- universal +ssh-unix-epoch+))
+
+(defparameter +ssh-certificate-plain-types+
+  '("ssh-ed25519" "ssh-rsa"
+    "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521")
+  "The plain key types OpenSSH can certify and this build understands.")
+
+(defun ssh-certificate-type-name-p (name)
+  "Whether NAME is a certificate key type this build understands."
+  (let ((suffix +ssh-certificate-suffix+))
+    (and (> (length name) (length suffix))
+         (string= suffix name :start2 (- (length name) (length suffix)))
+         (member (subseq name 0 (- (length name) (length suffix)))
+                 +ssh-certificate-plain-types+ :test #'string=))))
+
+(defun ssh-certificate-type (key-blob)
+  "The certificate type name in KEY-BLOB, or NIL when it is not a cert."
+  (handler-case
+      (let ((name (ssh-read-text (ssh-make-reader key-blob))))
+        (and (ssh-certificate-type-name-p name) name))
+    (error () nil)))
+
+(defun ssh-certificate-blob-p (key-blob)
+  "Whether KEY-BLOB is an OpenSSH certificate this build understands."
+  (not (null (ssh-certificate-type key-blob))))
+
+(defun ssh-certificate-plain-type (name)
+  "The plain key type of certificate type NAME, or NIL."
+  (and (ssh-certificate-type-name-p name)
+       (subseq name 0 (- (length name) (length +ssh-certificate-suffix+)))))
+
+(defstruct (ssh-certificate (:constructor %make-ssh-certificate))
+  (key-type nil :type (or null string))
+  (plain-key-type nil :type (or null string))
+  (plain-blob nil :type (or null ssh-octets))
+  (serial 0 :type integer)
+  ;; 1 is a user certificate and 2 a host certificate (PROTOCOL.certkeys).
+  (cert-type 0 :type integer)
+  (key-id "" :type string)
+  (principals '())
+  (valid-after 0 :type integer)
+  (valid-before 0 :type integer)
+  ;; (NAME . VALUE) pairs in wire order.  VALUE is a string for the options
+  ;; that carry one and the empty string for the flags.
+  (critical '())
+  (extensions '())
+  (reserved "")
+  (signature-key nil :type (or null ssh-octets))
+  (signature nil :type (or null ssh-octets))
+  (signature-algorithm nil :type (or null string))
+  (signed-data nil :type (or null ssh-octets)))
+
+(defun ssh-certificate-option-list (reader)
+  "The (NAME . VALUE) option pairs in READER.
+
+Each option is a name string and a data string.  A key/value option's data
+is itself a length-prefixed string holding the value (ssh-keygen writes it
+that way), while a flag option's data is empty."
+  (let ((options '()))
+    (loop while (plusp (ssh-reader-remaining reader))
+          do (let* ((name (ssh-read-text reader))
+                    (data (ssh-read-string reader))
+                    (value
+                      (if (zerop (length data))
+                          ""
+                          (let ((inner (ssh-make-reader data)))
+                            (prog1 (ssh-read-text inner)
+                              (unless (zerop (ssh-reader-remaining inner))
+                                (error 'ssh-protocol-error
+                                       :detail
+                                       "trailing certificate option data")))))))
+               (push (cons name value) options)))
+    (nreverse options)))
+
+(defun ssh-certificate-key-field-count (plain-type)
+  "How many length-prefixed fields PLAIN-TYPE's public key has."
+  (cond
+    ((string= plain-type "ssh-ed25519") 1)
+    ((string= plain-type "ssh-rsa") 2)
+    ((member plain-type
+             '("ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384"
+               "ecdsa-sha2-nistp521")
+             :test #'string=)
+     2)
+    (t nil)))
+
+(defun ssh-certificate-parse (key-blob)
+  "KEY-BLOB as an SSH-CERTIFICATE, or NIL when it is not a readable cert.
+
+The certificate's signature is not checked here; see
+SSH-CERTIFICATE-SIGNATURE-VALID-P."
+  (when (ssh-certificate-blob-p key-blob)
+    (handler-case
+        (let* ((reader (ssh-make-reader key-blob))
+               (type (ssh-read-text reader))
+               (plain-type (ssh-certificate-plain-type type))
+               (field-count (ssh-certificate-key-field-count plain-type))
+               (key-writer (ssh-writer)))
+          ;; The nonce precedes the plain key fields.
+          (ssh-read-string reader)
+          (ssh-write-text key-writer plain-type)
+          (dotimes (index field-count)
+            (declare (ignore index))
+            (ssh-write-string key-writer (ssh-read-string reader)))
+          (let ((plain-key-blob (ssh-writer-output key-writer))
+                (serial (ssh-read-u64 reader))
+                (cert-type (ssh-read-u32 reader))
+                (key-id (ssh-read-text reader))
+                (principal-reader
+                  (ssh-make-reader (ssh-read-string reader)))
+                (valid-after (ssh-read-u64 reader))
+                (valid-before (ssh-read-u64 reader))
+                (critical (ssh-certificate-option-list
+                           (ssh-make-reader (ssh-read-string reader))))
+                (extensions (ssh-certificate-option-list
+                             (ssh-make-reader (ssh-read-string reader))))
+                (reserved (ssh-read-text reader))
+                (signature-key (ssh-read-string reader))
+                (signature-start (ssh-reader-position reader))
+                (signature (ssh-read-string reader)))
+            (unless (zerop (ssh-reader-remaining reader))
+              (error 'ssh-protocol-error
+                     :detail "trailing data after a certificate"))
+            (let ((principals '()))
+              (when (plusp (ssh-reader-remaining principal-reader))
+                (loop while (plusp (ssh-reader-remaining principal-reader))
+                      do (push (ssh-read-text principal-reader) principals)))
+              (%make-ssh-certificate
+               :key-type type
+               :plain-key-type plain-type
+               :plain-blob plain-key-blob
+               :serial serial
+               :cert-type cert-type
+               :key-id key-id
+               :principals (nreverse principals)
+               :valid-after valid-after
+               :valid-before valid-before
+               :critical critical
+               :extensions extensions
+               :reserved reserved
+               :signature-key signature-key
+               :signature signature
+               :signature-algorithm
+               (nth-value 0 (ssh-parse-signature-blob signature))
+               :signed-data (subseq key-blob 0 signature-start)))))
+      (error () nil))))
+
+(defun ssh-certificate-plain-key-blob (key-blob)
+  "The plain public key blob inside certificate KEY-BLOB, or NIL."
+  (let ((certificate (ssh-certificate-parse key-blob)))
+    (and certificate (ssh-certificate-plain-blob certificate))))
+
+(defun ssh-key-plain-blob (key-blob)
+  "KEY-BLOB with a certificate's certified key substituted for the cert.
+
+A plain key is returned unchanged.  A malformed certificate is returned as
+it is, so every caller fails closed instead of trusting the wrapper."
+  (if (ssh-certificate-blob-p key-blob)
+      (or (ssh-certificate-plain-key-blob key-blob) key-blob)
+      key-blob))
+
+(defun ssh-certificate-signature-valid-p (certificate)
+  "Whether CERTIFICATE's body carries a valid CA signature.
+
+The CA key itself may not be a certificate, which is OpenSSH's rule for a
+valid certificate authority."
+  (and (ssh-certificate-p certificate)
+       (let ((ca (ssh-certificate-signature-key certificate)))
+         (and ca
+              (not (ssh-certificate-blob-p ca))
+              (ssh-public-key-signature-valid-p
+               ca (ssh-certificate-signature certificate)
+               (ssh-certificate-signed-data certificate))))))

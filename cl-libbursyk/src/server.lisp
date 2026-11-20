@@ -152,7 +152,7 @@ TCP-KEEP-ALIVE (default T) controls SO_KEEPALIVE on accepted sockets.
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.18\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.19\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 

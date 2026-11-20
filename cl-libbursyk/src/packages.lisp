@@ -170,6 +170,11 @@
    #:ssh-server-config-address-family
    #:ssh-server-config-host-key-files
    #:ssh-server-config-authorized-keys-files
+   #:ssh-server-config-trusted-user-ca-keys
+   #:ssh-server-config-authorized-principals-file
+   #:ssh-server-config-authorized-principals-command
+   #:ssh-server-config-authorized-principals-command-user
+   #:ssh-server-config-ca-signature-algorithms
    #:ssh-server-config-accept-env
    #:ssh-server-config-permit-open
    #:ssh-server-config-permit-listen
@@ -238,6 +243,9 @@
    #:ssh-authorization-options-p
    #:ssh-authorization-options-restricted
    #:ssh-authorization-options-from
+   #:ssh-authorization-options-cert-authority
+   #:ssh-authorization-options-cert-principals
+   #:ssh-authorization-options-cert-from
    #:ssh-authorization-options-force-command
    #:ssh-authorization-options-permit-open
    #:ssh-authorization-options-permit-listen
@@ -253,6 +261,13 @@
    #:ssh-authorization-options-permit-now-p
    #:ssh-authorization-options-permit-open-p
    #:ssh-authorization-options-permit-listen-p
+   #:ssh-authorization-options-merge
+   #:ssh-certificate-authorization-options-empty
+   #:ssh-certificate-authorization-options-from-certificate
+   #:ssh-principals-line-principal-and-options
+   #:ssh-authorization-principals-file-match
+   #:ssh-server-ca-signature-algorithms
+   #:ssh-server-ca-signature-algorithm-names
    #:ssh-session-remote-ip
    #:ssh-session-permits-pty-p
    #:ssh-session-permits-direct-tcpip-p
@@ -275,6 +290,41 @@
    #:ssh-public-key-parts
    #:ssh-make-public-key-blob
    #:ssh-public-key-blob-of
+   #:ssh-key-plain-blob
+   ;; OpenSSH certificates
+   #:ssh-certificate
+   #:ssh-certificate-p
+   #:ssh-certificate-blob-p
+   #:ssh-certificate-type
+   #:ssh-certificate-type-name-p
+   #:ssh-certificate-key-type
+   #:ssh-certificate-parse
+   #:ssh-certificate-plain-type
+   #:ssh-certificate-plain-key-type
+   #:ssh-certificate-plain-key-blob
+   #:ssh-certificate-plain-blob
+   #:ssh-certificate-serial
+   #:ssh-certificate-cert-type
+   #:ssh-certificate-key-id
+   #:ssh-certificate-principals
+   #:ssh-certificate-valid-after
+   #:ssh-certificate-valid-before
+   #:ssh-certificate-critical
+   #:ssh-certificate-extensions
+   #:ssh-certificate-signature-key
+   #:ssh-certificate-signature
+   #:ssh-certificate-signature-algorithm
+   #:ssh-certificate-signed-data
+   #:ssh-certificate-signature-valid-p
+   #:ssh-certificate-signature-algorithm-allowed-p
+   #:ssh-certificate-check
+   #:ssh-certificate-principal-p
+   #:ssh-certificate-principals-match-p
+   #:ssh-certificate-ca-listed-p
+   #:ssh-certificate-user-authorized-p
+   #:ssh-certificate-authorized-key-match
+   #:+ssh-unix-epoch+
+   #:ssh-unix-time
    #:ssh-ed25519-verify
    #:ssh-ed25519-sign
    #:ssh-ed25519-signature-blob

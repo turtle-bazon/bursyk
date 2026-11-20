@@ -166,7 +166,8 @@ the whole line."
                        (permit-agent-forwarding t)
                        (permit-x11-forwarding t)
                        (permit-user-rc t)
-                       restricted from force-command permit-open permit-listen
+                       restricted cert-authority cert-principals cert-from
+                       from force-command permit-open permit-listen
                        valid-before (environments '()))))
   "What the authorized_keys line that admitted a key permits.
 
@@ -174,19 +175,39 @@ The defaults are sshd's for a line with no options: every feature is
 allowed.  FROM is one sshd address pattern list (\"10.0.0.0/8,!10.1.2.3\"),
 FORCE-COMMAND replaces the client's command, PERMIT-OPEN and PERMIT-LISTEN
 are (HOST . PORT) pairs with :ANY for a wildcard port, and VALID-BEFORE is a
-UNIVERSAL-TIME after which the key stops working."
+UNIVERSAL-TIME after which the key stops working.
+
+CERT-AUTHORITY marks the line's key as a CA rather than a login key,
+CERT-PRINCIPALS is its principals= list, and CERT-FROM is the source-address
+critical option read from a certificate."
   (permit-pty t)
   (permit-port-forwarding t)
   (permit-agent-forwarding t)
   (permit-x11-forwarding t)
   (permit-user-rc t)
   (restricted nil)
+  (cert-authority nil)
+  (cert-principals nil)
+  (cert-from nil)
   (from nil)
   (force-command nil)
   (permit-open nil)
   (permit-listen nil)
   (valid-before nil)
   (environments '()))
+
+(defun ssh-certificate-authorization-options-empty ()
+  "An authorization record whose every permission is off.
+
+Certificates grant features through their extensions, so a certificate that
+carries no extension permits nothing; sshd starts from sshauthopt_new(), not
+the permissive defaults of an authorized_keys line."
+  (%make-ssh-authorization-options
+   :permit-pty nil
+   :permit-port-forwarding nil
+   :permit-agent-forwarding nil
+   :permit-x11-forwarding nil
+   :permit-user-rc nil))
 
 (defun ssh-authorization-options-permit-pty-p (options)
   "Whether OPTIONS allow a pty request; NIL options keep sshd's default."
@@ -200,11 +221,17 @@ UNIVERSAL-TIME after which the key stops working."
   "Whether ADDRESS may use the key described by OPTIONS.
 
 The from= option is one sshd address list; when it is present and the
-backend did not report an address, the key is refused rather than trusted."
+backend did not report an address, the key is refused rather than trusted.
+A certificate's source-address critical option is a separate list and must
+also admit the peer."
   (or (null options)
-      (let ((from (ssh-authorization-options-from options)))
-        (or (null from)
-            (and address (ssh-address-pattern-match-p address from))))))
+      (let ((from (ssh-authorization-options-from options))
+            (cert-from (ssh-authorization-options-cert-from options)))
+        (and (or (null from)
+                 (and address (ssh-address-pattern-match-p address from)))
+             (or (null cert-from)
+                 (and address
+                      (ssh-address-pattern-match-p address cert-from)))))))
 
 (defun ssh-authorization-options-permit-now-p
     (options &optional (now (get-universal-time)))
@@ -398,9 +425,9 @@ restriction we do not implement stays a restriction."
                      (ssh-authorization-options-permit-x11-forwarding parsed) nil
                      (ssh-authorization-options-permit-user-rc parsed) nil))
               ((string-equal token "cert-authority")
-               ;; The line marks a certificate authority.  Treating it as a
-               ;; plain login key would be a privilege escalation.
-               (fail))
+               ;; The line marks a certificate authority.  The key itself
+               ;; cannot log in; only certificates it signed can.
+               (setf (ssh-authorization-options-cert-authority parsed) t))
               ((flag token "port-forwarding" t)
                (setf (ssh-authorization-options-permit-port-forwarding parsed)
                      flag-value))
@@ -491,11 +518,20 @@ restriction we do not implement stays a restriction."
                         (if (and valid-p (<= (length permit-listen) 4096))
                             (push (cons host port) permit-listen)
                             (fail)))))
-                   ((or (string-equal name "principals")
-                        (string-equal name "tunnel"))
-                    ;; Certificate principals and TUN devices are features
-                    ;; this server does not implement; accepting the line
-                    ;; would quietly drop a permission or a restriction.
+                   ((string-equal name "principals")
+                    (multiple-value-bind (text matched value-valid)
+                        (ssh-authorization-option-quoted token "principals")
+                      (if (or (not matched)
+                              (not value-valid)
+                              (ssh-authorization-options-cert-principals
+                               parsed))
+                          (fail)
+                          (setf (ssh-authorization-options-cert-principals
+                                 parsed) text))))
+                   ((string-equal name "tunnel")
+                    ;; TUN devices are a feature this server does not
+                    ;; implement; accepting the line would quietly drop a
+                    ;; restriction.
                     (fail))
                    (t (fail))))))))
         (if valid
@@ -514,27 +550,258 @@ restriction we do not implement stays a restriction."
   (let ((options (nth-value 2 (ssh-authorized-key-line-parts line))))
     (and options (ssh-authorization-options-environments options))))
 
+;;;; ---- Certificate options ----
+;;;
+;;; A certificate starts with every permission off and turns features on
+;;; through its extension list.  Critical options restrict further and an
+;;; unknown critical option makes the certificate unusable, as sshd's
+;;; cert_option_list does; unknown extensions are ignored.
+
+(defun ssh-certificate-authorization-options-from-certificate (certificate)
+  "VALUES AUTHORIZATION VALID for CERTIFICATE's critical options.
+
+Critical options this build knows are force-command, source-address and
+verify-required.  An unknown one invalidates the certificate rather than
+being ignored, because it may be the only thing stopping a wider login."
+  (let ((options (ssh-certificate-authorization-options-empty))
+        (valid t))
+    (dolist (entry (ssh-certificate-critical certificate))
+      (let ((name (car entry))
+            (value (cdr entry)))
+        (cond
+          ((string= name "force-command")
+           (if (ssh-authorization-options-force-command options)
+               (setf valid nil)
+               (setf (ssh-authorization-options-force-command options)
+                     value)))
+          ((string= name "source-address")
+           (if (ssh-authorization-options-cert-from options)
+               (setf valid nil)
+               (setf (ssh-authorization-options-cert-from options) value)))
+          ((string= name "verify-required")
+           ;; User-presence verification needs a security key, which this
+           ;; build cannot ask for, so honouring the option is impossible;
+           ;; such a certificate is refused rather than weakened.
+           (setf valid nil))
+          (t (setf valid nil)))))
+    (when valid
+      (dolist (entry (ssh-certificate-extensions certificate))
+        (let ((name (car entry)))
+          (cond
+            ((string= name "permit-X11-forwarding")
+             (setf (ssh-authorization-options-permit-x11-forwarding options) t))
+            ((string= name "permit-agent-forwarding")
+             (setf (ssh-authorization-options-permit-agent-forwarding options)
+                   t))
+            ((string= name "permit-port-forwarding")
+             (setf (ssh-authorization-options-permit-port-forwarding options)
+                   t))
+            ((string= name "permit-pty")
+             (setf (ssh-authorization-options-permit-pty options) t))
+            ((string= name "permit-user-rc")
+             (setf (ssh-authorization-options-permit-user-rc options) t))
+            ;; no-touch-required and unknown extensions do not change any
+            ;; permission this server can grant.
+            (t nil)))))
+    (values options valid)))
+
+(defun ssh-authorization-options-merge (primary additional)
+  "PRIMARY and ADDITIONAL merged as sshd's sshauthopt_merge does.
+
+Permission flags are logical-AND (the certificate must grant a feature and
+the key or principals line must not withhold it), while restrictive values
+are combined.  Force-command clauses must agree; NIL means the two cannot be
+merged.  Certificate authorities and principals are cleared, as sshd does."
+  (when (and primary additional)
+    (let ((result (ssh-certificate-authorization-options-empty)))
+      (setf (ssh-authorization-options-permit-pty result)
+            (and (ssh-authorization-options-permit-pty primary)
+                 (ssh-authorization-options-permit-pty additional))
+            (ssh-authorization-options-permit-port-forwarding result)
+            (and (ssh-authorization-options-permit-port-forwarding primary)
+                 (ssh-authorization-options-permit-port-forwarding additional))
+            (ssh-authorization-options-permit-agent-forwarding result)
+            (and (ssh-authorization-options-permit-agent-forwarding primary)
+                 (ssh-authorization-options-permit-agent-forwarding additional))
+            (ssh-authorization-options-permit-x11-forwarding result)
+            (and (ssh-authorization-options-permit-x11-forwarding primary)
+                 (ssh-authorization-options-permit-x11-forwarding additional))
+            (ssh-authorization-options-permit-user-rc result)
+            (and (ssh-authorization-options-permit-user-rc primary)
+                 (ssh-authorization-options-permit-user-rc additional))
+            (ssh-authorization-options-restricted result)
+            (or (ssh-authorization-options-restricted primary)
+                (ssh-authorization-options-restricted additional))
+            (ssh-authorization-options-from result)
+            (or (ssh-authorization-options-from primary)
+                (ssh-authorization-options-from additional))
+            (ssh-authorization-options-cert-from result)
+            (or (ssh-authorization-options-cert-from primary)
+                (ssh-authorization-options-cert-from additional))
+            (ssh-authorization-options-permit-open result)
+            (or (ssh-authorization-options-permit-open primary)
+                (ssh-authorization-options-permit-open additional))
+            (ssh-authorization-options-permit-listen result)
+            (or (ssh-authorization-options-permit-listen primary)
+                (ssh-authorization-options-permit-listen additional))
+            (ssh-authorization-options-environments result)
+            (or (ssh-authorization-options-environments primary)
+                (ssh-authorization-options-environments additional)))
+      (let ((left (ssh-authorization-options-force-command primary))
+            (right (ssh-authorization-options-force-command additional)))
+        (cond
+          ((and left right (not (string= left right))) (return-from
+                                                         ssh-authorization-options-merge
+                                                         nil))
+          (t (setf (ssh-authorization-options-force-command result)
+                   (or left right)))))
+      (let ((left (ssh-authorization-options-valid-before primary))
+            (right (ssh-authorization-options-valid-before additional)))
+        (setf (ssh-authorization-options-valid-before result)
+              (cond
+                ((null left) right)
+                ((null right) left)
+                (t (min left right)))))
+      result)))
+
+(defun ssh-certificate-principals-match-p (certificate names)
+  "Whether any principal in CERTIFICATE is named in the comma-separated NAMES."
+  (let ((wanted (uiop:split-string names :separator ",")))
+    (some (lambda (principal)
+            (member principal wanted :test #'string=))
+          (ssh-certificate-principals certificate))))
+
+(defun ssh-principals-line-principal-and-options (line)
+  "VALUES PRINCIPAL OPTIONS for one AuthorizedPrincipalsFile LINE.
+
+sshd takes the last whitespace-separated field as the principal and treats
+everything before it as authorized_keys-style options; a line with no options
+is just a principal.  Comments and blank lines yield NIL."
+  (let* ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line))
+         (hash (position #\# trimmed))
+         (text (if hash (string-right-trim
+                          '(#\Space #\Tab #\Return #\Newline)
+                          (subseq trimmed 0 hash))
+                   trimmed)))
+    (when (plusp (length text))
+      (let ((last (max (or (position #\Space text :from-end t) -1)
+                       (or (position #\Tab text :from-end t) -1))))
+        (if (< last 0)
+            (values text nil)
+            (values (string-left-trim '(#\Space #\Tab) (subseq text (1+ last)))
+                    (string-right-trim '(#\Space #\Tab)
+                                       (subseq text 0 (1+ last)))))))))
+
+(defun ssh-authorization-principals-file-match (source certificate)
+  "Values OPTIONS FOUND from an AuthorizedPrincipalsFile SOURCE.
+
+SOURCE is a path, a list of lines, or one line.  The first line whose
+principal equals a certificate principal supplies its options; the
+principal comparison is exact, as sshd's auth_check_principals_line."
+  (let ((entries
+          (cond
+            ((listp source) source)
+            ((pathnamep source)
+             (if (probe-file source)
+                 (with-open-file (stream source :direction :input
+                                                :if-does-not-exist nil
+                                                :external-format :utf-8)
+                   (loop for line = (read-line stream nil nil)
+                         while line collect line))
+                 '()))
+            ((stringp source)
+             (if (probe-file source)
+                 (ssh-authorization-principals-file-match (pathname source)
+                                                          certificate)
+                 (list source)))
+            (t '()))))
+    (dolist (line entries (values nil nil))
+      (multiple-value-bind (principal options-text)
+          (ssh-principals-line-principal-and-options line)
+        (when (and principal
+                   (member principal (ssh-certificate-principals certificate)
+                           :test #'string=))
+          (multiple-value-bind (options valid)
+              (ssh-authorized-key-options-parse (or options-text ""))
+            (when (and valid
+                       (not (ssh-authorization-options-cert-authority options)))
+              (return-from ssh-authorization-principals-file-match
+                (values options t)))))))))
+
+
+(defparameter +ssh-certificate-type-suffix+ "-cert-v01@openssh.com")
+
+(defun ssh-certificate-userauth-signature-algorithm (algorithm)
+  "The signature blob's own algorithm for a userauth request ALGORITHM.
+
+A certificate names itself with its certificate key type in the request, but
+the signature it carries is made by the certified key and named for the plain
+algorithm.  OpenSSH's RSA certificates also use rsa-sha2-256/512 names."
+  (if (and (> (length algorithm) (length +ssh-certificate-type-suffix+))
+           (string= +ssh-certificate-type-suffix+ algorithm
+                    :start2 (- (length algorithm)
+                               (length +ssh-certificate-type-suffix+))))
+      (subseq algorithm 0 (- (length algorithm)
+                             (length +ssh-certificate-type-suffix+)))
+      algorithm))
+
 (defun ssh-server-user-key-algorithm-p (key-blob algorithm)
   "Whether KEY-BLOB may sign as ALGORITHM in a userauth request.
 
-The key type decides the names it may use: an ECDSA key signs under its
+A plain key type decides the names it may use: an ECDSA key signs under its
 curve's name, an RSA key under any RFC 8332 name, and ed25519 under its own.
-A blob that does not parse is never acceptable."
+A certificate is offered under its certificate type name (and, for RSA, the
+rsa-sha2 certificate names), while the signature inside is made by the
+certified key.  A blob that does not parse is never acceptable."
   (handler-case
-      (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
-        (declare (ignore data))
-        (cond
-          ((string= type "ssh-ed25519")
-           (string= algorithm "ssh-ed25519"))
-          ((string= type "ssh-rsa")
-           (not (null (ssh-rsa-digest-keyword algorithm))))
-          ((member type '("ecdsa-sha2-nistp256"
-                          "ecdsa-sha2-nistp384"
-                          "ecdsa-sha2-nistp521")
-                   :test #'string=)
-           (string= algorithm type))
-          (t nil)))
+      (if (ssh-certificate-blob-p key-blob)
+          (let ((certificate (ssh-certificate-parse key-blob)))
+            (and certificate
+                 (let ((plain (ssh-certificate-plain-key-type certificate)))
+                   (cond
+                     ((string= plain "ssh-rsa")
+                      (member algorithm
+                              '("ssh-rsa-cert-v01@openssh.com"
+                                "rsa-sha2-256-cert-v01@openssh.com"
+                                "rsa-sha2-512-cert-v01@openssh.com")
+                              :test #'string=))
+                     ((string= plain "ssh-ed25519")
+                      (string= algorithm
+                               "ssh-ed25519-cert-v01@openssh.com"))
+                     ((member plain '("ecdsa-sha2-nistp256"
+                                      "ecdsa-sha2-nistp384"
+                                      "ecdsa-sha2-nistp521")
+                              :test #'string=)
+                      (string= algorithm
+                               (concatenate 'string plain
+                                            +ssh-certificate-type-suffix+)))
+                     (t nil)))))
+          (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+            (declare (ignore data))
+            (cond
+              ((string= type "ssh-ed25519")
+               (string= algorithm "ssh-ed25519"))
+              ((string= type "ssh-rsa")
+               (not (null (ssh-rsa-digest-keyword algorithm))))
+              ((member type '("ecdsa-sha2-nistp256"
+                              "ecdsa-sha2-nistp384"
+                              "ecdsa-sha2-nistp521")
+                       :test #'string=)
+               (string= algorithm type))
+              (t nil))))
     (error () nil)))
+
+(defun ssh-certificate-signature-algorithm-allowed-p (certificate allowed)
+  "Whether CERTIFICATE's CA signature algorithm is in ALLOWED.
+
+ALLOWED is a list of algorithm names, or NIL for the default.  OpenSSH
+checks the certificate's signature type, not the user's signature type."
+  (and certificate
+       (let ((algorithm (ssh-certificate-signature-algorithm certificate)))
+         (and algorithm
+              (member algorithm (or allowed
+                                    +ssh-server-ca-signature-algorithms+)
+                      :test #'string=)))))
 
 (defun ssh-session-user-key-algorithm-p (session key-blob algorithm)
   "Whether SESSION accepts KEY-BLOB signing as ALGORITHM.
@@ -656,6 +923,124 @@ base config, which is the same value sshd uses to build KEXINIT."
                nil))))
     (t nil)))
 
+(defun ssh-certificate-check
+    (certificate user &key address (now (get-universal-time))
+                          ca-signature-algorithms require-principal)
+  "VALUES VALID OPTIONS for a USER certificate at a connection.
+
+VALID means the certificate is a user certificate, is inside its validity
+window, carries a CA signature this build accepts, its source-address critical
+option admits ADDRESS, and (when REQUIRE-PRINCIPAL is true) it names at least
+one principal.  OPTIONS is the permission set the certificate itself grants; a
+caller still has to establish that one of the certificate's principals may log
+in as USER."
+  (let ((unix-now (ssh-unix-time now)))
+    (when (and certificate
+               (= (ssh-certificate-cert-type certificate) 1)
+               (<= (ssh-certificate-valid-after certificate) unix-now)
+               (< unix-now (ssh-certificate-valid-before certificate))
+               (or (not require-principal)
+                   (plusp (length (ssh-certificate-principals certificate))))
+               (ssh-certificate-signature-valid-p certificate)
+               (ssh-certificate-signature-algorithm-allowed-p
+                certificate ca-signature-algorithms))
+      (multiple-value-bind (options valid)
+          (ssh-certificate-authorization-options-from-certificate certificate)
+        (when (and valid
+                   (ssh-authorization-options-permit-address-p
+                    options address))
+          (values t options))))))
+
+(defun ssh-certificate-principal-p (certificate user)
+  "Whether USER is an acceptable principal of CERTIFICATE.
+
+An empty principal list means any principal, which is how OpenSSH treats a
+certificate used without AuthorizedPrincipalsFile."
+  (or (null (ssh-certificate-principals certificate))
+      (member user (ssh-certificate-principals certificate)
+              :test #'string=)))
+
+(defun ssh-certificate-ca-listed-p (ca source)
+  "Whether the CA public key blob CA appears in SOURCE."
+  (some (lambda (entry)
+          (ssh-octets= (car entry) ca))
+        (ssh-authorized-key-source-entries source)))
+
+(defun ssh-certificate-user-authorized-p
+    (user key-blob
+     &key address (now (get-universal-time))
+          ca-keys principals-source ca-signature-algorithms)
+  "VALUES MATCHED ENVIRONMENTS OPTIONS for certificate KEY-BLOB as USER.
+
+This is sshd's user_cert_trusted_ca: the CA must be listed in CA-KEYS, and
+when a PRINCIPALS-SOURCE is given one of the certificate's principals must
+appear on a line there, whose options are merged with the certificate's own.
+Without a principals source the certificate principal list must name USER, or
+be empty."
+  (let ((certificate (ssh-certificate-parse key-blob)))
+    (multiple-value-bind (valid cert-options)
+        (ssh-certificate-check certificate user :address address :now now
+                               :ca-signature-algorithms
+                               ca-signature-algorithms
+                               :require-principal (null principals-source))
+      (when (and valid
+                 ca-keys
+                 (ssh-certificate-ca-listed-p
+                  (ssh-certificate-signature-key certificate) ca-keys))
+        (if principals-source
+            (multiple-value-bind (principals-options found)
+                (ssh-authorization-principals-file-match
+                 principals-source certificate)
+              (when found
+                (let ((merged (ssh-authorization-options-merge
+                               principals-options cert-options)))
+                  (when merged
+                    (values t
+                            (ssh-authorization-options-environments merged)
+                            merged)))))
+            (when (ssh-certificate-principal-p certificate user)
+              (values t
+                      (ssh-authorization-options-environments cert-options)
+                      cert-options)))))))
+
+(defun ssh-certificate-authorized-key-match
+    (source certificate user
+     &key address (now (get-universal-time))
+          ca-signature-algorithms)
+  "VALUES MATCHED ENVIRONMENTS OPTIONS when SOURCE authorizes CERTIFICATE.
+
+SOURCE is an authorized_keys file or line list.  A cert-authority line whose
+key is the certificate's CA admits it; principals= on the line must name one
+of the certificate's principals, and otherwise USER must be one.  The line's
+options and the certificate's options are merged."
+  (let ((ca (ssh-certificate-signature-key certificate)))
+    (iter (for entry in (ssh-authorized-key-source-entries source))
+      (let ((options (second entry)))
+        (when (and options
+                   (ssh-authorization-options-cert-authority options)
+                   (ssh-octets= (first entry) ca)
+                   (ssh-authorization-options-permit-now-p options now)
+                   (ssh-authorization-options-permit-address-p
+                    options address))
+          (let ((named (ssh-authorization-options-cert-principals options)))
+            (when (if named
+                      (ssh-certificate-principals-match-p certificate named)
+                      (ssh-certificate-principal-p certificate user))
+              (multiple-value-bind (valid cert-options)
+                  (ssh-certificate-check certificate user
+                                         :address address :now now
+                                         :ca-signature-algorithms
+                                         ca-signature-algorithms)
+                (when valid
+                  (let ((merged (ssh-authorization-options-merge
+                                 options cert-options)))
+                    (when merged
+                      (return-from ssh-certificate-authorized-key-match
+                        (values t
+                                (ssh-authorization-options-environments merged)
+                                merged)))))))))))
+    (values nil nil nil)))
+
 (defun ssh-authorized-key-blob-match
     (source key-blob &key address (now (get-universal-time)))
   "Whether KEY-BLOB is listed in SOURCE, and the options it carries.
@@ -668,7 +1053,10 @@ permissive defaults."
   (iter (for entry in (ssh-authorized-key-source-entries source))
     (when (ssh-octets= (car entry) key-blob)
       (let ((options (second entry)))
-        (when (and (ssh-authorization-options-permit-now-p options now)
+        ;; A cert-authority line names a CA and never logs the CA key in
+        ;; itself; only certificates it signed may use the line.
+        (when (and (not (ssh-authorization-options-cert-authority options))
+                   (ssh-authorization-options-permit-now-p options now)
                    (ssh-authorization-options-permit-address-p
                     options address))
           (return-from ssh-authorized-key-blob-match

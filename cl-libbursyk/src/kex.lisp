@@ -343,7 +343,12 @@ Everything this library can verify is supported here: ssh-ed25519, ssh-rsa
 under any of RFC 8332's three signature names, and the three ECDSA curves.
 A malformed or mismatched blob is simply not a valid signature."
   (handler-case
-      (multiple-value-bind (type key-bytes) (ssh-public-key-parts key-blob)
+      ;; A userauthentication request may carry a certificate; the client's
+      ;; signature is made by the certified key, so verify against the key
+      ;; inside the wrapper.  The wrapper's own CA signature is checked when
+      ;; the certificate is authorized.
+      (multiple-value-bind (type key-bytes)
+          (ssh-public-key-parts (ssh-key-plain-blob key-blob))
         (multiple-value-bind (algorithm signature)
             (ssh-parse-signature-blob signature-blob)
           (cond

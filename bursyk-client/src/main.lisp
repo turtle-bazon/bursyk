@@ -472,7 +472,7 @@ still disables the feature and therefore silences the refusal."
       ;; user with a weaker or different connection than they asked for.
       (when (cl-pnet-ssh:ssh-config-options-certificate-files options)
         (unsupported "CertificateFile"
-                     "certificate authentication is not implemented"))
+                     "only the KEY-cert.pub beside an IdentityFile is used"))
       (when (cl-pnet-ssh:ssh-config-options-bind-address options)
         (unsupported "BindAddress"
                      "binding the source address is not implemented"))

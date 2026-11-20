@@ -265,8 +265,8 @@ came up."
     (ssh-write-string writer signature)
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
-(defun ssh-server-send-ext-info (session)
-  "Tell the client which public-key signatures this server accepts.
+(defun ssh-server-ext-info-payload ()
+  "The EXT_INFO payload naming the public-key signatures this server accepts.
 
 RFC 8308 sends EXT_INFO right after the first NEWKEYS, when the client
 asked for it with ext-info-c.  Without server-sig-algs an OpenSSH client
@@ -277,15 +277,28 @@ cannot know that rsa-sha2-512 is acceptable."
     (ssh-write-u32 writer 1)
     (ssh-write-text writer "server-sig-algs")
     (ssh-write-name-list writer +ssh-server-user-key-algorithms+)
-    (ssh-session-send-payload session (ssh-writer-output writer))))
+    (ssh-writer-output writer)))
+
+(defun ssh-server-send-ext-info (session)
+  "Send EXT_INFO as a packet of its own."
+  (ssh-session-send-payload session (ssh-server-ext-info-payload)))
 
 (defun ssh-server-send-newkeys (session)
-  "Send NEWKEYS, then switch our sending half to the negotiated keys."
-  (let ((keys (ssh-session-derived-keys session))
-        (cipher (ssh-session-cipher session)))
-    (ssh-session-send-payload
-     session (make-array 1 :element-type '(unsigned-byte 8)
-                           :initial-element +ssh-msg-newkeys+))
+  "Send NEWKEYS, then switch our sending half to the negotiated keys.
+
+EXT_INFO goes out in the same write as NEWKEYS, as OpenSSH's server does.
+A client only learns that an RSA key may sign with rsa-sha2-512 from
+server-sig-algs; libssh decides that before it next reads the socket, so an
+announcement left in a second segment makes it fall back to SHA-1 ssh-rsa
+and refuse the key without ever asking."
+  (let* ((keys (ssh-session-derived-keys session))
+         (cipher (ssh-session-cipher session))
+         (ext-info (and (getf (ssh-session-negotiated session) :ext-info)
+                        (not (ssh-session-rekey session))))
+         (newkeys (ssh-encode-packet
+                   (make-array 1 :element-type '(unsigned-byte 8)
+                                 :initial-element +ssh-msg-newkeys+)
+                   cipher)))
     (when (ssh-session-strict-kex session)
       (ssh-reset-send-sequence cipher))
     (ssh-install-keys cipher
@@ -295,9 +308,13 @@ cannot know that rsa-sha2-512 is acceptable."
                       :aead (getf keys :aead))
     (setf (ssh-session-keys-sent session) t
           (ssh-session-kexinit-sent session) nil)
-    (when (and (getf (ssh-session-negotiated session) :ext-info)
-               (not (ssh-session-rekey session)))
-      (ssh-server-send-ext-info session))
+    (ssh-session-send-bytes
+     session
+     (if ext-info
+         (ssh-concat newkeys
+                     (ssh-encode-packet
+                      (ssh-server-ext-info-payload) cipher))
+         newkeys))
     (ssh-server-maybe-finish-kex session)))
 
 (defun ssh-server-handle-newkeys (session)
@@ -434,7 +451,9 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
            (multiple-value-bind (signature-algorithm signature-bytes)
                (ssh-parse-signature-blob signature)
              (declare (ignore signature-bytes))
-             (and (string= signature-algorithm algorithm)
+             (and (string= signature-algorithm
+                           (ssh-certificate-userauth-signature-algorithm
+                            algorithm))
                   (ssh-public-key-signature-valid-p
                    key-blob signature
                    (ssh-server-signed-data session user algorithm key-blob))))

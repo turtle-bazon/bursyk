@@ -1785,3 +1785,129 @@ Subsystem sftp /usr/lib/openssh/sftp-server"))
                     :state :open)))
       (setf (gethash 2 (cl-pnet-ssh::ssh-session-channels session)) channel)
       (is (zerop (cl-pnet-ssh:ssh-server-session-channel-count session))))))
+
+;;; ---- Certificate authentication ----
+
+(defun certificate-test-keygen-available-p ()
+  (handler-case
+      (zerop (nth-value 2 (uiop:run-program '("sh" "-c" "command -v ssh-keygen")
+                                            :ignore-error-status t
+                                            :output nil :error-output nil)))
+    (error () nil)))
+
+(defun certificate-test-keygen (&rest arguments)
+  (uiop:run-program (cons "ssh-keygen" arguments)
+                    :output :string :error-output :string))
+
+(defun certificate-test-key-blob (path)
+  "The base64 key blob on the first line of PATH."
+  (let ((line (with-open-file (stream path :direction :input)
+                (read-line stream))))
+    (cl-pnet-ssh:ssh-base64-octets
+     (second (uiop:split-string line :separator " ")))))
+
+(defun certificate-test-directory (prefix)
+  (merge-pathnames
+   (format nil "~A-~D-~D/" prefix (get-universal-time) (random 1000000))
+   (uiop:temporary-directory)))
+
+#-win32
+(test trusted-user-ca-keys-authorizes-a-user-certificate
+  "A certificate from TrustedUserCAKeys logs in through its principal, and
+the certificate's force-command and source-address are enforced."
+  (if (not (certificate-test-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (certificate-test-directory "bursyk-server-cert"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory))
+             (ca-pub (merge-pathnames "ca.pub" directory))
+             (principals (merge-pathnames "principals" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring ca))
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring user))
+               (certificate-test-keygen
+                "-q" "-s" (namestring ca) "-I" "server-id"
+                "-n" "turtle" "-V" "-1m:+52w"
+                "-O" "force-command=echo certified"
+                "-O" "source-address=127.0.0.1/32"
+                (namestring (merge-pathnames "user.pub" directory)))
+               (with-open-file (stream principals :direction :output
+                                                  :if-exists :supersede)
+                 (write-string "turtle" stream))
+               (let* ((cert-blob
+                        (certificate-test-key-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (config
+                        (config-from-text
+                         (format nil "TrustedUserCAKeys ~A~%~
+                                      AuthorizedPrincipalsFile ~A~%~
+                                      AuthorizedKeysFile none~%"
+                                 ca-pub principals))))
+                 (let ((bursyk-server::*server-config* config)
+                       (bursyk-server::*options* nil))
+                   ;; The principal in the file admits the login; the
+                   ;; certificate's force-command becomes the session's.
+                   (multiple-value-bind (matched environment options)
+                       (bursyk-server::authorized-keys-p
+                        "turtle" cert-blob "127.0.0.1")
+                     (declare (ignore environment))
+                     (is (not (null matched)))
+                     (is (string=
+                          "echo certified"
+                          (cl-pnet-ssh:ssh-authorization-options-force-command
+                           options))))
+                   ;; A principal the file does not name is refused.
+                   (is (null (bursyk-server::authorized-keys-p
+                              "other" cert-blob "127.0.0.1")))
+                   ;; source-address excludes any other client address.
+                   (is (null (bursyk-server::authorized-keys-p
+                              "turtle" cert-blob "10.0.0.1"))))
+                 ;; A cert-authority line in -A works without TrustedUserCAKeys.
+                 (let ((authkeys (merge-pathnames "authkeys" directory)))
+                   (with-open-file (stream authkeys :direction :output
+                                                    :if-exists :supersede)
+                     (format stream "cert-authority,principals=\"turtle\" ~A~%"
+                             (with-open-file (ca-file ca-pub)
+                               (read-line ca-file))))
+                   (let ((bursyk-server::*server-config* nil)
+                         (bursyk-server::*options*
+                           (list :authorized-keys authkeys)))
+                     (multiple-value-bind (matched environment options)
+                         (bursyk-server::authorized-keys-p
+                          "turtle" cert-blob "127.0.0.1")
+                       (declare (ignore environment))
+                       (is (not (null matched)))
+                       (is (string=
+                            "echo certified"
+                            (cl-pnet-ssh:ssh-authorization-options-force-command
+                             options))))
+                     ;; The CA's own key is not a login key on such a line.
+                     (is (null (bursyk-server::authorized-keys-p
+                                "turtle"
+                                (certificate-test-key-blob ca-pub)
+                                "127.0.0.1")))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test certificate-command-line-splitting-follows-sshd
+  "AuthorizedPrincipalsCommand is split the way argv_split does."
+  (is (equal '("echo" "one" "two words")
+             (bursyk-server::split-command-arguments
+              "echo one \"two words\"")))
+  (is (equal '("a b" "c")
+             (bursyk-server::split-command-arguments "a\\ b c")))
+  (is (string= "echo turtle xssh-ed25519"
+               (bursyk-server::expand-command-tokens
+                "echo %u x%T"
+                (list (cons #\u "turtle") (cons #\T "ssh-ed25519")))))
+  ;; %% is a literal percent sign.
+  (is (string= "100%" (bursyk-server::expand-command-tokens
+                       "100%%" (list (cons #\% "%")))))
+  (let ((unmatched
+          (handler-case
+              (progn (bursyk-server::split-command-arguments "\"unclosed") nil)
+            (error () t))))
+    (is (not (null unmatched)))))

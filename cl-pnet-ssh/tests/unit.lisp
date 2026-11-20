@@ -405,7 +405,232 @@ flag at a rekey would make the two sides count packets differently."
                    (ssh-load-private-key path))))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
-;;; ---- known_hosts ----
+;;; ---- OpenSSH certificates ----
+
+(defun ssh-test-public-key-blob (path)
+  "The public key blob on the first line of PATH's key file."
+  (let ((line (with-open-file (stream path :direction :input)
+                (read-line stream))))
+    (ssh-base64-octets (second (uiop:split-string line :separator " ")))))
+
+(defun ssh-test-certificate-blob (path)
+  "The certificate blob in PATH's .pub file."
+  (ssh-test-public-key-blob path))
+
+(test user-certificates-parse-verify-and-authorize
+  "A CA-signed user certificate carries the right fields, verifies against
+its CA, and is admitted only for a principal and address its options allow."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-cert"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory))
+             (ca-pub (merge-pathnames "ca.pub" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring user)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "test-id"
+                      "-n" "alice,bob" "-V" "-1m:+52w"
+                      "-O" "clear" "-O" "permit-pty"
+                      "-O" "force-command=echo certified"
+                      "-O" "source-address=127.0.0.1/32"
+                      (namestring (merge-pathnames "user.pub" directory))))
+               (let* ((cert-blob
+                        (ssh-test-certificate-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (certificate (ssh-certificate-parse cert-blob))
+                      (ca-blob (ssh-test-public-key-blob ca-pub))
+                      (plain-blob (ssh-test-public-key-blob
+                                   (merge-pathnames "user.pub" directory))))
+                 (is (ssh-certificate-blob-p cert-blob))
+                 (is (string= "test-id"
+                              (ssh-certificate-key-id (ssh-certificate-parse cert-blob))))
+                 (is (string= "ssh-ed25519-cert-v01@openssh.com"
+                              (ssh-certificate-key-type certificate)))
+                 (is (string= "ssh-ed25519"
+                              (ssh-certificate-plain-key-type certificate)))
+                 (is (= 1 (ssh-certificate-cert-type certificate)))
+                 (is (string= "test-id"
+                              (ssh-certificate-key-id certificate)))
+                 (is (equal '("alice" "bob")
+                            (ssh-certificate-principals certificate)))
+                 (is (ssh-certificate-signature-valid-p certificate))
+                 (is (string= "echo certified"
+                              (cdr (assoc "force-command"
+                                          (ssh-certificate-critical certificate)
+                                          :test #'string=))))
+                 (is (string= "127.0.0.1/32"
+                              (cdr (assoc "source-address"
+                                          (ssh-certificate-critical certificate)
+                                          :test #'string=))))
+                 ;; The certified key is what a userauth signature uses.
+                 (is (equalp plain-blob (ssh-key-plain-blob cert-blob)))
+                 (is (equalp plain-blob
+                             (ssh-certificate-plain-key-blob cert-blob)))
+                 (multiple-value-bind (valid options)
+                     (ssh-certificate-check certificate "alice"
+                                            :address "127.0.0.1")
+                   (is (not (null valid)))
+                   (is (ssh-authorization-options-permit-pty-p options))
+                   ;; The certificate grants only pty.
+                   (is (not (ssh-authorization-options-permit-port-forwarding-p
+                             options)))
+                   (is (string= "echo certified"
+                                (ssh-authorization-options-force-command
+                                 options))))
+                 ;; source-address and the principal list are enforced.
+                 (is (null (ssh-certificate-check certificate "alice"
+                                                  :address "10.0.0.1")))
+                 (is (null (ssh-certificate-check certificate "carol")))
+                 ;; TrustedUserCAKeys alone: the user name must be a
+                 ;; principal when no principals file is in use.
+                 (multiple-value-bind (matched environments options)
+                     (ssh-certificate-user-authorized-p
+                      "alice" cert-blob
+                      :address "127.0.0.1"
+                      :ca-keys (namestring ca-pub))
+                   (declare (ignore environments))
+                   (is (not (null matched)))
+                   (is (string= "echo certified"
+                                (ssh-authorization-options-force-command
+                                 options))))
+                 (is (null (ssh-certificate-user-authorized-p
+                            "carol" cert-blob
+                            :address "127.0.0.1"
+                            :ca-keys (namestring ca-pub))))
+                 ;; A CA not in the trusted file authorizes nothing.
+                 (is (null (ssh-certificate-user-authorized-p
+                            "alice" cert-blob
+                            :address "127.0.0.1"
+                            :ca-keys (namestring
+                                      (merge-pathnames "user.pub" directory)))))
+                 ;; An authorized_keys cert-authority line works the same way.
+                 (let ((line (format nil "cert-authority,principals=\"alice,bob\" ~A"
+                                     (with-open-file (stream ca-pub)
+                                       (read-line stream)))))
+                   (is (not (null (nth-value 0
+                                             (ssh-certificate-authorized-key-match
+                                              line certificate "alice"
+                                              :address "127.0.0.1")))))
+                   ;; A line that names other principals refuses this cert.
+                   (let ((other (format nil "cert-authority,principals=\"carol\" ~A"
+                                        (with-open-file (stream ca-pub)
+                                          (read-line stream)))))
+                     (is (null (ssh-certificate-authorized-key-match
+                                other certificate "alice"
+                                :address "127.0.0.1"))))
+                   ;; The CA key itself cannot log in on a cert-authority line.
+                   (is (null (ssh-authorized-key-blob-match
+                              line ca-blob :address "127.0.0.1"))))
+                 ;; An expired certificate is refused.
+                 (let ((old (merge-pathnames "old" directory)))
+                   (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                     "-f" (namestring old)))
+                   (ssh-keygen
+                    (list "-q" "-s" (namestring ca) "-I" "old-id"
+                          "-n" "alice" "-V" "-2h:-1h"
+                          (namestring (merge-pathnames "old.pub" directory))))
+                   (is (null (ssh-certificate-check
+                              (ssh-certificate-parse
+                               (ssh-test-certificate-blob
+                                (merge-pathnames "old-cert.pub" directory)))
+                              "alice" :address "127.0.0.1"))))
+                 ;; A host certificate is not a user certificate.
+                 (let ((host (merge-pathnames "host" directory)))
+                   (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                     "-f" (namestring host)))
+                   (ssh-keygen
+                    (list "-q" "-s" (namestring ca) "-h" "-I" "host-id"
+                          "-n" "example.org" "-V" "-1m:+52w"
+                          (namestring (merge-pathnames "host.pub" directory))))
+                   (let ((host-certificate
+                           (ssh-certificate-parse
+                            (ssh-test-certificate-blob
+                             (merge-pathnames "host-cert.pub" directory)))))
+                     (is (= 2 (ssh-certificate-cert-type host-certificate)))
+                     (is (null (ssh-certificate-check host-certificate
+                                                      "example.org")))))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test certificate-option-merge-follows-sshd
+  "Permission flags are ANDed, restrictive values are combined, and two
+different force-command clauses cannot be merged."
+  (let* ((primary (nth-value 0
+                             (ssh-authorized-key-options-parse
+                              "no-pty,command=\"one\",permitopen=\"db:5432\"")))
+         (additional (ssh-certificate-authorization-options-empty)))
+    (setf (ssh-authorization-options-permit-pty additional) t
+          (ssh-authorization-options-permit-port-forwarding additional) t)
+    (let ((merged (ssh-authorization-options-merge primary additional)))
+      (is (not (null merged)))
+      ;; no-pty withholds pty even though the certificate grants it.
+      (is (not (ssh-authorization-options-permit-pty-p merged)))
+      ;; The certificate grants port forwarding and the line does not deny it.
+      (is (ssh-authorization-options-permit-port-forwarding-p merged))
+      (is (string= "one"
+                   (ssh-authorization-options-force-command merged)))
+      (is (equal '(("db" . 5432))
+                 (ssh-authorization-options-permit-open merged))))
+    (setf (ssh-authorization-options-force-command additional) "two")
+    (is (null (ssh-authorization-options-merge primary additional)))))
+
+(test client-offers-the-certificate-beside-its-private-key
+  "ssh -i KEY offers KEY-cert.pub when it is the certificate of KEY, and
+refuses to pair a certificate with a different key."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-cert"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring user)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "client-id"
+                      "-n" "turtle" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "user.pub" directory))))
+               (let* ((cert-blob
+                        (ssh-test-certificate-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (signer
+                        (ssh-private-key-signer
+                         (ssh-load-private-key user))))
+                 (is (string= "ssh-ed25519-cert-v01@openssh.com"
+                              (cl-pnet-ssh::ssh-signer-type signer)))
+                 (is (equalp cert-blob
+                             (cl-pnet-ssh::ssh-signer-blob signer))))
+               ;; A certificate for another key is refused, not silently
+               ;; ignored: that would authenticate as someone else.
+               (let ((other (merge-pathnames "other" directory)))
+                 (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                   "-f" (namestring other)))
+                 (ssh-keygen
+                  (list "-q" "-s" (namestring ca) "-I" "other-id"
+                        "-n" "turtle" "-V" "-1m:+52w"
+                        (namestring (merge-pathnames "other.pub" directory))))
+                 (ignore-errors
+                   (delete-file (merge-pathnames "user-cert.pub" directory)))
+                 (rename-file
+                  (merge-pathnames "other-cert.pub" directory)
+                  (merge-pathnames "user-cert.pub" directory))
+                 (let ((mismatch
+                         (handler-case
+                             (progn (ssh-private-key-signer
+                                     (ssh-load-private-key user))
+                                    nil)
+                           (error () t))))
+                   (is (not (null mismatch))))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
 
 (defun ssh-test-known-host-blob ()
   (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
@@ -2529,11 +2754,28 @@ option the server cannot honour refuses the line rather than being lost."
       (is (cl-pnet-ssh:ssh-authorization-options-permit-pty-p options))
       (is (not (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
                 options))))
-    ;; Unknown options, certificates, TUN and the unsupported positive forms
-    ;; make sshd skip the whole line.
-    (dolist (text '("no-such-option" "cert-authority" "tunnel=\"0\""
-                    "principals=\"alice\"" "touch-required" "verify-required"
+    ;; Unknown options, TUN and the unsupported positive forms make sshd skip
+    ;; the whole line.  Certificate options are understood.
+    (dolist (text '("no-such-option" "tunnel=\"0\""
+                    "touch-required" "verify-required"
                     "user-rc" "pty,,no-pty" "command=\"unterminated"))
+      (is (null (nth-value 0 (parse text))) text)
+      (is (null (nth-value 1 (parse text))) text))
+    (multiple-value-bind (options valid) (parse "cert-authority")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-cert-authority options))
+      (is (null (cl-pnet-ssh:ssh-authorization-options-cert-principals
+                 options))))
+    (multiple-value-bind (options valid)
+        (parse "cert-authority,principals=\"alice,bob\"")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-cert-authority options))
+      (is (string= "alice,bob"
+                   (cl-pnet-ssh:ssh-authorization-options-cert-principals
+                    options))))
+    ;; sshd refuses a second principals= clause and an unquoted value.
+    (dolist (text '("principals=\"a\",principals=\"b\"" "principals=alice"
+                    "principals=\"unterminated"))
       (is (null (nth-value 0 (parse text))) text)
       (is (null (nth-value 1 (parse text))) text))
     (multiple-value-bind (options valid)
@@ -2803,6 +3045,59 @@ option the server cannot honour refuses the line rather than being lost."
                 :test #'string=)))
   (is (not (member "ssh-rsa" cl-pnet-ssh::+ssh-server-user-key-algorithms+
                    :test #'string=))))
+
+#-ssh-backend-ffi
+(test server-sends-newkeys-and-ext-info-in-one-write
+  ;; libssh decides how to sign an RSA key from server-sig-algs before its
+  ;; next read of the socket.  An EXT_INFO left in a second segment makes it
+  ;; fall back to SHA-1 ssh-rsa and refuse the key without ever asking, so
+  ;; the two packets must leave in one write, as OpenSSH's server sends them.
+  (let* ((original (symbol-function 'cl-pnet:send-data))
+         (writes '())
+         (capture
+           (lambda (negotiated)
+             (setf writes nil)
+             (let* ((server (cl-pnet-ssh::%make-ssh-server :host-keys nil))
+                    (session (cl-pnet-ssh::%make-ssh-session
+                              :server server)))
+               (setf (cl-pnet-ssh::ssh-session-connection session) :captured
+                     (cl-pnet-ssh::ssh-session-negotiated session)
+                     negotiated)
+               (cl-pnet-ssh::ssh-server-send-newkeys session)
+               (values (length writes) (first writes))))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'cl-pnet:send-data)
+                 (lambda (connection data &key on-error on-write)
+                   (declare (ignore connection on-error on-write))
+                   (push (copy-seq data) writes)
+                   (length data)))
+           (multiple-value-bind (write-count wire)
+               (funcall capture '(:ext-info t))
+             ;; One write, holding NEWKEYS then EXT_INFO.
+             (is (= 1 write-count))
+             (let ((state (cl-pnet-ssh::ssh-make-cipher-state)))
+               (multiple-value-bind (payload consumed)
+                   (ssh-decode-packet wire state)
+                 (is (= cl-pnet-ssh::+ssh-msg-newkeys+ (aref payload 0)))
+                 (let ((ext (ssh-decode-packet (subseq wire consumed) state)))
+                   (is (= cl-pnet-ssh::+ssh-msg-ext-info+ (aref ext 0)))
+                   (let ((reader (ssh-make-reader ext)))
+                     (ssh-read-u8 reader)
+                     (is (= 1 (ssh-read-u32 reader)))
+                     (is (string= "server-sig-algs" (ssh-read-text reader)))
+                     (is (member "rsa-sha2-512"
+                                 (ssh-read-name-list reader)
+                                 :test #'string=)))))))
+           ;; Without a client that asked for extensions, only NEWKEYS.
+           (multiple-value-bind (plain-count plain-wire)
+               (funcall capture '(:ext-info nil))
+             (is (= 1 plain-count))
+             (let ((decoded (ssh-decode-packet
+                             plain-wire
+                             (cl-pnet-ssh::ssh-make-cipher-state))))
+               (is (= cl-pnet-ssh::+ssh-msg-newkeys+ (aref decoded 0))))))
+      (setf (symbol-function 'cl-pnet:send-data) original))))
 
 (test local-network-cidr-matching-uses-the-network-bits
   ;; ssh_config's LocalNetwork (and sshd's AllowUsers host patterns) treat
