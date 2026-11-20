@@ -48,6 +48,8 @@ is refused here rather than corrupting the greeting on the wire."
                           on-session
                           on-channel
                           on-direct-tcpip
+                          on-tcpip-forward
+                          on-cancel-tcpip-forward
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -60,14 +62,18 @@ of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.1\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.2\", so peers and logs identify it correctly.
 
 ACCEPT-ENV is T (accept every env request), a list of names, a function of
 (NAME VALUE), or NIL (refuse).  ON-SESSION runs once a client has
 authenticated.  ON-DIRECT-TCPIP is a function of
 (SESSION HOST PORT ORIGIN-ADDRESS ORIGIN-PORT) returning true to allow a
-forwarded connection.  ON-ERROR receives (SESSION CONDITION) (SESSION is NIL
-for listener errors), ON-CLOSE receives (SESSION REASON)."
+forwarded connection.  ON-TCPIP-FORWARD is a function of
+(SESSION BIND-ADDRESS BIND-PORT) returning the port actually bound, or NIL to
+refuse a remote forwarding request; ON-CANCEL-TCPIP-FORWARD takes the same
+arguments and returns true once the listener is gone.  ON-ERROR receives
+(SESSION CONDITION) (SESSION is NIL for listener errors), ON-CLOSE receives
+(SESSION REASON)."
   (let* ((software (if server-version
                        (format nil "SSH-2.0-~A"
                                (check-server-version server-version))
@@ -86,6 +92,8 @@ for listener errors), ON-CLOSE receives (SESSION REASON)."
                   :on-session on-session
                   :on-channel on-channel
                   :on-direct-tcpip on-direct-tcpip
+                  :on-tcpip-forward on-tcpip-forward
+                  :on-cancel-tcpip-forward on-cancel-tcpip-forward
                   :on-error on-error
                   :on-close on-close
                   :connections (make-hash-table :test #'eq)))

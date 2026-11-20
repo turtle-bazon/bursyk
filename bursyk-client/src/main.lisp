@@ -412,8 +412,6 @@ algorithms still have to exist here, because the set is fixed at build time."
     (unsupported "-O" "connection sharing is not implemented"))
   (when (getf *options* :tunnel)
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
-  (when (getf *options* :remote-forward)
-    (unsupported "-R" "the server role does not implement tcpip-forward"))
   (when (getf *options* :dynamic-forward)
     (unsupported "-D" "the SOCKS proxy is not implemented"))
   (when (getf *options* :gssapi-auth)
@@ -447,6 +445,9 @@ algorithms still have to exist here, because the set is fixed at build time."
   (setf (getf *options* :local-forward)
         (mapcar #'parse-local-forward
                 (reverse (getf *options* :local-forward))))
+  (setf (getf *options* :remote-forward)
+        (mapcar #'parse-config-remote-forward
+                (reverse (getf *options* :remote-forward))))
   (values))
 
 ;;; ---- ~/.ssh/config and -o ----
@@ -689,6 +690,27 @@ session down."
       (t
        (fail "invalid forwarding specification ~A" spec)))))
 
+(defun parse-remote-forward (spec)
+  "SPEC as a FORWARD for [bind_address:]port:host:hostport.
+
+A remote forward names the listener on the server (BIND-ADDRESS/BIND-PORT)
+and the target this client dials (HOST/PORT), which is the reverse of -L."
+  (let ((fields (split-forward-fields spec)))
+    (cond
+      ((= (length fields) 3)
+       (destructuring-bind (port host hostport) fields
+         (%make-forward :bind-port (forwarding-port port spec)
+                        :host host
+                        :port (forwarding-port hostport spec))))
+      ((= (length fields) 4)
+       (destructuring-bind (bind port host hostport) fields
+         (%make-forward :bind-address (if (plusp (length bind)) bind nil)
+                        :bind-port (forwarding-port port spec)
+                        :host host
+                        :port (forwarding-port hostport spec))))
+      (t
+       (fail "invalid remote forwarding specification ~A" spec)))))
+
 (defun split-host-port (text)
   "TEXT as (VALUES HOST PORT-STRING), bracketing IPv6 literals."
   (if (and (plusp (length text)) (char= (char text 0) #\[))
@@ -722,6 +744,27 @@ line is handled as the command-line form, which is what a user who wrote
   (let ((words (uiop:split-string spec :separator '(#\Space #\Tab))))
     (if (/= 2 (length words))
         (parse-local-forward spec)
+        (destructuring-bind (listen target) words
+          (multiple-value-bind (first second) (split-host-port listen)
+            (let (bind port)
+              (if second
+                  (setf bind first port second)
+                  (setf port first))
+              (multiple-value-bind (host hostport) (split-host-port target)
+                (unless (and hostport (plusp (length hostport)))
+                  (fail "~A: streaming to a unix socket is not implemented"
+                        spec))
+                (%make-forward
+                 :bind-address (and bind (plusp (length bind)) bind)
+                 :bind-port (forwarding-port port spec)
+                 :host host
+                 :port (forwarding-port hostport spec)))))))))
+
+(defun parse-config-remote-forward (spec)
+  "SPEC as a FORWARD for ssh_config's \"[bind_address:]port host:hostport\"."
+  (let ((words (uiop:split-string spec :separator '(#\Space #\Tab))))
+    (if (/= 2 (length words))
+        (parse-remote-forward spec)
         (destructuring-bind (listen target) words
           (multiple-value-bind (first second) (split-host-port listen)
             (let (bind port)
@@ -1135,20 +1178,77 @@ line there is a request this client cannot honour.  Skipping it quietly
 would leave the user waiting for a tunnel that was never opened."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
     (when options
-      (let ((remote (cl-pnet-ssh:ssh-config-options-remote-forwards options))
-            (dynamic (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
-        (when remote
-          (fail "RemoteForward in the ssh config is not supported: ~A"
-                (first (reverse remote))))
+      (let ((dynamic (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
         (when dynamic
           (fail "DynamicForward in the ssh config is not supported: ~A"
                 (first (reverse dynamic))))))))
+
+(defun configured-remote-forwards (client)
+  "The RemoteForward lines in CLIENT's config, in file order."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (mapcar #'parse-config-remote-forward
+                 (reverse (cl-pnet-ssh:ssh-config-options-remote-forwards
+                           options))))))
+
+(defun remote-forward-match-p (forward bind-address bind-port)
+  "Whether a forwarded-tcpip opening names FORWARD's listener."
+  (and (= (forward-bind-port forward) bind-port)
+       (or (null (forward-bind-address forward))
+           (string= (forward-bind-address forward) "*")
+           (string-equal (forward-bind-address forward) bind-address))))
+
+(defun forwarded-tcpip-target (client bind-address bind-port
+                               origin-address origin-port)
+  "Answer the local target for a server-initiated forwarded-tcpip channel.
+
+The library calls this with the listener the server actually used and the
+peer that connected to it; NIL refuses the channel."
+  (declare (ignore client origin-address origin-port))
+  (let ((forward (find-if (lambda (candidate)
+                            (remote-forward-match-p candidate
+                                                    bind-address bind-port))
+                          *remote-forwards*)))
+    (if forward
+        (values (forward-host forward) (forward-port forward))
+        (values nil nil))))
+
+(defun start-remote-forward (client forward)
+  "Ask CLIENT's server to listen for FORWARD and relay to this machine."
+  (let ((address (or (forward-bind-address forward) ""))
+        (port (forward-bind-port forward)))
+    (push forward *remote-forwards*)
+    (cl-pnet-ssh:ssh-client-send-global-request
+     client "tcpip-forward"
+     :fields (lambda (writer)
+               (cl-pnet-ssh::ssh-write-text writer address)
+               (cl-pnet-ssh::ssh-write-u32 writer port))
+     :on-success
+     (lambda (reader)
+       ;; RFC 4254 only carries the port back when 0 was requested.
+       (when (zerop port)
+         (setf (forward-bind-port forward)
+               (cl-pnet-ssh::ssh-read-u32 reader)))
+       (log-line "remote forward ~A:~D to ~A:~D"
+                 address (forward-bind-port forward)
+                 (forward-host forward) (forward-port forward)))
+     :on-failure
+     (lambda ()
+       (setf *remote-forwards* (delete forward *remote-forwards*))
+       (unless (getf *options* :quiet)
+         (format *error-output*
+                 "burs: remote forward ~A:~D was refused~%"
+                 address port))))
+    forward))
 
 (defun start-forwards (client)
   (check-config-features client)
   (dolist (forward (append (configured-local-forwards client)
                            (getf *options* :local-forward)))
-    (start-local-forward client forward)))
+    (start-local-forward client forward))
+  (dolist (forward (append (configured-remote-forwards client)
+                           (getf *options* :remote-forward)))
+    (start-remote-forward client forward)))
 
 (defun stop-forwards ()
   (dolist (forward *forwards*)
@@ -1156,6 +1256,7 @@ would leave the user waiting for a tunnel that was never opened."
       (ignore-errors (cl-pnet:close-listener (forward-listener forward)))
       (setf (forward-listener forward) nil)))
   (setf *forwards* nil)
+  (setf *remote-forwards* nil)
   (let ((tunnels '()))
     (maphash (lambda (connection tunnel)
                (declare (ignore connection))
@@ -1295,6 +1396,7 @@ would leave the user waiting for a tunnel that was never opened."
    :exec-matcher #'match-exec
    :on-client (lambda (client) (setf *client* client))
    :on-config-error (lambda (condition) (fail "~A" condition))
+   :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-open
    (lambda (client)
      (start-forwards client)

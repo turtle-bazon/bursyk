@@ -46,6 +46,63 @@
     (ssh-write-text writer "")
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
+(defun ssh-server-open-forwarded-tcpip (session bind-address bind-port
+                                        origin-address origin-port
+                                        &key on-data on-eof on-close on-error)
+  "Ask SESSION's client to open a forwarded-tcpip channel.
+
+BIND-ADDRESS:BIND-PORT is the address the client asked the server to listen
+on, and ORIGIN-ADDRESS:ORIGIN-PORT names the peer that connected there.  The
+channel starts in :OPENING; data queued with SSH-SERVER-CHANNEL-WRITE goes
+out once the client confirms."
+  (let* ((id (ssh-session-next-channel-id session))
+         (window (ssh-session-window session))
+         (max-packet (ssh-session-max-packet session))
+         (channel (%make-ssh-server-channel
+                   :session session
+                   :local-id id
+                   :type "forwarded-tcpip"
+                   :state :opening
+                   :local-window window
+                   :local-max-packet max-packet
+                   :on-data on-data :on-eof on-eof
+                   :on-close on-close :on-error on-error)))
+    (incf (ssh-session-next-channel-id session))
+    (setf (gethash id (ssh-session-channels session)) channel)
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-channel-open+)
+      (ssh-write-text writer "forwarded-tcpip")
+      (ssh-write-u32 writer id)
+      (ssh-write-u32 writer window)
+      (ssh-write-u32 writer max-packet)
+      (ssh-write-text writer bind-address)
+      (ssh-write-u32 writer bind-port)
+      (ssh-write-text writer origin-address)
+      (ssh-write-u32 writer origin-port)
+      (ssh-session-send-payload session (ssh-writer-output writer)))
+    channel))
+
+(defun ssh-server-channel-handle-open-confirmation (channel reader)
+  "The client accepted a forwarded-tcpip CHANNEL we opened."
+  (setf (ssh-server-channel-remote-id channel) (ssh-read-u32 reader)
+        (ssh-server-channel-remote-window channel) (ssh-read-u32 reader)
+        (ssh-server-channel-remote-max-packet channel) (ssh-read-u32 reader)
+        (ssh-server-channel-state channel) :open)
+  (ssh-server-channel-flush channel))
+
+(defun ssh-server-channel-handle-open-failure (channel reader)
+  "The client refused a forwarded-tcpip CHANNEL we opened."
+  (let ((reason (ssh-read-u32 reader))
+        (description (ssh-read-text reader)))
+    (declare (ignore reason))
+    (when (ssh-server-channel-on-error channel)
+      (funcall (ssh-server-channel-on-error channel) channel
+               (make-condition 'ssh-channel-error
+                               :channel channel
+                               :detail (format nil "channel open refused: ~A"
+                                               description))))
+    (ssh-server-channel-finish channel)))
+
 (defun ssh-server-register-channel (session type sender window max-packet
                                      &key open-extra on-data on-eof on-exec
                                        on-close on-error)
@@ -370,6 +427,10 @@ reader."
 
 (defun ssh-server-dispatch-channel-message (session type channel reader)
   (case type
+    (#.+ssh-msg-channel-open-confirmation+
+     (ssh-server-channel-handle-open-confirmation channel reader))
+    (#.+ssh-msg-channel-open-failure+
+     (ssh-server-channel-handle-open-failure channel reader))
     (#.+ssh-msg-channel-window-adjust+
      (incf (ssh-server-channel-remote-window channel) (ssh-read-u32 reader))
      (ssh-server-channel-flush channel))

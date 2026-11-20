@@ -140,6 +140,30 @@ that ends the stream too."
     (is (equal '("*.example.com:443" "db:5432")
                (getf bursyk-server::*options* :permit-open)))))
 
+(test remote-forward-bind-policy
+  (let ((bursyk-server::*options* nil))
+    (is (string= "127.0.0.1"
+                 (bursyk-server::remote-bind-address nil)))
+    (is (string= "127.0.0.1"
+                 (bursyk-server::remote-bind-address "localhost")))
+    ;; A client cannot expose a LAN address unless the server allows it.
+    (is (null (bursyk-server::remote-bind-address "0.0.0.0")))
+    (is (null (bursyk-server::remote-bind-address "192.0.2.10"))))
+  (let ((bursyk-server::*options* (list :gateway-ports t)))
+    (is (string= "0.0.0.0"
+                 (bursyk-server::remote-bind-address "0.0.0.0")))
+    (is (string= "0.0.0.0"
+                 (bursyk-server::remote-bind-address "*")))
+    (is (string= "192.0.2.10"
+                 (bursyk-server::remote-bind-address "192.0.2.10")))))
+
+(test remote-forward-options-parse
+  (let ((bursyk-server::*options* nil))
+    (bursyk-server::parse-arguments
+     '("--no-remote-forwarding" "--gateway-ports"))
+    (is (eq t (getf bursyk-server::*options* :no-remote-forwarding)))
+    (is (eq t (getf bursyk-server::*options* :gateway-ports)))))
+
 ;;; ---- status pipe ----
 
 #-win32

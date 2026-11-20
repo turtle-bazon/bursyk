@@ -8,11 +8,16 @@
 (defvar *options*
   '(:address "0.0.0.0" :port "2222" :host-key nil :authorized-keys nil
     :accept-env nil :allow nil :subsystem nil
-    :no-tcp-forwarding nil :permit-open nil)
+    :no-tcp-forwarding nil :permit-open nil
+    :no-remote-forwarding nil :gateway-ports nil)
   "The command line as parsed.")
 
 (defvar *server* nil)
 (defvar *signal* nil)
+(defvar *remote-forwards* nil
+  "Remote forwarding listeners requested with tcpip-forward, newest first.")
+(defvar *remote-tunnels* (make-hash-table :test #'eq)
+  "Accepted remote-forwarding connections, keyed by their CL-PNET connection.")
 
 (defparameter *default-subsystems*
   #+win32
@@ -23,7 +28,7 @@
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.1"
+(defparameter +bursyk-server-version+ "0.0.2.2"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -37,7 +42,8 @@ version rather than a generic library string.")
           "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY~%~
            ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%~
            ~15@T[-S NAME=PATH]... [--no-tcp-forwarding]~%~
-           ~15@T[--allow-tcpip HOST:PORT]... [-V]~%")
+           ~15@T[--allow-tcpip HOST:PORT]... [--no-remote-forwarding]~%~
+           ~15@T[--gateway-ports] [-V]~%")
   (finish-output *error-output*))
 
 (defun print-version ()
@@ -60,6 +66,8 @@ version rather than a generic library string.")
         ((member name '("-c" "--command") :test #'string=) :allow)
         ((member name '("-S" "--subsystem") :test #'string=) :subsystem)
         ((string= name "--no-tcp-forwarding") :no-tcp-forwarding)
+        ((string= name "--no-remote-forwarding") :no-remote-forwarding)
+        ((string= name "--gateway-ports") :gateway-ports)
         ((member name '("--allow-tcpip" "--permit-open") :test #'string=)
          :permit-open)
         (t nil)))
@@ -102,7 +110,8 @@ version rather than a generic library string.")
         ((null arguments) (return))
         ((option-key argument)
          (let ((key (option-key argument)))
-           (if (eq key :no-tcp-forwarding)
+           (if (member key '(:no-tcp-forwarding :no-remote-forwarding
+                             :gateway-ports))
                (progn
                  (record-option key t)
                  (setf arguments (cdr arguments)))
@@ -178,6 +187,198 @@ narrows that set, and --no-tcp-forwarding refuses them all."
                                 (string= rule-port
                                          (princ-to-string port))))))
                    rules)))))
+
+;;; ---- Remote forwarding (tcpip-forward) ----
+;;;
+;;; The client asks the server to listen on an address and port; when a
+;;; connection arrives the server opens a forwarded-tcpip channel back to the
+;;; client, which dials the target on its side.  The listener belongs to this
+;;; program, not the library, because the policy of which addresses may be
+;;; exposed is an sshd decision.
+
+(defstruct (remote-forward (:constructor %make-remote-forward))
+  session
+  requested-address
+  bind-address
+  bind-port
+  listener)
+
+(defun loopback-bind-address-p (address)
+  (member address '("" "localhost" "127.0.0.1" "::1") :test #'string-equal))
+
+(defun remote-bind-address (requested)
+  "The address to bind for a tcpip-forward request, or NIL to refuse.
+
+Empty means loopback, as in sshd.  Any other non-loopback address is refused
+unless --gateway-ports was given: binding a LAN-wide port is a policy change
+a client should not make by itself."
+  (cond
+    ((or (null requested) (zerop (length requested)))
+     "127.0.0.1")
+    ((string= requested "*")
+     (if (getf *options* :gateway-ports) "0.0.0.0" "127.0.0.1"))
+    ((loopback-bind-address-p requested) "127.0.0.1")
+    ((getf *options* :gateway-ports) requested)
+    (t nil)))
+
+(defun remote-forward-for (session bind-address bind-port)
+  "The REMOTE-FORWARD SESSION opened for BIND-ADDRESS:BIND-PORT, if any."
+  (find-if (lambda (forward)
+             (and (eq (remote-forward-session forward) session)
+                  (= (remote-forward-bind-port forward) bind-port)
+                  (string-equal (remote-forward-bind-address forward)
+                                bind-address)))
+           *remote-forwards*))
+
+(defun remote-forward-close (forward)
+  (when (remote-forward-listener forward)
+    (ignore-errors
+      (cl-pnet:close-listener (remote-forward-listener forward)))
+    (setf (remote-forward-listener forward) nil)))
+
+(defun close-remote-forwards (&optional session)
+  "Close remote forward listeners, for SESSION or for every session."
+  (let ((kept '()))
+    (dolist (forward *remote-forwards*)
+      (if (or (null session) (eq (remote-forward-session forward) session))
+          (remote-forward-close forward)
+          (push forward kept)))
+    (setf *remote-forwards* (nreverse kept))))
+
+(defun remote-tunnel-data (connection data)
+  "Move bytes between an accepted remote-forwarding connection and its channel.
+
+DATA NIL means the local peer will send nothing more; tell the channel so the
+client can half-close its target, and the reply can still come back."
+  (let ((channel (gethash connection *remote-tunnels*)))
+    (when channel
+      (if data
+          (handler-case
+              (cl-pnet-ssh:ssh-server-channel-write channel data)
+            (error (condition)
+              (declare (ignore condition))
+              (remote-tunnel-close connection)))
+          (ignore-errors
+            (cl-pnet-ssh:ssh-server-channel-eof channel))))))
+
+(defun remote-tunnel-close (connection)
+  "Close a remote-forwarding connection and the channel paired with it."
+  (let ((channel (gethash connection *remote-tunnels*)))
+    (remhash connection *remote-tunnels*)
+    (when channel
+      (remhash channel *remote-tunnels*)
+      (ignore-errors (cl-pnet-ssh:ssh-server-channel-close channel)))
+    (ignore-errors (cl-pnet:close-connection connection))))
+
+(defun remote-tunnel-half-close (connection)
+  "Tell the accepted connection that the client will send nothing more."
+  (let ((fd (cl-pnet:connection-fileno connection)))
+    (when fd
+      (ignore-errors (cl-pnet-sockets:c-shutdown fd 1)))))
+
+(defun remote-forward-accept (forward connection)
+  "Open the forwarded-tcpip channel for a connection that reached FORWARD."
+  (let* ((peer (cl-pnet:connection-peer-address connection))
+         (origin (or (getf peer :address) "0.0.0.0"))
+         (origin-port (or (getf peer :port) 0))
+         (channel
+           (cl-pnet-ssh:ssh-server-open-forwarded-tcpip
+            (remote-forward-session forward)
+            (remote-forward-requested-address forward)
+            (remote-forward-bind-port forward)
+            origin origin-port
+            :on-data (lambda (channel data kind)
+                       (declare (ignore kind))
+                       (let ((connection (gethash channel *remote-tunnels*)))
+                         (when connection
+                           (cl-pnet:send-data
+                            connection data
+                            :on-error
+                            (lambda (status)
+                              (declare (ignore status))
+                              (remote-tunnel-close connection))))))
+            :on-eof (lambda (channel)
+                      (let ((connection (gethash channel *remote-tunnels*)))
+                        (when connection
+                          (remote-tunnel-half-close connection))))
+            :on-close (lambda (channel)
+                        (remote-tunnel-close-by-channel channel))
+            :on-error (lambda (channel condition)
+                        (declare (ignore condition))
+                        (remote-tunnel-close-by-channel channel)))))
+    (setf (gethash connection *remote-tunnels*) channel)
+    (setf (gethash channel *remote-tunnels*) connection)
+    channel))
+
+(defun remote-tunnel-close-by-channel (channel)
+  (let ((connection (gethash channel *remote-tunnels*)))
+    (when connection
+      (remhash connection *remote-tunnels*)
+      (ignore-errors (cl-pnet:close-connection connection)))
+    (remhash channel *remote-tunnels*)))
+
+(defun start-remote-forward (session bind-address bind-port)
+  "Listener for a client's tcpip-forward request; returns the bound port."
+  (when (getf *options* :no-remote-forwarding)
+    (format *error-output*
+            "bursyk-server: remote forwarding refused by --no-remote-forwarding~%")
+    (return-from start-remote-forward nil))
+  (let ((address (remote-bind-address bind-address)))
+    (unless address
+      (format *error-output*
+              "bursyk-server: refusing a remote forward bound to ~A; use --gateway-ports~%"
+              bind-address)
+      (return-from start-remote-forward nil))
+    (let* ((forward (%make-remote-forward
+                     :session session
+                     :requested-address (or bind-address "")
+                     :bind-address address
+                     :bind-port bind-port))
+           (listener
+             (handler-case
+                 (cl-pnet:make-tcp-listener
+                  address bind-port
+                  :read-cb #'remote-tunnel-data
+                  :on-accept (lambda (connection)
+                               (remote-forward-accept forward connection))
+                  :on-error (lambda (status)
+                              (declare (ignore status))
+                              (remote-forward-close forward)))
+               (error () nil))))
+      (unless listener
+        (format *error-output*
+                "bursyk-server: remote forward could not listen on ~A:~D~%"
+                address bind-port)
+        (return-from start-remote-forward nil))
+      (setf (remote-forward-bind-port forward)
+            (or (cl-pnet:listener-port listener) bind-port)
+            (remote-forward-listener forward) listener)
+      (push forward *remote-forwards*)
+      ;; The session may end before the client cancels; when it does, the
+      ;; listener must not outlive it.
+      (remote-forward-bind-port forward))))
+
+(defun cancel-remote-forward (session bind-address bind-port)
+  (let ((forward (remote-forward-for session bind-address bind-port)))
+    (if forward
+        (progn
+          (remote-forward-close forward)
+          (setf *remote-forwards* (delete forward *remote-forwards*))
+          t)
+        ;; The client may name the requested address while we stored the
+        ;; resolved loopback address.
+        (let ((any (find-if (lambda (candidate)
+                              (and (eq (remote-forward-session candidate)
+                                       session)
+                                   (= (remote-forward-bind-port candidate)
+                                      bind-port)))
+                            *remote-forwards*)))
+          (if any
+              (progn
+                (remote-forward-close any)
+                (setf *remote-forwards* (delete any *remote-forwards*))
+                t)
+              nil)))))
 
 (defun split-subsystem (text)
   "NAME=PATH from one --subsystem argument, as (NAME . PATH)."
@@ -678,8 +879,18 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
            (lambda (session host port origin origin-port)
              (declare (ignore session origin origin-port))
              (tcpip-allowed-p host port))
+           :on-tcpip-forward
+           (lambda (session bind-address bind-port)
+             (start-remote-forward session bind-address bind-port))
+           :on-cancel-tcpip-forward
+           (lambda (session bind-address bind-port)
+             (cancel-remote-forward session bind-address bind-port))
+           :on-close (lambda (session reason)
+                       (declare (ignore reason))
+                       (close-remote-forwards session))
            :on-error (lambda (session condition)
-                       (declare (ignore session))
+                       (when session
+                         (close-remote-forwards session))
                        (format *error-output* "bursyk-server: ~A~%" condition)
                        (finish-output *error-output*))))
     (format t "bursyk-server: listening on ~A:~D~%"
@@ -690,6 +901,7 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 
 (defun close-server ()
   (when *server*
+    (close-remote-forwards)
     (cl-pnet-ssh:ssh-server-close *server*)
     (setf *server* nil)))
 

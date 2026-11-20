@@ -93,6 +93,10 @@ line, and NIL while the line is still incomplete."
        (ssh-client-handle-auth-failure client payload))
       ((= type +ssh-msg-global-request+)
        (ssh-client-handle-global-request client payload))
+      ((= type +ssh-msg-request-success+)
+       (ssh-client-handle-global-reply client payload t))
+      ((= type +ssh-msg-request-failure+)
+       (ssh-client-handle-global-reply client payload nil))
       ((<= +ssh-msg-channel-open+ type +ssh-msg-channel-failure+)
        (ssh-client-handle-channel-message client payload)))))
 
@@ -398,6 +402,39 @@ request goes out from the callback rather than from this function's tail."
          (make-condition 'ssh-authentication-error
                          :detail (format nil "server accepts ~{~A~^, ~}"
                                          methods))))))
+
+(defun ssh-client-send-global-request (client name &key fields on-success
+                                                     on-failure)
+  "Send the global request NAME to CLIENT's peer, expecting an answer.
+
+FIELDS, when given, writes the request's arguments.  ON-SUCCESS receives a
+reader over the success reply after its message type, so it can read an
+allocated port; ON-FAILURE takes no arguments.  The peer answers requests in
+order, which is how the callbacks stay paired with their requests."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-global-request+)
+    (ssh-write-text writer name)
+    (ssh-write-boolean writer t)
+    (when fields (funcall fields writer))
+    (setf (ssh-client-pending-global-requests client)
+          (append (ssh-client-pending-global-requests client)
+                  (list (list :on-success on-success
+                              :on-failure on-failure))))
+    (ssh-client-send-payload client (ssh-writer-output writer))
+    t))
+
+(defun ssh-client-handle-global-reply (client payload success-p)
+  (let ((pending (ssh-client-pending-global-requests client)))
+    (when pending
+      (setf (ssh-client-pending-global-requests client) (cdr pending))
+      (let ((entry (car pending))
+            (reader (ssh-make-reader payload)))
+        (ssh-read-u8 reader)
+        (if success-p
+            (when (getf entry :on-success)
+              (funcall (getf entry :on-success) reader))
+            (when (getf entry :on-failure)
+              (funcall (getf entry :on-failure))))))))
 
 (defun ssh-client-handle-global-request (client payload)
   (let* ((reader (ssh-make-reader payload))

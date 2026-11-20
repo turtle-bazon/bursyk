@@ -363,7 +363,8 @@ uses whichever of the two it saw first instead of chaining them."
 
 (defun ssh-config-launch-client (parameters options
                                  connect-host connect-port
-                                 on-open on-error on-close)
+                                 on-open on-error on-close
+                                 &key on-forwarded-tcpip)
   "Make the client PARAMETERS describes and remember OPTIONS on it."
   (let ((client
           (make-ssh-client
@@ -385,7 +386,8 @@ uses whichever of the two it saw first instead of chaining them."
            :proxy-command (getf parameters :proxy-command)
            :on-open on-open
            :on-error on-error
-           :on-close on-close)))
+           :on-close on-close
+           :on-forwarded-tcpip on-forwarded-tcpip)))
     (setf (ssh-client-config-options client) options)
     client))
 
@@ -469,7 +471,7 @@ in the tunnel's buffers."
 
 (defun ssh-config-finish-client (host options hops overrides
                                  on-open on-error on-close
-                                 &key proxy-command)
+                                 &key proxy-command on-forwarded-tcpip)
   "Build the target client for HOST, directly or through HOPS."
   (let ((target (ssh-config-client-parameters
                  host options
@@ -492,7 +494,8 @@ in the tunnel's buffers."
         overrides options target on-open on-error on-close))
       (t
        (ssh-config-launch-client target options nil nil
-                                 on-open on-error on-close)))))
+                                 on-open on-error on-close
+                                 :on-forwarded-tcpip on-forwarded-tcpip)))))
 
 ;;; ---- Entry point ----
 
@@ -509,7 +512,8 @@ in the tunnel's buffers."
 
 (defun ssh-config-build-client (source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
-                                on-close fail on-built)
+                                on-close fail on-built
+                                &key on-forwarded-tcpip)
   "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT."
   (handler-case
       (let ((command (ssh-config-proxy-command options proxy-command)))
@@ -523,7 +527,8 @@ in the tunnel's buffers."
                     (ssh-config-finish-client
                      host options hops overrides
                      on-open on-error on-close
-                     :proxy-command command)))
+                     :proxy-command command
+                     :on-forwarded-tcpip on-forwarded-tcpip)))
          fail))
     (error (condition) (funcall fail condition))))
 
@@ -531,7 +536,7 @@ in the tunnel's buffers."
     (host &key config original-host user port private-key agent passphrase
               known-hosts host-key-policy host-key-callback proxy-jump
               proxy-command exec-matcher options on-client on-config-error
-              on-open on-error on-close)
+              on-open on-error on-close on-forwarded-tcpip)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -564,7 +569,8 @@ failures."
      (lambda (options)
        (ssh-config-build-client source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
-                                on-close fail on-built))
+                                on-close fail on-built
+                                :on-forwarded-tcpip on-forwarded-tcpip))
      :on-error (lambda (condition) (funcall fail condition)))
     (when (and (not finished) (null on-client))
       (error 'ssh-config-error

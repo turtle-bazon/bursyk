@@ -219,18 +219,151 @@ side is known to accept."
 
 ;;; ---- Incoming messages ----
 
-(defun ssh-client-refuse-channel-open (client reader)
-  "Answer a server-initiated CHANNEL_OPEN with administratively prohibited."
-  (let* ((type (ssh-read-text reader))
-         (sender (ssh-read-u32 reader))
-         (writer (ssh-writer)))
-    (declare (ignore type))
+(defun ssh-client-send-channel-open-failure (client sender reason)
+  (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-channel-open-failure+)
     (ssh-write-u32 writer sender)
     (ssh-write-u32 writer 1)
-    (ssh-write-text writer "server-initiated channels are not accepted")
+    (ssh-write-text writer reason)
     (ssh-write-text writer "")
     (ssh-client-send-payload client (ssh-writer-output writer))))
+
+(defun ssh-client-handle-channel-open (client reader)
+  "Answer a server-initiated CHANNEL_OPEN; only forwarded-tcpip is wanted."
+  (let ((type (ssh-read-text reader))
+        (sender (ssh-read-u32 reader))
+        (window (ssh-read-u32 reader))
+        (max-packet (ssh-read-u32 reader)))
+    (cond
+      ((string= type "forwarded-tcpip")
+       (ssh-client-accept-forwarded-tcpip client reader sender window
+                                          max-packet))
+      (t
+       (ssh-client-send-channel-open-failure
+        client sender (format nil "unsupported channel type ~A" type))))))
+
+(defun ssh-client-confirm-channel (channel)
+  "Confirm a server-initiated CHANNEL, our half of the open handshake."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-channel-open-confirmation+)
+    (ssh-write-u32 writer (ssh-channel-remote-id channel))
+    (ssh-write-u32 writer (ssh-channel-local-id channel))
+    (ssh-write-u32 writer (ssh-channel-local-window channel))
+    (ssh-write-u32 writer (ssh-channel-local-max-packet channel))
+    (ssh-client-send-payload (ssh-channel-client channel)
+                             (ssh-writer-output writer))))
+
+(defun ssh-client-accept-forwarded-tcpip (client reader sender window
+                                          max-packet)
+  "Accept a forwarded-tcpip channel and dial the application's local target."
+  (let* ((bind-address (ssh-read-text reader))
+         (bind-port (ssh-read-u32 reader))
+         (origin-address (ssh-read-text reader))
+         (origin-port (ssh-read-u32 reader))
+         (handler (ssh-client-on-forwarded-tcpip client)))
+    (ssh-log "forwarded-tcpip for ~A:~D from ~A:~D"
+             bind-address bind-port origin-address origin-port)
+    (multiple-value-bind (host port)
+        (and handler (funcall handler client bind-address bind-port
+                              origin-address origin-port))
+      (if (null host)
+          (progn
+            (ssh-log "refusing forwarded-tcpip for ~A:~D" bind-address bind-port)
+            (ssh-client-send-channel-open-failure
+             client sender
+             (format nil "forwarded-tcpip for ~A:~D was not requested"
+                     bind-address bind-port)))
+          (let* ((id (ssh-client-next-channel-id client))
+                 (channel (%make-ssh-channel
+                           :client client
+                           :local-id id
+                           :remote-id sender
+                           :type "forwarded-tcpip"
+                           :state :open
+                           :remote-window window
+                           :remote-max-packet max-packet
+                           :local-window (ssh-client-window client)
+                           :local-max-packet (ssh-client-max-packet client))))
+            (incf (ssh-client-next-channel-id client))
+            (setf (gethash id (ssh-client-channels client)) channel)
+            (ssh-client-confirm-channel channel)
+            (ssh-client-connect-forward-target channel host port)
+            channel)))))
+
+(defun ssh-client-connect-forward-target (channel host port)
+  "Connect a forwarded-tcpip CHANNEL to HOST:PORT without blocking."
+  (handler-case
+      (burzay:resolve-host
+       host
+       (lambda (address)
+         (ssh-client-dial-forward-target channel address port))
+       (lambda (condition)
+         (ssh-client-forward-fail channel condition)))
+    (error (condition) (ssh-client-forward-fail channel condition))))
+
+(defun ssh-client-dial-forward-target (channel address port)
+  (ssh-log "forwarded-tcpip dialling ~A:~D" address port)
+  (let ((connection
+          (cl-pnet:tcp-connect
+           address port
+           :read-cb (lambda (data)
+                      (if data
+                          (ssh-channel-write channel data)
+                          (ssh-client-channel-target-ended channel)))
+           :on-error
+           (lambda (status)
+             (ssh-client-forward-fail
+              channel
+              (make-condition 'ssh-channel-error
+                              :channel channel
+                              :detail (format nil "target connect failed (~A)"
+                                              status)))))))
+    (if connection
+        (setf (ssh-channel-target channel) connection)
+        (ssh-client-forward-fail
+         channel
+         (make-condition 'ssh-channel-error
+                         :channel channel
+                         :detail (format nil "could not connect to ~A:~D"
+                                         address port))))))
+
+(defun ssh-client-forward-fail (channel condition)
+  (when (ssh-channel-on-error channel)
+    (funcall (ssh-channel-on-error channel) channel condition))
+  (ssh-channel-close channel))
+
+(defun ssh-client-channel-write-target (channel reader)
+  "Move channel data to a forwarded-tcpip CHANNEL's local socket."
+  (let ((data (ssh-read-string reader))
+        (target (ssh-channel-target channel)))
+    (decf (ssh-channel-local-window channel) (length data))
+    (ssh-channel-adjust-window channel (length data))
+    (when target
+      (cl-pnet:send-data
+       target data
+       :on-error
+       (lambda (status)
+         (ssh-client-forward-fail
+          channel
+          (make-condition 'ssh-channel-error
+                          :channel channel
+                          :detail (format nil "target send failed (~A)"
+                                          status))))))))
+
+(defun ssh-client-channel-half-close-target (channel)
+  "Tell a forwarded-tcpip target that the peer will send nothing more."
+  (let ((target (ssh-channel-target channel)))
+    (when target
+      (let ((fd (cl-pnet:connection-fileno target)))
+        (when fd
+          (ignore-errors (cl-pnet-sockets:c-shutdown fd 1)))))))
+
+(defun ssh-client-channel-target-ended (channel)
+  "A forwarded-tcpip CHANNEL's local target closed its output side."
+  (setf (ssh-channel-target-eof channel) t)
+  (ssh-channel-eof channel)
+  (when (ssh-channel-eof-received channel)
+    (ssh-channel-close channel)))
 
 (defun ssh-channel-handle-open-confirmation (channel reader)
   (setf (ssh-channel-remote-id channel) (ssh-read-u32 reader)
@@ -302,6 +435,9 @@ side is known to accept."
   "Mark CHANNEL closed once, unregister it, and report its end."
   (unless (eq (ssh-channel-state channel) :closed)
     (setf (ssh-channel-state channel) :closed)
+    (when (ssh-channel-target channel)
+      (ignore-errors (cl-pnet:close-connection (ssh-channel-target channel)))
+      (setf (ssh-channel-target channel) nil))
     (remhash (ssh-channel-local-id channel)
              (ssh-client-channels (ssh-channel-client channel)))
     (when (ssh-channel-on-close channel)
@@ -319,7 +455,7 @@ side is known to accept."
   (let* ((reader (ssh-make-reader payload))
          (type (ssh-read-u8 reader)))
     (if (= type +ssh-msg-channel-open+)
-        (ssh-client-refuse-channel-open client reader)
+        (ssh-client-handle-channel-open client reader)
         (let ((channel (ssh-client-channel-for client (ssh-read-u32 reader))))
           (when channel
             (case type
@@ -331,13 +467,20 @@ side is known to accept."
                (incf (ssh-channel-remote-window channel) (ssh-read-u32 reader))
                (ssh-channel-flush channel))
               (#.+ssh-msg-channel-data+
-               (ssh-channel-handle-data channel reader nil))
+               (if (string= (ssh-channel-type channel) "forwarded-tcpip")
+                   (ssh-client-channel-write-target channel reader)
+                   (ssh-channel-handle-data channel reader nil)))
               (#.+ssh-msg-channel-extended-data+
                (ssh-channel-handle-data channel reader t))
               (#.+ssh-msg-channel-eof+
                (setf (ssh-channel-eof-received channel) t)
-               (when (ssh-channel-on-eof channel)
-                 (funcall (ssh-channel-on-eof channel) channel)))
+               (if (string= (ssh-channel-type channel) "forwarded-tcpip")
+                   (ssh-client-channel-half-close-target channel)
+                   (when (ssh-channel-on-eof channel)
+                     (funcall (ssh-channel-on-eof channel) channel)))
+               (when (and (string= (ssh-channel-type channel) "forwarded-tcpip")
+                          (ssh-channel-target-eof channel))
+                 (ssh-channel-close channel)))
               (#.+ssh-msg-channel-close+
                (ssh-channel-handle-close channel))
               (#.+ssh-msg-channel-request+

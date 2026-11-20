@@ -220,6 +220,46 @@ CLI's decision and at the plist it filled."
     (is (= 18082 (burs::forward-bind-port forward)))
     (is (= 22 (burs::forward-port forward)))))
 
+(test remote-forward-specifications-parse
+  (let ((forward
+          (burs::parse-remote-forward "127.0.0.1:8080:example.org:80")))
+    (is (equal "127.0.0.1" (burs::forward-bind-address forward)))
+    (is (= 8080 (burs::forward-bind-port forward)))
+    (is (equal "example.org" (burs::forward-host forward)))
+    (is (= 80 (burs::forward-port forward))))
+  ;; Port 0 asks the server to allocate one.
+  (let ((forward (burs::parse-remote-forward "0:example.org:80")))
+    (is (null (burs::forward-bind-address forward)))
+    (is (= 0 (burs::forward-bind-port forward))))
+  (let ((forward (burs::parse-remote-forward "[::1]:8080:[::2]:80")))
+    (is (equal "::1" (burs::forward-bind-address forward)))
+    (is (equal "::2" (burs::forward-host forward)))))
+
+(test config-remote-forward-uses-the-two-word-form
+  (let ((forward
+          (burs::parse-config-remote-forward "18082 127.0.0.1:22")))
+    (is (null (burs::forward-bind-address forward)))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (equal "127.0.0.1" (burs::forward-host forward)))
+    (is (= 22 (burs::forward-port forward))))
+  (let ((forward
+          (burs::parse-config-remote-forward "127.0.0.1:18082 127.0.0.1:22")))
+    (is (equal "127.0.0.1" (burs::forward-bind-address forward)))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (= 22 (burs::forward-port forward)))))
+
+(test remote-forward-match-accepts-the-address-the-server-names
+  (let ((forward (burs::parse-remote-forward "8080:example.org:80")))
+    ;; An empty bind address means loopback, and the server may answer with
+    ;; the address it resolved or with the one the client wrote.
+    (is (burs::remote-forward-match-p forward "127.0.0.1" 8080))
+    (is (burs::remote-forward-match-p forward "localhost" 8080))
+    (is (not (burs::remote-forward-match-p forward "127.0.0.1" 8081))))
+  (let ((forward
+          (burs::parse-remote-forward "127.0.0.1:8080:example.org:80")))
+    (is (burs::remote-forward-match-p forward "127.0.0.1" 8080))
+    (is (not (burs::remote-forward-match-p forward "10.0.0.1" 8080)))))
+
 (test stdio-forward-parses-host-and-port
   (multiple-value-bind (host port)
       (burs::parse-host-port "example.org:2200")

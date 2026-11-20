@@ -166,7 +166,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                user known-hosts policy connect-timeout
                                server-alive-interval server-alive-count-max
                                proxy-command
-                               on-open on-error on-close)
+                               on-open on-error on-close on-forwarded-tcpip)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -182,7 +182,8 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :proxy-command (ssh-proxy-command-value proxy-command)
                     :on-open on-open
                     :on-error on-error
-                    :on-close on-close))
+                    :on-close on-close
+                    :on-forwarded-tcpip on-forwarded-tcpip))
 
 (defun ssh-resolve-and-connect (client private-key agent passphrase)
   "Find CLIENT's signers, then start its connection.
@@ -206,7 +207,7 @@ in either step ends CLIENT through its error callback."
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
-                             on-open on-error on-close)
+                             on-open on-error on-close on-forwarded-tcpip)
   "Connect to HOST as USER, authenticate, return at once.
 
 HOST is the name HOST-KEY checks and KNOWN-HOSTS records; it is resolved
@@ -249,7 +250,7 @@ role-neutral."
                            connect-timeout
                            server-alive-interval server-alive-count-max
                            proxy-command
-                           on-open on-error on-close)
+                           on-open on-error on-close on-forwarded-tcpip)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

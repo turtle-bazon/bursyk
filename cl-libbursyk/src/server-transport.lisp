@@ -378,12 +378,53 @@ SSH-WRITE-STRING; writing its raw octets would shift every later field."
                                       has-signature)))
       (t (ssh-server-send-auth-failure session)))))
 
+(defun ssh-server-send-global-reply (session success-p &optional fields)
+  "Answer the last global request.  FIELDS writes its success arguments."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer (if success-p
+                             +ssh-msg-request-success+
+                             +ssh-msg-request-failure+))
+    (when (and success-p fields) (funcall fields writer))
+    (ssh-session-send-payload session (ssh-writer-output writer))))
+
+(defun ssh-server-handle-tcpip-forward (session reader want-reply)
+  "Offer a remote forwarding request to the application.
+
+The application binds the requested address and port and returns the port
+it got, which differs from the request only when the client asked for port
+0.  A NIL answer refuses the request."
+  (let* ((bind-address (ssh-read-text reader))
+         (bind-port (ssh-read-u32 reader))
+         (handler (ssh-server-on-tcpip-forward (ssh-session-server session)))
+         (bound (and handler
+                     (funcall handler session bind-address bind-port))))
+    (when want-reply
+      (if bound
+          (ssh-server-send-global-reply
+           session t
+           (and (zerop bind-port)
+                (lambda (writer) (ssh-write-u32 writer bound))))
+          (ssh-server-send-global-reply session nil)))))
+
+(defun ssh-server-handle-cancel-tcpip-forward (session reader want-reply)
+  (let* ((bind-address (ssh-read-text reader))
+         (bind-port (ssh-read-u32 reader))
+         (handler (ssh-server-on-cancel-tcpip-forward
+                   (ssh-session-server session)))
+         (ok (and handler
+                  (funcall handler session bind-address bind-port))))
+    (when want-reply
+      (ssh-server-send-global-reply session (not (null ok))))))
+
 (defun ssh-server-handle-global-request (session payload)
   (let* ((reader (ssh-make-reader payload))
          (name (progn (ssh-read-u8 reader) (ssh-read-text reader)))
          (want-reply (ssh-read-boolean reader)))
-    (declare (ignore name))
-    (when want-reply
-      (let ((writer (ssh-writer)))
-        (ssh-write-u8 writer +ssh-msg-request-failure+)
-        (ssh-session-send-payload session (ssh-writer-output writer))))))
+    (cond
+      ((string= name "tcpip-forward")
+       (ssh-server-handle-tcpip-forward session reader want-reply))
+      ((string= name "cancel-tcpip-forward")
+       (ssh-server-handle-cancel-tcpip-forward session reader want-reply))
+      (t
+       (when want-reply
+         (ssh-server-send-global-reply session nil))))))

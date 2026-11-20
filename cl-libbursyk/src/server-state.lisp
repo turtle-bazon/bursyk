@@ -8,7 +8,7 @@
 ;;;; the peer: a request that needs work (an authorized-keys file, a command)
 ;;;; hands that work to the caller's callback and returns.
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.2"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.3"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -26,6 +26,12 @@ the library's own default is only for callers that do not name themselves.")
   (on-session nil)
   (on-channel nil)
   (on-direct-tcpip nil)
+  ;; Remote forwarding: the application owns the listener, because it knows
+  ;; which addresses and ports its user is willing to expose.  The first
+  ;; returns the bound port (or NIL to refuse); the second returns true once
+  ;; the listener is closed.
+  (on-tcpip-forward nil)
+  (on-cancel-tcpip-forward nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))

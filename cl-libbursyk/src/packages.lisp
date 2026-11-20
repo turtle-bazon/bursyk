@@ -18,6 +18,7 @@
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
+   #:ssh-client-send-global-request
    #:ssh-channel
    #:ssh-channel-p
    #:ssh-channel-exec
@@ -60,6 +61,7 @@
    #:ssh-server-channel-subsystem
    #:ssh-server-channel-write
    #:ssh-server-channel-write-stderr
+   #:ssh-server-open-forwarded-tcpip
    #:ssh-server-channel-eof
    #:ssh-server-channel-exit
    #:ssh-server-channel-close
