@@ -300,6 +300,14 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
             (start-client host (join-command command))
             (cl-pnet:event-loop-run)
             (finish *status*))))
+    #+sbcl
+    (sb-sys:interactive-interrupt ()
+      ;; Ctrl-C is not an error: leave the terminal on a fresh line and exit
+      ;; with the status a shell reports for SIGINT, instead of dropping into
+      ;; SBCL's debugger.
+      (format *error-output* "~&")
+      (finish-output *error-output*)
+      (finish 130))
     (error (condition)
       (when (uiop:getenv "BURS_DEBUG")
         (sb-debug:print-backtrace :count 40 :stream *error-output*))
