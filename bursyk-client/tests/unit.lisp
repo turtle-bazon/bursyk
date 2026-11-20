@@ -25,6 +25,15 @@
         :bind-address nil :gssapi-auth nil :tunnel nil :x11-forward nil
         :escape-char nil))
 
+(defun parse (arguments)
+  "Parse ARGUMENTS with fresh options.
+Returns (VALUES DESTINATION COMMAND OPTIONS), so a test can look at the
+CLI's decision and at the plist it filled."
+  (let ((burs::*options* (empty-options)))
+    (multiple-value-bind (destination command)
+        (burs::parse-arguments arguments)
+      (values destination command burs::*options*))))
+
 ;;; ---- command line ----
 
 (test split-destination-splits-at-the-first-at-sign
@@ -41,71 +50,140 @@
     (is (equal "b@example.org" host))
     (is (equal "a" user))))
 
-(test short-options-stay-case-sensitive
-  (is (eq :port (burs::option-key "-p")))
-  (is (eq :user (burs::option-key "-l")))
-  (is (eq :identity (burs::option-key "-i")))
-  (is (eq :options (burs::option-key "-o")))
-  (is (eq :config (burs::option-key "-F")))
-  (is (eq :jump (burs::option-key "-J")))
-  ;; The rest of ssh's flags now mean what ssh means: -f backgrounds, -L
-  ;; forwards a local port, -4 pins the address family.
-  (is (eq :background (burs::option-key "-f")))
-  (is (eq :local-forward (burs::option-key "-L")))
-  (is (eq :address-family (burs::option-key "-4")))
-  (is (eq :verbose (burs::option-key "-v")))
-  ;; -P is not an option for ssh or for this client.
-  (is (null (burs::option-key "-P")))
-  ;; Long options stay case-insensitive.
-  (is (eq :port (burs::option-key "--PORT"))))
-
 (test parse-arguments-stops-at-the-destination
-  (let ((burs::*options* (empty-options)))
-    (multiple-value-bind (destination command)
-        (burs::parse-arguments '("-p" "2222" "-l" "alice" "-i" "one"
-                                 "-i" "two" "host.example" "uname" "-a"))
-      (is (equal "host.example" destination))
-      (is (equal '("uname" "-a") command))
-      (is (equal "2222" (getf burs::*options* :port)))
-      (is (equal "alice" (getf burs::*options* :user)))
-      ;; -i may repeat; both keys are kept for authentication.
-      (is (equal '("two" "one") (getf burs::*options* :identity))))))
+  (multiple-value-bind (destination command options)
+      (parse '("-p" "2222" "-l" "alice" "-i" "one"
+               "-i" "two" "host.example" "uname" "-a"))
+    (is (equal "host.example" destination))
+    (is (equal '("uname" "-a") command))
+    (is (equal "2222" (getf options :port)))
+    (is (equal "alice" (getf options :user)))
+    ;; -i may repeat; both keys are kept for authentication.
+    (is (equal '("two" "one") (getf options :identity)))))
 
 (test double-dash-ends-option-parsing
-  (let ((burs::*options* (empty-options)))
-    (multiple-value-bind (destination command)
-        (burs::parse-arguments '("--" "host.example" "-p" "not-a-port"))
-      (is (equal "host.example" destination))
-      (is (equal '("-p" "not-a-port") command))
-      (is (null (getf burs::*options* :port))))))
+  (multiple-value-bind (destination command options)
+      (parse '("--" "host.example" "-p" "not-a-port"))
+    (is (equal "host.example" destination))
+    (is (equal '("-p" "not-a-port") command))
+    (is (null (getf options :port)))))
 
 (test clustered-short-options
-  (let ((burs::*options* (empty-options)))
-    (multiple-value-bind (destination command)
-        (burs::parse-arguments '("-vvT" "host" "-p" "2222"))
-      (is (equal "host" destination))
-      ;; Parsing stops at the destination, so -p here belongs to the
-      ;; remote command even though ssh would have taken it as a flag.
-      (is (equal '("-p" "2222") command))
-      (is (= 2 (getf burs::*options* :verbose)))
-      (is (eq :no (getf burs::*options* :request-tty)))
-      (is (null (getf burs::*options* :port))))))
+  (multiple-value-bind (destination command options)
+      (parse '("-vvT" "host" "-p" "2222"))
+    (is (equal "host" destination))
+    ;; Parsing stops at the destination, so -p here belongs to the
+    ;; remote command even though ssh would have taken it as a flag.
+    (is (equal '("-p" "2222") command))
+    (is (= 2 (getf options :verbose)))
+    (is (eq :no (getf options :request-tty)))
+    (is (null (getf options :port)))))
 
 (test attached-and-long-option-values
+  (multiple-value-bind (destination command options)
+      (parse '("-p2222" "-lalice" "host" "true"))
+    (is (equal "host" destination))
+    (is (equal '("true") command))
+    (is (equal "2222" (getf options :port)))
+    (is (equal "alice" (getf options :user))))
+  (multiple-value-bind (destination command options)
+      (parse '("--port=2200" "--user" "bob" "host"))
+    (is (equal "host" destination))
+    (is (null command))
+    (is (equal "2200" (getf options :port)))
+    (is (equal "bob" (getf options :user))))
+  ;; The readable spellings stay case-insensitive, and --identity-file is
+  ;; accepted as another name for --identity.
+  (multiple-value-bind (destination command options)
+      (parse '("--PORT=2201" "--IDENTITY-FILE=/tmp/key" "host"))
+    (is (equal "host" destination))
+    (is (null command))
+    (is (equal "2201" (getf options :port)))
+    (is (equal '("/tmp/key") (getf options :identity)))))
+
+(test short-options-keep-ssh-meanings
+  ;; -a disables agent forwarding; the agent picker is --agent.
+  (multiple-value-bind (destination command options)
+      (parse '("-a" "host"))
+    (declare (ignore destination command))
+    (is (null (getf options :forward-agent))))
+  (multiple-value-bind (destination command options)
+      (parse '("-A" "host"))
+    (declare (ignore destination command))
+    (is (eq t (getf options :forward-agent))))
+  (multiple-value-bind (destination command options)
+      (parse '("-4" "host"))
+    (declare (ignore destination command))
+    (is (equal "inet" (getf options :address-family))))
+  (multiple-value-bind (destination command options)
+      (parse '("-6" "host"))
+    (declare (ignore destination command))
+    (is (equal "inet6" (getf options :address-family))))
+  (multiple-value-bind (destination command options)
+      (parse '("--address-family=any" "host"))
+    (declare (ignore destination command))
+    (is (equal "any" (getf options :address-family))))
+  (multiple-value-bind (destination command options)
+      (parse '("-t" "host"))
+    (declare (ignore destination command))
+    (is (eq :force (getf options :request-tty))))
+  (multiple-value-bind (destination command options)
+      (parse '("-T" "host"))
+    (declare (ignore destination command))
+    (is (eq :no (getf options :request-tty))))
+  (multiple-value-bind (destination command options)
+      (parse '("--request-tty=no" "host"))
+    (declare (ignore destination command))
+    (is (equal "no" (getf options :request-tty)))))
+
+(test repeated-options-keep-command-line-order
+  (multiple-value-bind (destination command options)
+      (parse '("-L" "8080:example.org:80"
+               "-L" "127.0.0.1:9090:example.org:90" "host"))
+    (declare (ignore destination command))
+    (is (equal '("127.0.0.1:9090:example.org:90" "8080:example.org:80")
+               (getf options :local-forward))))
   (let ((burs::*options* (empty-options)))
-    (multiple-value-bind (destination command)
-        (burs::parse-arguments '("-p2222" "-lalice" "host" "true"))
-      (is (equal "host" destination))
-      (is (equal '("true") command))
-      (is (equal "2222" (getf burs::*options* :port)))
-      (is (equal "alice" (getf burs::*options* :user)))))
-  (let ((burs::*options* (empty-options)))
-    (multiple-value-bind (destination command)
-        (burs::parse-arguments '("--port=2200" "--user" "bob" "host"))
-      (is (equal "host" destination))
-      (is (null command))
-      (is (equal "2200" (getf burs::*options* :port)))
-      (is (equal "bob" (getf burs::*options* :user))))))
+    (burs::parse-arguments '("-o" "User=first" "-oUser=second" "host"))
+    ;; *OPTIONS* keeps the list reversed, as the old parser did;
+    ;; COMMAND-LINE-OPTION-LIST restores the written order.
+    (is (equal '("User=second" "User=first")
+               (getf burs::*options* :options)))
+    (is (equal '("User=first" "User=second")
+               (burs::command-line-option-list)))))
+
+(test ssh-flags-map-onto-the-option-plist
+  (multiple-value-bind (destination command options)
+      (parse '("-G" "-q" "-n" "-N" "host"))
+    (declare (ignore destination command))
+    (is (eq t (getf options :print-config)))
+    (is (eq t (getf options :quiet)))
+    (is (eq t (getf options :stdin-null)))
+    (is (eq t (getf options :no-command))))
+  (multiple-value-bind (destination command options)
+      (parse '("-s" "host" "sftp"))
+    (is (equal "host" destination))
+    (is (equal '("sftp") command))
+    (is (eq t (getf options :subsystem))))
+  (multiple-value-bind (destination command options)
+      (parse '("-W" "example.org:22" "host"))
+    (declare (ignore destination command))
+    (is (equal "example.org:22" (getf options :stdio-forward))))
+  (multiple-value-bind (destination command options)
+      (parse '("-Q" "cipher" "host"))
+    (declare (ignore destination command))
+    (is (equal "cipher" (getf options :query))))
+  (multiple-value-bind (destination command options)
+      (parse '("-V"))
+    (declare (ignore destination command))
+    (is (eq t (getf options :version)))))
+
+(test a-missing-destination-is-not-invented
+  (multiple-value-bind (destination command options)
+      (parse '("-v"))
+    (is (null destination))
+    (is (null command))
+    (is (= 1 (getf options :verbose)))))
 
 (test forwarding-specifications-parse
   (is (equal '("8080" "::1" "22")

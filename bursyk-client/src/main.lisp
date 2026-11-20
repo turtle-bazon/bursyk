@@ -45,17 +45,7 @@
     :tunnel nil :x11-forward nil :escape-char nil)
   "The command line as parsed, before ~/.ssh/config is applied.")
 
-(defun usage (&optional (stream *error-output*))
-  (format stream
-          "usage: burs [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface]~%~
-           ~10@T[-b bind_address] [-c cipher_spec] [-D [bind_address:]port]~%~
-           ~10@T[-E log_file] [-e escape_char] [-F configfile] [-I pkcs11]~%~
-           ~10@T[-i identity_file] [-J [user@]host[:port]] [-L address]~%~
-           ~10@T[-l login_name] [-m mac_spec] [-O ctl_cmd] [-o option]~%~
-           ~10@T[-p port] [-Q query_option] [-R address] [-S ctl_path]~%~
-           ~10@T[-W host:port] [-w local_tun[:remote_tun]]~%~
-           ~10@Tdestination [command [argument ...]]~%")
-  (finish-output stream))
+;;; ---- Command line ----
 
 (defun print-version ()
   (format t "burs ~A~%" +burs-version+)
@@ -69,8 +59,6 @@
 (defun unsupported (option &optional (detail "not implemented by this client"))
   (fail "~A is not supported: ~A" option detail))
 
-;;; ---- Command line ----
-
 (defun split-destination (destination)
   "DESTINATION as (VALUES HOST USER), splitting USER@HOST at the first @."
   (let ((at (position #\@ destination)))
@@ -78,188 +66,338 @@
         (values (subseq destination (1+ at)) (subseq destination 0 at))
         (values destination nil))))
 
-(defun short-option-spec (character)
-  "The plist describing short option CHARACTER, or NIL.
+;;; ssh(1)'s option surface, built once as a CLINGON command.  CLINGON parses
+;;; the clustered and attached forms (-vvT, -p2222, -oPort=22), writes the
+;;; help text, and reports unknown options and missing values.  The parser
+;;; here only finds the destination first, because ssh stops looking for
+;;; options there and CLINGON does not.
 
-Short options are case-sensitive, as in SSH itself: -p is the port and -P is
-not an option at all."
-  (case character
-    (#\4 (list :key :address-family :value "inet"))
-    (#\6 (list :key :address-family :value "inet6"))
-    (#\A (list :key :forward-agent :value t))
-    (#\a (list :key :forward-agent :value nil))
-    (#\B (list :key :bind-interface :takes-value t))
-    (#\b (list :key :bind-address :takes-value t))
-    (#\C (list :key :compression :value t))
-    (#\c (list :key :ciphers :takes-value t))
-    (#\D (list :key :dynamic-forward :takes-value t))
-    (#\E (list :key :log-file :takes-value t))
-    (#\e (list :key :escape-char :takes-value t))
-    (#\F (list :key :config :takes-value t))
-    (#\f (list :key :background :value t))
-    (#\G (list :key :print-config :value t))
-    (#\g (list :key :gateway-ports :value t))
-    (#\h (list :key :help :value t))
-    (#\I (list :key :pkcs11 :takes-value t))
-    (#\i (list :key :identity :takes-value t))
-    (#\J (list :key :jump :takes-value t))
-    (#\K (list :key :gssapi-auth :value t))
-    (#\k (list :key :gssapi-auth :value nil))
-    (#\L (list :key :local-forward :takes-value t))
-    (#\l (list :key :user :takes-value t))
-    (#\M (list :key :control-master :value t))
-    (#\m (list :key :macs :takes-value t))
-    (#\N (list :key :no-command :value t))
-    (#\n (list :key :stdin-null :value t))
-    (#\O (list :key :control-command :takes-value t))
-    (#\o (list :key :options :takes-value t))
-    (#\p (list :key :port :takes-value t))
-    (#\q (list :key :quiet :value t))
-    (#\Q (list :key :query :takes-value t))
-    (#\R (list :key :remote-forward :takes-value t))
-    (#\S (list :key :control-path :takes-value t))
-    (#\s (list :key :subsystem :value t))
-    (#\T (list :key :request-tty :value :no))
-    (#\t (list :key :request-tty :value :force))
-    (#\V (list :key :version :value t))
-    (#\v (list :key :verbose :value t))
-    (#\W (list :key :stdio-forward :takes-value t))
-    (#\w (list :key :tunnel :takes-value t))
-    (#\X (list :key :x11-forward :value :yes))
-    (#\x (list :key :x11-forward :value :no))
-    (#\Y (list :key :x11-forward :value :trust))
-    (otherwise nil)))
+(defvar *burs-command* nil
+  "The command parsed most recently, so MAIN can print its usage.")
 
-(defparameter *long-options*
-  ;; (NAME KEY TAKES-VALUE VALUE), matched case-insensitively.  These are the
-  ;; readable spellings this client has always had; ssh itself has only -o.
-  '(("address-family" :address-family t nil)
-    ("agent" :agent t nil)
-    ("bind-address" :bind-address t nil)
-    ("ciphers" :ciphers t nil)
-    ("config" :config t nil)
-    ("dynamic-forward" :dynamic-forward t nil)
-    ("gateway-ports" :gateway-ports nil t)
-    ("help" :help nil t)
-    ("identity" :identity t nil)
-    ("identity-file" :identity t nil)
-    ("jump" :jump t nil)
-    ("known-hosts" :known-hosts t nil)
-    ("local-forward" :local-forward t nil)
-    ("log-file" :log-file t nil)
-    ("macs" :macs t nil)
-    ("no-command" :no-command nil t)
-    ("option" :options t nil)
-    ("port" :port t nil)
-    ("quiet" :quiet nil t)
-    ("remote-forward" :remote-forward t nil)
-    ("request-tty" :request-tty t nil)
-    ("stdin-null" :stdin-null nil t)
-    ("stdio-forward" :stdio-forward t nil)
-    ("subsystem" :subsystem nil t)
-    ("user" :user t nil)
-    ("verbose" :verbose nil t)
-    ("version" :version nil t)))
+(defun burs-flag (key description &key short long)
+  (clingon:make-option :flag
+                       :key key
+                       :description description
+                       :short-name short
+                       :long-name long))
 
-(defun option-key (name)
-  "The option NAME selects, or NIL.
+(defun burs-string (key description &key short long (parameter "VALUE"))
+  (clingon:make-option :string
+                       :key key
+                       :description description
+                       :short-name short
+                       :long-name long
+                       :parameter parameter))
 
-A two-character short option and a --long spelling are both accepted.  A
-cluster such as -vv is not one option, so it answers NIL here and the parser
-walks it character by character."
-  (cond
-    ((and (> (length name) 2)
-          (char= (char name 0) #\-)
-          (char= (char name 1) #\-))
-     (let* ((body (string-downcase (subseq name 2)))
-            (equals (position #\= body))
-            (plain (if equals (subseq body 0 equals) body)))
-       (second (assoc plain *long-options* :test #'string=))))
-    ((and (= (length name) 2) (char= (char name 0) #\-))
-     (getf (short-option-spec (char name 1)) :key))
-    (t nil)))
+(defun burs-list (key description &key short long (parameter "VALUE"))
+  "An option that may repeat, keeping the values in command-line order."
+  (clingon:make-option :list
+                       :key key
+                       :description description
+                       :short-name short
+                       :long-name long
+                       :parameter parameter))
 
-(defun record-option (key value)
-  (case key
-    ((:identity :options :local-forward :remote-forward :dynamic-forward)
-     (push value (getf *options* key)))
-    (:verbose
-     (setf (getf *options* :verbose)
-           (1+ (getf *options* :verbose 0))))
-    (t (setf (getf *options* key) value))))
+(defun make-burs-options ()
+  "A fresh option set for one parse.
+
+CLINGON keeps the parsed value in the option object, so building new ones
+for every invocation keeps two parses from sharing state."
+  (list
+   ;; -a and -A keep ssh's meanings.  -a is inert because this client never
+   ;; forwards the agent; the agent *picker* is --agent or -o IdentityAgent=.
+   (burs-flag :forward-agent "Forward the authentication agent" :short #\A)
+   (burs-flag :no-forward-agent "Do not forward the authentication agent"
+              :short #\a)
+   (burs-flag :compression "Request compression" :short #\C
+              :long "compression")
+   (burs-flag :background "Background before command execution" :short #\f
+              :long "background")
+   (burs-flag :print-config "Print the effective configuration and exit"
+              :short #\G :long "print-config")
+   (burs-flag :gateway-ports "Allow remote hosts to use forwarded ports"
+              :short #\g :long "gateway-ports")
+   (burs-flag :gssapi-auth "Enable GSSAPI authentication" :short #\K)
+   (burs-flag :no-gssapi-auth "Disable GSSAPI authentication" :short #\k)
+   (burs-flag :control-master "Enable control-master mode" :short #\M)
+   (burs-flag :no-command "Do not execute a remote command" :short #\N
+              :long "no-command")
+   (burs-flag :stdin-null "Redirect stdin from /dev/null" :short #\n
+              :long "stdin-null")
+   (burs-flag :quiet "Suppress diagnostic messages" :short #\q
+              :long "quiet")
+   (burs-flag :request-tty-no "Disable pseudo-terminal allocation" :short #\T)
+   (burs-flag :request-tty-force "Force pseudo-terminal allocation" :short #\t)
+   (burs-flag :subsystem "Request a subsystem; the name follows the destination"
+              :short #\s :long "subsystem")
+   (burs-flag :x11-yes "Forward the X11 display" :short #\X)
+   (burs-flag :x11-no "Do not forward the X11 display" :short #\x)
+   (burs-flag :x11-trust "Forward X11 with trusted cookies" :short #\Y)
+   (burs-flag :version "Display the client version and exit" :short #\V
+              :long "version")
+   (clingon:make-option :counter
+                        :key :verbose
+                        :description "Increase logging verbosity (repeatable)"
+                        :short-name #\v
+                        :long-name "verbose")
+   (burs-flag :address-family-4 "Use IPv4 only" :short #\4)
+   (burs-flag :address-family-6 "Use IPv6 only" :short #\6)
+   (burs-string :bind-interface "Bind the source to an interface"
+                :short #\B :long "bind-interface" :parameter "INTERFACE")
+   (burs-string :bind-address "Bind the source to a local address"
+                :short #\b :long "bind-address" :parameter "ADDRESS")
+   (burs-string :ciphers "Select the cipher specification"
+                :short #\c :long "ciphers" :parameter "SPEC")
+   (burs-list :dynamic-forward "Dynamic SOCKS forwarding"
+              :short #\D :long "dynamic-forward" :parameter "ADDRESS")
+   (burs-string :log-file "Append debug output to a file"
+                :short #\E :long "log-file" :parameter "FILE")
+   (burs-string :escape-char "Set the escape character"
+                :short #\e :parameter "CHAR")
+   (burs-string :config "Read an alternative ssh_config file"
+                :short #\F :long "config" :parameter "FILE")
+   (burs-string :pkcs11 "Use a PKCS#11 provider" :short #\I
+                :parameter "PROVIDER")
+   (burs-list :identity "Select a private key file" :short #\i
+              :long "identity" :parameter "FILE")
+   (burs-string :jump "Connect through a jump host" :short #\J
+                :long "jump" :parameter "DESTINATION")
+   (burs-list :local-forward "Forward a local port to the remote side"
+              :short #\L :long "local-forward" :parameter "SPEC")
+   (burs-string :user "Specify the remote login name" :short #\l
+                :long "user" :parameter "NAME")
+   (burs-string :macs "Select the MAC specification" :short #\m
+                :long "macs" :parameter "SPEC")
+   (burs-string :control-command "Control a running master connection"
+                :short #\O :parameter "COMMAND")
+   (burs-list :options "Set an ssh_config option" :short #\o
+              :long "option" :parameter "OPTION")
+   (burs-string :port "Connect to this remote port" :short #\p
+                :long "port" :parameter "PORT")
+   (burs-string :query "Query supported algorithms and exit" :short #\Q
+                :parameter "QUERY")
+   (burs-list :remote-forward "Forward a remote port to the local side"
+              :short #\R :long "remote-forward" :parameter "SPEC")
+   (burs-string :control-path "Use this control socket" :short #\S
+                :parameter "PATH")
+   (burs-string :stdio-forward "Forward stdin and stdout to a remote host"
+                :short #\W :long "stdio-forward" :parameter "HOST:PORT")
+   (burs-string :tunnel "Tunnel a TUN device" :short #\w
+                :parameter "LOCAL[:REMOTE]")
+   ;; The readable spellings this client has always had.  ssh itself spells
+   ;; everything through -o.
+   (burs-string :address-family "Select the address family"
+                :long "address-family" :parameter "FAMILY")
+   (burs-string :agent "Select the authentication agent socket"
+                :long "agent" :parameter "SOCKET")
+   (burs-string :known-hosts "Read known hosts from this file"
+                :long "known-hosts" :parameter "FILE")
+   (burs-string :request-tty "Control pseudo-terminal allocation"
+                :long "request-tty" :parameter "STATE")))
+
+(defun make-burs-command ()
+  (let ((command
+          (clingon:make-command
+           :name "burs"
+           :description "Connect to a remote host over SSH"
+           :version +burs-version+
+           :usage "[options] destination [command [argument ...]]"
+           :options (make-burs-options))))
+    ;; ssh spells the version flag -V and prints one line.  CLINGON's own
+    ;; --version would print "burs version ...", so drop that default and
+    ;; keep the --version/-V pair defined above.
+    (setf (clingon:command-options command)
+          (remove clingon:*default-version-flag*
+                  (clingon:command-options command)
+                  :test #'eq))
+    command))
+
+(defun find-burs-short-option (command character)
+  (find character (clingon:command-options command)
+        :key (lambda (option)
+               (or (clingon:option-short-name option) #\Nul))
+        :test #'char=))
+
+(defun find-burs-long-option (command name)
+  (find name (clingon:command-options command)
+        :key (lambda (option) (or (clingon:option-long-name option) ""))
+        :test #'string=))
+
+(defun split-at-destination (arguments command)
+  "Split ARGUMENTS at the destination, normalising long option names.
+
+Returns (VALUES OPTION-ARGUMENTS DESTINATION COMMAND-ARGUMENTS).  ssh(1)
+stops looking for options at the destination, so the remote command may
+contain things like `uname -a' that would otherwise look like flags.
+CLINGON keeps parsing options among free arguments, so the destination and
+everything after it are handed to it behind `--'.
+
+The scan also lower-cases a long option name and expands the
+--identity-file alias, which CLINGON would otherwise take literally."
+  (let ((option-arguments '())
+        (remaining arguments))
+    (labels
+        ((take-value ()
+           (let ((value (pop remaining)))
+             (when value
+               (push value option-arguments))))
+         (scan-short (argument)
+           (push argument option-arguments)
+           (loop with length = (length argument)
+                 for index from 1 below length
+                 for option = (find-burs-short-option
+                               command (char argument index))
+                 do (cond
+                      ((null option)
+                       ;; CLINGON reports the unknown option itself.
+                       (return))
+                      ((clingon:option-parameter option)
+                       ;; A value attached to the option (-p2222) is already
+                       ;; in this argument; otherwise it is the next one.
+                       (when (= (1+ index) length)
+                         (take-value))
+                       (return)))))
+         (scan-long (argument)
+           (let* ((equals (position #\= argument))
+                  (end (or equals (length argument)))
+                  (name (string-downcase (subseq argument 2 end)))
+                  (name (if (string= name "identity-file") "identity" name))
+                  (token (concatenate 'string
+                                      "--" name
+                                      (if equals (subseq argument equals) "")))
+                  (option (find-burs-long-option command name)))
+             (push token option-arguments)
+             (when (and (null equals)
+                        option
+                        (clingon:option-parameter option))
+               (take-value)))))
+      (loop
+        for argument = (pop remaining)
+        do (cond
+             ((null argument)
+              (return (values (nreverse option-arguments) nil nil)))
+             ((string= argument "--")
+              (return (values (nreverse option-arguments)
+                              (pop remaining)
+                              remaining)))
+             ((and (> (length argument) 2)
+                   (char= (char argument 0) #\-)
+                   (char= (char argument 1) #\-))
+              (scan-long argument))
+             ((and (> (length argument) 1)
+                   (char= (char argument 0) #\-))
+              (scan-short argument))
+             (t
+              (return (values (nreverse option-arguments)
+                              argument
+                              remaining))))))))
+
+(defun parsed-list (command key)
+  "The values of KEY in command-line order, or NIL."
+  (reverse (clingon:getopt command key)))
+
+(defun apply-parsed-options (command)
+  "Copy COMMAND's values into *OPTIONS*.
+
+Every key is written, even when it is NIL, so a second parse cannot inherit
+a value from the first.  The list options are stored in reverse, which is
+the order the old push-based parser kept them in."
+  (let ((getopt (lambda (key) (clingon:getopt command key))))
+    (labels ((value (key) (funcall getopt key))
+             (flag (key) (funcall getopt key)))
+      (setf (getf *options* :port) (value :port)
+            (getf *options* :user) (value :user)
+            (getf *options* :identity) (parsed-list command :identity)
+            (getf *options* :config) (value :config)
+            (getf *options* :known-hosts) (value :known-hosts)
+            (getf *options* :policy) nil
+            (getf *options* :agent) (value :agent)
+            (getf *options* :options) (parsed-list command :options)
+            (getf *options* :jump) (value :jump)
+            (getf *options* :proxy-command) nil
+            (getf *options* :verbose) (or (value :verbose) 0)
+            (getf *options* :quiet) (flag :quiet)
+            (getf *options* :log-file) (value :log-file)
+            (getf *options* :address-family)
+            (cond ((flag :address-family-4) "inet")
+                  ((flag :address-family-6) "inet6")
+                  (t (value :address-family)))
+            (getf *options* :ciphers) (value :ciphers)
+            (getf *options* :macs) (value :macs)
+            (getf *options* :kex-algorithms) nil
+            (getf *options* :compression) (flag :compression)
+            (getf *options* :request-tty)
+            (cond ((flag :request-tty-no) :no)
+                  ((flag :request-tty-force) :force)
+                  (t (value :request-tty)))
+            (getf *options* :forward-agent) (flag :forward-agent)
+            (getf *options* :gateway-ports) (flag :gateway-ports)
+            (getf *options* :no-command) (flag :no-command)
+            (getf *options* :stdin-null) (flag :stdin-null)
+            (getf *options* :subsystem) (flag :subsystem)
+            (getf *options* :stdio-forward) (value :stdio-forward)
+            (getf *options* :local-forward) (parsed-list command :local-forward)
+            (getf *options* :remote-forward)
+            (parsed-list command :remote-forward)
+            (getf *options* :dynamic-forward)
+            (parsed-list command :dynamic-forward)
+            (getf *options* :query) (value :query)
+            (getf *options* :help) nil
+            (getf *options* :version) (flag :version)
+            (getf *options* :print-config) (flag :print-config)
+            (getf *options* :background) (flag :background)
+            (getf *options* :control-master) (flag :control-master)
+            (getf *options* :control-path) (value :control-path)
+            (getf *options* :control-command) (value :control-command)
+            (getf *options* :pkcs11) (value :pkcs11)
+            (getf *options* :bind-interface) (value :bind-interface)
+            (getf *options* :bind-address) (value :bind-address)
+            (getf *options* :gssapi-auth) (flag :gssapi-auth)
+            (getf *options* :tunnel) (value :tunnel)
+            (getf *options* :x11-forward)
+            (cond ((flag :x11-yes) :yes)
+                  ((flag :x11-trust) :trust)
+                  ((flag :x11-no) :no)
+                  (t nil))
+            (getf *options* :escape-char) (value :escape-char)))
+    (values)))
 
 (defun parse-arguments (arguments)
   "Fill *OPTIONS* from ARGUMENTS; return (VALUES DESTINATION COMMAND).
 
-Options may be clustered (-vvT) and a value may be attached to its option
-(-p2222, -oPort=22, --port=2222) or given as the next argument.  Parsing
-stops at the destination; everything after it is the remote command."
-  (let ((destination nil)
-        (command nil)
-        (arguments (copy-list arguments)))
-    (labels
-        ((take-value (token attached)
-           (or attached
-               (pop arguments)
-               (fail "~A needs a value" token)))
-         (apply-spec (spec token attached)
-           (let ((key (getf spec :key))
-                 (value (getf spec :value)))
-             (if (getf spec :takes-value)
-                 (record-option key (take-value token attached))
-                 (record-option key value))))
-         (short-cluster (argument)
-           (let ((length (length argument)))
-             (loop with index = 1
-                   while (< index length)
-                   do (let* ((character (char argument index))
-                             (spec (short-option-spec character)))
-                        (unless spec
-                          (fail "unknown option -~C" character))
-                        (cond
-                          ((getf spec :takes-value)
-                           (apply-spec spec argument
-                                       (if (< (1+ index) length)
-                                           (subseq argument (1+ index))
-                                           nil))
-                           (setf index length))
-                          (t
-                           (apply-spec spec argument nil)
-                           (incf index)))))))
-         (long-option (argument)
-           (let* ((body (subseq argument 2))
-                  (equals (position #\= body))
-                  (name (if equals (subseq body 0 equals) body))
-                  (attached (and equals (subseq body (1+ equals))))
-                  (entry (assoc (string-downcase name) *long-options*
-                                :test #'string=)))
-             (unless entry
-               (fail "unknown option --~A" name))
-             (apply-spec (list :key (second entry)
-                               :takes-value (third entry)
-                               :value (fourth entry))
-                         argument attached))))
-      (loop
-        (let ((argument (pop arguments)))
-          (cond
-            ((null argument)
-             (return))
-            ((string= argument "--")
-             (setf destination (pop arguments)
-                   command arguments)
-             (return))
-            ((and (> (length argument) 2)
-                  (char= (char argument 0) #\-)
-                  (char= (char argument 1) #\-))
-             (long-option argument))
-            ((and (> (length argument) 1)
-                  (char= (char argument 0) #\-))
-             (short-cluster argument))
-            (t
-             (setf destination argument
-                   command arguments)
-             (return))))))
-    (values destination command)))
+CLINGON parses the options and produces the help.  Splitting the line at the
+destination first is the one part of ssh(1)'s grammar CLINGON does not
+model: after the destination everything belongs to the remote command."
+  (let ((command (make-burs-command)))
+    (multiple-value-bind (option-arguments destination command-arguments)
+        (split-at-destination arguments command)
+      (setf *burs-command* command)
+      (handler-case
+          (let* ((line (append option-arguments
+                               (when destination
+                                 (cons "--"
+                                       (cons destination command-arguments)))))
+                 (parsed (clingon:parse-command-line command line))
+                 (free (clingon:command-arguments parsed)))
+            (apply-parsed-options parsed)
+            (values (first free) (rest free)))
+        (clingon:exit-error (condition)
+          ;; --help and --version have already written their answer.
+          (uiop:quit (clingon:exit-error-code condition)))
+        (clingon:unknown-option (condition)
+          (fail "unknown option ~A" (clingon:unknown-option-name condition)))
+        (clingon:missing-option-argument (condition)
+          (let ((option (clingon:missing-option-argument-item condition)))
+            (fail "~A needs a value"
+                  (if (clingon:option-short-name option)
+                      (format nil "-~A" (clingon:option-short-name option))
+                      (format nil "--~A"
+                              (clingon:option-long-name option))))))
+        (clingon:missing-required-option-value (condition)
+          (fail "~A" condition))
+        (clingon:option-derive-error (condition)
+          (fail "~A" condition))))))
 
 ;;; ---- Checking what this client can actually do ----
 
@@ -1057,6 +1195,26 @@ would leave the user waiting for a tunnel that was never opened."
       (format nil "~{~A~^ ~}" arguments)
       (remote-shell)))
 
+(defun stdin-terminal-p ()
+  #+sbcl (plusp (sb-unix:unix-isatty 0))
+  #-sbcl nil)
+
+(defun check-interactive-session (command)
+  "Refuse the pseudo-terminal ssh(1) would allocate for a bare destination.
+
+With no remote command and a terminal on stdin, ssh asks for a PTY.  This
+client does not implement PTY allocation; running the remote shell without
+one looks exactly like a hang, because it gets neither a prompt nor echo.
+Say what is missing instead.  -T asks for no PTY and keeps working."
+  (when (and (null command)
+             (null (getf *options* :subsystem))
+             (null (getf *options* :no-command))
+             (null (getf *options* :stdio-forward))
+             (not (member (getf *options* :request-tty)
+                          '(:no "no" "false" :off) :test #'equal))
+             (stdin-terminal-p))
+    (fail "an interactive session needs a PTY, which this client does not implement; give a remote command or use -T")))
+
 ;;; ---- The target client ----
 
 (defun client-port ()
@@ -1112,9 +1270,6 @@ would leave the user waiting for a tunnel that was never opened."
       (let ((arguments (uiop:command-line-arguments)))
         (multiple-value-bind (destination command)
             (parse-arguments arguments)
-          (when (getf *options* :help)
-            (usage *standard-output*)
-            (uiop:quit 0))
           (when (getf *options* :version)
             (print-version)
             (uiop:quit 0))
@@ -1124,7 +1279,7 @@ would leave the user waiting for a tunnel that was never opened."
           (when (getf *options* :query)
             (print-query (getf *options* :query)))
           (unless destination
-            (usage)
+            (clingon:print-usage *burs-command* *error-output*)
             (uiop:quit 255))
           (multiple-value-bind (host user) (split-destination destination)
             (when user (setf (getf *options* :user) user))
@@ -1134,6 +1289,7 @@ would leave the user waiting for a tunnel that was never opened."
               (fail "-W cannot be combined with a remote command"))
             (when (getf *options* :print-config)
               (print-config host))
+            (check-interactive-session command)
             (handler-case
                 (start-client host (join-command command))
               (cl-pnet-ssh:ssh-config-error (condition)
