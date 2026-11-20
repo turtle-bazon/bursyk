@@ -66,6 +66,7 @@
    #:ssh-config
    #:ssh-config-p
    #:ssh-config-load
+   #:ssh-config-combine
    #:ssh-config-resolve
    #:ssh-config-option-line
    #:ssh-config-option-lines
@@ -85,6 +86,13 @@
    #:ssh-config-options-send-env
    #:ssh-config-options-proxy-jump
    #:ssh-config-options-proxy-command
+   #:ssh-config-options-address-family
+   #:ssh-config-options-gateway-ports
+   #:ssh-config-options-local-forwards
+   #:ssh-config-options-remote-forwards
+   #:ssh-config-options-dynamic-forwards
+   #:ssh-config-options-request-tty
+   #:ssh-config-client-source
    #:ssh-config-error
    #:ssh-config-error-path
    #:ssh-config-error-line
@@ -189,4 +197,11 @@
    #:ssh-make-kexinit-payload
    #:ssh-parse-kexinit-payload
    #:ssh-negotiate
-   #:ssh-parse-signature-blob))
+   #:ssh-parse-signature-blob
+   ;; The offers this build can make, for -Q and for a caller that wants to
+   ;; check a choice before connecting.
+   #:+ssh-kex-algorithms+
+   #:+ssh-host-key-algorithms+
+   #:+ssh-ciphers+
+   #:+ssh-macs+
+   #:+ssh-compressions+))

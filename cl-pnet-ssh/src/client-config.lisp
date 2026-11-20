@@ -8,18 +8,32 @@
 
 ;;; ---- Reading the options ----
 
+(defparameter +ssh-system-config-file+ #p"/etc/ssh/ssh_config"
+  "The system-wide ssh_config OpenSSH reads before the user's file.
+
+Its Include directives are followed, which is how a distribution's
+/etc/ssh/ssh_config.d/*.conf files take effect.")
+
+(defun ssh-config-user-file ()
+  (merge-pathnames ".ssh/config" (user-homedir-pathname)))
+
 (defun ssh-config-client-source (config &optional options)
-  "CONFIG as an SSH-CONFIG; NIL means ~/.ssh/config.
+  "CONFIG as an SSH-CONFIG; NIL means the user and system ssh_config files.
+
+OpenSSH reads ~/.ssh/config first and then the system file, keeping the
+first value each keyword obtains; combining them in that order gives the
+same answers, so a user setting wins over a system default.  An explicit
+CONFIG (-F) replaces both, as it does in ssh.
 
 OPTIONS are the command-line -o answers; they are applied as if they came
-before the file, so every keyword they name wins over the file the way ssh
+before the files, so every keyword they name wins over them the way ssh
 itself orders them."
   (let ((source
           (typecase config
             (ssh-config config)
-            (null (or (ssh-config-load
-                       (merge-pathnames ".ssh/config" (user-homedir-pathname)))
-                      (%make-ssh-config)))
+            (null (ssh-config-combine
+                   (ssh-config-load (ssh-config-user-file))
+                   (ssh-config-load +ssh-system-config-file+)))
             (t (or (ssh-config-load config)
                    (error 'ssh-config-error
                           :path (namestring (pathname config))

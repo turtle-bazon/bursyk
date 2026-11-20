@@ -1250,6 +1250,58 @@ than connect and quietly skip the known_hosts record."
     ;; Adding no options leaves the parsed config itself untouched.
     (is (eq config (ssh-config-add-options config nil)))))
 
+(test forwarding-lines-are-kept-in-file-order
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "LocalForward 18082 127.0.0.1:22")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "LocalForward 127.0.0.1:18083 127.0.0.1:22")
+                  (cl-pnet-ssh::ssh-config-option-line "DynamicForward 1080"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal '("18082 127.0.0.1:22" "127.0.0.1:18083 127.0.0.1:22")
+               ;; The slots are built by pushing, so reading them back in
+               ;; file order means reversing once.
+               (reverse (ssh-config-options-local-forwards options))))
+    (is (equal '("1080")
+               (reverse (ssh-config-options-dynamic-forwards options))))
+    ;; A command line -o LocalForward is a forwarding line too.
+    (let ((combined (ssh-config-add-options
+                     config '("LocalForward 18084 127.0.0.1:22")))
+          (more nil))
+      (ssh-config-resolve combined "alias"
+                          :on-options (lambda (value) (setf more value)))
+      (is (equal '("18084 127.0.0.1:22" "18082 127.0.0.1:22"
+                   "127.0.0.1:18083 127.0.0.1:22")
+                 (reverse (ssh-config-options-local-forwards more)))))))
+
+(test user-config-values-come-before-the-system-file
+  (let* ((system
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "Port 22")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostName system.example"))))
+         (user
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "Port 2200")
+                  (cl-pnet-ssh::ssh-config-option-line "User alice"))))
+         (options nil))
+    (ssh-config-resolve (ssh-config-combine user system) "alias"
+                        :on-options (lambda (value) (setf options value)))
+    ;; OpenSSH reads the user file first and every keyword keeps its first
+    ;; value, so the user's Port wins; the system file still supplies what
+    ;; the user file omitted.
+    (is (= 2200 (ssh-config-options-port options)))
+    (is (equal "system.example" (ssh-config-options-hostname options)))
+    (is (equal "alice" (ssh-config-options-user options)))
+    ;; An absent file contributes nothing.
+    (is (eq user (ssh-config-combine user nil)))))
+
 (test client-source-applies-options-before-the-file
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-opt"))
          (path (merge-pathnames "config" directory)))

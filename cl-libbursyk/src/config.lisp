@@ -70,6 +70,9 @@
   (rekey-limit nil)
   (forward-agent nil)
   (gateway-ports nil)
+  (local-forwards nil)
+  (remote-forwards nil)
+  (dynamic-forwards nil)
   (request-tty nil)
   (tag nil)
   (extra nil))
@@ -373,6 +376,24 @@ the caller can treat the '[' literally."
     (when (probe-file path)
       (%make-ssh-config :path path
                         :directives (ssh-config-read-directives path 0)))))
+
+(defun ssh-config-combine (&rest configs)
+  "CONFIGS as one directive stream, in the order given, skipping absent ones.
+
+OpenSSH reads ~/.ssh/config first and the system file after it, and keeps
+the first value it obtains for each keyword, so appending in that order
+preserves the same precedence."
+  (let ((present (remove nil configs)))
+    (cond
+      ((null present) (%make-ssh-config))
+      ((null (rest present)) (first present))
+      (t
+       (%make-ssh-config
+        :path (ssh-config-path (first present))
+        :directives
+        (mapcan (lambda (config)
+                  (copy-list (ssh-config-directives config)))
+                present))))))
 
 ;;; ---- Command-line -o options ----
 
@@ -747,8 +768,21 @@ enough.  Commas in a pattern are separators, as in ssh_config."
                      (ssh-config-line-args line))))
       ((member keyword '("localforward" "remoteforward" "dynamicforward")
                :test #'string=)
-       (push (cons keyword (ssh-config-line-args line))
-             (ssh-config-options-extra options)))
+       ;; Keep the tokens as written for callers that want them, and also
+       ;; keep each forwarding line as one string: the destination follows
+       ;; ssh_config's two-word form ("port host:hostport"), which is not
+       ;; what the command line's single colon-separated argument looks
+       ;; like, so the text is preserved and the caller decides.
+       (let ((value (format nil "~{~A~^ ~}" (ssh-config-line-args line))))
+         (push (cons keyword (ssh-config-line-args line))
+               (ssh-config-options-extra options))
+         (cond
+           ((string= keyword "localforward")
+            (push value (ssh-config-options-local-forwards options)))
+           ((string= keyword "remoteforward")
+            (push value (ssh-config-options-remote-forwards options)))
+           (t
+            (push value (ssh-config-options-dynamic-forwards options))))))
       ((string= keyword "tag")
        (ssh-config-set-once
         seen options :tag
