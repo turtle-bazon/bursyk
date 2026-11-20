@@ -2,7 +2,7 @@
   :description "libssh CFFI bindings"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.0"
+  :version "0.0.1.1"
   :depends-on (#:cffi
                #:cl-libbursyk
                #:cl-pnet

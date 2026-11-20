@@ -28,7 +28,7 @@
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.3"
+(defparameter +bursyk-server-version+ "0.0.3.0"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -39,7 +39,7 @@ version rather than a generic library string.")
 
 (defun usage ()
   (format *error-output*
-          "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY~%~
+          "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY...~%~
            ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%~
            ~15@T[-S NAME=PATH]... [--no-tcp-forwarding]~%~
            ~15@T[--allow-tcpip HOST:PORT]... [--no-remote-forwarding]~%~
@@ -94,7 +94,7 @@ version rather than a generic library string.")
 
 (defun record-option (key value)
   (case key
-    ((:accept-env :allow :subsystem)
+    ((:accept-env :allow :subsystem :host-key)
      (push value (getf *options* key)))
     (:permit-open
      (multiple-value-bind (host port) (split-host-port value)
@@ -855,13 +855,21 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 (defun home-file (name)
   (merge-pathnames name (user-homedir-pathname)))
 
+(defun host-key-files ()
+  "The -H keys in command-line order, or the default identity.
+
+A server may present several key types; a client picks the strongest one
+they share, so an RSA-only client still connects to an ed25519-first host."
+  (or (reverse (getf *options* :host-key))
+      (list (home-file ".ssh/id_ed25519"))))
+
 (defun start-server ()
-  (let* ((host-key (or (getf *options* :host-key)
-                       (home-file ".ssh/id_ed25519")))
+  (let* ((host-keys (host-key-files))
          (authorized (or (getf *options* :authorized-keys)
                          (home-file ".ssh/authorized_keys"))))
-    (unless (probe-file host-key)
-      (fail "host key not found: ~A" host-key))
+    (dolist (host-key host-keys)
+      (unless (probe-file host-key)
+        (fail "host key not found: ~A" host-key)))
     (unless (probe-file authorized)
       (format *error-output* "bursyk-server: warning: ~A not found~%"
               authorized))
@@ -869,7 +877,7 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
           (cl-pnet-ssh:make-ssh-server
            (getf *options* :address)
            (port-option)
-           :host-key host-key
+           :host-key host-keys
            :authorized-keys authorized
            :server-version (format nil "bursyk-server_~A"
                                    +bursyk-server-version+)

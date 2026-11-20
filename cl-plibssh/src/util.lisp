@@ -95,7 +95,7 @@
   listener
   watcher
   bind
-  host-key
+  (host-keys nil)
   authorized-keys
   authorize
   (accept-env nil)
@@ -106,6 +106,10 @@
   (on-close nil)
   (sessions (make-hash-table :test #'eq))
   (closed nil))
+
+(defun ssh-server-host-key (server)
+  "The first host key SERVER presents."
+  (first (ssh-server-host-keys server)))
 
 (defstruct (ssh-session (:constructor %make-ssh-session))
   server

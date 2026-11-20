@@ -11,13 +11,15 @@
   "Server KEX offers.  The strict marker tells OpenSSH clients to reset
 sequence numbers at NEWKEYS; it is not an algorithm and is never selected.")
 
-(defun ssh-server-make-kexinit-payload ()
-  "A fresh server SSH_MSG_KEXINIT."
-  (let ((writer (ssh-writer)))
+(defun ssh-server-make-kexinit-payload (session)
+  "A fresh server SSH_MSG_KEXINIT advertising the keys SESSION's server holds."
+  (let ((host-keys (ssh-server-host-keys
+                    (ssh-session-server session)))
+        (writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-kexinit+)
     (ssh-write-octets writer (ssh-random-octets 16))
     (iter (for list in (list +ssh-server-kex-algorithms+
-                             +ssh-server-host-key-algorithms+
+                             (ssh-server-host-key-algorithms host-keys)
                              +ssh-ciphers+ +ssh-ciphers+
                              +ssh-macs+ +ssh-macs+
                              +ssh-compressions+ +ssh-compressions+
@@ -36,7 +38,7 @@ sequence numbers at NEWKEYS; it is not an algorithm and is never selected.")
    (ssh-string-octets (concatenate 'string
                                    (ssh-session-server-version session)
                                    (string #\Return) (string #\Newline))))
-  (let ((kexinit (ssh-server-make-kexinit-payload)))
+  (let ((kexinit (ssh-server-make-kexinit-payload session)))
     (setf (ssh-session-server-kexinit session) kexinit
           (ssh-session-kexinit-sent session) t)
     (ssh-session-send-payload session kexinit)))
@@ -122,11 +124,16 @@ and NIL while the line is still incomplete."
 ;;; ---- Key exchange ----
 
 (defun ssh-server-negotiate (session client-kexinit)
-  "Choose algorithms from CLIENT-KEXINIT for the server role."
+  "Choose algorithms from CLIENT-KEXINIT for the server role.
+
+The host key offer is built from SESSION's loaded keys, so every algorithm
+advertised can be signed with."
   (let* ((kex (ssh-choose-algorithm +ssh-server-kex-algorithms+
                                     (getf client-kexinit :kex)))
-         (host-key (ssh-choose-algorithm +ssh-server-host-key-algorithms+
-                                         (getf client-kexinit :host-keys)))
+         (host-key (ssh-choose-algorithm
+                    (ssh-server-host-key-algorithms
+                     (ssh-server-host-keys (ssh-session-server session)))
+                    (getf client-kexinit :host-keys)))
          (cipher-c2s (ssh-choose-algorithm +ssh-ciphers+
                                            (getf client-kexinit :ciphers-c2s)))
          (cipher-s2c (ssh-choose-algorithm +ssh-ciphers+
@@ -148,7 +155,7 @@ and NIL while the line is still incomplete."
                           (getf client-kexinit :kex) :test #'string=))))
 
 (defun ssh-server-send-kexinit (session)
-  (let ((kexinit (ssh-server-make-kexinit-payload)))
+  (let ((kexinit (ssh-server-make-kexinit-payload session)))
     (setf (ssh-session-server-kexinit session) kexinit
           (ssh-session-kexinit-sent session) t)
     (ssh-session-send-payload session kexinit)))
@@ -179,6 +186,11 @@ came up."
   "Answer the client's curve25519 offer: host key, ephemeral key, signature."
   (let* ((reader (ssh-make-reader payload))
          (client-public (progn (ssh-read-u8 reader) (ssh-read-string reader)))
+         (algorithm (getf (ssh-session-negotiated session) :host-key))
+         (host-key (and algorithm
+                        (ssh-server-host-key-for
+                         (ssh-server-host-keys (ssh-session-server session))
+                         algorithm)))
          (private nil)
          (server-public nil)
          (shared nil)
@@ -186,6 +198,9 @@ came up."
          (signature nil))
     (unless (ssh-session-negotiated session)
       (error 'ssh-protocol-error :detail "ECDH_INIT before KEXINIT"))
+    (unless host-key
+      (error 'ssh-protocol-error
+             :detail (format nil "no key for host key algorithm ~A" algorithm)))
     (multiple-value-setq (private server-public) (ssh-curve25519-keypair))
     (setf shared (ssh-curve25519-shared private client-public))
     (setf hash (ssh-exchange-hash
@@ -193,18 +208,15 @@ came up."
                 (ssh-session-server-version session)
                 (ssh-session-client-kexinit session)
                 (ssh-session-server-kexinit session)
-                (ssh-public-key-blob-of (ssh-server-host-key
-                                         (ssh-session-server session)))
+                (ssh-public-key-blob-of host-key)
                 client-public server-public shared)
-          signature (ssh-ed25519-signature-blob
-                     (ssh-server-host-key (ssh-session-server session)) hash))
+          signature (ssh-server-host-key-signature host-key algorithm hash))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
           (ssh-session-ephemeral-private session) private
           (ssh-session-ephemeral-public session) server-public
           (ssh-session-host-key-blob session)
-          (ssh-public-key-blob-of (ssh-server-host-key
-                                   (ssh-session-server session)))
+          (ssh-public-key-blob-of host-key)
           (ssh-session-derived-keys session)
           (ssh-session-keys (ssh-session-negotiated session) shared hash
                             (ssh-session-session-id session) :server t))

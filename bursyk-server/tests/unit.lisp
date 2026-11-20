@@ -84,6 +84,19 @@ that ends the stream too."
   (is (eq :permit-open (bursyk-server::option-key "--allow-tcpip")))
   (is (null (bursyk-server::option-key "-Z"))))
 
+(test repeated-host-keys-keep-command-line-order
+  ;; -H may be repeated so a server can present ed25519, ECDSA and RSA; the
+  ;; first key the user named is the first the server advertises.
+  (let ((bursyk-server::*options* (list :host-key nil)))
+    (bursyk-server::parse-arguments
+     '("-H" "first" "--host-key" "second" "-H" "third"))
+    (is (equal '("first" "second" "third")
+               (bursyk-server::host-key-files))))
+  (let ((bursyk-server::*options* (list :host-key nil)))
+    (is (equal (list (merge-pathnames ".ssh/id_ed25519"
+                                      (user-homedir-pathname)))
+               (bursyk-server::host-key-files)))))
+
 ;;; ---- forwarded connections ----
 
 (test tcpip-forwarding-is-allowed-by-default

@@ -22,21 +22,28 @@
     (ssh-server-connected session connection)
     session))
 
-(defun check-server-version (version)
-  "Validate VERSION as the tail of the SSH identification string.
+(defun ssh-server-host-key-list (host-key)
+  "HOST-KEY as a list of loaded private keys.
 
-RFC 4253 allows printable US-ASCII and forbids space, so a malformed value
-is refused here rather than corrupting the greeting on the wire."
-  (unless (and (stringp version)
-               (plusp (length version))
-               (<= (+ 10 (length version)) 255)
-               (every (lambda (character)
-                        (let ((code (char-code character)))
-                          (and (<= 32 code 126) (/= code 32))))
-                      version))
-    (error 'ssh-connection-error
-           :detail (format nil "invalid server version ~S" version)))
-  version)
+HOST-KEY is one key, one path, or a list of those.  Every key must be a type
+the server can present; a key it could not sign with would otherwise be
+advertised and then fail the first KEX."
+  (let ((values (if (listp host-key) host-key (list host-key))))
+    (unless values
+      (error 'ssh-connection-error :detail "no host key given"))
+    (mapcar (lambda (value)
+              (let ((key (if (typep value 'ssh-private-key)
+                             value
+                             (ssh-load-private-key value))))
+                (unless (some (lambda (algorithm)
+                                (ssh-server-host-key-algorithm-p
+                                 key algorithm))
+                              +ssh-server-host-key-preference+)
+                  (error 'ssh-connection-error
+                         :detail (format nil "unsupported host key type ~A"
+                                         (ssh-private-key-type key))))
+                key))
+            values)))
 
 (defun make-ssh-server (address port
                         &key
@@ -54,15 +61,16 @@ is refused here rather than corrupting the greeting on the wire."
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
 
-HOST-KEY is an ssh-private-key or a path to an OpenSSH key; only
-ssh-ed25519 is implemented.  AUTHORIZED-KEYS is an authorized_keys file,
-a list of public key blobs, or NIL.  AUTHORIZE, when given, is a function
-of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
+HOST-KEY is an ssh-private-key, a path to an OpenSSH key, or a list of
+those; ssh-ed25519, ECDSA and RSA keys are supported, and the server
+advertises every algorithm its keys can sign with.  AUTHORIZED-KEYS is an
+authorized_keys file, a list of public key blobs, or NIL.  AUTHORIZE, when
+given, is a function of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.3\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.3.0\", so peers and logs identify it correctly.
 
 ACCEPT-ENV is T (accept every env request), a list of names, a function of
 (NAME VALUE), or NIL (refuse).  ON-SESSION runs once a client has
@@ -78,14 +86,12 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                        (format nil "SSH-2.0-~A"
                                (check-server-version server-version))
                        +ssh-server-version+))
-         (key (if (typep host-key 'ssh-private-key)
-                  host-key
-                  (ssh-load-private-key host-key)))
+         (keys (ssh-server-host-key-list host-key))
          (server (%make-ssh-server
                   :address address
                   :port port
                   :version software
-                  :host-key key
+                  :host-keys keys
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :accept-env accept-env

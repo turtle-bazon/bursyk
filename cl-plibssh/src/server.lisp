@@ -713,6 +713,7 @@
                           authorized-keys
                           authorize
                           accept-env
+                          server-version
                           on-session
                           on-channel
                           on-direct-tcpip
@@ -722,14 +723,19 @@
 
 The libssh backend owns the listener and every accepted descriptor, so no
 call in this file waits for a peer.  The arguments are the same as the pure
-backend's; HOST-KEY may be an ssh-private-key or a path."
-  (let* ((key (if (typep host-key 'ssh-private-key)
-                  host-key
-                  (ssh-load-private-key host-key)))
+backend's; HOST-KEY may be an ssh-private-key, a path, or a list of those.
+libssh needs a file for each key it presents, so a key parsed from octets
+without a path is refused here.  SERVER-VERSION is the part of the greeting
+after \"SSH-2.0-\"; libssh adds that prefix itself."
+  (let* ((keys (mapcar (lambda (value)
+                         (if (typep value 'ssh-private-key)
+                             value
+                             (ssh-load-private-key value)))
+                       (if (listp host-key) host-key (list host-key))))
          (server (%make-ssh-server
                   :address address
                   :port port
-                  :host-key key
+                  :host-keys keys
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :accept-env accept-env
@@ -742,6 +748,20 @@ backend's; HOST-KEY may be an ssh-private-key or a path."
     (when (ssh-plibssh-null-p bind)
       (error 'ssh-connection-error :detail "could not allocate a libssh bind"))
     (setf (ssh-server-bind server) bind)
+    ;; libssh prepends "SSH-2.0-" to the banner, so the option takes only the
+    ;; version tail.  A program that names itself must appear that way in a
+    ;; peer's log instead of being hidden behind libssh's own string.
+    (when (minusp (ssh-plibssh-bind-string-option
+                   bind +ssh-bind-options-banner+
+                   (if server-version
+                       (check-server-version server-version)
+                       (subseq +ssh-server-version+
+                               (length "SSH-2.0-")))))
+      (let ((detail (ssh-plibssh-error bind)))
+        (ssh-bind-free bind)
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected the server version: ~A"
+                               detail))))
     ;; The library must not read /etc/ssh/sshd_config behind the caller's
     ;; back: this server's host key and policy are the arguments it was given.
     (when (minusp (ssh-plibssh-bind-int-option
@@ -751,15 +771,22 @@ backend's; HOST-KEY may be an ssh-private-key or a path."
         (error 'ssh-connection-error
                :detail (format nil "libssh rejected the config flag: ~A"
                                detail))))
-    (when (minusp (ssh-plibssh-bind-string-option
-                   bind +ssh-bind-options-host-key+
-                   (or (ssh-private-key-path key)
-                       (error 'ssh-connection-error
-                              :detail "the host key has no file path"))))
+    (unless keys
       (ssh-bind-free bind)
-      (error 'ssh-connection-error
-             :detail (format nil "libssh rejected the host key: ~A"
-                             (ssh-plibssh-error bind))))
+      (error 'ssh-connection-error :detail "no host key given"))
+    (dolist (key keys)
+      (let ((path (or (ssh-private-key-path key)
+                      (progn
+                        (ssh-bind-free bind)
+                        (error 'ssh-connection-error
+                               :detail "the host key has no file path")))))
+        (when (minusp (ssh-plibssh-bind-string-option
+                       bind +ssh-bind-options-host-key+ path))
+          (let ((detail (ssh-plibssh-error bind)))
+            (ssh-bind-free bind)
+            (error 'ssh-connection-error
+                   :detail (format nil "libssh rejected the host key ~A: ~A"
+                                   path detail))))))
     (handler-case
         (let ((fd (ssh-plibssh-listen address port)))
           (setf (ssh-server-listener server) fd

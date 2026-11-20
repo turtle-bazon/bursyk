@@ -51,6 +51,7 @@
 (defconstant +ssh-bind-options-bind-address+ 0)
 (defconstant +ssh-bind-options-bind-port+ 1)
 (defconstant +ssh-bind-options-host-key+ 3)
+(defconstant +ssh-bind-options-banner+ 6)
 (defconstant +ssh-bind-options-process-config+ 20)
 
 ;;; enum ssh_requests_e

@@ -39,6 +39,44 @@
 ;; Disconnect reason codes (RFC 4250 section 4.2.2).
 (defconstant +ssh-disconnect-by-application+ 11)
 
+;;; ---- Identification and disconnection ----
+
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.5"
+  "The default SSH identification string a server sends.
+
+A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
+the library's own default is only for callers that do not name themselves.")
+
+(defun check-server-version (version)
+  "Validate VERSION as the tail of the SSH identification string.
+
+RFC 4253 allows printable US-ASCII and forbids space, so a malformed value
+is refused here rather than corrupting the greeting on the wire."
+  (unless (and (stringp version)
+               (plusp (length version))
+               (<= (+ 10 (length version)) 255)
+               (every (lambda (character)
+                        (let ((code (char-code character)))
+                          (and (<= 32 code 126) (/= code 32))))
+                      version))
+    (error 'ssh-connection-error
+           :detail (format nil "invalid server version ~S" version)))
+  version)
+
+(defun ssh-disconnect-payload (&optional (description "client closed"))
+  "A DISCONNECT payload: reason code, description and language tag.
+
+Both strings are length-prefixed as RFC 4253 section 11.1 requires;
+SSH-STRING-OCTETS only turns text into UTF-8 bytes, so building the message
+with SSH-CONCAT around it would hand the peer the text itself as a length."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-disconnect+)
+    (ssh-write-u32 writer +ssh-disconnect-by-application+)
+    (ssh-write-text writer (princ-to-string description))
+    (ssh-write-text writer "")
+    (ssh-writer-output writer)))
+
+
 ;;; ---- Algorithm preferences ----
 
 (defparameter +ssh-kex-algorithms+
@@ -62,12 +100,59 @@
     "ssh-rsa")
   "Host key algorithms offered to a server, in preference order.")
 
-(defparameter +ssh-server-host-key-algorithms+
-  '("ssh-ed25519")
-  "Host key algorithms the pure server can answer with.
+(defparameter +ssh-server-host-key-preference+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "rsa-sha2-512"
+    "rsa-sha2-256"
+    "ssh-rsa")
+  "Host key algorithms a server can present, in preference order.
 
-It signs with one ed25519 key, so it must not advertise an RSA or ECDSA
-algorithm a client would then select.")
+A server advertises only those its loaded keys can actually sign with, so a
+client never selects an algorithm that would fail at KEX_ECDH_REPLY.")
+
+(defun ssh-server-host-key-algorithm-p (key algorithm)
+  "Whether private KEY can sign with host key ALGORITHM."
+  (let ((type (ssh-private-key-type key)))
+    (and type
+         (cond
+           ((string= algorithm "ssh-ed25519")
+            (string= type "ssh-ed25519"))
+           ((ssh-rsa-digest-keyword algorithm)
+            ;; A single ssh-rsa key serves all three signature algorithms.
+            (string= type "ssh-rsa"))
+           (t
+            (string= type algorithm))))))
+
+(defun ssh-server-host-key-algorithms (keys)
+  "The host key algorithms KEYS can present, in preference order."
+  (remove-if-not
+   (lambda (algorithm)
+     (some (lambda (key)
+             (ssh-server-host-key-algorithm-p key algorithm))
+           keys))
+   +ssh-server-host-key-preference+))
+
+(defun ssh-server-host-key-for (keys algorithm)
+  "The first of KEYS able to sign with host key ALGORITHM, or NIL."
+  (find-if (lambda (key)
+             (ssh-server-host-key-algorithm-p key algorithm))
+           keys))
+
+(defun ssh-server-host-key-signature (key algorithm message)
+  "A signature blob of MESSAGE under host KEY for negotiated ALGORITHM.
+
+RSA is the one type whose wire signature name differs from the key type:
+rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa."
+  (let ((digest (ssh-rsa-digest-keyword algorithm)))
+    (cond
+      (digest (ssh-rsa-signature-blob key message digest))
+      ((string= algorithm "ssh-ed25519")
+       (ssh-ed25519-signature-blob key message))
+      (t (ssh-ecdsa-signature-blob key message)))))
+
 
 (defparameter +ssh-ciphers+ '("chacha20-poly1305@openssh.com"))
 

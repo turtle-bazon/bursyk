@@ -37,6 +37,7 @@
    #:ssh-server-address
    #:ssh-server-port
    #:ssh-server-version
+   #:ssh-server-host-keys
    #:ssh-server-host-key
    #:ssh-session
    #:ssh-session-p

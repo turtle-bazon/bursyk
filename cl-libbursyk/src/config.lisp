@@ -13,7 +13,7 @@
 (defparameter +ssh-config-max-depth+ 16
   "Include nesting limit, matching OpenSSH's own guard.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.4")
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.5")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)

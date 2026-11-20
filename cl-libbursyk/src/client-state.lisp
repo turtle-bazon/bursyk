@@ -33,7 +33,7 @@ can never take a connection down.")
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
-  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.4")
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.5")
   (server-version nil)
   (session-id nil)
   (cipher (ssh-make-cipher-state))
@@ -274,19 +274,6 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
   "Frame and send one protocol PAYLOAD."
   (ssh-client-send-bytes client
                          (ssh-encode-packet payload (ssh-client-cipher client))))
-
-(defun ssh-disconnect-payload (&optional (description "client closed"))
-  "A DISCONNECT payload: reason code, description and language tag.
-
-Both strings are length-prefixed as RFC 4253 section 11.1 requires;
-SSH-STRING-OCTETS only turns text into UTF-8 bytes, so building the message
-with SSH-CONCAT around it would hand the peer the text itself as a length."
-  (let ((writer (ssh-writer)))
-    (ssh-write-u8 writer +ssh-msg-disconnect+)
-    (ssh-write-u32 writer +ssh-disconnect-by-application+)
-    (ssh-write-text writer (princ-to-string description))
-    (ssh-write-text writer "")
-    (ssh-writer-output writer)))
 
 (defun ssh-client-send-disconnect (client &optional (description "client closed"))
   "Tell the peer CLIENT is going away, so it can close the session.

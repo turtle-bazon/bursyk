@@ -933,8 +933,11 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
            (first state))
       (when timeout (cl-pnet:timer-stop timeout)))))
 
-(defun ssh-test-loopback-result ()
+(defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519")))
   "Run one exec through a server and client in this process.
+
+HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
+prove an RSA or ECDSA host key is negotiated and its signature verified.
 Returns (VALUES STDOUT STDERR STATUS)."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop"))
          (server-key (merge-pathnames "host_key" directory))
@@ -947,8 +950,9 @@ Returns (VALUES STDOUT STDERR STATUS)."
     (ensure-directories-exist server-key)
     (unwind-protect
          (progn
-           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                             "-f" (namestring server-key)))
+           (ssh-keygen (append (list "-q" "-N" "")
+                               host-key-arguments
+                               (list "-f" (namestring server-key))))
            (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
                              "-f" (namestring client-key)))
            (ssh-test-write-authorized-keys
@@ -978,6 +982,113 @@ Returns (VALUES STDOUT STDERR STATUS)."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+(test server-loopback-exec-rsa-host-key
+  ;; An ssh-rsa key serves rsa-sha2-512/256, so the client must negotiate one
+  ;; of those and verify an RSA signature over the exchange hash.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-loopback-result
+           :host-key-arguments '("-t" "rsa" "-b" "2048"))
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))
+
+(test server-loopback-exec-ecdsa-host-key
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-loopback-result :host-key-arguments '("-t" "ecdsa"))
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))
+
+(test server-host-key-advertisement
+  ;; KEXINIT must list exactly the algorithms the loaded keys can sign with,
+  ;; in preference order, and no algorithm whose key is missing.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostkeys"))
+             (rsa (merge-pathnames "rsa" directory))
+             (ecdsa (merge-pathnames "ecdsa" directory))
+             (ed25519 (merge-pathnames "ed25519" directory)))
+        (ensure-directories-exist rsa)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring rsa)))
+               (ssh-keygen (list "-q" "-t" "ecdsa" "-N" ""
+                                 "-f" (namestring ecdsa)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ed25519)))
+               (let* ((keys (list (ssh-load-private-key ed25519)
+                                  (ssh-load-private-key ecdsa)
+                                  (ssh-load-private-key rsa)))
+                      (advertised
+                        (cl-pnet-ssh::ssh-server-host-key-algorithms keys)))
+                 (is (equal '("ssh-ed25519"
+                              "ecdsa-sha2-nistp256"
+                              "rsa-sha2-512"
+                              "rsa-sha2-256"
+                              "ssh-rsa")
+                            advertised))
+                 (is (eq (first keys)
+                         (cl-pnet-ssh::ssh-server-host-key-for
+                          keys "ssh-ed25519")))
+                 (is (eq (second keys)
+                         (cl-pnet-ssh::ssh-server-host-key-for
+                          keys "ecdsa-sha2-nistp256")))
+                 (is (eq (third keys)
+                         (cl-pnet-ssh::ssh-server-host-key-for
+                          keys "rsa-sha2-512")))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test server-loopback-exec-multiple-host-keys
+  ;; The server advertises several key types and the client picks the one it
+  ;; prefers; the KEX must succeed whichever key is chosen.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-multikey"))
+             (rsa (merge-pathnames "rsa" directory))
+             (ecdsa (merge-pathnames "ecdsa" directory))
+             (ed25519 (merge-pathnames "ed25519" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist rsa)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring rsa)))
+               (ssh-keygen (list "-q" "-t" "ecdsa" "-N" ""
+                                 "-f" (namestring ecdsa)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ed25519)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key (list rsa ed25519 ecdsa)
+                      :authorized-keys authorized
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((status (ssh-test-loopback-run
+                              server client-key known-hosts stdout stderr)))
+                 (is (equal "hello" (get-output-stream-string stdout)))
+                 (is (equal "oops" (get-output-stream-string stderr)))
+                 (is (eql 3 status))))
+          (when server (ssh-server-close server))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
 
 (defun ssh-test-loopback-outcome (policy &key server-version)
   "Run one client handshake against a loopback server with POLICY.
@@ -1067,10 +1178,10 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.0")
+           :server-version "bursyk-server_0.0.3.0")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.0" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.3.0" greeting)))))
 
 (test server-version-is-checked-before-it-reaches-the-wire
   (is (equal "burst_1.2.3"

@@ -8,18 +8,12 @@
 ;;;; the peer: a request that needs work (an authorized-keys file, a command)
 ;;;; hands that work to the caller's callback and returns.
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.4"
-  "The default SSH identification string a server sends.
-
-A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
-the library's own default is only for callers that do not name themselves.")
-
 (defstruct (ssh-server (:constructor %make-ssh-server))
   (address "0.0.0.0")
   (version +ssh-server-version+)
   (port 22)
   listener
-  host-key
+  (host-keys nil)
   authorized-keys
   authorize
   (accept-env nil)
@@ -37,6 +31,13 @@ the library's own default is only for callers that do not name themselves.")
   (sessions (make-hash-table :test #'eq))
   (connections (make-hash-table :test #'eq))
   (closed nil))
+
+(defun ssh-server-host-key (server)
+  "The first host key SERVER presents.
+
+A server may hold several; this returns the preferred one, for callers that
+only want to describe it."
+  (first (ssh-server-host-keys server)))
 
 (defstruct (ssh-session (:constructor %make-ssh-session))
   server
