@@ -264,6 +264,23 @@ CLI's decision and at the plist it filled."
   (is (equal "uname -a" (burs::join-command '("uname" "-a"))))
   (is (stringp (burs::join-command nil))))
 
+(test request-tty-follows-ssh-policy
+  (labels ((request (setting command-given-p)
+             (let ((burs::*options* (empty-options)))
+               (setf (getf burs::*options* :request-tty) setting)
+               (burs::request-tty-p nil command-given-p))))
+    ;; -t forces a PTY even when no local terminal will drive it.
+    (is (eq t (request :force nil)))
+    (is (eq t (request :force t)))
+    ;; -T never asks for one, with or without a command.
+    (is (eq nil (request :no nil)))
+    (is (eq nil (request :no t)))
+    ;; RequestTTY=no is the same decision spelled through -o.
+    (is (eq nil (request "no" nil)))
+    ;; auto is a login session only: a command means no PTY.
+    (is (eq nil (request "auto" t)))
+    (is (eq nil (request nil t)))))
+
 ;;; ---- config hooks ----
 
 (test match-exec-runs-the-condition

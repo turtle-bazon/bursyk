@@ -30,6 +30,12 @@
   "Local forwarding listeners, in the order they were started.")
 (defvar *tunnels* (make-hash-table :test #'eq :size 16)
   "Accepted forwarding connections, keyed by their CL-PNET connection.")
+(defvar *pty-timer* nil
+  "The watchdog that sends pty-req once the session channel is open.")
+(defvar *terminal-saved* nil
+  "The terminal settings STTY -G reported, or NIL when not in raw mode.")
+(defvar *winch* nil
+  "The SIGWINCH watcher that forwards terminal resizes to the remote PTY.")
 
 (defvar *options*
   '(:port nil :user nil :identity nil :config nil :known-hosts nil
@@ -45,6 +51,21 @@
     :tunnel nil :x11-forward nil :escape-char nil)
   "The command line as parsed, before ~/.ssh/config is applied.")
 
+(defun stdin-terminal-p ()
+  #+sbcl (plusp (sb-unix:unix-isatty 0))
+  #-sbcl nil)
+
+(defun restore-terminal ()
+  "Put the terminal back the way TERMINAL-ENTER-RAW found it."
+  (when *terminal-saved*
+    (let ((saved *terminal-saved*))
+      (setf *terminal-saved* nil)
+      (ignore-errors
+       (uiop:run-program (list "stty" saved)
+                         :input :interactive
+                         :output nil
+                         :error-output nil)))))
+
 ;;; ---- Command line ----
 
 (defun print-version ()
@@ -54,6 +75,7 @@
 (defun fail (format-string &rest arguments)
   (format *error-output* "burs: ~?~%" format-string arguments)
   (finish-output *error-output*)
+  (restore-terminal)
   (uiop:quit 255))
 
 (defun unsupported (option &optional (detail "not implemented by this client"))
@@ -460,12 +482,6 @@ algorithms still have to exist here, because the set is fixed at build time."
     (unsupported "-A" "agent forwarding is not implemented"))
   (when (getf *options* :compression)
     (unsupported "-C" "only uncompressed streams are implemented"))
-  (when (and (getf *options* :request-tty)
-             (not (member (getf *options* :request-tty)
-                          '(:no "no" "false" :off)
-                          :test #'equal)))
-    (unsupported (if (eq (getf *options* :request-tty) :force) "-t" "RequestTTY")
-                 "PTY allocation is not implemented"))
   (when (getf *options* :ciphers)
     (check-algorithm-list "-c" (getf *options* :ciphers)
                           cl-pnet-ssh:+ssh-ciphers+))
@@ -780,6 +796,190 @@ line is handled as the command-line form, which is what a user who wrote
 
 ;;; ---- Session ----
 
+;;; A PTY session needs three things the library's session API does not name:
+;;; a pty-req channel request before exec/shell, a raw local terminal, and a
+;;; window-change request on resize.  They stay here rather than in the
+;;; library because they are policy: which terminal settings to save, what
+;;; TERM to send, and whether the user asked for a PTY at all.
+
+(defun run-stty (&rest arguments)
+  "Run stty with ARGUMENTS on our terminal; its output, or NIL.
+
+STTY -G and STTY SIZE talk to stdin, so the child inherits fd 0.  A caller
+must already know that stdin is a terminal."
+  (handler-case
+      (string-trim '(#\Newline #\Return)
+                   (uiop:run-program (cons "stty" arguments)
+                                     :input :interactive
+                                     :output :string
+                                     :error-output nil))
+    (error () nil)))
+
+(defun terminal-size ()
+  "The terminal's (VALUES ROWS COLUMNS), or (VALUES NIL NIL)."
+  (let ((text (run-stty "size")))
+    (when text
+      (let ((space (position #\Space text)))
+        (when space
+          (let ((rows (parse-integer text :end space :junk-allowed t))
+                (columns (parse-integer text :start (1+ space)
+                                       :junk-allowed t)))
+            (when (and rows columns)
+              (values rows columns))))))))
+
+(defun terminal-enter-raw ()
+  "Save the terminal settings and stop local line editing and signals.
+
+With a PTY, the remote side echoes and edits.  Leaving the local terminal in
+raw mode is also what makes Ctrl-C a byte for the remote shell, as in ssh."
+  (when (and (stdin-terminal-p)
+             (not (getf *options* :stdin-null)))
+    (setf *terminal-saved* (run-stty "-g"))
+    (when *terminal-saved*
+      (run-stty "raw" "-echo"))))
+
+(defun stop-pty-timer ()
+  (when *pty-timer*
+    (ignore-errors (cl-pnet:timer-stop *pty-timer*))
+    (setf *pty-timer* nil)))
+
+(defun stop-winch ()
+  (when *winch*
+    (ignore-errors (cl-pnet:signal-stop *winch*))
+    (setf *winch* nil)))
+
+(defun send-channel-request (channel request want-reply fields)
+  "Send REQUEST on CHANNEL; FIELDS writes its arguments.
+
+This is the one channel-request form the library does not expose, because
+pty-req and window-change are client policy rather than protocol plumbing."
+  (cl-pnet-ssh::ssh-channel-send-message
+   channel cl-pnet-ssh::+ssh-msg-channel-request+
+   :fields (lambda (writer)
+             (cl-pnet-ssh::ssh-write-text writer request)
+             (cl-pnet-ssh::ssh-write-boolean writer want-reply)
+             (funcall fields writer))))
+
+(defun send-pty-request (channel)
+  "Ask the peer to attach a PTY to CHANNEL at the terminal's current size.
+
+The terminal-modes string is empty, so sshd applies the defaults of the pty
+it allocates.  The local terminal is already raw, and the remote side owns
+echo and line editing."
+  (multiple-value-bind (rows columns) (terminal-size)
+    (unless (and rows columns (plusp rows) (plusp columns))
+      (setf rows 24 columns 80))
+    (send-channel-request
+     channel "pty-req" t
+     (lambda (writer)
+       (cl-pnet-ssh::ssh-write-text writer (or (uiop:getenv "TERM") "xterm"))
+       (cl-pnet-ssh::ssh-write-u32 writer columns)
+       (cl-pnet-ssh::ssh-write-u32 writer rows)
+       (cl-pnet-ssh::ssh-write-u32 writer 0)
+       (cl-pnet-ssh::ssh-write-u32 writer 0)
+       (cl-pnet-ssh::ssh-write-string
+        writer (make-array 0 :element-type '(unsigned-byte 8)))))))
+
+(defun send-window-change (channel)
+  "Tell the peer the terminal size changed."
+  (multiple-value-bind (rows columns) (terminal-size)
+    (when (and rows columns)
+      (send-channel-request
+       channel "window-change" nil
+       (lambda (writer)
+         (cl-pnet-ssh::ssh-write-u32 writer columns)
+         (cl-pnet-ssh::ssh-write-u32 writer rows)
+         (cl-pnet-ssh::ssh-write-u32 writer 0)
+         (cl-pnet-ssh::ssh-write-u32 writer 0))))))
+
+(defun send-exec-request (channel command)
+  "Run COMMAND on CHANNEL's PTY."
+  (send-channel-request
+   channel "exec" t
+   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer command))))
+
+(defun send-shell-request (channel)
+  "Start the peer's login shell on CHANNEL, the ssh(1) session default."
+  (send-channel-request
+   channel "shell" t (lambda (writer) (declare (ignore writer)))))
+
+(defun send-subsystem-request (channel subsystem)
+  (send-channel-request
+   channel "subsystem" t
+   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer subsystem))))
+
+(defun tty-setting (client)
+  "The RequestTTY decision, the command line winning over the config file."
+  (or (getf *options* :request-tty)
+      (let ((options (and client
+                          (cl-pnet-ssh:ssh-client-config-options client))))
+        (and options
+             (cl-pnet-ssh:ssh-config-options-request-tty options)))))
+
+(defun tty-setting-name (setting)
+  (cond ((null setting) nil)
+        ((stringp setting) (string-downcase setting))
+        ((eq setting :force) "force")
+        ((eq setting :yes) "yes")
+        ((eq setting :no) "no")
+        (t (string-downcase (princ-to-string setting)))))
+
+(defun request-tty-p (client command-given-p)
+  "Whether to ask for a PTY, following ssh(1)'s -t, -T and RequestTTY.
+
+AUTO is a login session: no remote command and a terminal on stdin.  YES
+also asks when a command was given, FORCE asks even without a local terminal,
+and NO never asks."
+  (let ((setting (tty-setting-name (tty-setting client))))
+    (cond
+      ((null setting) (and (null command-given-p) (stdin-terminal-p)))
+      ((member setting '("no" "off" "false") :test #'string=) nil)
+      ((member setting '("force" "yes") :test #'string=)
+       (or (string= setting "force") (stdin-terminal-p)))
+      ((string= setting "auto")
+       (and (null command-given-p) (stdin-terminal-p)))
+      (t (and (null command-given-p) (stdin-terminal-p))))))
+
+(defun start-winch (channel)
+  "Forward terminal resizes to CHANNEL while the session is open."
+  (when (stdin-terminal-p)
+    (setf *winch*
+          (ignore-errors
+           (cl-pnet:signal-start
+            #+sbcl sb-unix:sigwinch
+            #-sbcl 28
+            (lambda ()
+              (handler-case (send-window-change channel)
+                (error () nil))))))))
+
+(defun start-pty-session (channel command command-given-p)
+  "Wait for CHANNEL to open, then send pty-req, the remote request, and input.
+
+The library sends exec as soon as the open confirmation arrives, but pty-req
+must precede it.  Polling the channel state from the event loop keeps that
+ordering without adding a request hook to the library."
+  (terminal-enter-raw)
+  (setf *pty-timer*
+        (cl-pnet:timer-start
+         0.005 0.005
+         (lambda ()
+           (case (cl-pnet-ssh::ssh-channel-state channel)
+             (:open
+              (stop-pty-timer)
+              (send-pty-request channel)
+              (start-winch channel)
+              (cond
+                ((getf *options* :subsystem)
+                 (send-subsystem-request channel command))
+                (command-given-p
+                 (send-exec-request channel command))
+                (t
+                 (send-shell-request channel)))
+              (start-input channel))
+             (:closed
+              (stop-pty-timer))
+             (t nil))))))
+
 (defun write-octets (stream octets)
   "Write channel output to STREAM, leaving as SIGPIPE would if it is closed.
 
@@ -834,6 +1034,7 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
 The normal path has already flushed both streams.  On the broken-pipe path
 the kernel has rejected stdout, and SB-EXT:EXIT would try to flush it once
 more and hang instead of exiting; :ABORT T skips that and the exit hooks."
+  (restore-terminal)
   #+sbcl (sb-ext:exit :code status :abort t)
   #-sbcl (uiop:quit status))
 
@@ -843,6 +1044,9 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   ;; connection (and a ProxyCommand helper) would be left half torn down.
   (unless *finishing*
     (setf *finishing* t)
+    (restore-terminal)
+    (stop-pty-timer)
+    (stop-winch)
     (stop-stdin)
     (stop-forwards)
     ;; Close the client before leaving: a ProxyCommand's helper is a child
@@ -860,7 +1064,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   (format *error-output* "burs: ~A~%" condition)
   (finish 255))
 
-(defun start-session (client command)
+(defun start-session (client command command-given-p)
   (setf *channel*
         (cl-pnet-ssh:ssh-open-session
          client
@@ -881,10 +1085,13 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
       (let ((value (uiop:getenv name)))
         (when value
           (cl-pnet-ssh:ssh-channel-env *channel* name value)))))
-  (if (getf *options* :subsystem)
-      (cl-pnet-ssh:ssh-channel-subsystem *channel* command)
-      (cl-pnet-ssh:ssh-channel-exec *channel* command))
-  (start-input *channel*))
+  (if (request-tty-p client command-given-p)
+      (start-pty-session *channel* command command-given-p)
+      (progn
+        (if (getf *options* :subsystem)
+            (cl-pnet-ssh:ssh-channel-subsystem *channel* command)
+            (cl-pnet-ssh:ssh-channel-exec *channel* command))
+        (start-input *channel*))))
 
 ;;; ---- -W: stream stdin and stdout over one channel ----
 
@@ -1059,20 +1266,13 @@ would leave the user waiting for a tunnel that was never opened."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
     (when options
       (let ((remote (cl-pnet-ssh:ssh-config-options-remote-forwards options))
-            (dynamic (cl-pnet-ssh:ssh-config-options-dynamic-forwards options))
-            (tty (cl-pnet-ssh:ssh-config-options-request-tty options)))
+            (dynamic (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
         (when remote
           (fail "RemoteForward in the ssh config is not supported: ~A"
                 (first (reverse remote))))
         (when dynamic
           (fail "DynamicForward in the ssh config is not supported: ~A"
-                (first (reverse dynamic))))
-        ;; -T on the command line answers this before the file does.
-        (unless (member (getf *options* :request-tty)
-                        '(:no "no" "false" :off) :test #'equal)
-          (when (and tty
-                     (not (member tty '("no" "false" "off") :test #'string=)))
-            (fail "RequestTTY in the ssh config is not supported: ~A" tty)))))))
+                (first (reverse dynamic))))))))
 
 (defun start-forwards (client)
   (check-config-features client)
@@ -1143,6 +1343,10 @@ would leave the user waiting for a tunnel that was never opened."
     (format t "addressfamily ~(~A~)~%"
             (or (cl-pnet-ssh:ssh-config-options-address-family options)
                 "any"))
+    (format t "requesttty ~A~%"
+            (or (tty-setting-name (getf *options* :request-tty))
+                (cl-pnet-ssh:ssh-config-options-request-tty options)
+                "auto"))
     (print-list-option
      "identityfile"
      (or (reverse (cl-pnet-ssh:ssh-config-options-identity-files options))
@@ -1195,26 +1399,6 @@ would leave the user waiting for a tunnel that was never opened."
       (format nil "~{~A~^ ~}" arguments)
       (remote-shell)))
 
-(defun stdin-terminal-p ()
-  #+sbcl (plusp (sb-unix:unix-isatty 0))
-  #-sbcl nil)
-
-(defun check-interactive-session (command)
-  "Refuse the pseudo-terminal ssh(1) would allocate for a bare destination.
-
-With no remote command and a terminal on stdin, ssh asks for a PTY.  This
-client does not implement PTY allocation; running the remote shell without
-one looks exactly like a hang, because it gets neither a prompt nor echo.
-Say what is missing instead.  -T asks for no PTY and keeps working."
-  (when (and (null command)
-             (null (getf *options* :subsystem))
-             (null (getf *options* :no-command))
-             (null (getf *options* :stdio-forward))
-             (not (member (getf *options* :request-tty)
-                          '(:no "no" "false" :off) :test #'equal))
-             (stdin-terminal-p))
-    (fail "an interactive session needs a PTY, which this client does not implement; give a remote command or use -T")))
-
 ;;; ---- The target client ----
 
 (defun client-port ()
@@ -1226,7 +1410,7 @@ Say what is missing instead.  -T asks for no PTY and keeps working."
             port
             (fail "invalid port ~A" value))))))
 
-(defun start-client (host command)
+(defun start-client (host command command-given-p)
   "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
   (cl-pnet-ssh:make-ssh-client-from-config
    host
@@ -1255,7 +1439,7 @@ Say what is missing instead.  -T asks for no PTY and keeps working."
             (parse-host-port (getf *options* :stdio-forward))
           (start-stdio-forward client target port)))
        ((getf *options* :no-command) nil)
-       (t (start-session client command))))
+       (t (start-session client command command-given-p))))
    :on-error (lambda (client condition)
                (declare (ignore client))
                (format *error-output* "burs: ~A~%" condition)
@@ -1289,9 +1473,8 @@ Say what is missing instead.  -T asks for no PTY and keeps working."
               (fail "-W cannot be combined with a remote command"))
             (when (getf *options* :print-config)
               (print-config host))
-            (check-interactive-session command)
             (handler-case
-                (start-client host (join-command command))
+                (start-client host (join-command command) (and command t))
               (cl-pnet-ssh:ssh-config-error (condition)
                 ;; An unreadable -F file and similar problems are command
                 ;; line errors, which ssh reports with status 255.
