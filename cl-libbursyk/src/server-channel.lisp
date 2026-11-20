@@ -345,6 +345,29 @@ returns NIL and is refused rather than accepted and abandoned."
     (ssh-server-channel-send-message channel +ssh-msg-channel-close+))
   (ssh-server-channel-finish channel))
 
+(defun ssh-server-channel-half-close-target (channel)
+  "Tell a direct-tcpip target that the client will send nothing more.
+
+The channel stays open for the target's remaining output, which is what a
+client using -W or -L expects after it closes its own stdin.  1 is SHUT_WR
+on POSIX and SD_SEND on Winsock."
+  (let ((target (ssh-server-channel-target channel)))
+    (when target
+      (let ((fd (cl-pnet:connection-fileno target)))
+        (when fd
+          (ignore-errors (cl-pnet-sockets:c-shutdown fd 1)))))))
+
+(defun ssh-server-channel-target-ended (channel)
+  "The target of a direct-tcpip CHANNEL closed its output side.
+
+Send the channel EOF, and close the channel when the client has already
+said it will send nothing more; otherwise its remaining input still has a
+reader."
+  (setf (ssh-server-channel-target-eof channel) t)
+  (ssh-server-channel-eof channel)
+  (when (ssh-server-channel-eof-received channel)
+    (ssh-server-channel-close channel)))
+
 (defun ssh-server-dispatch-channel-message (session type channel reader)
   (case type
     (#.+ssh-msg-channel-window-adjust+
@@ -356,6 +379,10 @@ returns NIL and is refused rather than accepted and abandoned."
      (ssh-server-channel-handle-data channel reader t))
     (#.+ssh-msg-channel-eof+
      (setf (ssh-server-channel-eof-received channel) t)
+     (when (string= (ssh-server-channel-type channel) "direct-tcpip")
+       (ssh-server-channel-half-close-target channel)
+       (when (ssh-server-channel-target-eof channel)
+         (ssh-server-channel-close channel)))
      (when (ssh-server-channel-on-eof channel)
        (funcall (ssh-server-channel-on-eof channel) channel)))
     (#.+ssh-msg-channel-close+
@@ -398,11 +425,10 @@ returns NIL and is refused rather than accepted and abandoned."
   (let ((connection
           (cl-pnet:tcp-connect
            address port
-           :read-cb (lambda (connection data)
-                      (declare (ignore connection))
+           :read-cb (lambda (data)
                       (if data
                           (ssh-server-channel-write channel data)
-                          (ssh-server-channel-eof channel)))
+                          (ssh-server-channel-target-ended channel)))
            :on-error (lambda (status)
                        (ssh-server-channel-fail
                         channel

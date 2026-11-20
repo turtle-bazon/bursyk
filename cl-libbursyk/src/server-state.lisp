@@ -8,7 +8,7 @@
 ;;;; the peer: a request that needs work (an authorized-keys file, a command)
 ;;;; hands that work to the caller's callback and returns.
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.1"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.2"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -98,6 +98,7 @@ the library's own default is only for callers that do not name themselves.")
   (eof-received nil)
   (exit-status nil)
   (target nil)
+  (target-eof nil)
   (on-data nil)
   (on-eof nil)
   (on-exec nil)

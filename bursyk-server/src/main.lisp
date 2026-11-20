@@ -7,7 +7,8 @@
 
 (defvar *options*
   '(:address "0.0.0.0" :port "2222" :host-key nil :authorized-keys nil
-    :accept-env nil :allow nil :subsystem nil)
+    :accept-env nil :allow nil :subsystem nil
+    :no-tcp-forwarding nil :permit-open nil)
   "The command line as parsed.")
 
 (defvar *server* nil)
@@ -22,7 +23,7 @@
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.3.0"
+(defparameter +bursyk-server-version+ "0.0.2.1"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -35,7 +36,8 @@ version rather than a generic library string.")
   (format *error-output*
           "usage: bursyk-server [-a ADDRESS] [-p PORT] -H HOST_KEY~%~
            ~15@T[-A AUTHORIZED_KEYS] [-e NAME]... [-c PREFIX]...~%~
-           ~15@T[-S NAME=PATH]... [-V]~%")
+           ~15@T[-S NAME=PATH]... [--no-tcp-forwarding]~%~
+           ~15@T[--allow-tcpip HOST:PORT]... [-V]~%")
   (finish-output *error-output*))
 
 (defun print-version ()
@@ -57,11 +59,40 @@ version rather than a generic library string.")
         ((member name '("-e" "--accept-env") :test #'string=) :accept-env)
         ((member name '("-c" "--command") :test #'string=) :allow)
         ((member name '("-S" "--subsystem") :test #'string=) :subsystem)
+        ((string= name "--no-tcp-forwarding") :no-tcp-forwarding)
+        ((member name '("--allow-tcpip" "--permit-open") :test #'string=)
+         :permit-open)
         (t nil)))
+
+(defun split-host-port (text)
+  "HOST and PORT from HOST:PORT, allowing [ ] around an IPv6 HOST."
+  (let ((colon (position #\: text :from-end t)))
+    (when (and colon (plusp colon) (< (1+ colon) (length text)))
+      (let ((host (subseq text 0 colon))
+            (port (subseq text (1+ colon))))
+        (when (and (>= (length host) 2)
+                   (char= (char host 0) #\[)
+                   (char= (char host (1- (length host))) #\]))
+          (setf host (subseq host 1 (1- (length host)))))
+        (values host port)))))
+
+(defun valid-permit-port-p (port)
+  "Whether PORT is a number or the * wildcard."
+  (and port
+       (or (string= port "*")
+           (and (plusp (length port))
+                (every #'digit-char-p port)
+                (<= 1 (parse-integer port) 65535)))))
 
 (defun record-option (key value)
   (case key
-    ((:accept-env :allow :subsystem) (push value (getf *options* key)))
+    ((:accept-env :allow :subsystem)
+     (push value (getf *options* key)))
+    (:permit-open
+     (multiple-value-bind (host port) (split-host-port value)
+       (unless (and host (valid-permit-port-p port))
+         (fail "--allow-tcpip needs HOST:PORT, not ~A" value))
+       (push value (getf *options* :permit-open))))
     (t (setf (getf *options* key) value))))
 
 (defun parse-arguments (arguments)
@@ -70,10 +101,15 @@ version rather than a generic library string.")
       (cond
         ((null arguments) (return))
         ((option-key argument)
-         (let ((value (second arguments)))
-           (unless value (fail "~A needs a value" argument))
-           (record-option (option-key argument) value)
-           (setf arguments (cddr arguments))))
+         (let ((key (option-key argument)))
+           (if (eq key :no-tcp-forwarding)
+               (progn
+                 (record-option key t)
+                 (setf arguments (cdr arguments)))
+               (let ((value (second arguments)))
+                 (unless value (fail "~A needs a value" argument))
+                 (record-option key value)
+                 (setf arguments (cddr arguments))))))
         ((and (> (length argument) 1) (char= (char argument 0) #\-))
          (fail "unknown option ~A" argument))
         (t (fail "unexpected argument ~A" argument))))))
@@ -92,6 +128,56 @@ version rather than a generic library string.")
                 (and (<= (length prefix) (length command))
                      (string= prefix command :end2 (length prefix))))
               prefixes))))
+
+;;; ---- Forwarded connections ----
+
+(defun host-pattern-match-p (pattern host)
+  "Whether HOST matches PATTERN, where * stands for any run of characters."
+  (let ((pattern-length (length pattern))
+        (host-length (length host))
+        (p 0)
+        (h 0)
+        (star nil)
+        (resume 0))
+    (loop while (< h host-length)
+          do (cond
+               ((and (< p pattern-length)
+                     (char= (char pattern p) #\*))
+                (setf star p
+                      resume h
+                      p (1+ p)))
+               ((and (< p pattern-length)
+                     (char-equal (char pattern p) (char host h)))
+                (incf p)
+                (incf h))
+               (star
+                (incf resume)
+                (setf h resume
+                      p (1+ star)))
+               (t (return nil))))
+    (loop while (and (< p pattern-length)
+                     (char= (char pattern p) #\*))
+          do (incf p))
+    (= p pattern-length)))
+
+(defun tcpip-allowed-p (host port)
+  "Whether a direct-tcpip connection to HOST:PORT may be opened.
+
+As sshd does by default, every destination is allowed.  Each --allow-tcpip
+narrows that set, and --no-tcp-forwarding refuses them all."
+  (and (not (getf *options* :no-tcp-forwarding))
+       (let ((rules (reverse (getf *options* :permit-open))))
+         (or (null rules)
+             (some (lambda (rule)
+                     (multiple-value-bind (rule-host rule-port)
+                         (split-host-port rule)
+                       (and rule-host
+                            rule-port
+                            (host-pattern-match-p rule-host host)
+                            (or (string= rule-port "*")
+                                (string= rule-port
+                                         (princ-to-string port))))))
+                   rules)))))
 
 (defun split-subsystem (text)
   "NAME=PATH from one --subsystem argument, as (NAME . PATH)."
@@ -588,6 +674,10 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
                                    +bursyk-server-version+)
            :accept-env (reverse (getf *options* :accept-env))
            :on-channel #'install-channel-handlers
+           :on-direct-tcpip
+           (lambda (session host port origin origin-port)
+             (declare (ignore session origin origin-port))
+             (tcpip-allowed-p host port))
            :on-error (lambda (session condition)
                        (declare (ignore session))
                        (format *error-output* "bursyk-server: ~A~%" condition)

@@ -79,7 +79,66 @@ that ends the stream too."
   (is (eq :authorized-keys (bursyk-server::option-key "-A")))
   (is (eq :host-key (bursyk-server::option-key "-H")))
   (is (eq :port (bursyk-server::option-key "--port")))
+  (is (eq :no-tcp-forwarding
+          (bursyk-server::option-key "--no-tcp-forwarding")))
+  (is (eq :permit-open (bursyk-server::option-key "--allow-tcpip")))
   (is (null (bursyk-server::option-key "-Z"))))
+
+;;; ---- forwarded connections ----
+
+(test tcpip-forwarding-is-allowed-by-default
+  (let ((bursyk-server::*options* nil))
+    (is (bursyk-server::tcpip-allowed-p "example.com" 443))
+    (is (bursyk-server::tcpip-allowed-p "127.0.0.1" 22))))
+
+(test no-tcp-forwarding-refuses-every-target
+  (let ((bursyk-server::*options* (list :no-tcp-forwarding t)))
+    (is (not (bursyk-server::tcpip-allowed-p "example.com" 443)))
+    (is (not (bursyk-server::tcpip-allowed-p "127.0.0.1" 22)))))
+
+(test allow-tcpip-narrows-the-destinations
+  (let ((bursyk-server::*options*
+          (list :permit-open '("db.internal:5432" "*.example.com:*"
+                               "[::1]:22"))))
+    (is (bursyk-server::tcpip-allowed-p "db.internal" 5432))
+    (is (not (bursyk-server::tcpip-allowed-p "db.internal" 5433)))
+    (is (bursyk-server::tcpip-allowed-p "api.example.com" 443))
+    (is (bursyk-server::tcpip-allowed-p "API.EXAMPLE.COM" 443))
+    (is (not (bursyk-server::tcpip-allowed-p "api.example.org" 443)))
+    (is (bursyk-server::tcpip-allowed-p "::1" 22))
+    (is (not (bursyk-server::tcpip-allowed-p "::1" 23)))
+    ;; The master switch still wins over any allow rule.
+    (setf (getf bursyk-server::*options* :no-tcp-forwarding) t)
+    (is (not (bursyk-server::tcpip-allowed-p "db.internal" 5432)))))
+
+(test host-port-splitting-and-validation
+  (multiple-value-bind (host port)
+      (bursyk-server::split-host-port "db:5432")
+    (is (string= "db" host))
+    (is (string= "5432" port)))
+  (multiple-value-bind (host port)
+      (bursyk-server::split-host-port "[::1]:22")
+    (is (string= "::1" host))
+    (is (string= "22" port)))
+  (multiple-value-bind (host port)
+      (bursyk-server::split-host-port "no-port")
+    (is (null host))
+    (is (null port)))
+  (is (null (bursyk-server::split-host-port "")))
+  (is (bursyk-server::valid-permit-port-p "22"))
+  (is (bursyk-server::valid-permit-port-p "*"))
+  (is (not (bursyk-server::valid-permit-port-p "0")))
+  (is (not (bursyk-server::valid-permit-port-p "65536")))
+  (is (not (bursyk-server::valid-permit-port-p "ssh"))))
+
+(test forwarding-options-parse-as-a-flag-and-a-list
+  (let ((bursyk-server::*options* nil))
+    (bursyk-server::parse-arguments
+     '("--no-tcp-forwarding" "--allow-tcpip" "db:5432"
+       "--allow-tcpip" "*.example.com:443"))
+    (is (eq t (getf bursyk-server::*options* :no-tcp-forwarding)))
+    (is (equal '("*.example.com:443" "db:5432")
+               (getf bursyk-server::*options* :permit-open)))))
 
 ;;; ---- status pipe ----
 
