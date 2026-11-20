@@ -20,7 +20,7 @@
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
-  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.13")
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.14")
   (server-version nil)
   ;; USERAUTH_BANNER text, if the server sent one.  A program shows it once;
   ;; after that this is just the last banner received.

@@ -92,7 +92,7 @@ prohibit-password and means the same thing.")
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
-  '("forcecommand" "chrootdirectory"
+  '("chrootdirectory"
     "authorizedkeyscommand" "authorizedkeyscommanduser"
     "authorizedprincipalsfile" "authorizedprincipalscommand"
     "authorizedprincipalscommanduser"
@@ -148,6 +148,10 @@ prohibit-password and means the same thing.")
   ;; SetEnv assignments, "NAME=VALUE", in the order they were read.
   (set-env '())
   (pid-file nil)
+  ;; ForceCommand: the command sshd runs instead of whatever the client
+  ;; asked for, kept verbatim because sshd passes it to the login shell
+  ;; exactly as written.  NIL means no forced command.
+  (force-command nil)
   ;; Banner is a file read for every connection, or :none to send nothing.
   (banner nil)
   (version-addendum nil)
@@ -562,6 +566,19 @@ Port and ListenAddress the way sshd's own command-line options do."
        ;; writer recognises it.
        (ssh-server-config-set-once
         config 'pid-file (ssh-server-config-one-argument line)))
+      ((string= keyword "forcecommand")
+       ;; sshd keeps the whole remainder of the line, quotes included, and
+       ;; hands it to the user's login shell with -c.  internal-sftp is an
+       ;; in-process server this build does not have, so name the problem
+       ;; instead of running a command that would fail obscurely.
+       (let ((value (ssh-config-line-raw line)))
+         (when (zerop (length value))
+           (ssh-server-config-line-error
+            line "ForceCommand needs a command"))
+         (when (eql 0 (search "internal-sftp" value))
+           (ssh-server-config-line-error
+            line "ForceCommand internal-sftp is not supported; name an external sftp-server"))
+         (ssh-server-config-set-once config 'force-command value)))
       ((string= keyword "banner")
        ;; sshd reads this file for each connection and ignores one it cannot
        ;; read, so the reader keeps the path and the program reads it later.

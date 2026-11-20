@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.12"
+(defparameter +bursyk-server-version+ "0.0.2.13"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -995,16 +995,18 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 (defun install-channel-handlers (channel)
   "Attach the session policy and remember the bridge for window changes.
 
-A forced command from the authorized_keys line replaces the client's exec,
-shell or subsystem command, as sshd's command= option does.  It runs through
-the same bridge as any other command, with SSH_ORIGINAL_COMMAND in its
-environment holding what the client asked for, when it asked for anything."
+A forced command replaces the client's exec, shell or subsystem command, as
+sshd's ForceCommand and the authorized_keys command= option do; ForceCommand
+wins when both are present.  It runs through the same bridge as any other
+command, with SSH_ORIGINAL_COMMAND in its environment holding what the client
+asked for, when it asked for anything."
   (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
          (authorization (cl-pnet-ssh:ssh-session-authorization session))
          (forced-command
-           (and authorization
-                (cl-pnet-ssh:ssh-authorization-options-force-command
-                 authorization)))
+           (or (config-setting #'cl-pnet-ssh:ssh-server-config-force-command)
+               (and authorization
+                    (cl-pnet-ssh:ssh-authorization-options-force-command
+                     authorization))))
          (bridge nil))
     (labels ((remember (new-bridge)
                (setf bridge new-bridge))

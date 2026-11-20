@@ -387,6 +387,28 @@ that ends the stream too."
                (cl-pnet-ssh:ssh-server-config-subsystems config)))
     (is (eq :verbose (cl-pnet-ssh:ssh-server-config-log-level config)))))
 
+(test forcecommand-is-kept-verbatim-and-internal-sftp-is-refused
+  ;; sshd hands the rest of the line to the login shell untouched, quotes
+  ;; and all, so the reader must not tokenise it.
+  (is (equal "/usr/bin/true --flag"
+             (config-value #'cl-pnet-ssh:ssh-server-config-force-command
+                           "ForceCommand /usr/bin/true --flag")))
+  (is (equal "\"/bin/echo hi\""
+             (config-value #'cl-pnet-ssh:ssh-server-config-force-command
+                           "ForceCommand \"/bin/echo hi\"")))
+  ;; The first ForceCommand wins, as sshd's adm_forced_command does.
+  (is (equal "one"
+             (config-value #'cl-pnet-ssh:ssh-server-config-force-command
+                           "ForceCommand one
+ForceCommand two")))
+  ;; internal-sftp is an in-process server this build does not have.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "ForceCommand internal-sftp"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "ForceCommand internal-sftp -d /srv"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "ForceCommand")))
+
 (test sshd-config-refuses-what-this-server-cannot-honour
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User root"))
@@ -1038,6 +1060,49 @@ DenyGroups banned")))
                (is (equal '(("echo forced"
                              (("SSH_ORIGINAL_COMMAND" . "client-command")))
                             ("echo forced" nil))
+                          (nreverse started))))
+          (setf (symbol-function 'bursyk-server::start-command) original))))))
+
+(test admin-forced-command-wins-over-the-keys
+  "ForceCommand replaces exec, shell and subsystem, and outranks command=."
+  (let* ((authorization
+           (nth-value 0
+                      (cl-pnet-ssh:ssh-authorized-key-options-parse
+                       "command=\"echo from-key\"")))
+         (config (config-from-text
+                  "ForceCommand echo from-config
+Subsystem sftp /usr/lib/openssh/sftp-server"))
+         (session (cl-pnet-ssh::%make-ssh-session))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session :local-id 1 :type "session"
+                   :state :open))
+         (bursyk-server::*server-config* config)
+         (started '()))
+    (setf (cl-pnet-ssh:ssh-session-authorization session) authorization)
+    (labels ((start (channel command &key extra-environment)
+               (declare (ignore channel))
+               (push (list command extra-environment) started)
+               nil))
+      (let ((original (symbol-function 'bursyk-server::start-command)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'bursyk-server::start-command) #'start)
+               (bursyk-server::install-channel-handlers channel)
+               (funcall (cl-pnet-ssh:ssh-server-channel-on-exec channel)
+                        channel "client-command")
+               (funcall (funcall (cl-pnet-ssh:ssh-server-channel-on-shell channel)
+                                 channel))
+               (funcall (funcall
+                         (cl-pnet-ssh:ssh-server-channel-on-subsystem channel)
+                         channel "sftp"))
+               ;; The admin command outranks the key's command= and runs for
+               ;; all three requests, with each original command exported.
+               (is (equal '(("echo from-config"
+                             (("SSH_ORIGINAL_COMMAND" . "client-command")))
+                            ("echo from-config" nil)
+                            ("echo from-config"
+                             (("SSH_ORIGINAL_COMMAND"
+                               . "/usr/lib/openssh/sftp-server"))))
                           (nreverse started))))
           (setf (symbol-function 'bursyk-server::start-command) original))))))
 
