@@ -62,7 +62,7 @@ of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.2\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.3\", so peers and logs identify it correctly.
 
 ACCEPT-ENV is T (accept every env request), a list of names, a function of
 (NAME VALUE), or NIL (refuse).  ON-SESSION runs once a client has

@@ -260,6 +260,20 @@ CLI's decision and at the plist it filled."
     (is (burs::remote-forward-match-p forward "127.0.0.1" 8080))
     (is (not (burs::remote-forward-match-p forward "10.0.0.1" 8080)))))
 
+(test dynamic-forward-specifications-parse
+  (let ((forward (burs::parse-dynamic-forward "1080")))
+    (is (null (burs::dynamic-forward-bind-address forward)))
+    (is (= 1080 (burs::dynamic-forward-bind-port forward))))
+  (let ((forward (burs::parse-dynamic-forward "127.0.0.1:1080")))
+    (is (equal "127.0.0.1" (burs::dynamic-forward-bind-address forward)))
+    (is (= 1080 (burs::dynamic-forward-bind-port forward))))
+  (let ((forward (burs::parse-dynamic-forward "*:1080")))
+    (is (equal "*" (burs::dynamic-forward-bind-address forward)))
+    (is (= 1080 (burs::dynamic-forward-bind-port forward))))
+  (let ((forward (burs::parse-dynamic-forward "[::1]:1080")))
+    (is (equal "::1" (burs::dynamic-forward-bind-address forward)))
+    (is (= 1080 (burs::dynamic-forward-bind-port forward)))))
+
 (test stdio-forward-parses-host-and-port
   (multiple-value-bind (host port)
       (burs::parse-host-port "example.org:2200")

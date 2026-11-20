@@ -4,7 +4,7 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.2")
+(defparameter +burs-version+ "0.0.2.3")
 
 (defvar *status* nil
   "The exit status the remote command reported, or NIL before it does.")
@@ -25,6 +25,10 @@
   "Local forwarding listeners, in the order they were started.")
 (defvar *remote-forwards* nil
   "Remote forwarding requests, in the order they were sent.")
+(defvar *dynamic-forwards* nil
+  "SOCKS proxy listeners, in the order they were started.")
+(defvar *socks-sessions* (make-hash-table :test #'eq :size 16)
+  "SOCKS handshakes in progress, keyed by their CL-PNET connection.")
 (defvar *tunnels* (make-hash-table :test #'eq :size 16)
   "Accepted forwarding connections, keyed by their CL-PNET connection.")
 (defvar *pty-timer* nil

@@ -105,8 +105,14 @@ out once the client confirms."
 
 (defun ssh-server-register-channel (session type sender window max-packet
                                      &key open-extra on-data on-eof on-exec
-                                       on-close on-error)
-  "Create a channel for SENDER and confirm it."
+                                       on-close on-error (confirm t))
+  "Create a channel for SENDER.
+
+CONFIRM defaults to true: the channel is open at once and the client is told
+so.  A caller that still has work to do before the channel can carry data -
+Direct-tcpip dials its target first - passes NIL and calls
+SSH-SERVER-CHANNEL-CONFIRM-TARGET once the channel is usable; until then the
+channel stays in :OPENING and client data is not expected."
   (let* ((id (ssh-session-next-channel-id session))
          (channel (%make-ssh-server-channel
                    :session session
@@ -115,7 +121,7 @@ out once the client confirms."
                    :type type
                    :open-extra (or open-extra
                                    (make-array 0 :element-type '(unsigned-byte 8)))
-                   :state :open
+                   :state (if confirm :open :opening)
                    :remote-window window
                    :remote-max-packet max-packet
                    :local-window (ssh-session-window session)
@@ -124,7 +130,8 @@ out once the client confirms."
                    :on-close on-close :on-error on-error)))
     (incf (ssh-session-next-channel-id session))
     (setf (gethash id (ssh-session-channels session)) channel)
-    (ssh-server-channel-open-confirmation channel)
+    (when confirm
+      (ssh-server-channel-open-confirmation channel))
     channel))
 
 (defun ssh-server-open-session-channel (session sender window max-packet)
@@ -154,7 +161,11 @@ out once the client confirms."
 
 (defun ssh-server-handle-direct-tcpip-open (session reader sender window
                                             max-packet)
-  "Ask the application about a forwarded connection, then pipe it."
+  "Ask the application about a forwarded connection, then pipe it.
+
+The channel is confirmed only after its target is connected, so a refused
+target makes the client's channel open fail - which is what OpenSSH's sshd
+reports - instead of opening a channel that can never carry a byte."
   (let* ((host (ssh-read-text reader))
          (port (ssh-read-u32 reader))
          (origin (ssh-read-text reader))
@@ -164,7 +175,8 @@ out once the client confirms."
                        (funcall handler session host port origin origin-port))))
     (if allowed
         (let ((channel (ssh-server-register-channel
-                        session "direct-tcpip" sender window max-packet)))
+                        session "direct-tcpip" sender window max-packet
+                        :confirm nil)))
           (ssh-server-connect-target channel host port))
         (ssh-server-channel-open-failure
          session sender 1
@@ -353,9 +365,15 @@ returns NIL and is refused rather than accepted and abandoned."
 
 (defun ssh-server-channel-close (channel)
   "Start the close handshake, after everything already queued."
-  (when (member (ssh-server-channel-state channel) '(:open :opening))
-    (setf (ssh-server-channel-want-close channel) t)
-    (ssh-server-channel-flush channel))
+  (cond
+    ((and (eq (ssh-server-channel-state channel) :opening)
+          (null (ssh-server-channel-remote-id channel)))
+     ;; A channel we opened has not been confirmed, so the client has no id to
+     ;; close; there is nothing to tell it and no reason to keep the record.
+     (ssh-server-channel-finish channel))
+    ((member (ssh-server-channel-state channel) '(:open :opening))
+     (setf (ssh-server-channel-want-close channel) t)
+     (ssh-server-channel-flush channel)))
   channel)
 
 (defun ssh-server-channel-exit (channel status)
@@ -481,11 +499,21 @@ reader."
          (ssh-server-channel-fail channel condition)))
     (error (condition) (ssh-server-channel-fail channel condition))))
 
+(defun ssh-server-channel-confirm-target (channel)
+  "Confirm CHANNEL now that its direct-tcpip target accepted the connection."
+  (when (eq (ssh-server-channel-state channel) :opening)
+    (setf (ssh-server-channel-state channel) :open)
+    (ssh-server-channel-open-confirmation channel)
+    (ssh-server-channel-flush channel)))
+
 (defun ssh-server-dial-target (channel address port)
   "Open the target TCP connection for CHANNEL once its name resolved."
   (let ((connection
           (cl-pnet:tcp-connect
            address port
+           :on-connect (lambda (connection)
+                         (declare (ignore connection))
+                         (ssh-server-channel-confirm-target channel))
            :read-cb (lambda (data)
                       (if data
                           (ssh-server-channel-write channel data)
@@ -505,10 +533,24 @@ reader."
                                          address port))))))
 
 (defun ssh-server-channel-fail (channel condition)
-  "Report CONDITION and close CHANNEL."
+  "Report CONDITION and end CHANNEL.
+
+A channel that was never confirmed cannot be closed: the client does not know
+its local id yet, and CHANNEL_CLOSE would name an id it never opened.  Refuse
+the open instead, which is what turns a refused direct-tcpip target into a
+SOCKS failure reply rather than an accepted-but-dead tunnel."
   (when (ssh-server-channel-on-error channel)
     (funcall (ssh-server-channel-on-error channel) channel condition))
-  (ssh-server-channel-close channel))
+  (if (and (eq (ssh-server-channel-state channel) :opening)
+           (ssh-server-channel-remote-id channel))
+      (progn
+        (ssh-server-channel-open-failure
+         (ssh-server-channel-session channel)
+         (ssh-server-channel-remote-id channel)
+         2
+         (princ-to-string condition))
+        (ssh-server-channel-finish channel))
+      (ssh-server-channel-close channel)))
 
 (defun ssh-server-channel-write-target (channel data)
   "Send client channel DATA to CHANNEL's direct-tcpip target."

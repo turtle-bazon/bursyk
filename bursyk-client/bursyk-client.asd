@@ -2,8 +2,8 @@
   :description "SSH client command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.2"
-  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:clingon
+  :version "0.0.2.3"
+  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cl-pnet-socks #:clingon
                #:cffi #:bordeaux-threads #:uiop)
   :serial t
   :components ((:module "src"

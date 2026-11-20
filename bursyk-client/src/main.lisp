@@ -412,8 +412,6 @@ algorithms still have to exist here, because the set is fixed at build time."
     (unsupported "-O" "connection sharing is not implemented"))
   (when (getf *options* :tunnel)
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
-  (when (getf *options* :dynamic-forward)
-    (unsupported "-D" "the SOCKS proxy is not implemented"))
   (when (getf *options* :gssapi-auth)
     (unsupported "-K" "GSSAPI authentication is not implemented"))
   (when (eq (getf *options* :x11-forward) :yes)
@@ -448,6 +446,9 @@ algorithms still have to exist here, because the set is fixed at build time."
   (setf (getf *options* :remote-forward)
         (mapcar #'parse-config-remote-forward
                 (reverse (getf *options* :remote-forward))))
+  (setf (getf *options* :dynamic-forward)
+        (mapcar #'parse-dynamic-forward
+                (reverse (getf *options* :dynamic-forward))))
   (values))
 
 ;;; ---- ~/.ssh/config and -o ----
@@ -640,6 +641,16 @@ session down."
   (local-eof nil)
   (eof-sent nil))
 
+(defstruct (dynamic-forward (:constructor %make-dynamic-forward))
+  bind-address
+  bind-port
+  listener)
+
+(defstruct (socks-session (:constructor %make-socks-session))
+  client
+  connection
+  (state (cl-pnet-socks:make-socks5-server-state)))
+
 (defun split-forward-fields (text)
   "TEXT split at colons, keeping a bracketed IPv6 literal whole."
   (let ((fields '())
@@ -710,6 +721,14 @@ and the target this client dials (HOST/PORT), which is the reverse of -L."
                         :port (forwarding-port hostport spec))))
       (t
        (fail "invalid remote forwarding specification ~A" spec)))))
+
+(defun parse-dynamic-forward (spec)
+  "SPEC as a DYNAMIC-FORWARD for [bind_address:]port."
+  (multiple-value-bind (first second) (split-host-port spec)
+    (if second
+        (%make-dynamic-forward :bind-address (if (plusp (length first)) first nil)
+                               :bind-port (forwarding-port second spec))
+        (%make-dynamic-forward :bind-port (forwarding-port first spec)))))
 
 (defun split-host-port (text)
   "TEXT as (VALUES HOST PORT-STRING), bracketing IPv6 literals."
@@ -1096,36 +1115,47 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
       (setf (forward-tunnel-channel tunnel) nil)
       (ignore-errors (cl-pnet-ssh:ssh-channel-close channel)))))
 
-(defun open-forward-channel (client tunnel)
+(defun open-forward-channel (client tunnel &key on-open on-error)
+  "Open a direct-tcpip channel for TUNNEL and start bridging bytes.
+
+ON-OPEN runs once the peer confirms the channel.  ON-ERROR, when given,
+replaces the usual diagnostic for a failed open; either way the tunnel is
+closed afterwards."
   (let ((forward (forward-tunnel-forward tunnel)))
-    (handler-case
-        (let ((channel
-                (cl-pnet-ssh:ssh-open-direct-tcpip
-                 client (forward-host forward) (forward-port forward)
-                 :on-data (lambda (channel data kind)
-                            (declare (ignore channel kind))
-                            (forward-send tunnel data))
-                 :on-eof (lambda (channel)
-                           (declare (ignore channel))
-                           (forward-close tunnel))
-                 :on-close (lambda (channel reason)
-                             (declare (ignore channel reason))
-                             (forward-close tunnel))
-                 :on-error (lambda (channel condition)
+    (flet ((failed (condition)
+             (if on-error
+                 (funcall on-error condition)
+                 (unless (getf *options* :quiet)
+                   (format *error-output*
+                           "burs: forward to ~A:~D failed: ~A~%"
+                           (forward-host forward)
+                           (forward-port forward)
+                           condition)))
+             (forward-close tunnel)))
+      (handler-case
+          (let ((channel
+                  (cl-pnet-ssh:ssh-open-direct-tcpip
+                   client (forward-host forward) (forward-port forward)
+                   :on-data (lambda (channel data kind)
+                              (declare (ignore channel kind))
+                              (forward-send tunnel data))
+                   :on-open (and on-open
+                                 (lambda (channel)
+                                   (declare (ignore channel))
+                                   (funcall on-open)))
+                   :on-eof (lambda (channel)
                              (declare (ignore channel))
-                             (unless (getf *options* :quiet)
-                               (format *error-output*
-                                       "burs: forward to ~A:~D failed: ~A~%"
-                                       (forward-host forward)
-                                       (forward-port forward)
-                                       condition))
-                             (forward-close tunnel)))))
-          (setf (forward-tunnel-channel tunnel) channel)
-          (forward-flush tunnel)
-          (forward-flush-to-connection tunnel))
-      (error (condition)
-        (format *error-output* "burs: forward failed: ~A~%" condition)
-        (forward-close tunnel)))))
+                             (forward-close tunnel))
+                   :on-close (lambda (channel reason)
+                               (declare (ignore channel reason))
+                               (forward-close tunnel))
+                   :on-error (lambda (channel condition)
+                               (declare (ignore channel))
+                               (failed condition)))))
+            (setf (forward-tunnel-channel tunnel) channel)
+            (forward-flush tunnel)
+            (forward-flush-to-connection tunnel))
+        (error (condition) (failed condition))))))
 
 (defun forward-accept (client forward connection)
   (let ((tunnel (%make-forward-tunnel :forward forward
@@ -1162,6 +1192,172 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
         (format *error-output* "Allocated port ~D for local forward~%" port)))
     forward))
 
+;;; ---- -D: dynamic SOCKS forwarding ----
+;;;
+;;; OpenSSH's -D is a local SOCKS5 proxy whose CONNECT requests become
+;;; direct-tcpip channels.  The handshake runs before the tunnel exists, so a
+;;; session keeps its bytes until the greeting and request are complete; after
+;;; that the ordinary -L tunnel machinery carries the stream.
+
+(defun socks-reply (reply)
+  "A SOCKS5 reply with code REPLY and an all-zero bound address."
+  (cl-pnet-socks:make-socks5-reply reply))
+
+(defun socks-write-then-close (connection data)
+  "Send DATA and close CONNECTION once the kernel has it."
+  (handler-case
+      (cl-pnet:send-data
+       connection data
+       :on-write (lambda (count)
+                   (declare (ignore count))
+                   (ignore-errors (cl-pnet:close-connection connection)))
+       :on-error (lambda (status)
+                   (declare (ignore status))
+                   (ignore-errors (cl-pnet:close-connection connection))))
+    (error () (ignore-errors (cl-pnet:close-connection connection)))))
+
+(defun socks-abandon (session)
+  "Forget SESSION and close its connection without a reply."
+  (let ((connection (socks-session-connection session)))
+    (remhash connection *socks-sessions*)
+    (ignore-errors (cl-pnet:close-connection connection))))
+
+(defun socks-fail (session reply)
+  "Answer SESSION with SOCKS5 reply REPLY, then close it."
+  (let ((connection (socks-session-connection session)))
+    (remhash connection *socks-sessions*)
+    (socks-write-then-close connection (socks-reply reply))))
+
+(defun socks-send (session data)
+  "Send DATA to SESSION's client, abandoning the session on a write error."
+  (let ((connection (socks-session-connection session)))
+    (when connection
+      (handler-case
+          (cl-pnet:send-data
+           connection data
+           :on-error (lambda (status)
+                       (declare (ignore status))
+                       (socks-abandon session)))
+        (error () (socks-abandon session))))))
+
+(defun socks-start-tunnel (session request remaining)
+  "Dial REQUEST's target through the SSH connection for SESSION's client.
+
+REMAINING is any stream data the client sent right behind the request; it is
+buffered with the tunnel and flushed once the channel is open."
+  (let* ((connection (socks-session-connection session))
+         (client (socks-session-client session))
+         (host (cl-pnet-socks:socks5-request-host request))
+         (port (cl-pnet-socks:socks5-request-port request))
+         (tunnel (%make-forward-tunnel
+                  :forward (%make-forward :host host :port port)
+                  :connection connection)))
+    (remhash connection *socks-sessions*)
+    (setf (gethash connection *tunnels*) tunnel)
+    (when (and remaining (plusp (length remaining)))
+      (forward-read tunnel remaining))
+    (log-line "dynamic forward to ~A:~D" host port)
+    (open-forward-channel
+     client tunnel
+     :on-open
+     (lambda ()
+       ;; The peer accepted the connection: release the SOCKS client.
+       (handler-case
+           (cl-pnet:send-data
+            connection (socks-reply cl-pnet-socks:+socks5-reply-success+)
+            :on-error (lambda (status)
+                        (declare (ignore status))
+                        (forward-close tunnel)))
+         (error () (forward-close tunnel))))
+     :on-error
+     (lambda (condition)
+       (declare (ignore condition))
+       ;; The open was refused, so answer the SOCKS request instead of just
+       ;; dropping the connection: FORWARD-CLOSE would hide why it failed.
+       (setf (forward-tunnel-connection tunnel) nil)
+       (remhash connection *tunnels*)
+       (socks-write-then-close
+        connection
+        (socks-reply cl-pnet-socks:+socks5-reply-general-failure+))))))
+
+(defun socks-process (session data)
+  "Feed DATA to SESSION and act on whatever the handshake produced."
+  (multiple-value-bind (output request error remaining)
+      (cl-pnet-socks:socks5-server-consume (socks-session-state session) data)
+    (cond
+      (error
+       ;; OUTPUT is the protocol's own last word: a method refusal, an
+       ;; authentication failure, or a reply for a malformed request.
+       (let ((connection (socks-session-connection session)))
+         (remhash connection *socks-sessions*)
+         (if output
+             (socks-write-then-close connection output)
+             (ignore-errors (cl-pnet:close-connection connection)))))
+      (request
+       (when output
+         (socks-send session output))
+       (cond
+         ((= (cl-pnet-socks:socks5-request-command request)
+             cl-pnet-socks:+socks5-cmd-connect+)
+          (socks-start-tunnel session request remaining))
+         (t
+          (socks-fail session
+                      cl-pnet-socks:+socks5-reply-command-unsupported+))))
+      (output
+       (socks-send session output)))))
+
+(defun socks-connection-data (connection data)
+  "Listener callback for -D: run the handshake, then bridge bytes."
+  (let ((session (gethash connection *socks-sessions*)))
+    (if session
+        (if data
+            (socks-process session data)
+            (socks-abandon session))
+        (forward-connection-data connection data))))
+
+(defun socks-accept (client connection)
+  (setf (gethash connection *socks-sessions*)
+        (%make-socks-session :client client :connection connection)))
+
+(defun dynamic-bind-address (forward)
+  (let ((address (dynamic-forward-bind-address forward)))
+    (cond
+      ((or (null address) (zerop (length address))) "127.0.0.1")
+      ((string= address "*") "0.0.0.0")
+      (t address))))
+
+(defun start-dynamic-forward (client forward)
+  (let* ((address (dynamic-bind-address forward))
+         (listener
+           (cl-pnet:make-tcp-listener
+            address (dynamic-forward-bind-port forward)
+            :read-cb #'socks-connection-data
+            :on-accept (lambda (connection)
+                         (socks-accept client connection))
+            :on-error (lambda (status)
+                        (log-line "dynamic forward listen error ~A" status)))))
+    (unless listener
+      (format *error-output*
+              "burs: cannot listen on ~A:~D for -D~%"
+              address (dynamic-forward-bind-port forward))
+      (finish 255))
+    (setf (dynamic-forward-listener forward) listener)
+    (push forward *dynamic-forwards*)
+    (let ((port (cl-pnet:listener-port listener)))
+      (log-line "dynamic forward ~A:~D" address port)
+      (when (and (zerop (dynamic-forward-bind-port forward))
+                 (not (getf *options* :quiet)))
+        (format *error-output* "Allocated port ~D for dynamic forward~%" port)))
+    forward))
+
+(defun configure-dynamic-forwards (client)
+  "The DynamicForward lines in CLIENT's config, in file order."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (mapcar #'parse-dynamic-forward
+                 (reverse (cl-pnet-ssh:ssh-config-options-dynamic-forwards
+                           options))))))
+
 (defun configured-local-forwards (client)
   "The LocalForward lines in CLIENT's config, in file order."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -1169,19 +1365,6 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
          (mapcar #'parse-config-local-forward
                  (reverse (cl-pnet-ssh:ssh-config-options-local-forwards
                            options))))))
-
-(defun check-config-features (client)
-  "Refuse a config feature this client would otherwise silently drop.
-
-A config file is shared with OpenSSH, so a RemoteForward or DynamicForward
-line there is a request this client cannot honour.  Skipping it quietly
-would leave the user waiting for a tunnel that was never opened."
-  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
-    (when options
-      (let ((dynamic (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
-        (when dynamic
-          (fail "DynamicForward in the ssh config is not supported: ~A"
-                (first (reverse dynamic))))))))
 
 (defun configured-remote-forwards (client)
   "The RemoteForward lines in CLIENT's config, in file order."
@@ -1242,15 +1425,34 @@ peer that connected to it; NIL refuses the channel."
     forward))
 
 (defun start-forwards (client)
-  (check-config-features client)
   (dolist (forward (append (configured-local-forwards client)
                            (getf *options* :local-forward)))
     (start-local-forward client forward))
   (dolist (forward (append (configured-remote-forwards client)
                            (getf *options* :remote-forward)))
-    (start-remote-forward client forward)))
+    (start-remote-forward client forward))
+  (dolist (forward (append (configure-dynamic-forwards client)
+                           (getf *options* :dynamic-forward)))
+    (start-dynamic-forward client forward)))
+
+(defun stop-dynamic-forwards ()
+  (dolist (forward *dynamic-forwards*)
+    (when (dynamic-forward-listener forward)
+      (ignore-errors
+        (cl-pnet:close-listener (dynamic-forward-listener forward)))
+      (setf (dynamic-forward-listener forward) nil)))
+  (setf *dynamic-forwards* nil)
+  (let ((connections '()))
+    (maphash (lambda (connection session)
+               (declare (ignore session))
+               (push connection connections))
+             *socks-sessions*)
+    (dolist (connection connections)
+      (ignore-errors (cl-pnet:close-connection connection))))
+  (clrhash *socks-sessions*))
 
 (defun stop-forwards ()
+  (stop-dynamic-forwards)
   (dolist (forward *forwards*)
     (when (forward-listener forward)
       (ignore-errors (cl-pnet:close-listener (forward-listener forward)))

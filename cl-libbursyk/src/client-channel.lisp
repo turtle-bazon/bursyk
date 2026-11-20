@@ -37,12 +37,13 @@
     (ssh-write-octets writer (ssh-channel-open-extra channel))
     (ssh-writer-output writer)))
 
-(defun ssh-open-channel (client type &key open-extra on-data on-eof on-exit
-                                      on-close on-error)
+(defun ssh-open-channel (client type &key open-extra on-data on-open on-eof
+                                      on-exit on-close on-error)
   "Register a channel of TYPE on CLIENT and ask the peer for it.
 
 The returned channel is usable immediately: requests and writes made before
-the open confirmation are queued and flushed once the peer answers."
+the open confirmation are queued and flushed once the peer answers.  ON-OPEN
+runs once the peer has confirmed the channel, before any of its data."
   (let* ((id (ssh-client-next-channel-id client))
          (channel (%make-ssh-channel
                    :client client
@@ -52,7 +53,8 @@ the open confirmation are queued and flushed once the peer answers."
                                    (make-array 0 :element-type '(unsigned-byte 8)))
                    :local-window (ssh-client-window client)
                    :local-max-packet (ssh-client-max-packet client)
-                   :on-data on-data :on-eof on-eof :on-exit on-exit
+                   :on-data on-data :on-open on-open :on-eof on-eof
+                   :on-exit on-exit
                    :on-close on-close :on-error on-error)))
     (incf (ssh-client-next-channel-id client))
     (setf (gethash id (ssh-client-channels client)) channel)
@@ -68,7 +70,7 @@ the open confirmation are queued and flushed once the peer answers."
 
 (defun ssh-open-direct-tcpip (client host port
                               &key (origin-address "0.0.0.0") (origin-port 0)
-                                   on-data on-eof on-close on-error)
+                                   on-data on-open on-eof on-close on-error)
   "Ask the peer to connect to HOST:PORT and carry the bytes on a channel."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer host)
@@ -77,7 +79,7 @@ the open confirmation are queued and flushed once the peer answers."
     (ssh-write-u32 writer origin-port)
     (ssh-open-channel client "direct-tcpip"
                       :open-extra (ssh-writer-output writer)
-                      :on-data on-data :on-eof on-eof
+                      :on-data on-data :on-open on-open :on-eof on-eof
                       :on-close on-close :on-error on-error)))
 
 ;;; ---- Requests ----
@@ -382,19 +384,24 @@ side is known to accept."
       (ssh-channel-send-exec channel exec))
     (when subsystem
       (ssh-channel-send-subsystem channel subsystem)))
-  (ssh-channel-flush channel))
+  (ssh-channel-flush channel)
+  (when (ssh-channel-on-open channel)
+    (funcall (ssh-channel-on-open channel) channel)))
 
 (defun ssh-channel-handle-open-failure (channel reader)
   (let ((reason (ssh-read-u32 reader))
         (description (ssh-read-text reader)))
     (declare (ignore reason))
-    (ssh-channel-finish channel)
+    ;; Report before FINISH: FINISH runs ON-CLOSE, and a caller that answers a
+    ;; failed open (a SOCKS proxy sends a refusal reply) needs its local
+    ;; connection still open when its ON-ERROR runs.
     (when (ssh-channel-on-error channel)
       (funcall (ssh-channel-on-error channel) channel
                (make-condition 'ssh-channel-error
                                :channel channel
                                :detail (format nil "channel open refused: ~A"
-                                               description))))))
+                                               description))))
+    (ssh-channel-finish channel)))
 
 (defun ssh-channel-handle-data (channel reader extended)
   (let* ((kind (if extended
