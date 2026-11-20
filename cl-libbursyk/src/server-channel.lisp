@@ -189,7 +189,8 @@ reports - instead of opening a channel that can never carry a byte."
          (origin (ssh-read-text reader))
          (origin-port (ssh-read-u32 reader))
          (handler (ssh-server-on-direct-tcpip (ssh-session-server session)))
-         (allowed (and handler
+         (allowed (and (ssh-session-permits-direct-tcpip-p session host port)
+                       handler
                        (funcall handler session host port origin origin-port))))
     (if allowed
         (let ((channel (ssh-server-register-channel
@@ -219,7 +220,9 @@ NIL predicate refuses it, as a server that cannot allocate a PTY should."
          (height (ssh-read-u32 reader))
          (modes (ssh-read-string reader))
          (handler (ssh-server-channel-on-pty channel))
-         (ok (and handler
+         (ok (and (ssh-session-permits-pty-p
+                   (ssh-server-channel-session channel))
+                  handler
                   (funcall handler channel term columns rows width height
                            modes))))
     (when ok

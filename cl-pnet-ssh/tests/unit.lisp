@@ -981,9 +981,10 @@ Returns (VALUES STDOUT STDERR STATUS)."
       (ignore-errors (delete-directory-tree directory :validate t)))))
 
 #-ssh-backend-ffi
-(defun ssh-test-loopback-pty-shell-result ()
+(defun ssh-test-loopback-pty-shell-result (&key authorized-options)
   "Run one pty and shell session through a loopback server and client.
 
+AUTHORIZED-OPTIONS is placed before the client's key in authorized_keys.
 Returns (VALUES STDOUT PTY WINDOW-CHANGE STATUS).  PTY is the (TERM COLUMNS
 ROWS) the server recorded from the pty request, WINDOW-CHANGE the (COLUMNS
 ROWS) it saw afterwards, and STATUS the command's exit status.  Both backends
@@ -1000,7 +1001,12 @@ share the test, so each must dispatch the same channel requests."
          (pty nil)
          (window-change nil)
          (server nil)
-         (timeout nil))
+         (timeout nil)
+         ;; A no-pty or restrict line makes the server refuse the pty request;
+         ;; the client reports that refusal, and this helper expects it.
+         (refuse-pty (and authorized-options
+                          (or (search "no-pty" authorized-options)
+                              (search "restrict" authorized-options)))))
     (ensure-directories-exist server-key)
     (unwind-protect
          (progn
@@ -1009,7 +1015,8 @@ share the test, so each must dispatch the same channel requests."
            (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
                              "-f" (namestring client-key)))
            (ssh-test-write-authorized-keys
-            (merge-pathnames "client_key.pub" directory) authorized)
+            (merge-pathnames "client_key.pub" directory) authorized
+            :prefix authorized-options)
            (setf server
                  (make-ssh-server
                   "127.0.0.1" 0
@@ -1088,8 +1095,13 @@ share the test, so each must dispatch the same channel requests."
                            (cl-pnet:event-loop-stop))
                :on-error (lambda (channel condition)
                            (declare (ignore channel))
-                           (setf error condition)
-                           (cl-pnet:event-loop-stop))))
+                           ;; A refused pty is the expected answer to a no-pty
+                           ;; key line, so it must not fail the whole session.
+                           (unless (and refuse-pty
+                                        (typep condition
+                                               'cl-pnet-ssh:ssh-channel-error))
+                             (setf error condition)
+                             (cl-pnet:event-loop-stop)))))
             :on-error (lambda (client condition)
                         (declare (ignore client))
                         (setf error condition)
@@ -1139,6 +1151,22 @@ share the test, so each must dispatch the same channel requests."
 
 #+ssh-backend-ffi
 (test server-loopback-pty-shell
+  (skip "the pure client transport is not built"))
+
+(test server-loopback-no-pty-key-option
+  ;; A no-pty option on the authenticating key refuses the pty request; the
+  ;; shell itself still runs, as it does in sshd.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout pty window-change status)
+          (ssh-test-loopback-pty-shell-result :authorized-options "no-pty")
+        (is (equal "pty-shell" stdout))
+        (is (null pty))
+        (is (equal '(100 50) window-change))
+        (is (eql 7 status)))))
+
+#+ssh-backend-ffi
+(test server-loopback-no-pty-key-option
   (skip "the pure client transport is not built"))
 
 (test server-loopback-exec-ecdsa-host-key
@@ -1363,11 +1391,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.11"
+           :server-version "bursyk-server_0.0.2.12"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.11 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.12 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1378,11 +1406,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.11"
+           :server-version "bursyk-server_0.0.2.12"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.11" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.12" greeting)))))
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
@@ -1398,7 +1426,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.12" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.13" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))
@@ -2049,6 +2077,162 @@ also covers that the verifier trims it before padding to the curve width."
                (is (equal '("FROM=first") environment)))))
       (ignore-errors (delete-directory-tree directory :validate t)))))
 
+(test authorized-keys-options-follow-sshd
+  "Key options decide pty, forwarding, command and environment, and an
+option the server cannot honour refuses the line rather than being lost."
+  (labels ((parse (text)
+             (multiple-value-bind (options valid)
+                 (cl-pnet-ssh:ssh-authorized-key-options-parse text)
+               (values options valid))))
+    ;; No options keeps every default.
+    (multiple-value-bind (options valid) (parse "")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-pty-p options))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
+           options))
+      (is (null (cl-pnet-ssh:ssh-authorization-options-force-command options))))
+    ;; Negative flags, positive re-enable, and restrict clears everything.
+    (multiple-value-bind (options valid) (parse "no-pty,no-port-forwarding")
+      (is (not (null valid)))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-pty-p options)))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
+                options))))
+    (multiple-value-bind (options valid) (parse "restrict,pty")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-pty-p options))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
+                options))))
+    ;; Unknown options, certificates, TUN and the unsupported positive forms
+    ;; make sshd skip the whole line.
+    (dolist (text '("no-such-option" "cert-authority" "tunnel=\"0\""
+                    "principals=\"alice\"" "touch-required" "verify-required"
+                    "user-rc" "pty,,no-pty" "command=\"unterminated"))
+      (is (null (nth-value 0 (parse text))) text)
+      (is (null (nth-value 1 (parse text))) text))
+    (multiple-value-bind (options valid)
+        (parse "no-touch-required,no-verify-required,no-user-rc")
+      (declare (ignore options))
+      (is (not (null valid))))
+    ;; command= is the forced command; a second one is refused.
+    (multiple-value-bind (options valid) (parse "command=\"echo hi\"")
+      (is (not (null valid)))
+      (is (equal "echo hi"
+                 (cl-pnet-ssh:ssh-authorization-options-force-command
+                  options))))
+    (is (null (nth-value 1 (parse "command=\"a\",command=\"b\""))))
+    ;; from= is one address list, and a missing address fails closed.
+    (multiple-value-bind (options valid)
+        (parse "from=\"10.0.0.0/8,!10.1.2.3\"")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-address-p
+           options "10.9.8.7"))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-address-p
+                options "10.1.2.3")))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-address-p
+                options "192.168.0.1")))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-address-p
+                options nil))))
+    (is (null (nth-value 1 (parse "from=\"a\",from=\"b\""))))
+    ;; permitopen= is exact host and port, with * as the only wildcard.
+    (multiple-value-bind (options valid)
+        (parse "permitopen=\"host:22\",permitopen=\"[::1]:*\"")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-open-p
+           options "host" 22))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-open-p
+                options "host" 23)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-open-p
+           options "::1" 999))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-open-p
+                options "other" 22))))
+    ;; A bare permitlisten= port means every address, as sshd expands it.
+    (multiple-value-bind (options valid)
+        (parse "permitlisten=\"127.0.0.1:8080\",permitlisten=\"9000\"")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-listen-p
+           options "127.0.0.1" 8080))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-listen-p
+                options "localhost" 8080)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-listen-p
+           options "0.0.0.0" 9000)))
+    ;; expiry-time= is a universal time; the earliest value wins.
+    (multiple-value-bind (options valid)
+        (parse "expiry-time=\"29990101\"")
+      (is (not (null valid)))
+      (is (cl-pnet-ssh:ssh-authorization-options-permit-now-p
+           options (encode-universal-time 0 0 0 1 1 2026 0))))
+    (multiple-value-bind (options valid)
+        (parse "expiry-time=\"20000101\"")
+      (is (not (null valid)))
+      (is (not (cl-pnet-ssh:ssh-authorization-options-permit-now-p
+                options (encode-universal-time 0 0 0 1 1 2026 0)))))
+    (is (null (nth-value 1 (parse "expiry-time=\"2999\""))))
+    ;; The first environment= for a name wins, as sshd's parser does.
+    (multiple-value-bind (options valid)
+        (parse "environment=\"A=1\",environment=\"A=2\",environment=\"B=3\"")
+      (is (not (null valid)))
+      (is (equal '("A=1" "B=3")
+                 (cl-pnet-ssh:ssh-authorization-options-environments
+                  options))))))
+
+(test authorized-key-line-splits-options-like-sshd
+  "Option values must be quoted, and a space ends the options as in sshd."
+  (let ((key (format nil "ssh-ed25519 ~A" +test-authorized-key-blob+)))
+    ;; sshd's opt_dequote requires the opening quote.
+    (is (null (cl-pnet-ssh:ssh-authorized-key-line-blob
+               (format nil "no-pty,from=10.0.0.1 ~A" key))))
+    ;; sshd stops the options at the first unquoted space, so the token it
+    ;; would read as a key type here is "hi" and the line is refused.
+    (is (null (cl-pnet-ssh:ssh-authorized-key-line-blob
+               (format nil "command=echo hi ~A" key))))
+    ;; Quoting keeps the space inside the value.
+    (multiple-value-bind (blob options parsed)
+        (cl-pnet-ssh:ssh-authorized-key-line-parts
+         (format nil "command=\"echo hi\" ~A" key))
+      (is (not (null blob)))
+      (is (equal "command=\"echo hi\"" options))
+      (is (equal "echo hi"
+                 (cl-pnet-ssh:ssh-authorization-options-force-command
+                  parsed))))
+    ;; Only \" escapes in sshd's opt_dequote; other backslashes pass through.
+    (multiple-value-bind (blob options parsed)
+        (cl-pnet-ssh:ssh-authorized-key-line-parts
+         (format nil "command=\"printf \\\"hi\\\" \\\\n\" ~A" key))
+      (declare (ignore options))
+      (is (not (null blob)))
+      (is (equal "printf \"hi\" \\\\n"
+                 (cl-pnet-ssh:ssh-authorization-options-force-command
+                  parsed))))))
+
+(test authorized-key-blob-match-checks-from-and-expiry
+  "A matching key is refused when from= or expiry-time= excludes this peer."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-key-policy"))
+         (authorized (merge-pathnames "authorized_keys" directory)))
+    (ensure-directories-exist authorized)
+    (unwind-protect
+         (progn
+           (with-open-file (stream authorized :direction :output
+                                             :if-exists :supersede
+                                             :if-does-not-exist :create)
+             (format stream "from=\"127.0.0.1\",no-pty ssh-ed25519 ~A~%"
+                     +test-authorized-key-blob+))
+           (multiple-value-bind (matched environment options)
+               (cl-pnet-ssh:ssh-authorized-key-blob-match
+                authorized (cl-pnet-ssh:ssh-authorized-key-line-blob
+                            (format nil "ssh-ed25519 ~A"
+                                    +test-authorized-key-blob+))
+                :address "127.0.0.1")
+             (is (not (null matched)))
+             (is (null environment))
+             (is (not (cl-pnet-ssh:ssh-authorization-options-permit-pty-p
+                       options))))
+           (is (null (cl-pnet-ssh:ssh-authorized-key-blob-match
+                      authorized (cl-pnet-ssh:ssh-authorized-key-line-blob
+                                  (format nil "ssh-ed25519 ~A"
+                                          +test-authorized-key-blob+))
+                      :address "10.0.0.1"))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test server-records-authorized-key-environment
   "A successful publickey login keeps the environment= options it carried."
   (if (not (ssh-keygen-available-p))
@@ -2064,6 +2248,36 @@ also covers that the verifier trims it before padding to the curve width."
         (is (null error))
         (is (not (null opened)))
         (is (equal '("LANG=en_US.UTF-8" "TZ=UTC") key-env)))))
+
+(test session-forwarding-policy-follows-key-options
+  "no-port-forwarding, permitopen= and permitlisten= reach the session."
+  (let* ((server (cl-pnet-ssh::%make-ssh-server))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (options (lambda (text)
+                    (nth-value 0
+                               (cl-pnet-ssh:ssh-authorized-key-options-parse
+                                text)))))
+    ;; An unrestricted key keeps sshd's defaults.
+    (is (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 22))
+    (is (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "host" 22))
+    ;; no-port-forwarding stops both directions.
+    (setf (cl-pnet-ssh:ssh-session-authorization session)
+          (funcall options "no-port-forwarding"))
+    (is (not (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 22)))
+    (is (not (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "host" 22)))
+    ;; permitopen= restricts the local direction only.
+    (setf (cl-pnet-ssh:ssh-session-authorization session)
+          (funcall options "permitopen=\"host:22\""))
+    (is (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 22))
+    (is (not (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 23)))
+    (is (not (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "other" 22)))
+    (is (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "0.0.0.0" 9000))
+    ;; permitlisten= restricts the remote direction only.
+    (setf (cl-pnet-ssh:ssh-session-authorization session)
+          (funcall options "permitlisten=\"127.0.0.1:8080\""))
+    (is (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "127.0.0.1" 8080))
+    (is (not (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "127.0.0.1" 8081)))
+    (is (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 22))))
 
 (test ssh-config-carries-the-features-the-caller-must-refuse
   ;; Agent, X11 and compression wishes can come from the file.  The parser

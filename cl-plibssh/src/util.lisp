@@ -142,6 +142,9 @@
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())
+  ;; The rest of that line's options: no-pty, from=, command=, permitopen=
+  ;; and so on.  NIL means the line had no options (every default allowed).
+  (authorization nil)
   ;; Userauth bookkeeping, as in the pure backend: sshd exempts the first
   ;; "none" probe and counts every refusal after it.
   (auth-attempts 0)

@@ -410,15 +410,18 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
                    (ssh-server-signed-data session user algorithm key-blob))))
          (error () nil))))
 
-(defun ssh-server-complete-auth (session user key-blob &optional key-env)
+(defun ssh-server-complete-auth (session user key-blob
+                                 &optional key-env authorization)
   "Accept SESSION's authenticated user, then let the application run.
 
 KEY-ENV holds the environment= assignments from the authorized_keys line
 that admitted the key; the application applies them under
-PermitUserEnvironment."
+PermitUserEnvironment.  AUTHORIZATION holds that line's remaining options,
+which the transport enforces for pty and forwarding requests."
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
         (ssh-session-key-env session) key-env
+        (ssh-session-authorization session) authorization
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
   (setf (ssh-session-login-grace-timer session)
@@ -432,11 +435,13 @@ PermitUserEnvironment."
                                     &key (count t))
   (let ((signature (ssh-read-string reader)))
     (if (ssh-server-verify-signature session user algorithm key-blob signature)
-        (multiple-value-bind (authorized key-env)
-            (ssh-server-authorized-key-p (ssh-session-server session)
-                                         user key-blob)
+        (multiple-value-bind (authorized key-env authorization)
+            (ssh-server-authorized-key-p
+             (ssh-session-server session) user key-blob
+             :address (ssh-session-remote-ip session))
           (if authorized
-              (ssh-server-complete-auth session user key-blob key-env)
+              (ssh-server-complete-auth session user key-blob
+                                        key-env authorization)
               (ssh-server-send-auth-failure session :count count)))
         (ssh-server-send-auth-failure session :count count))))
 
@@ -444,8 +449,9 @@ PermitUserEnvironment."
                                     has-signature &key (count t))
   "Handle one publickey attempt, signed or merely offered."
   (if (and (ssh-server-user-key-algorithm-p key-blob algorithm)
-           (ssh-server-authorized-key-p (ssh-session-server session)
-                                        user key-blob))
+           (ssh-server-authorized-key-p
+            (ssh-session-server session) user key-blob
+            :address (ssh-session-remote-ip session)))
       (if has-signature
           (ssh-server-handle-signed-key session user algorithm key-blob reader
                                         :count count)
@@ -525,6 +531,8 @@ it got, which differs from the request only when the client asked for port
          (bind-port (ssh-read-u32 reader))
          (handler (ssh-server-on-tcpip-forward (ssh-session-server session)))
          (bound (and handler
+                     (ssh-session-permits-tcpip-forward-p
+                      session bind-address bind-port)
                      (funcall handler session bind-address bind-port))))
     (when want-reply
       (if bound

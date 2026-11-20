@@ -92,6 +92,9 @@ only want to describe it."
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())
+  ;; The rest of that line's options: no-pty, from=, command=, permitopen=
+  ;; and so on.  NIL means the line had no options (every default allowed).
+  (authorization nil)
   ;; Userauth bookkeeping: a fresh connection starts at zero, and the first
   ;; "none" probe is exempt from the failure count, as in sshd.
   (auth-attempts 0)

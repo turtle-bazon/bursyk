@@ -262,9 +262,15 @@ draining it."
   (bridge-start bridge)
   bridge)
 
-(defun start-command (channel command)
-  "Run COMMAND as a child, on a ConPTY when the client asked for a pty."
+(defun start-command (channel command &key extra-environment)
+  "Run COMMAND as a child, on a ConPTY when the client asked for a pty.
+
+EXTRA-ENVIRONMENT is added last, for values the server itself sets such as
+SSH_ORIGINAL_COMMAND."
   (let ((environment (session-environment channel)))
+    (dolist (pair extra-environment)
+      (setf environment
+            (environment-put environment (car pair) (cdr pair))))
     (if (channel-pty-p channel)
         (multiple-value-bind (pid input output console)
             (spawn-pty-shell command (windows-shell)

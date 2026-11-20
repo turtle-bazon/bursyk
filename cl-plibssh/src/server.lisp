@@ -249,14 +249,15 @@ the reason is recorded and the pump finishes it after the callback returns."
   (ssh-plibssh-auth-failure message))
 
 (defun ssh-plibssh-session-complete-auth (session message user key-blob
-                                          &optional key-env)
+                                          &optional key-env authorization)
   "Accept USER for SESSION, then let the application run.
 
 KEY-ENV holds the environment= assignments from the authorized_keys line
-that admitted the key."
+that admitted the key, and AUTHORIZATION the rest of that line's options."
   (declare (ignore key-blob))
   (setf (ssh-session-user session) user
         (ssh-session-key-env session) key-env
+        (ssh-session-authorization session) authorization
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
   (setf (ssh-session-login-grace-timer session)
@@ -296,18 +297,21 @@ authentication attempt."
          (state (ssh-message-auth-publickey-state message))
          (blob (and key (ssh-plibssh-public-key-blob key)))
          (authorized nil)
-         (key-env nil))
+         (key-env nil)
+         (authorization nil))
     (when blob
-      (multiple-value-setq (authorized key-env)
+      (multiple-value-setq (authorized key-env authorization)
         (ssh-server-authorized-key-p
-         (ssh-session-server session) user blob)))
+         (ssh-session-server session) user blob
+         :address (ssh-session-remote-ip session))))
     (cond
       ((null key) (ssh-plibssh-session-auth-failure session message
                                                     :count count))
       ((and authorized (= state +ssh-publickey-state-none+))
        (ssh-message-auth-reply-pk-ok-simple message))
       ((and authorized (= state +ssh-publickey-state-valid+))
-       (ssh-plibssh-session-complete-auth session message user blob key-env))
+       (ssh-plibssh-session-complete-auth session message user blob
+                                          key-env authorization))
       (t (ssh-plibssh-session-auth-failure session message :count count)))))
 
 ;;; ---- Channel opens ----
@@ -364,7 +368,8 @@ is refused instead of allocated."
          (origin (ssh-message-open-originator message))
          (origin-port (ssh-message-open-originator-port message))
          (handler (ssh-server-on-direct-tcpip (ssh-session-server session)))
-         (allowed (and handler
+         (allowed (and (ssh-session-permits-direct-tcpip-p session host port)
+                       handler
                        (funcall handler session host port origin origin-port))))
     (unless allowed
       (ssh-message-reply-default message)
@@ -431,7 +436,9 @@ terminal name and both sizes are kept."
          (width (ssh-message-channel-request-pty-pxwidth message))
          (height (ssh-message-channel-request-pty-pxheight message))
          (handler (ssh-server-channel-on-pty channel))
-         (ok (and handler
+         (ok (and (ssh-session-permits-pty-p
+                   (ssh-server-channel-session channel))
+                  handler
                   (funcall handler channel term columns rows width height
                            nil))))
     (when ok
@@ -748,8 +755,7 @@ terminal name and both sizes are kept."
   (let ((connection
           (cl-pnet:tcp-connect
            address port
-           :read-cb (lambda (connection data)
-                      (declare (ignore connection))
+           :read-cb (lambda (data)
                       (if data
                           (ssh-server-channel-write channel data)
                           (ssh-server-channel-eof channel)))

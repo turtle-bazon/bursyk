@@ -938,11 +938,58 @@ DenyGroups banned")))
   (is (not (cl-pnet-ssh:ssh-root-login-allowed-p :prohibit-password "password")))
   (is (cl-pnet-ssh:ssh-root-login-allowed-p :yes "password"))
   (is (not (cl-pnet-ssh:ssh-root-login-allowed-p :no "publickey")))
-  ;; No forced command exists in this build, so this mode refuses.
+  ;; Even in this mode a key without command= cannot log root in; one with
+  ;; a forced command can.
   (is (not (cl-pnet-ssh:ssh-root-login-allowed-p
             :forced-commands-only "publickey")))
   (is (cl-pnet-ssh:ssh-root-login-allowed-p
        :forced-commands-only "publickey" :force-command "id")))
+
+(test forced-commands-only-root-needs-a-forced-command
+  ;; PermitRootLogin forced-commands-only is decided when the key matches:
+  ;; a key carrying command= admits root, one without it does not.
+  (if (null (nth-value 1 (bursyk-server::user-home-and-uid "root")))
+      (skip "no local root account")
+      (let* ((directory (merge-pathnames
+                         (format nil "bursyk-server-root-~D/"
+                                 (random 1000000))
+                         (uiop:temporary-directory)))
+             (blob (concatenate
+                    'string
+                    "AAAAB3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5"
+                    "C9okWi0dh2l9GKJl"))
+             (with-command (merge-pathnames "with_command" directory))
+             (without-command (merge-pathnames "without_command" directory))
+             (config (config-from-text
+                      "PermitRootLogin forced-commands-only")))
+        (ensure-directories-exist with-command)
+        (unwind-protect
+             (let ((bursyk-server::*server-config* config)
+                   (key (cl-pnet-ssh:ssh-authorized-key-line-blob
+                         (format nil "ssh-ed25519 ~A" blob))))
+               (with-open-file (out with-command :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                 (format out "command=\"id\",no-pty ssh-ed25519 ~A~%" blob))
+               (with-open-file (out without-command :direction :output
+                                                   :if-exists :supersede
+                                                   :if-does-not-exist :create)
+                 (format out "no-pty ssh-ed25519 ~A~%" blob))
+               ;; The pre-authentication gate defers this mode to the key.
+               (is (bursyk-server::root-login-allowed-p "root"))
+               (let ((bursyk-server::*options*
+                       (list :authorized-keys with-command)))
+                 (multiple-value-bind (matched environment authorization)
+                     (bursyk-server::authorized-keys-p "root" key)
+                   (declare (ignore environment))
+                   (is (not (null matched)))
+                   (is (equal "id"
+                              (cl-pnet-ssh:ssh-authorization-options-force-command
+                               authorization)))))
+               (let ((bursyk-server::*options*
+                       (list :authorized-keys without-command)))
+                 (is (null (bursyk-server::authorized-keys-p "root" key)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test max-auth-tries-counts-failures-and-has-sshd-defaults
   ;; The limit is stored per server; the counter is per connection.
@@ -961,6 +1008,39 @@ DenyGroups banned")))
   (is (cl-pnet-ssh::ssh-server-auth-failure-counts-p 2 "none"))
   (is (cl-pnet-ssh::ssh-server-auth-failure-counts-p 1 "publickey")))
   
+(test forced-command-replaces-the-clients-choice
+  "command= runs instead of exec or shell and carries SSH_ORIGINAL_COMMAND."
+  (let* ((authorization
+           (nth-value 0
+                      (cl-pnet-ssh:ssh-authorized-key-options-parse
+                       "command=\"echo forced\"")))
+         (session (cl-pnet-ssh::%make-ssh-session))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session :local-id 1 :type "session"
+                   :state :open))
+         (started '()))
+    (setf (cl-pnet-ssh:ssh-session-authorization session) authorization)
+    (labels ((start (channel command &key extra-environment)
+               (declare (ignore channel))
+               (push (list command extra-environment) started)
+               nil))
+      (let ((original (symbol-function 'bursyk-server::start-command)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'bursyk-server::start-command) #'start)
+               (bursyk-server::install-channel-handlers channel)
+               (funcall (cl-pnet-ssh:ssh-server-channel-on-exec channel)
+                        channel "client-command")
+               (funcall (funcall (cl-pnet-ssh:ssh-server-channel-on-shell channel)
+                                 channel))
+               ;; The key's command replaces both requests; only the exec one
+               ;; leaves the client's own command visible as the original.
+               (is (equal '(("echo forced"
+                             (("SSH_ORIGINAL_COMMAND" . "client-command")))
+                            ("echo forced" nil))
+                          (nreverse started))))
+          (setf (symbol-function 'bursyk-server::start-command) original))))))
+
 (test max-sessions-counts-live-session-channels
   (let* ((server (cl-pnet-ssh::%make-ssh-server :max-sessions 2))
          (session (cl-pnet-ssh::%make-ssh-session :server server)))

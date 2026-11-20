@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.11"
+(defparameter +bursyk-server-version+ "0.0.2.12"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -910,13 +910,17 @@ to spin on it."
   (bridge-watch bridge)
   bridge)
 
-(defun start-command (channel command)
+(defun start-command (channel command &key extra-environment)
   "Run COMMAND as a child, on the pty the client asked for if there is one.
 
 The channel's accepted environment requests are added to the child's own
 environment, so a SendEnv from the client arrives where the command can see
-it.  The library has already applied AcceptEnv."
+it.  The library has already applied AcceptEnv.  EXTRA-ENVIRONMENT is added
+last, for values the server itself sets such as SSH_ORIGINAL_COMMAND."
   (let ((environment (session-environment channel)))
+    (dolist (pair extra-environment)
+      (setf environment
+            (environment-put environment (car pair) (cdr pair))))
     (if (channel-pty-p channel)
         (multiple-value-bind (pid master status)
             (spawn-pty-shell command (user-shell)
@@ -989,8 +993,19 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
   (cl-pnet-ssh:ssh-server-channel-close channel))
 
 (defun install-channel-handlers (channel)
-  "Attach the session policy and remember the bridge for window changes."
-  (let ((bridge nil))
+  "Attach the session policy and remember the bridge for window changes.
+
+A forced command from the authorized_keys line replaces the client's exec,
+shell or subsystem command, as sshd's command= option does.  It runs through
+the same bridge as any other command, with SSH_ORIGINAL_COMMAND in its
+environment holding what the client asked for, when it asked for anything."
+  (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
+         (authorization (cl-pnet-ssh:ssh-session-authorization session))
+         (forced-command
+           (and authorization
+                (cl-pnet-ssh:ssh-authorization-options-force-command
+                 authorization)))
+         (bridge nil))
     (labels ((remember (new-bridge)
                (setf bridge new-bridge))
            (run-command (command)
@@ -999,6 +1014,15 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
                    (error (condition)
                      (session-failure channel "~A" condition)))
                  (session-failure channel "command not allowed: ~A" command)))
+           (run-forced (original-command)
+             (handler-case
+                 (remember
+                  (start-command
+                   channel forced-command
+                   :extra-environment
+                   (and original-command
+                        (list (cons "SSH_ORIGINAL_COMMAND" original-command)))))
+               (error (condition) (session-failure channel "~A" condition))))
            (run-shell ()
              (handler-case (remember (start-login-shell channel))
                (error (condition) (session-failure channel "~A" condition))))
@@ -1008,7 +1032,9 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
       (setf (cl-pnet-ssh:ssh-server-channel-on-exec channel)
             (lambda (channel command)
               (declare (ignore channel))
-              (run-command command)))
+              (if forced-command
+                  (run-forced command)
+                  (run-command command))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-pty channel)
             (lambda (channel term columns rows width height modes)
               (declare (ignore channel term columns rows width height modes))
@@ -1020,12 +1046,19 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
               (declare (ignore channel))
               ;; Returning a thunk lets the library send the success reply
               ;; before the shell can write its first prompt.
-              (lambda () (run-shell))))
+              (lambda () (if forced-command
+                             (run-forced nil)
+                             (run-shell)))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-subsystem channel)
             (lambda (channel name)
               (declare (ignore channel))
+              ;; sshd still refuses an unknown subsystem before the forced
+              ;; command is considered, so look the name up first.
               (let ((path (subsystem-path name)))
-                (and path (lambda () (run-subsystem path))))))
+                (and path
+                     (if forced-command
+                         (lambda () (run-forced path))
+                         (lambda () (run-subsystem path)))))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-window-change channel)
             (lambda (channel columns rows)
               (declare (ignore channel))
@@ -1153,36 +1186,68 @@ unprivileged run simple."
             found)
           (list (home-file ".ssh/id_ed25519")))))
 
-(defun authorized-keys-p (user key-blob)
+(defun root-uid-p (user)
+  "Whether USER is uid 0, the only account PermitRootLogin governs."
+  (let ((uid (nth-value 1 (user-home-and-uid user))))
+    (and uid (string= uid "0"))))
+
+(defun approved-authorized-key (user key-env authorization)
+  "The authorized-keys-p answer for a key that matched USER's file.
+
+PermitRootLogin forced-commands-only admits root only when the key that
+authenticated carries command=, which sshd checks once the key options are
+known.  Any other mode was already enforced before authentication."
+  (if (and (root-uid-p user)
+           (eq (config-setting
+                #'cl-pnet-ssh:ssh-server-config-permit-root-login)
+               :forced-commands-only)
+           (not (and authorization
+                     (cl-pnet-ssh:ssh-authorization-options-force-command
+                      authorization))))
+      (values nil nil nil)
+      (values t key-env authorization)))
+
+(defun authorized-keys-p (user key-blob &optional address)
   "Whether KEY-BLOB may log in as USER, and the environment it carries.
 
 -A names one file for every user.  Otherwise AuthorizedKeysFile decides,
 with its %h/%u/%U tokens expanded for USER; when the user has no local
 passwd entry, the single key file of the account running the server is used,
 so an unprivileged or Windows setup keeps working.  The second value is the
-environment= options of the line that matched, which
-PermitUserEnvironment decides whether to apply."
-  (let ((global (getf *options* :authorized-keys)))
-    (if global
-        (cl-pnet-ssh:ssh-authorized-key-blob-match global key-blob)
-        (multiple-value-bind (home uid) (user-home-and-uid user)
-          (if (null home)
+environment= options of the line that matched, which PermitUserEnvironment
+decides whether to apply; the third is the rest of the line's options,
+including from=, which ADDRESS is needed to check."
+  (labels ((approve (matched key-env authorization)
+             (if matched
+                 (approved-authorized-key user key-env authorization)
+                 (values nil nil nil))))
+    (let ((global (getf *options* :authorized-keys)))
+      (if global
+          (multiple-value-bind (matched key-env authorization)
               (cl-pnet-ssh:ssh-authorized-key-blob-match
-               (home-file ".ssh/authorized_keys") key-blob)
-              (let ((patterns
-                      (or (config-setting
-                           #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
-                          cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
-                (dolist (pattern patterns (values nil nil))
-                  (unless (string-equal pattern "none")
-                    (multiple-value-bind (matched key-env)
-                        (cl-pnet-ssh:ssh-authorized-key-blob-match
-                         (expand-authorized-keys-path
-                          pattern user home uid)
-                         key-blob)
-                      (when matched
-                        (return-from authorized-keys-p
-                          (values t key-env))))))))))))
+               global key-blob :address address)
+            (approve matched key-env authorization))
+          (multiple-value-bind (home uid) (user-home-and-uid user)
+            (if (null home)
+                (multiple-value-bind (matched key-env authorization)
+                    (cl-pnet-ssh:ssh-authorized-key-blob-match
+                     (home-file ".ssh/authorized_keys") key-blob
+                     :address address)
+                  (approve matched key-env authorization))
+                (let ((patterns
+                        (or (config-setting
+                             #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
+                            cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
+                  (dolist (pattern patterns (values nil nil nil))
+                    (unless (string-equal pattern "none")
+                      (multiple-value-bind (matched key-env authorization)
+                          (cl-pnet-ssh:ssh-authorized-key-blob-match
+                           (expand-authorized-keys-path
+                            pattern user home uid)
+                           key-blob :address address)
+                        (when matched
+                          (return-from authorized-keys-p
+                            (approve matched key-env authorization)))))))))))))
 
 ;;; ---- Account policy ----
 ;;;
@@ -1195,18 +1260,20 @@ PermitUserEnvironment decides whether to apply."
   (getf (cl-pnet-ssh:ssh-session-remote-address session) :address))
 
 (defun root-login-allowed-p (user)
-  "Whether PermitRootLogin admits USER, when USER is uid 0.
+  "Whether PermitRootLogin admits USER at the start of authentication.
 
-Only publickey exists in this build, so forced-commands-only has no forced
-command to allow and refuses root outright."
+A non-root user always passes.  Root under forced-commands-only also passes
+here, because sshd decides that mode once the authenticating key is known:
+only a key carrying command= may log root in, which APPROVED-AUTHORIZED-KEY
+checks after the key matches."
   (multiple-value-bind (home uid) (user-home-and-uid user)
     (declare (ignore home))
     (or (null uid)
         (not (string= uid "0"))
-        (cl-pnet-ssh:ssh-root-login-allowed-p
-         (config-setting
-          #'cl-pnet-ssh:ssh-server-config-permit-root-login)
-         "publickey"))))
+        (let ((mode (config-setting
+                     #'cl-pnet-ssh:ssh-server-config-permit-root-login)))
+          (or (eq mode :forced-commands-only)
+              (cl-pnet-ssh:ssh-root-login-allowed-p mode "publickey"))))))
 
 (defun user-allowed-p (session user)
   "Whether sshd's account policy admits USER from SESSION's peer."

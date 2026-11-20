@@ -76,7 +76,11 @@ HOST-KEY is an ssh-private-key, a path to an OpenSSH key, or a list of
 those; ssh-ed25519, ECDSA and RSA keys are supported, and the server
 advertises every algorithm its keys can sign with.  AUTHORIZED-KEYS is an
 authorized_keys file, a list of public key blobs, or NIL.  AUTHORIZE, when
-given, is a function of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
+given, is a function of (USER KEY-BLOB ADDRESS) and replaces AUTHORIZED-KEYS;
+it should return the same (VALUES MATCHED ENVIRONMENTS OPTIONS) that
+SSH-AUTHORIZED-KEY-BLOB-MATCH does, so the caller can enforce from=, no-pty,
+command= and the other key options.  ADDRESS is the connection's peer
+address.
 AUTHORIZE-USER is a function of (SESSION USER) answering whether the
 account may try to authenticate at all; it runs before any method and its
 answer is cached for that name, which is where AllowUsers, DenyUsers and
@@ -102,7 +106,7 @@ default, so a config's explicit zero is still honoured.
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.11\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.12\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 

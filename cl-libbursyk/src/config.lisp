@@ -17,7 +17,7 @@
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.12")
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.13")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)

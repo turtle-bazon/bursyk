@@ -45,6 +45,7 @@
    #:ssh-session-server
    #:ssh-session-user
    #:ssh-session-key-env
+   #:ssh-session-authorization
    #:ssh-session-client-version
    #:ssh-session-remote-address
    #:ssh-session-auth-failures
@@ -181,6 +182,31 @@
    #:ssh-authorized-key-line-blob
    #:ssh-authorized-key-line-environments
    #:ssh-authorized-key-line-parts
+   #:ssh-authorized-key-options-parse
+   #:ssh-authorization-options
+   #:ssh-authorization-options-p
+   #:ssh-authorization-options-restricted
+   #:ssh-authorization-options-from
+   #:ssh-authorization-options-force-command
+   #:ssh-authorization-options-permit-open
+   #:ssh-authorization-options-permit-listen
+   #:ssh-authorization-options-valid-before
+   #:ssh-authorization-options-environments
+   #:ssh-authorization-options-permit-pty
+   #:ssh-authorization-options-permit-port-forwarding
+   #:ssh-authorization-options-permit-agent-forwarding
+   #:ssh-authorization-options-permit-x11-forwarding
+   #:ssh-authorization-options-permit-pty-p
+   #:ssh-authorization-options-permit-port-forwarding-p
+   #:ssh-authorization-options-permit-address-p
+   #:ssh-authorization-options-permit-now-p
+   #:ssh-authorization-options-permit-open-p
+   #:ssh-authorization-options-permit-listen-p
+   #:ssh-session-remote-ip
+   #:ssh-session-permits-pty-p
+   #:ssh-session-permits-direct-tcpip-p
+   #:ssh-session-permits-tcpip-forward-p
+   #:ssh-parse-absolute-time
    #:ssh-match-pattern-list
    #:ssh-server-permit-user-environment-p
    ;; known hosts
