@@ -7,9 +7,10 @@
 (defparameter +ssh-server-kex-algorithms+
   '("curve25519-sha256"
     "curve25519-sha256@libssh.org"
-    "kex-strict-s-v00@openssh.com")
-  "Server KEX offers.  The strict marker tells OpenSSH clients to reset
-sequence numbers at NEWKEYS; it is not an algorithm and is never selected.")
+    ;; Markers, never selected: strict KEX and RFC 8308 extensions.
+    "kex-strict-s-v00@openssh.com"
+    "ext-info-s")
+  "Server KEX offers.  The markers are negotiation signals, not algorithms.")
 
 (defun ssh-server-make-kexinit-payload (session)
   "A fresh server SSH_MSG_KEXINIT advertising the keys SESSION's server holds."
@@ -128,8 +129,9 @@ and NIL while the line is still incomplete."
 
 The host key offer is built from SESSION's loaded keys, so every algorithm
 advertised can be signed with."
-  (let* ((kex (ssh-choose-algorithm +ssh-server-kex-algorithms+
-                                    (getf client-kexinit :kex)))
+  (let* ((kex (ssh-choose-algorithm
+               (remove-if #'ssh-kex-marker-p +ssh-server-kex-algorithms+)
+               (getf client-kexinit :kex)))
          (host-key (ssh-choose-algorithm
                     (ssh-server-host-key-algorithms
                      (ssh-server-host-keys (ssh-session-server session)))
@@ -151,6 +153,9 @@ advertised can be signed with."
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
           :mac-c2s mac-c2s :mac-s2c mac-s2c
+          :ext-info (and (member "ext-info-c" (getf client-kexinit :kex)
+                                 :test #'string=)
+                         t)
           :strict (member "kex-strict-c-v00@openssh.com"
                           (getf client-kexinit :kex) :test #'string=))))
 
@@ -232,6 +237,20 @@ came up."
     (ssh-write-string writer signature)
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
+(defun ssh-server-send-ext-info (session)
+  "Tell the client which public-key signatures this server accepts.
+
+RFC 8308 sends EXT_INFO right after the first NEWKEYS, when the client
+asked for it with ext-info-c.  Without server-sig-algs an OpenSSH client
+refuses to try an RSA key (\"no mutual signature algorithm\"), because it
+cannot know that rsa-sha2-512 is acceptable."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-ext-info+)
+    (ssh-write-u32 writer 1)
+    (ssh-write-text writer "server-sig-algs")
+    (ssh-write-name-list writer +ssh-server-user-key-algorithms+)
+    (ssh-session-send-payload session (ssh-writer-output writer))))
+
 (defun ssh-server-send-newkeys (session)
   "Send NEWKEYS, then switch our sending half to the negotiated keys."
   (let ((keys (ssh-session-derived-keys session))
@@ -248,6 +267,9 @@ came up."
                       :aead (getf keys :aead))
     (setf (ssh-session-keys-sent session) t
           (ssh-session-kexinit-sent session) nil)
+    (when (and (getf (ssh-session-negotiated session) :ext-info)
+               (not (ssh-session-rekey session)))
+      (ssh-server-send-ext-info session))
     (ssh-server-maybe-finish-kex session)))
 
 (defun ssh-server-handle-newkeys (session)
@@ -331,16 +353,20 @@ SSH-WRITE-STRING; writing its raw octets would shift every later field."
     (ssh-writer-output writer)))
 
 (defun ssh-server-verify-signature (session user algorithm key-blob signature)
-  "True when SIGNATURE covers this request and SESSION's session id."
-  (handler-case
-      (multiple-value-bind (type bytes) (ssh-parse-signature-blob signature)
-        (and (string= type algorithm)
-             (string= algorithm "ssh-ed25519")
-             (ssh-ed25519-verify
-              bytes
-              (ssh-server-signed-data session user algorithm key-blob)
-              (ssh-ed25519-key-bytes key-blob))))
-    (error () nil)))
+  "True when SIGNATURE covers this request and SESSION's session id.
+
+The request's ALGORITHM and the signature blob's own name must agree, so an
+rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
+  (and (ssh-server-user-key-algorithm-p key-blob algorithm)
+       (handler-case
+           (multiple-value-bind (signature-algorithm signature-bytes)
+               (ssh-parse-signature-blob signature)
+             (declare (ignore signature-bytes))
+             (and (string= signature-algorithm algorithm)
+                  (ssh-public-key-signature-valid-p
+                   key-blob signature
+                   (ssh-server-signed-data session user algorithm key-blob))))
+         (error () nil))))
 
 (defun ssh-server-complete-auth (session user key-blob)
   "Accept SESSION's authenticated user, then let the application run."
@@ -363,7 +389,7 @@ SSH-WRITE-STRING; writing its raw octets would shift every later field."
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader
                                     has-signature)
   "Handle one publickey attempt, signed or merely offered."
-  (if (and (string= algorithm "ssh-ed25519")
+  (if (and (ssh-server-user-key-algorithm-p key-blob algorithm)
            (ssh-server-authorized-key-p (ssh-session-server session)
                                         user key-blob))
       (if has-signature

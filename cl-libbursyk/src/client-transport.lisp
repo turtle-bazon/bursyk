@@ -85,6 +85,10 @@ line, and NIL while the line is still incomplete."
        (ssh-client-handle-kex-reply client payload))
       ((= type +ssh-msg-newkeys+)
        (ssh-client-handle-newkeys client))
+      ((= type +ssh-msg-ext-info+)
+       ;; RFC 8308 server-sig-algs and friends.  This client already knows
+       ;; which signatures it can offer, so the announcement adds nothing.
+       nil)
       ((= type +ssh-msg-service-accept+)
        (ssh-client-handle-service-accept client payload))
       ((= type +ssh-msg-userauth-success+)

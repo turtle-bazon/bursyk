@@ -1178,10 +1178,10 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.5")
+           :server-version "bursyk-server_0.0.2.6")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.5" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.6" greeting)))))
 
 (test server-version-is-checked-before-it-reaches-the-wire
   (is (equal "burst_1.2.3"
@@ -1767,3 +1767,72 @@ also covers that the verifier trims it before padding to the curve width."
      "alias"
      :on-options (lambda (value) (setf options value)))
     (is (= 2200 (cl-pnet-ssh:ssh-config-options-port options)))))
+
+(test public-key-signature-valid-p-covers-ed25519-rsa-and-ecdsa
+  ;; User authentication uses the same verifier as host-key checking, so an
+  ;; authorized key of any supported type must verify under the signature
+  ;; algorithm its request names.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (spec '(("ed25519" nil "ssh-ed25519" "rsa-sha2-256")
+                      ("rsa" "2048" "ssh-rsa" "ssh-ed25519")
+                      ("ecdsa" "256" "ecdsa-sha2-nistp256"
+                       "ecdsa-sha2-nistp384")))
+        (destructuring-bind (kind bits type wrong-algorithm) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-userkey"))
+                 (path (merge-pathnames (format nil "id_~A" kind) directory)))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (progn
+                   (ssh-keygen
+                    (append (list "-q" "-t" kind)
+                            (when bits (list "-b" bits))
+                            (list "-N" "" "-f" (namestring path))))
+                   (let* ((key (ssh-load-private-key path))
+                          (blob (ssh-public-key-blob-of key))
+                          (message (octets-ascii "userauth data"))
+                          (signature
+                            (cl-pnet-ssh::ssh-private-key-signature-blob
+                             key message))
+                          (algorithm
+                            (nth-value 0 (ssh-parse-signature-blob signature))))
+                     (is (string= type (nth-value 0 (ssh-public-key-parts blob))))
+                     (is (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                          blob signature message))
+                     (is (not (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                               blob signature (octets-ascii "other data"))))
+                     (is (cl-pnet-ssh::ssh-server-user-key-algorithm-p
+                          blob algorithm))
+                     (is (not (cl-pnet-ssh::ssh-server-user-key-algorithm-p
+                               blob wrong-algorithm)))
+                     (when (string= type "ssh-rsa")
+                       ;; One RSA key signs under any RFC 8332 name.
+                       (is (cl-pnet-ssh::ssh-server-user-key-algorithm-p
+                            blob "rsa-sha2-512")))))
+              (ignore-errors (delete-directory-tree directory :validate t))))))))
+
+(test kex-markers-are-never-selected
+  ;; ext-info-* and kex-strict-* are negotiation signals.  A peer that lists
+  ;; one as a key exchange method must not make the server choose it.
+  (is (cl-pnet-ssh::ssh-kex-marker-p "ext-info-c"))
+  (is (cl-pnet-ssh::ssh-kex-marker-p "ext-info-s"))
+  (is (cl-pnet-ssh::ssh-kex-marker-p "kex-strict-s-v00@openssh.com"))
+  (is (not (cl-pnet-ssh::ssh-kex-marker-p "curve25519-sha256")))
+  (is (string= "curve25519-sha256"
+               (cl-pnet-ssh::ssh-choose-algorithm
+                (remove-if #'cl-pnet-ssh::ssh-kex-marker-p
+                           (list "kex-strict-s-v00@openssh.com"
+                                 "ext-info-s" "curve25519-sha256"))
+                (list "ext-info-s" "kex-strict-s-v00@openssh.com"
+                      "curve25519-sha256")))))
+
+(test server-advertises-the-user-key-signatures-it-accepts
+  ;; EXT_INFO's server-sig-algs is what makes an OpenSSH client willing to
+  ;; try an RSA key; the modern names must be there.
+  (dolist (algorithm '("ssh-ed25519" "ecdsa-sha2-nistp256"
+                       "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521"
+                       "rsa-sha2-512" "rsa-sha2-256"))
+    (is (member algorithm cl-pnet-ssh::+ssh-server-user-key-algorithms+
+                :test #'string=)))
+  (is (not (member "ssh-rsa" cl-pnet-ssh::+ssh-server-user-key-algorithms+
+                   :test #'string=))))

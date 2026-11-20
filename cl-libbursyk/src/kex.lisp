@@ -41,7 +41,7 @@
 
 ;;; ---- Identification and disconnection ----
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.6"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.7"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -330,43 +330,51 @@ the client-to-server and server-to-client directions, not the two ends."
   (let ((reader (ssh-make-reader blob)))
     (values (ssh-read-text reader) (ssh-read-string reader))))
 
+(defun ssh-kex-marker-p (name)
+  "Whether NAME is a KEXINIT marker rather than a key exchange method.
+
+ext-info-c, ext-info-s and the kex-strict-* names are negotiation signals;
+selecting one as the exchange algorithm would abort the connection."
+  (or (string= name "ext-info-c")
+      (string= name "ext-info-s")
+      (let ((prefix "kex-strict-"))
+        (and (>= (length name) (length prefix))
+             (string= prefix name :end2 (length prefix))))))
+
+(defun ssh-public-key-signature-valid-p (key-blob signature-blob message)
+  "Whether SIGNATURE-BLOB over MESSAGE verifies under public KEY-BLOB.
+
+Everything this library can verify is supported here: ssh-ed25519, ssh-rsa
+under any of RFC 8332's three signature names, and the three ECDSA curves.
+A malformed or mismatched blob is simply not a valid signature."
+  (handler-case
+      (multiple-value-bind (type key-bytes) (ssh-public-key-parts key-blob)
+        (multiple-value-bind (algorithm signature)
+            (ssh-parse-signature-blob signature-blob)
+          (cond
+            ((string= type "ssh-ed25519")
+             (and (string= algorithm "ssh-ed25519")
+                  (ssh-ed25519-verify signature message key-bytes)))
+            ((string= type "ssh-rsa")
+             (let ((digest (ssh-rsa-digest-keyword algorithm)))
+               (and digest
+                    (ssh-rsa-verify key-bytes signature digest message))))
+            ((member type '("ecdsa-sha2-nistp256"
+                            "ecdsa-sha2-nistp384"
+                            "ecdsa-sha2-nistp521")
+                     :test #'string=)
+             (and (string= algorithm type)
+                  (ssh-ecdsa-verify key-bytes signature message)))
+            (t nil))))
+    (error () nil)))
+
 (defun ssh-verify-host-signature (host-key-blob signature-blob exchange-hash)
   "Signal unless SIGNATURE-BLOB by HOST-KEY-BLOB covers EXCHANGE-HASH.
 
 The key blob names the key type; the signature blob names the algorithm.
 An RSA host key keeps the ssh-rsa type while the algorithm says
 rsa-sha2-256 or rsa-sha2-512, exactly as RFC 8332 defines."
-  (multiple-value-bind (type key-bytes) (ssh-public-key-parts host-key-blob)
-    (multiple-value-bind (algorithm signature)
-        (ssh-parse-signature-blob signature-blob)
-      (flet ((verify (ok)
-               (unless ok
-                 (error 'ssh-protocol-error
-                        :detail "host key signature does not verify"))))
-        (cond
-          ((string= type "ssh-ed25519")
-           (unless (string= algorithm "ssh-ed25519")
-             (error 'ssh-protocol-error
-                    :detail (format nil "host key ~A signed with ~A"
-                                    type algorithm)))
-           (verify (ssh-ed25519-verify signature exchange-hash key-bytes)))
-          ((string= type "ssh-rsa")
-           (let ((digest (ssh-rsa-digest-keyword algorithm)))
-             (unless digest
-               (error 'ssh-protocol-error
-                      :detail (format nil "host key ~A signed with ~A"
-                                      type algorithm)))
-             (verify (ssh-rsa-verify key-bytes signature digest
-                                     exchange-hash))))
-          ((member type '("ecdsa-sha2-nistp256"
-                          "ecdsa-sha2-nistp384"
-                          "ecdsa-sha2-nistp521")
-                   :test #'string=)
-           (unless (string= algorithm type)
-             (error 'ssh-protocol-error
-                    :detail (format nil "host key ~A signed with ~A"
-                                    type algorithm)))
-           (verify (ssh-ecdsa-verify key-bytes signature exchange-hash)))
-          (t
-           (error 'ssh-protocol-error
-                  :detail (format nil "unsupported host key type ~A" type))))))))
+  (unless (ssh-public-key-signature-valid-p
+           host-key-blob signature-blob exchange-hash)
+    (error 'ssh-protocol-error
+           :detail "host key signature does not verify")))

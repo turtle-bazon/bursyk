@@ -20,7 +20,7 @@
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
-  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.6")
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.7")
   (server-version nil)
   (session-id nil)
   (cipher (ssh-make-cipher-state))

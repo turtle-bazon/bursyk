@@ -17,7 +17,9 @@
       (let ((position (position-if
                        (lambda (field)
                          (member field '("ssh-ed25519" "ssh-rsa"
-                                         "ecdsa-sha2-nistp256")
+                                         "ecdsa-sha2-nistp256"
+                                         "ecdsa-sha2-nistp384"
+                                         "ecdsa-sha2-nistp521")
                                  :test #'string=))
                        fields)))
         (when (and position (< (1+ position) (length fields)))
@@ -26,6 +28,40 @@
           (handler-case
               (ssh-base64-octets (nth (1+ position) fields))
             (cl-base64:bad-base64-character () nil)))))))
+
+(defparameter +ssh-server-user-key-algorithms+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "rsa-sha2-512"
+    "rsa-sha2-256")
+  "Public-key signature algorithms the server accepts for user auth.
+
+This is what EXT_INFO's server-sig-algs names.  SHA-1 ssh-rsa is accepted
+for old clients but not advertised, matching modern OpenSSH defaults.")
+
+(defun ssh-server-user-key-algorithm-p (key-blob algorithm)
+  "Whether KEY-BLOB may sign as ALGORITHM in a userauth request.
+
+The key type decides the names it may use: an ECDSA key signs under its
+curve's name, an RSA key under any RFC 8332 name, and ed25519 under its own.
+A blob that does not parse is never acceptable."
+  (handler-case
+      (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+        (declare (ignore data))
+        (cond
+          ((string= type "ssh-ed25519")
+           (string= algorithm "ssh-ed25519"))
+          ((string= type "ssh-rsa")
+           (not (null (ssh-rsa-digest-keyword algorithm))))
+          ((member type '("ecdsa-sha2-nistp256"
+                          "ecdsa-sha2-nistp384"
+                          "ecdsa-sha2-nistp521")
+                   :test #'string=)
+           (string= algorithm type))
+          (t nil)))
+    (error () nil)))
 
 (defun ssh-authorized-key-file-blobs (path)
   "Every well-formed key blob in the authorized_keys file at PATH."

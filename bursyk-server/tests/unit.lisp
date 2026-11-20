@@ -611,3 +611,14 @@ PermitOpen db:5432")))
   (signals cl-pnet-ssh:ssh-server-config-error
     (cl-pnet-ssh:ssh-server-config-load
      nil :options '("Port=2200" "Port=2201"))))
+
+(test authorized-keys-recognise-every-ecdsa-curve
+  ;; The authorized_keys reader decides which key lines are worth decoding;
+  ;; all three curves OpenSSH can write must be recognised.
+  (dolist (type '("ecdsa-sha2-nistp256"
+                  "ecdsa-sha2-nistp384"
+                  "ecdsa-sha2-nistp521"))
+    (is (cl-pnet-ssh::ssh-authorized-key-line-blob
+         (format nil "~A AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=" type))))
+  (is (null (cl-pnet-ssh::ssh-authorized-key-line-blob
+             "ssh-dss AAAAB3NzaC1kc3M="))))
