@@ -46,7 +46,7 @@ disconnect rather than a plain application one.")
 
 ;;; ---- Identification and disconnection ----
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.14"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.15"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -100,13 +100,18 @@ with SSH-CONCAT around it would hand the peer the text itself as a length."
 
 ;;; ---- Algorithm preferences ----
 
-(defparameter +ssh-kex-algorithms+
+(defparameter +ssh-kex-real-algorithms+
   '("curve25519-sha256"
-    "curve25519-sha256@libssh.org"
-    ;; Not algorithms: markers asking the peer to answer EXT_INFO and to
-    ;; reset packet sequence numbers at NEWKEYS (OpenSSH's strict KEX).
-    "ext-info-c"
-    "kex-strict-c-v00@openssh.com"))
+    "curve25519-sha256@libssh.org")
+  "The key-exchange methods themselves, without the protocol markers.")
+
+(defparameter +ssh-kex-algorithms+
+  (append +ssh-kex-real-algorithms+
+          ;; Not algorithms: markers asking the peer to answer EXT_INFO and
+          ;; to reset packet sequence numbers at NEWKEYS (OpenSSH's strict
+          ;; KEX).  They ride along with whatever KexAlgorithms selects.
+          '("ext-info-c"
+            "kex-strict-c-v00@openssh.com")))
 
 (defparameter +ssh-host-key-algorithms+
   '("ssh-ed25519"
@@ -189,15 +194,92 @@ rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa."
     (when (member candidate theirs :test #'string=)
       (leave candidate))))
 
-(defun ssh-make-kexinit-payload ()
-  "A fresh SSH_MSG_KEXINIT."
-  (let ((writer (ssh-writer)))
+(defun ssh-algorithm-pattern-matches (pattern supported option)
+  "SUPPORTED names matching the glob PATTERN, in SUPPORTED order."
+  (when (and (plusp (length pattern)) (char= (char pattern 0) #\!))
+    (error 'ssh-config-error
+           :keyword option
+           :detail (format nil "negated pattern ~A is not allowed here"
+                           pattern)))
+  (let ((matches (remove-if-not (lambda (name)
+                                  (ssh-match-pattern pattern name))
+                                supported)))
+    (unless matches
+      (error 'ssh-config-error
+             :keyword option
+             :detail (format nil "~A matches no algorithm this build offers (~{~A~^, ~})"
+                             pattern supported)))
+    matches))
+
+(defun ssh-resolve-algorithm-list (names supported option)
+  "NAMES, a configured algorithm list, as the ordered list this build offers.
+
+NAMES is the comma-separated list ssh_config or a command-line flag gave,
+split into strings.  ssh's prefixes apply: a leading + appends to SUPPORTED,
+- removes from it, and ^ puts the named algorithms first.  A plain list
+replaces SUPPORTED outright, so an algorithm absent from this build is an
+error instead of being silently dropped."
+  (let* ((text (format nil "~{~A~^,~}" (remove "" names :test #'string=)))
+         (head (and (plusp (length text)) (char text 0)))
+         (mode (cond ((null head) :replace)
+                     ((char= head #\+) :append)
+                     ((char= head #\-) :remove)
+                     ((char= head #\^) :prepend)
+                     (t :replace)))
+         (patterns (if (eq mode :replace) text (subseq text 1))))
+    (flet ((expand ()
+             (let ((result '()))
+               (dolist (pattern (uiop:split-string patterns :separator ",")
+                        (nreverse result))
+                 (dolist (name (ssh-algorithm-pattern-matches
+                                pattern supported option))
+                   (pushnew name result :test #'string=))))))
+      (ecase mode
+        (:replace
+         (expand))
+        (:append
+         (let ((result (copy-list supported)))
+           (dolist (name (expand) result)
+             (unless (member name result :test #'string=)
+               (setf result (append result (list name)))))))
+        (:prepend
+         (let ((result (expand)))
+           (dolist (name supported result)
+             (unless (member name result :test #'string=)
+               (setf result (append result (list name)))))))
+        (:remove
+         (let ((kept (remove-if (lambda (name)
+                                  (some (lambda (pattern)
+                                          (ssh-match-pattern pattern name))
+                                        (uiop:split-string
+                                         patterns :separator ",")))
+                                supported)))
+           (unless kept
+             (error 'ssh-config-error
+                    :keyword option
+                    :detail (format nil "~A removes every algorithm this build offers"
+                                    text)))
+           kept))))))
+
+(defun ssh-kex-with-markers (kex)
+  "KEX with the EXT_INFO and strict-KEX markers this client always offers."
+  (let ((result (copy-list kex)))
+    (dolist (marker '("ext-info-c" "kex-strict-c-v00@openssh.com") result)
+      (unless (member marker result :test #'string=)
+        (setf result (append result (list marker)))))))
+
+(defun ssh-make-kexinit-payload (&key kex host-keys ciphers macs)
+  "A fresh SSH_MSG_KEXINIT, offering the caller's lists or this build's."
+  (let ((writer (ssh-writer))
+        (kex (if kex (ssh-kex-with-markers kex) +ssh-kex-algorithms+))
+        (host-keys (or host-keys +ssh-host-key-algorithms+))
+        (ciphers (or ciphers +ssh-ciphers+))
+        (macs (or macs +ssh-macs+)))
     (ssh-write-u8 writer +ssh-msg-kexinit+)
     (ssh-write-octets writer (ssh-random-octets 16))
-    (iter (for list in (list +ssh-kex-algorithms+
-                             +ssh-host-key-algorithms+
-                             +ssh-ciphers+ +ssh-ciphers+
-                             +ssh-macs+ +ssh-macs+
+    (iter (for list in (list kex host-keys
+                             ciphers ciphers
+                             macs macs
                              +ssh-compressions+ +ssh-compressions+
                              '() '()))
       (ssh-write-name-list writer list))
@@ -223,29 +305,37 @@ rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa."
           :languages-s2c (ssh-read-name-list reader)
           :first-kex-packet-follows (ssh-read-boolean reader))))
 
-(defun ssh-negotiate (server-kexinit)
+(defun ssh-negotiate (server-kexinit &key kex-algorithms host-key-algorithms
+                                       ciphers macs)
   "The mutually acceptable algorithms as a plist, or signal when empty.
 
 :STRICT is true when the peer offered OpenSSH's strict-KEX marker, which
-makes both sides reset packet sequence numbers at NEWKEYS."
-  (let* ((kex (ssh-choose-algorithm +ssh-kex-algorithms+
+makes both sides reset packet sequence numbers at NEWKEYS.  The keyword
+arguments override this build's lists, for ssh_config Ciphers and friends."
+  (let* ((kex-algorithms (or kex-algorithms +ssh-kex-algorithms+))
+         (host-key-algorithms (or host-key-algorithms
+                                  +ssh-host-key-algorithms+))
+         (ciphers (or ciphers +ssh-ciphers+))
+         (macs (or macs +ssh-macs+))
+         (kex (ssh-choose-algorithm kex-algorithms
                                     (getf server-kexinit :kex)))
-         (host-key (ssh-choose-algorithm +ssh-host-key-algorithms+
+         (host-key (ssh-choose-algorithm host-key-algorithms
                                          (getf server-kexinit :host-keys)))
-         (cipher-c2s (ssh-choose-algorithm +ssh-ciphers+
+         (cipher-c2s (ssh-choose-algorithm ciphers
                                            (getf server-kexinit :ciphers-c2s)))
-         (cipher-s2c (ssh-choose-algorithm +ssh-ciphers+
+         (cipher-s2c (ssh-choose-algorithm ciphers
                                            (getf server-kexinit :ciphers-s2c)))
-         (mac-c2s (ssh-choose-algorithm +ssh-macs+
+         (mac-c2s (ssh-choose-algorithm macs
                                         (getf server-kexinit :macs-c2s)))
-         (mac-s2c (ssh-choose-algorithm +ssh-macs+
+         (mac-s2c (ssh-choose-algorithm macs
                                         (getf server-kexinit :macs-s2c)))
          (compression (ssh-choose-algorithm +ssh-compressions+
                                             (getf server-kexinit
                                                   :compressions-c2s))))
     (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c compression)
       (error 'ssh-protocol-error
-             :detail "no common algorithm (need curve25519, a supported host key and chacha20-poly1305)"))
+             :detail (format nil "no common algorithm (we offer kex ~{~A~^,~}; host key ~{~A~^,~}; cipher ~{~A~^,~}; mac ~{~A~^,~})"
+                             kex-algorithms host-key-algorithms ciphers macs)))
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
           :mac-c2s mac-c2s :mac-s2c mac-s2c

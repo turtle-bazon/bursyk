@@ -383,19 +383,12 @@ model: after the destination everything belongs to the remote command."
 (defun check-algorithm-list (option value supported)
   "Reject an algorithm choice this build cannot offer.
 
-OpenSSH accepts +/-^ prefixes that edit the default list; the named
-algorithms still have to exist here, because the set is fixed at build time."
-  (let ((names (split-list value)))
-    (unless names
-      (fail "~A needs at least one algorithm name" option))
-    (dolist (name names)
-      (let ((plain (if (and (plusp (length name))
-                            (member (char name 0) '(#\+ #\- #\^)))
-                       (subseq name 1)
-                       name)))
-        (unless (member plain supported :test #'string=)
-          (fail "~A: unsupported algorithm ~A (this build offers ~{~A~^, ~})"
-                option plain supported))))))
+ssh's +/-^ prefixes and glob patterns are applied exactly as in ssh_config, so
+a name this build lacks is an error instead of a silently widened offer."
+  (handler-case
+      (cl-pnet-ssh:ssh-resolve-algorithm-list (split-list value) supported option)
+    (cl-pnet-ssh:ssh-config-error (condition)
+      (fail "~A" condition))))
 
 (defun check-supported-options ()
   "Fail before connecting on a flag whose feature is not in this build."
@@ -433,7 +426,7 @@ algorithms still have to exist here, because the set is fixed at build time."
                           cl-pnet-ssh:+ssh-macs+))
   (when (getf *options* :kex-algorithms)
     (check-algorithm-list "KexAlgorithms" (getf *options* :kex-algorithms)
-                          cl-pnet-ssh:+ssh-kex-algorithms+))
+                          cl-pnet-ssh:+ssh-kex-real-algorithms+))
   (when (getf *options* :address-family)
     (unless (member (getf *options* :address-family) '("inet" "any")
                     :test #'string-equal)
@@ -473,7 +466,35 @@ still disables the feature and therefore silences the refusal."
                      (cl-pnet-ssh:ssh-config-options-forward-x11-trusted
                       options))
                  (not (eq (getf *options* :x11-forward) :no)))
-        (unsupported "ForwardX11" "X11 forwarding is not implemented")))))
+        (unsupported "ForwardX11" "X11 forwarding is not implemented"))
+      ;; Every one of these is a real request from the configuration.  This
+      ;; build cannot honour it, and pretending otherwise would leave the
+      ;; user with a weaker or different connection than they asked for.
+      (when (cl-pnet-ssh:ssh-config-options-certificate-files options)
+        (unsupported "CertificateFile"
+                     "certificate authentication is not implemented"))
+      (when (cl-pnet-ssh:ssh-config-options-bind-address options)
+        (unsupported "BindAddress"
+                     "binding the source address is not implemented"))
+      (when (cl-pnet-ssh:ssh-config-options-rekey-limit options)
+        (unsupported "RekeyLimit" "rekeying is not implemented"))
+      (when (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)
+                :no)
+        (unsupported "PubkeyAuthentication no"
+                     "public-key authentication is the only method implemented"))
+      (let ((methods
+              (cl-pnet-ssh:ssh-config-options-preferred-authentications
+               options)))
+        (when (and methods
+                   (not (member "publickey" methods :test #'string-equal)))
+          (unsupported
+           "PreferredAuthentications"
+           (format nil "~{~A~^,~} excludes publickey, the only method implemented"
+                   methods))))
+      (when (eq (cl-pnet-ssh:ssh-config-options-address-family options)
+                :inet6)
+        (unsupported "AddressFamily inet6"
+                     "this build resolves IPv4 addresses only")))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -552,6 +573,19 @@ itself never blocks: this matcher is what a caller supplies."
 (defun command-line-option-list ()
   "The -o options in the order they were written."
   (reverse (getf *options* :options)))
+
+(defun resolver-option-list ()
+  "Every algorithm choice from the command line, as ssh_config lines.
+
+-o values already form a list; -c and -m are separate flags, so they are
+turned into Ciphers and MACs lines here.  They come first, and OpenSSH keeps
+the first value, so a dedicated flag outranks an -o for the same keyword."
+  (let ((options (command-line-option-list)))
+    (when (getf *options* :macs)
+      (push (format nil "MACs ~A" (getf *options* :macs)) options))
+    (when (getf *options* :ciphers)
+      (push (format nil "Ciphers ~A" (getf *options* :ciphers)) options))
+    options))
 
 (defun apply-command-line-options ()
   (dolist (option (command-line-option-list))
@@ -1630,7 +1664,7 @@ of calling back in the middle of authentication."
    ;; Every -o keyword reaches the same resolver the file uses, so facts the
    ;; command line has no dedicated flag for (HostName, ConnectTimeout,
    ;; ServerAliveInterval, ...) work too.
-   :options (command-line-option-list)
+   :options (resolver-option-list)
    :exec-matcher #'match-exec
    :on-client (lambda (client)
                 (setf *client* client)

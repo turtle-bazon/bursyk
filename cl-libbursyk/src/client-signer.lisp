@@ -41,6 +41,15 @@ ed25519, RSA and ECDSA keys all sign locally."
 An agent signs, so a curve it supports is enough; the client only has to
 name the key type the same way the protocol does.")
 
+(defparameter +ssh-signature-algorithms+
+  '("ssh-ed25519" "rsa-sha2-256"
+    "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521")
+  "Signature algorithms a signer here can name.
+
+RSA signs as rsa-sha2-256 rather than the SHA-1 ssh-rsa, so
+PubkeyAcceptedAlgorithms is resolved against this list; naming ssh-rsa is
+an error rather than a silent downgrade.")
+
 (defun ssh-agent-signer (key-blob path)
   "A signer that has the agent at PATH sign with KEY-BLOB."
   (multiple-value-bind (type data) (ssh-public-key-parts key-blob)

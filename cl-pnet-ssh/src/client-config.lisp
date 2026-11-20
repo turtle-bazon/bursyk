@@ -98,6 +98,15 @@ mean the feature is off to MAKE-SSH-CLIENT."
   "VALUE as a non-negative count, or NIL when it was not configured."
   (and (integerp value) value))
 
+(defun ssh-config-client-algorithms (options accessor supported option)
+  "OPTIONS' algorithm choice as this build's ordered offer, or NIL for default.
+
+Turning it into a list here means an algorithm this build lacks stops the
+client instead of quietly widening what it offers."
+  (let ((names (funcall accessor options)))
+    (when names
+      (ssh-resolve-algorithm-list names supported option))))
+
 (defun ssh-config-client-parameters (host options
                                      &key user port private-key agent passphrase
                                        known-hosts host-key-policy
@@ -116,6 +125,26 @@ MAKE-SSH-CLIENT's own defaults."
         :agent (ssh-config-client-agent options agent)
         :passphrase passphrase
         :known-hosts (ssh-config-client-known-hosts options known-hosts)
+        :kex-algorithms
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-kex-algorithms
+         +ssh-kex-real-algorithms+ "KexAlgorithms")
+        :host-key-algorithms
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-host-key-algorithms
+         +ssh-host-key-algorithms+ "HostKeyAlgorithms")
+        :ciphers
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-ciphers
+         +ssh-ciphers+ "Ciphers")
+        :macs
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-macs
+         +ssh-macs+ "MACs")
+        :pubkey-accepted-algorithms
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-pubkey-accepted-algorithms
+         +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms")
         :host-key-policy (or host-key-policy
                              (and (null host-key-callback)
                                   (ssh-config-client-policy options)))
@@ -384,6 +413,12 @@ uses whichever of the two it saw first instead of chaining them."
            :known-hosts (getf parameters :known-hosts)
            :host-key-policy (getf parameters :host-key-policy)
            :host-key-callback (getf parameters :host-key-callback)
+           :kex-algorithms (getf parameters :kex-algorithms)
+           :host-key-algorithms (getf parameters :host-key-algorithms)
+           :ciphers (getf parameters :ciphers)
+           :macs (getf parameters :macs)
+           :pubkey-accepted-algorithms
+           (getf parameters :pubkey-accepted-algorithms)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)
            :server-alive-count-max (getf parameters :server-alive-count-max)

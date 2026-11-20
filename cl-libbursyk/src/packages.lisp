@@ -122,6 +122,11 @@
    #:ssh-config-options-request-tty
    #:ssh-config-options-forward-agent
    #:ssh-config-options-compression
+   #:ssh-config-options-certificate-files
+   #:ssh-config-options-bind-address
+   #:ssh-config-options-rekey-limit
+   #:ssh-config-options-preferred-authentications
+   #:ssh-config-options-pubkey-authentication
    #:ssh-config-options-forward-x11
    #:ssh-config-options-forward-x11-trusted
    #:ssh-config-client-source
@@ -310,10 +315,12 @@
    #:ssh-make-kexinit-payload
    #:ssh-parse-kexinit-payload
    #:ssh-negotiate
+   #:ssh-resolve-algorithm-list
    #:ssh-parse-signature-blob
    ;; The offers this build can make, for -Q and for a caller that wants to
    ;; check a choice before connecting.
    #:+ssh-kex-algorithms+
+   #:+ssh-kex-real-algorithms+
    #:+ssh-host-key-algorithms+
    #:+ssh-ciphers+
    #:+ssh-macs+

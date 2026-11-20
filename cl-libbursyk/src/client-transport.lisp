@@ -14,7 +14,11 @@
                                    (ssh-client-client-version client)
                                    (string #\Return)
                                    (string #\Newline))))
-  (let ((kexinit (ssh-make-kexinit-payload)))
+  (let ((kexinit (ssh-make-kexinit-payload
+                  :kex (ssh-client-kex-algorithms client)
+                  :host-keys (ssh-client-host-key-algorithms client)
+                  :ciphers (ssh-client-ciphers client)
+                  :macs (ssh-client-macs client))))
     (setf (ssh-client-client-kexinit client) kexinit
           (ssh-client-kexinit-sent client) t)
     (ssh-client-send-payload client kexinit)))
@@ -126,13 +130,23 @@ A server-initiated rekey starts here too. Then we have not sent a KEXINIT for
 this exchange yet, and must do so before ECDH_INIT; the initial exchange sent
 its KEXINIT when the connection came up."
   (unless (ssh-client-kexinit-sent client)
-    (let ((kexinit (ssh-make-kexinit-payload)))
+    (let ((kexinit (ssh-make-kexinit-payload
+                    :kex (ssh-client-kex-algorithms client)
+                    :host-keys (ssh-client-host-key-algorithms client)
+                    :ciphers (ssh-client-ciphers client)
+                    :macs (ssh-client-macs client))))
       (setf (ssh-client-client-kexinit client) kexinit
             (ssh-client-kexinit-sent client) t)
       (ssh-client-send-payload client kexinit)))
   (let ((offers (ssh-parse-kexinit-payload payload)))
     (setf (ssh-client-server-kexinit client) payload
-          (ssh-client-negotiated client) (ssh-negotiate offers)
+          (ssh-client-negotiated client)
+          (ssh-negotiate offers
+                         :kex-algorithms (ssh-client-kex-algorithms client)
+                         :host-key-algorithms
+                         (ssh-client-host-key-algorithms client)
+                         :ciphers (ssh-client-ciphers client)
+                         :macs (ssh-client-macs client))
           ;; Strict KEX is negotiated once.  A rekey's KEXINIT leaves the
           ;; marker out, but the connection stays strict, so neither side may
           ;; forget it or the sequence resets at NEWKEYS stop matching.

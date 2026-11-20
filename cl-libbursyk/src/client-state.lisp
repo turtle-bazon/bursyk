@@ -20,7 +20,7 @@
   (phase :connecting)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
-  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.14")
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.15")
   (server-version nil)
   ;; USERAUTH_BANNER text, if the server sent one.  A program shows it once;
   ;; after that this is just the last banner received.
@@ -44,6 +44,16 @@
   (known-hosts nil)
   (host-key-policy :strict)
   (host-key-callback nil)
+  ;; Algorithm offers from ssh_config's Ciphers, MACs, KexAlgorithms and
+  ;; HostKeyAlgorithms.  NIL means this build's own list; a list from
+  ;; SSH-RESOLVE-ALGORITHM-LIST restricts what KEXINIT offers.
+  (kex-algorithms nil)
+  (host-key-algorithms nil)
+  (ciphers nil)
+  (macs nil)
+  ;; PubkeyAcceptedAlgorithms: key types that may authenticate.  NIL offers
+  ;; every signer; a list of patterns filters them before the first request.
+  (pubkey-accepted-algorithms nil)
   ;; ProxyCommand: a helper program carrying the stream on its stdin/stdout.
   ;; NIL means dial the address directly.
   proxy-command

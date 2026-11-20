@@ -166,7 +166,9 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                user known-hosts policy connect-timeout
                                server-alive-interval server-alive-count-max
                                proxy-command
-                               on-open on-error on-close on-forwarded-tcpip)
+                               on-open on-error on-close on-forwarded-tcpip
+                               &key kex-algorithms host-key-algorithms
+                                 ciphers macs pubkey-accepted-algorithms)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -180,23 +182,50 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :server-alive-interval server-alive-interval
                     :server-alive-count-max (or server-alive-count-max 3)
                     :proxy-command (ssh-proxy-command-value proxy-command)
+                    :kex-algorithms kex-algorithms
+                    :host-key-algorithms host-key-algorithms
+                    :ciphers ciphers
+                    :macs macs
+                    :pubkey-accepted-algorithms pubkey-accepted-algorithms
                     :on-open on-open
                     :on-error on-error
                     :on-close on-close
                     :on-forwarded-tcpip on-forwarded-tcpip))
+
+(defun ssh-filter-signers (signers patterns)
+  "SIGNERS whose type matches one of PATTERNS, or SIGNERS when PATTERNS is NIL."
+  (if (null patterns)
+      signers
+      (remove-if-not
+       (lambda (signer)
+         (let ((type (ssh-signer-type signer)))
+           (some (lambda (pattern) (ssh-match-pattern pattern type))
+                 patterns)))
+       signers)))
 
 (defun ssh-resolve-and-connect (client private-key agent passphrase)
   "Find CLIENT's signers, then start its connection.
 
 Key files load at once; an agent is asked over its socket without blocking,
 and the SSH connection starts as soon as the signers are known.  A failure
-in either step ends CLIENT through its error callback."
+in either step ends CLIENT through its error callback.  PubkeyAcceptedAlgorithms
+is applied here, before any request names a key the configuration forbade."
   (ssh-client-start-connect-timer client)
   (ssh-resolve-signers
    private-key agent passphrase
    (lambda (signers)
-     (setf (ssh-client-signers client) signers)
-     (ssh-open-connection client))
+     (let ((signers (ssh-filter-signers
+                     signers
+                     (ssh-client-pubkey-accepted-algorithms client))))
+       (if (null signers)
+           (ssh-client-fail
+            client
+            (make-condition
+             'ssh-authentication-error
+             :detail "no key matches PubkeyAcceptedAlgorithms"))
+           (progn
+             (setf (ssh-client-signers client) signers)
+             (ssh-open-connection client)))))
    (lambda (condition)
      (ssh-client-fail client condition)))
   client)
@@ -207,6 +236,8 @@ in either step ends CLIENT through its error callback."
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
+                             kex-algorithms host-key-algorithms
+                             ciphers macs pubkey-accepted-algorithms
                              on-open on-error on-close on-forwarded-tcpip)
   "Connect to HOST as USER, authenticate, return at once.
 
@@ -250,7 +281,13 @@ role-neutral."
                            connect-timeout
                            server-alive-interval server-alive-count-max
                            proxy-command
-                           on-open on-error on-close on-forwarded-tcpip)
+                           on-open on-error on-close on-forwarded-tcpip
+                           :kex-algorithms kex-algorithms
+                           :host-key-algorithms host-key-algorithms
+                           :ciphers ciphers
+                           :macs macs
+                           :pubkey-accepted-algorithms
+                           pubkey-accepted-algorithms)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

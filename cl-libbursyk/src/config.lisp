@@ -17,7 +17,7 @@
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.14")
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.15")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
@@ -935,7 +935,7 @@ understand them rather than silently match nothing."
                (ssh-config-split-list value)))
         ((string= keyword "pubkeyauthentication")
          (setf (ssh-config-options-pubkey-authentication options)
-               (boolean)))
+               (if (boolean) :yes :no)))
         ((string= keyword "passwordauthentication")
          (setf (ssh-config-options-password-authentication options)
                (boolean)))

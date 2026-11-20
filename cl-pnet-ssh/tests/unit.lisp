@@ -283,8 +283,8 @@ flag at a rekey would make the two sides count packets differently."
                (unwind-protect
                     (progn
                       (setf (symbol-function 'cl-pnet-ssh::ssh-negotiate)
-                            (lambda (offers)
-                              (declare (ignore offers))
+                            (lambda (offers &rest arguments)
+                              (declare (ignore offers arguments))
                               (list :kex "curve25519-sha256"
                                     :host-key "ssh-ed25519"
                                     :cipher-c2s "chacha20-poly1305@openssh.com"
@@ -1391,11 +1391,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.13"
+           :server-version "bursyk-server_0.0.2.14"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.13 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.14 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1406,11 +1406,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.13"
+           :server-version "bursyk-server_0.0.2.14"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.13" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.14" greeting)))))
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
@@ -1426,7 +1426,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.14" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.15" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))
@@ -1659,6 +1659,73 @@ newline")))
            :user "cli-user" :port 2222)))
     (is (equal "cli-user" (getf parameters :user)))
     (is (= 2222 (getf parameters :port)))))
+
+(test algorithm-selection-follows-ssh-prefixes
+  ;; ssh_config's +, - and ^ prefixes edit this build's list; a name it does
+  ;; not offer is an error, never a silently widened offer.
+  (is (equal '("chacha20-poly1305@openssh.com")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("chacha20-poly1305@openssh.com")
+              cl-pnet-ssh:+ssh-ciphers+ "Ciphers")))
+  (is (equal '("hmac-sha2-256" "hmac-sha2-512")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("+hmac-sha2-256") cl-pnet-ssh:+ssh-macs+ "MACs")))
+  (is (equal '("hmac-sha2-512")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("-hmac-sha2-256") cl-pnet-ssh:+ssh-macs+ "MACs")))
+  (is (equal '("hmac-sha2-512" "hmac-sha2-256")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("^hmac-sha2-512") cl-pnet-ssh:+ssh-macs+ "MACs")))
+  ;; ssh_config allows glob patterns in these lists too.
+  (is (equal '("hmac-sha2-256" "hmac-sha2-512")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("hmac-sha2-*") cl-pnet-ssh:+ssh-macs+ "MACs")))
+  (is (equal '("curve25519-sha256")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("curve25519-sha256")
+              cl-pnet-ssh:+ssh-kex-real-algorithms+ "KexAlgorithms")))
+  (signals cl-pnet-ssh:ssh-config-error
+    (cl-pnet-ssh:ssh-resolve-algorithm-list
+     '("aes128-ctr") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"))
+  (signals cl-pnet-ssh:ssh-config-error
+    (cl-pnet-ssh:ssh-resolve-algorithm-list
+     '("-*") cl-pnet-ssh:+ssh-macs+ "MACs")))
+
+(test kex-markers-survive-a-restricted-kex-list
+  ;; ext-info and strict KEX are protocol markers, not choices; a KexAlgorithms
+  ;; restriction must not turn them off.
+  (let ((offers (map 'string #'code-char
+                     (cl-pnet-ssh:ssh-make-kexinit-payload
+                      :kex '("curve25519-sha256")))))
+    (is (not (null (search "ext-info-c" offers))))
+    (is (not (null (search "kex-strict-c-v00@openssh.com" offers))))))
+
+(test facade-client-parameters-carry-algorithm-choices
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options
+            (list :ciphers '("chacha20-poly1305@openssh.com")
+                  :macs '("-hmac-sha2-256")
+                  :kex-algorithms '("curve25519-sha256")
+                  :host-key-algorithms '("ssh-ed25519")
+                  :pubkey-accepted-algorithms '("ssh-ed25519"))))))
+    (is (equal '("chacha20-poly1305@openssh.com")
+               (getf parameters :ciphers)))
+    (is (equal '("hmac-sha2-512") (getf parameters :macs)))
+    (is (equal '("curve25519-sha256") (getf parameters :kex-algorithms)))
+    (is (equal '("ssh-ed25519") (getf parameters :host-key-algorithms)))
+    (is (equal '("ssh-ed25519")
+               (getf parameters :pubkey-accepted-algorithms))))
+  ;; Absent choices leave the client on this build's own lists.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias" (facade-options nil))))
+    (is (null (getf parameters :ciphers)))
+    (is (null (getf parameters :macs)))
+    (is (null (getf parameters :kex-algorithms)))
+    (is (null (getf parameters :host-key-algorithms)))
+    (is (null (getf parameters :pubkey-accepted-algorithms)))))
 
 ;;; ---- Command-line -o options ----
 
