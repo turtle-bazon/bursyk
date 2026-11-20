@@ -17,7 +17,7 @@
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
 
-(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.7")
+(defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.8")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
@@ -605,9 +605,76 @@ enough.  Commas in a pattern are separators, as in ssh_config."
          (let ((mask (if (zerop bits)
                          0
                          (logand #xFFFFFFFF
-                                 (ash #xFFFFFFFF (- bits 32))))))
+                                 (ash #xFFFFFFFF (- 32 bits))))))
            (= (logand (ssh-config-ipv4-integer network) mask)
               (logand (ssh-config-ipv4-integer host) mask))))))
+
+(defun ssh-config-ipv6-words (string)
+  "The eight 16-bit words of an IPv6 literal, or NIL when it is not one.
+
+A trailing dotted quad is accepted, as in \"::ffff:192.168.1.1\", and one
+\"::\" stands for however many zero words are needed."
+  (let ((failed nil))
+    (labels ((words (part)
+               (if (zerop (length part))
+                   '()
+                   (uiop:split-string part :separator ":")))
+             (word (text)
+               (if (and (plusp (length text))
+                        (<= (length text) 4)
+                        (every (lambda (c) (digit-char-p c 16)) text))
+                   (parse-integer text :radix 16)
+                   (progn (setf failed t) nil)))
+             (v4-words (text)
+               (let ((octets (ssh-config-ipv4-octets text)))
+                 (if octets
+                     (list (+ (ash (first octets) 8) (second octets))
+                           (+ (ash (third octets) 8) (fourth octets)))
+                     (progn (setf failed t) nil))))
+             (expand (parts)
+               (let ((result '()))
+                 (dolist (part parts (nreverse result))
+                   (if (find #\. part)
+                       (dolist (w (v4-words part)) (push w result))
+                       (push (word part) result))))))
+      (let* ((double (search "::" string))
+             (left (expand (words (if double (subseq string 0 double) string))))
+             (right (and double
+                         (expand (words (subseq string (+ double 2)))))))
+        (unless failed
+          (cond
+            ((null double)
+             (when (= 8 (length left)) left))
+            ((<= (+ (length left) (length right)) 8)
+             (append left
+                     (make-list (- 8 (length left) (length right))
+                                :initial-element 0)
+                     right))))))))
+
+(defun ssh-config-ipv6-cidr-match-p (cidr address)
+  "Whether IPv6 ADDRESS is inside CIDR, whose prefix counts high-order bits.
+
+sshd accepts these in AllowUsers/DenyUsers host patterns, so a deny list must
+understand them rather than silently match nothing."
+  (let* ((slash (position #\/ cidr))
+         (network (ssh-config-ipv6-words (if slash (subseq cidr 0 slash) cidr)))
+         (bits (if slash
+                   (handler-case
+                       (parse-integer cidr :start (1+ slash) :junk-allowed t)
+                     (parse-error () nil))
+                   128))
+         (host (ssh-config-ipv6-words address)))
+    (and network host bits (<= 0 bits 128)
+         (let* ((full (floor bits 16))
+                (rest (mod bits 16))
+                (mask (if (zerop rest)
+                          0
+                          (logand #xFFFF (ash #xFFFF (- 16 rest))))))
+           (and (loop for index below full
+                      always (= (nth index network) (nth index host)))
+                (or (zerop rest)
+                    (= (logand (nth full network) mask)
+                       (logand (nth full host) mask))))))))
 
 (defun ssh-config-localnetwork-match-p (cidrs local-addresses)
   (let ((cidrs (loop for cidr in (uiop:split-string cidrs :separator ",")
@@ -615,7 +682,8 @@ enough.  Commas in a pattern are separators, as in ssh_config."
     (and local-addresses
          (some (lambda (address)
                  (some (lambda (cidr)
-                         (ssh-config-ipv4-cidr-match-p cidr address))
+                         (or (ssh-config-ipv4-cidr-match-p cidr address)
+                             (ssh-config-ipv6-cidr-match-p cidr address)))
                        cidrs))
                local-addresses))))
 

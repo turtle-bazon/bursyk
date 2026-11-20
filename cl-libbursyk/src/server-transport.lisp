@@ -308,8 +308,22 @@ cannot know that rsa-sha2-512 is acceptable."
     (ssh-write-text writer service)
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
-(defun ssh-server-send-auth-failure (session)
-  "Refuse the current attempt and say publickey is the only method."
+(defun ssh-server-send-auth-failure (session &key (count t))
+  "Refuse the current attempt and say publickey is the only method.
+
+COUNT is false for sshd's two exempt cases: the first \"none\" probe and an
+unsigned publickey offer that was answered with PK_OK.  Reaching
+MaxAuthTries sends DISCONNECT instead of another failure."
+  (when count
+    (incf (ssh-session-auth-failures session))
+    (when (>= (ssh-session-auth-failures session)
+              (ssh-server-max-auth-tries (ssh-session-server session)))
+      (ssh-session-send-payload-and-close
+       session
+       (ssh-disconnect-payload "Too many authentication failures"
+                               +ssh-disconnect-protocol-error+)
+       :auth-failures)
+      (return-from ssh-server-send-auth-failure nil)))
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-userauth-failure+)
     (ssh-write-name-list writer '("publickey"))
@@ -378,24 +392,54 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
   (when (ssh-server-on-session (ssh-session-server session))
     (funcall (ssh-server-on-session (ssh-session-server session)) session)))
 
-(defun ssh-server-handle-signed-key (session user algorithm key-blob reader)
+(defun ssh-server-handle-signed-key (session user algorithm key-blob reader
+                                    &key (count t))
   (let ((signature (ssh-read-string reader)))
     (if (and (ssh-server-verify-signature session user algorithm key-blob signature)
              (ssh-server-authorized-key-p (ssh-session-server session)
                                           user key-blob))
         (ssh-server-complete-auth session user key-blob)
-        (ssh-server-send-auth-failure session))))
+        (ssh-server-send-auth-failure session :count count))))
 
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader
-                                    has-signature)
+                                    has-signature &key (count t))
   "Handle one publickey attempt, signed or merely offered."
   (if (and (ssh-server-user-key-algorithm-p key-blob algorithm)
            (ssh-server-authorized-key-p (ssh-session-server session)
                                         user key-blob))
       (if has-signature
-          (ssh-server-handle-signed-key session user algorithm key-blob reader)
+          (ssh-server-handle-signed-key session user algorithm key-blob reader
+                                        :count count)
+          ;; An accepted offer is sshd's "partial" attempt: it may not count
+          ;; against MaxAuthTries because no authentication was tried.
           (ssh-server-send-pk-ok session algorithm key-blob))
-      (ssh-server-send-auth-failure session)))
+      (ssh-server-send-auth-failure session :count count)))
+
+(defun ssh-server-user-permitted-p (session user)
+  "Whether the application admits USER on SESSION.
+
+The answer is cached per name: sshd decides this once when the name first
+appears, and running a group lookup again on every retry would only repeat
+the same answer."
+  (let ((hook (ssh-server-authorize-user (ssh-session-server session))))
+    (if (null hook)
+        t
+        (let ((cached (assoc user (ssh-session-allowed-users session)
+                             :test #'string=)))
+          (if cached
+              (cdr cached)
+              (let ((allowed (and (funcall hook session user) t)))
+                (push (cons user allowed)
+                      (ssh-session-allowed-users session))
+                allowed))))))
+
+(defun ssh-server-auth-failure-counts-p (attempt method)
+  "Whether a failed ATTEMPT using METHOD counts toward MaxAuthTries.
+
+sshd exempts the first \"none\" probe every client sends to learn the
+allowed methods; everything after it counts."
+  (or (/= 1 attempt)
+      (not (string= method "none"))))
 
 (defun ssh-server-handle-userauth-request (session payload)
   "Parse one USER AUTH REQUEST and answer it."
@@ -405,16 +449,21 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
          (service (ssh-read-text reader))
          (method (ssh-read-text reader)))
     (declare (ignore type))
-    (cond
-      ((not (string= service "ssh-connection"))
-       (ssh-server-send-auth-failure session))
-      ((string= method "publickey")
-       (let ((has-signature (ssh-read-boolean reader))
-             (algorithm (ssh-read-text reader))
-             (key-blob (ssh-read-string reader)))
-         (ssh-server-handle-publickey session user algorithm key-blob reader
-                                      has-signature)))
-      (t (ssh-server-send-auth-failure session)))))
+    (incf (ssh-session-auth-attempts session))
+    (let ((count (ssh-server-auth-failure-counts-p
+                  (ssh-session-auth-attempts session) method)))
+      (cond
+        ((not (string= service "ssh-connection"))
+         (ssh-server-send-auth-failure session :count count))
+        ((not (ssh-server-user-permitted-p session user))
+         (ssh-server-send-auth-failure session :count count))
+        ((string= method "publickey")
+         (let ((has-signature (ssh-read-boolean reader))
+               (algorithm (ssh-read-text reader))
+               (key-blob (ssh-read-string reader)))
+           (ssh-server-handle-publickey session user algorithm key-blob reader
+                                        has-signature :count count)))
+        (t (ssh-server-send-auth-failure session :count count))))))
 
 (defun ssh-server-send-global-reply (session success-p &optional fields)
   "Answer the last global request.  FIELDS writes its success arguments."

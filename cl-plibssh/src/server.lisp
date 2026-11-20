@@ -141,7 +141,14 @@
         (return))
       (unwind-protect
            (ssh-plibssh-session-handle-message session message)
-        (ssh-message-free message))))
+        (ssh-message-free message))
+      ;; A policy refusal decided inside the callback (MaxAuthTries) takes
+      ;; effect now, with libssh no longer holding the message.
+      (let ((reason (ssh-session-pending-close session)))
+        (when reason
+          (setf (ssh-session-pending-close session) nil)
+          (ssh-session-finish session reason :close)
+          (return)))))
   (when (and (not (ssh-session-closed session))
              (eq (ssh-session-phase session) :ready))
     (iter (for channel in (ssh-plibssh-session-channels session))
@@ -168,10 +175,56 @@
 
 ;;; ---- Authentication ----
 
+;;; ---- Account policy helpers shared with the pure backend's API ----
+;;;
+;;; The pure backend defines these in CL-LIBBURSKY's server files, which a
+;;; :ssh-backend-ffi build does not compile.  The names are part of the public
+;;; server API either way, so this backend carries its own copies.
+
+(defun ssh-server-auth-failure-counts-p (attempt method)
+  "Whether a failed ATTEMPT using METHOD counts toward MaxAuthTries.
+
+sshd exempts the first \"none\" probe every client sends to learn the
+allowed methods; everything after it counts."
+  (or (/= 1 attempt)
+      (not (string= method "none"))))
+
+(defun ssh-server-session-channel-count (session)
+  "How many session channels SESSION still has open or opening."
+  (loop for channel being the hash-values of (ssh-session-channels session)
+        counting (and (string= (ssh-server-channel-type channel) "session")
+                      (not (eq (ssh-server-channel-state channel) :closed)))))
+
+(defun ssh-server-user-permitted-p (session user)
+  "Whether the application admits USER on SESSION, cached per name."
+  (let ((hook (ssh-server-authorize-user (ssh-session-server session))))
+    (if (null hook)
+        t
+        (let ((cached (assoc user (ssh-session-allowed-users session)
+                             :test #'string=)))
+          (if cached
+              (cdr cached)
+              (let ((allowed (and (funcall hook session user) t)))
+                (push (cons user allowed)
+                      (ssh-session-allowed-users session))
+                allowed))))))
+
 (defun ssh-plibssh-auth-failure (message)
   "Refuse a request, advertising the one method this server offers."
   (ssh-message-auth-set-methods message +ssh-auth-method-publickey+)
   (ssh-message-reply-default message))
+
+(defun ssh-plibssh-session-auth-failure (session message &key (count t))
+  "Refuse one userauth attempt, counting it toward MaxAuthTries when COUNT.
+
+A limit reached inside a libssh callback cannot close the session there, so
+the reason is recorded and the pump finishes it after the callback returns."
+  (when count
+    (incf (ssh-session-auth-failures session))
+    (when (>= (ssh-session-auth-failures session)
+              (ssh-server-max-auth-tries (ssh-session-server session)))
+      (setf (ssh-session-pending-close session) :auth-failures)))
+  (ssh-plibssh-auth-failure message))
 
 (defun ssh-plibssh-session-complete-auth (session message user key-blob)
   "Accept USER for SESSION, then let the application run."
@@ -188,15 +241,25 @@
   (let* ((user (ssh-message-auth-user message))
          (method (ssh-message-subtype message)))
     (setf (ssh-session-user session) user)
-    (cond
-      ((= method +ssh-auth-method-none+)
-       (ssh-plibssh-auth-failure message))
-      ((= method +ssh-auth-method-publickey+)
-       (ssh-plibssh-session-handle-publickey session message user))
-      (t (ssh-plibssh-auth-failure message)))))
+    (incf (ssh-session-auth-attempts session))
+    (let ((count (ssh-server-auth-failure-counts-p
+                  (ssh-session-auth-attempts session)
+                  (if (= method +ssh-auth-method-none+) "none" "other"))))
+      (cond
+        ((not (ssh-server-user-permitted-p session user))
+         (ssh-plibssh-session-auth-failure session message :count count))
+        ((= method +ssh-auth-method-none+)
+         (ssh-plibssh-session-auth-failure session message :count count))
+        ((= method +ssh-auth-method-publickey+)
+         (ssh-plibssh-session-handle-publickey session message user count))
+        (t (ssh-plibssh-session-auth-failure session message :count count))))))
 
-(defun ssh-plibssh-session-handle-publickey (session message user)
-  "Handle a publickey offer (state NONE) or a signed attempt (state VALID)."
+(defun ssh-plibssh-session-handle-publickey (session message user
+                                            &optional (count t))
+  "Handle a publickey offer (state NONE) or a signed attempt (state VALID).
+
+COUNT is false for an accepted offer, which sshd does not treat as a failed
+authentication attempt."
   (let* ((key (ssh-message-auth-pubkey message))
          (state (ssh-message-auth-publickey-state message))
          (blob (and key (ssh-plibssh-public-key-blob key)))
@@ -205,12 +268,13 @@
                 (ssh-server-authorized-key-p
                  (ssh-session-server session) user blob))))
     (cond
-      ((null key) (ssh-plibssh-auth-failure message))
+      ((null key) (ssh-plibssh-session-auth-failure session message
+                                                    :count count))
       ((and authorized (= state +ssh-publickey-state-none+))
        (ssh-message-auth-reply-pk-ok-simple message))
       ((and authorized (= state +ssh-publickey-state-valid+))
        (ssh-plibssh-session-complete-auth session message user blob))
-      (t (ssh-plibssh-auth-failure message)))))
+      (t (ssh-plibssh-session-auth-failure session message :count count)))))
 
 ;;; ---- Channel opens ----
 
@@ -238,7 +302,15 @@
     (t (ssh-message-reply-default message))))
 
 (defun ssh-plibssh-session-open-session (session message)
-  "Accept a session channel and offer it to the application."
+  "Accept a session channel and offer it to the application.
+
+MaxSessions bounds how many may be live at once, as in sshd: a further open
+is refused instead of allocated."
+  (let ((limit (ssh-server-max-sessions (ssh-session-server session))))
+    (when (and limit
+               (>= (ssh-server-session-channel-count session) limit))
+      (ssh-message-reply-default message)
+      (return-from ssh-plibssh-session-open-session nil)))
   (let ((handle (ssh-message-open-reply-accept message)))
     (when (ssh-plibssh-null-p handle)
       (error 'ssh-channel-error
@@ -712,8 +784,12 @@
                           host-key
                           authorized-keys
                           authorize
+                          authorize-user
+                          max-auth-tries
+                          max-sessions
                           accept-env
                           server-version
+                          version-addendum
                           on-session
                           on-channel
                           on-direct-tcpip
@@ -732,12 +808,22 @@ after \"SSH-2.0-\"; libssh adds that prefix itself."
                              value
                              (ssh-load-private-key value)))
                        (if (listp host-key) host-key (list host-key))))
+         (version (if server-version
+                      (check-server-version server-version)
+                      (subseq +ssh-server-version+
+                              (length "SSH-2.0-"))))
+         (addendum (and version-addendum
+                        (not (eq version-addendum :none))
+                        (check-version-addendum version-addendum)))
          (server (%make-ssh-server
                   :address address
                   :port port
                   :host-keys keys
                   :authorized-keys authorized-keys
                   :authorize authorize
+                  :authorize-user authorize-user
+                  :max-auth-tries (or max-auth-tries 6)
+                  :max-sessions (or max-sessions 10)
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel
@@ -753,10 +839,9 @@ after \"SSH-2.0-\"; libssh adds that prefix itself."
     ;; peer's log instead of being hidden behind libssh's own string.
     (when (minusp (ssh-plibssh-bind-string-option
                    bind +ssh-bind-options-banner+
-                   (if server-version
-                       (check-server-version server-version)
-                       (subseq +ssh-server-version+
-                               (length "SSH-2.0-")))))
+                   (if addendum
+                       (format nil "~A ~A" version addendum)
+                       version)))
       (let ((detail (ssh-plibssh-error bind)))
         (ssh-bind-free bind)
         (error 'ssh-connection-error

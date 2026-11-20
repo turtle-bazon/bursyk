@@ -47,7 +47,8 @@ when it is no more talkative than that; QUIET prints nothing at all."
 
 
 (defvar *server* nil)
-(defvar *signal* nil)
+(defvar *signals* '()
+  "The signal watchers this process installed, so each can be stopped.")
 (defvar *remote-forwards* nil
   "Remote forwarding listeners requested with tcpip-forward, newest first.")
 (defvar *remote-tunnels* (make-hash-table :test #'eq)
@@ -62,7 +63,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.6"
+(defparameter +bursyk-server-version+ "0.0.2.7"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1024,25 +1025,67 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 ;;; user who is trying to log in.
 
 #-win32
-(defun user-home-and-uid (user)
-  "HOME and UID for USER from /etc/passwd, or NIL when it names no one.
-
-sshd asks the C library, which also sees NSS users; this server reads the
-local file, so a directory-service account falls back to the global key file
-at authentication time."
+(defun passwd-fields (user)
+  "The colon-separated fields for USER in /etc/passwd, or NIL."
   (when (and user (plusp (length user)))
     (with-open-file (stream "/etc/passwd" :direction :input
                             :if-does-not-exist nil)
       (when stream
         (loop for line = (read-line stream nil nil)
               while line
-              do (let ((fields (uiop:split-string line :separator ":")))
-                   (when (and (>= (length fields) 7)
-                              (string= (first fields) user))
-                     (return (values (nth 5 fields) (nth 2 fields))))))))))
+              for fields = (uiop:split-string line :separator ":")
+              when (and (>= (length fields) 7)
+                        (string= (first fields) user))
+                do (return fields))))))
+
+#-win32
+(defun user-home-and-uid (user)
+  "HOME and UID for USER from /etc/passwd, or NIL when it names no one.
+
+sshd asks the C library, which also sees NSS users; this server reads the
+local file, so a directory-service account falls back to the global key file
+at authentication time."
+  (let ((fields (passwd-fields user)))
+    (when fields
+      (values (nth 5 fields) (nth 2 fields)))))
 
 #+win32
 (defun user-home-and-uid (user)
+  (declare (ignore user))
+  nil)
+
+#-win32
+(defun user-primary-gid (user)
+  "USER's primary group id from /etc/passwd, or NIL."
+  (let ((fields (passwd-fields user)))
+    (and fields (nth 3 fields))))
+
+#-win32
+(defun user-groups (user)
+  "Group names USER belongs to, primary group included.
+
+sshd asks the C library for the full list, NSS included; this reads
+/etc/group, as the account lookup already reads /etc/passwd.  An unknown
+user simply has no groups, so an AllowGroups rule then denies the login."
+  (let ((primary (user-primary-gid user))
+        (names '()))
+    (with-open-file (stream "/etc/group" :direction :input
+                            :if-does-not-exist nil)
+      (when stream
+        (loop for line = (read-line stream nil nil)
+              while line
+              for fields = (uiop:split-string line :separator ":")
+              when (and (>= (length fields) 4)
+                        (or (and primary (string= (nth 2 fields) primary))
+                            (member user
+                                    (uiop:split-string (nth 3 fields)
+                                                       :separator ",")
+                                    :test #'string=)))
+                do (pushnew (first fields) names :test #'string=))))
+    names))
+
+#+win32
+(defun user-groups (user)
   (declare (ignore user))
   nil)
 
@@ -1119,6 +1162,71 @@ so an unprivileged or Windows setup keeps working."
                            key-blob)))
                       patterns)))))))
 
+;;; ---- Account policy ----
+;;;
+;;; AllowUsers, DenyUsers, AllowGroups, DenyGroups and PermitRootLogin are
+;;; decided when a user name first appears, before any authentication
+;;; method runs, which is when sshd decides them too.
+
+(defun session-remote-ip (session)
+  "SESSION's peer address as text, or NIL when the backend did not report it."
+  (getf (cl-pnet-ssh:ssh-session-remote-address session) :address))
+
+(defun root-login-allowed-p (user)
+  "Whether PermitRootLogin admits USER, when USER is uid 0.
+
+Only publickey exists in this build, so forced-commands-only has no forced
+command to allow and refuses root outright."
+  (multiple-value-bind (home uid) (user-home-and-uid user)
+    (declare (ignore home))
+    (or (null uid)
+        (not (string= uid "0"))
+        (cl-pnet-ssh:ssh-root-login-allowed-p
+         (config-setting
+          #'cl-pnet-ssh:ssh-server-config-permit-root-login)
+         "publickey"))))
+
+(defun user-allowed-p (session user)
+  "Whether sshd's account policy admits USER from SESSION's peer."
+  (and (root-login-allowed-p user)
+       (or (null *server-config*)
+           (cl-pnet-ssh:ssh-server-user-allowed-p
+            *server-config* user (or (session-remote-ip session) "")
+            (user-groups user)))))
+
+;;; ---- Pid file ----
+
+#-win32
+(cffi:defcfun ("getpid" c-getpid) :int)
+
+#+win32
+(cffi:defcfun ("GetCurrentProcessId" c-getpid) :unsigned-long)
+
+(defvar *pid-file* nil
+  "The PidFile this process wrote, or NIL when it wrote none.")
+
+(defun write-pid-file ()
+  "Record the process id in the configured PidFile, if there is one.
+
+sshd's default /run/sshd.pid needs root, and an unprivileged run should not
+guess, so only an explicit PidFile is written."
+  (let ((path (config-setting #'cl-pnet-ssh:ssh-server-config-pid-file)))
+    (when (and path (not (string-equal path "none")))
+      (handler-case
+          (progn
+            (with-open-file (out path :direction :output
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create)
+              (format out "~D~%" (c-getpid)))
+            (setf *pid-file* path))
+        (error (condition)
+          (log-at :error "cannot write PidFile ~A: ~A" path condition))))))
+
+(defun remove-pid-file ()
+  (when *pid-file*
+    (ignore-errors (delete-file *pid-file*))
+    (setf *pid-file* nil)))
+
 (defun start-server ()
   (load-server-config)
   (let ((host-keys (host-key-files)))
@@ -1134,8 +1242,18 @@ so an unprivileged or Windows setup keeps working."
            (server-port)
            :host-key host-keys
            :authorize #'authorized-keys-p
+           :authorize-user #'user-allowed-p
+           :max-auth-tries
+           (config-setting #'cl-pnet-ssh:ssh-server-config-max-auth-tries)
+           :max-sessions
+           (config-setting #'cl-pnet-ssh:ssh-server-config-max-sessions)
            :server-version (format nil "bursyk-server_~A"
                                    +bursyk-server-version+)
+           :version-addendum
+           (let ((addendum
+                   (config-setting
+                    #'cl-pnet-ssh:ssh-server-config-version-addendum)))
+             (if (eq addendum :none) nil addendum))
            :accept-env (accept-env-names)
            :on-channel #'install-channel-handlers
            :on-session (lambda (session)
@@ -1168,13 +1286,15 @@ so an unprivileged or Windows setup keeps working."
     (log-at :info "listening on ~A:~D"
             (cl-pnet-ssh:ssh-server-address *server*)
             (cl-pnet-ssh:ssh-server-port *server*))
+    (write-pid-file)
     *server*))
 
 (defun close-server ()
   (when *server*
     (close-remote-forwards)
     (cl-pnet-ssh:ssh-server-close *server*)
-    (setf *server* nil)))
+    (setf *server* nil))
+  (remove-pid-file))
 
 (defun shutdown ()
   (close-server)
@@ -1192,19 +1312,22 @@ so an unprivileged or Windows setup keeps working."
           (uiop:quit 0))
         (parse-arguments arguments)
         (start-server)
-        ;; Ctrl-C is a convenience, not a requirement: a backend that cannot
-        ;; watch signals on this platform must not stop the server listening.
-        (setf *signal*
-              (handler-case (cl-pnet:signal-start 2 (lambda () (shutdown)))
-                (error (condition)
-                  (format *error-output*
-                          "bursyk-server: no interrupt handler: ~A~%"
-                          condition)
-                  nil)))
+        ;; Ctrl-C and SIGTERM are conveniences, not requirements: a backend
+        ;; that cannot watch signals on this platform must not stop the server
+        ;; listening.  SIGTERM is what a service manager sends, and it must
+        ;; remove the PidFile just as Ctrl-C does.
+        (dolist (signum '(2 15))
+          (handler-case
+              (push (cl-pnet:signal-start signum (lambda () (shutdown)))
+                    *signals*)
+            (error (condition)
+              (format *error-output*
+                      "bursyk-server: no handler for signal ~D: ~A~%"
+                      signum condition))))
         (cl-pnet:event-loop-run)
-        (when *signal*
-          (cl-pnet:signal-stop *signal*)
-          (setf *signal* nil))
+        (dolist (signal *signals*)
+          (cl-pnet:signal-stop signal))
+        (setf *signals* '())
         (close-server))
     (error (condition)
       (format *error-output* "bursyk-server: ~A~%" condition)

@@ -34,6 +34,14 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
   '(("no" . :no) ("yes" . :yes) ("all" . :yes)
     ("local" . :local) ("remote" . :remote)))
 
+(defparameter +ssh-server-config-permit-root-login-values+
+  '(("yes" . :yes) ("no" . :no)
+    ("prohibit-password" . :prohibit-password)
+    ("without-password" . :prohibit-password)
+    ("forced-commands-only" . :forced-commands-only))
+  "PermitRootLogin values; without-password is the old spelling of
+prohibit-password and means the same thing.")
+
 ;;; Keywords that are valid sshd_config but cannot change anything this
 ;;; server does.  They are accepted (so a stock file still loads) and named
 ;;; in a warning, never silently dropped.
@@ -66,7 +74,6 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
     ("permituserenvironment" . "no")
     ("strictmodes" . "no")
     ("ignorerhosts" . "yes")
-    ("permitrootlogin" . "yes")
     ("permittty" . "yes")
     ("permituserrc" . "yes")
     ("compression" . "no")
@@ -74,13 +81,12 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
-  '("allowusers" "denyusers" "allowgroups" "denygroups"
-    "forcecommand" "chrootdirectory"
+  '("forcecommand" "chrootdirectory"
     "authorizedkeyscommand" "authorizedkeyscommanduser"
     "authorizedprincipalsfile" "authorizedprincipalscommand"
     "authorizedprincipalscommanduser"
     "trustedusercakeys" "revokedkeys" "hostcertificate"
-    "authenticationmethods" "maxauthtries" "maxsessions" "maxstartups"
+    "authenticationmethods" "maxstartups"
     "persourcemaxstartups" "persourcenetblocksize" "logingracetime"
     "clientaliveinterval" "clientalivecountmax" "channeltimeout"
     "unusedconnectiontimeout" "tcpkeepalive"
@@ -89,7 +95,7 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "requiredrsasize" "hostkeyagent"
     "permitlisten" "streamlocalbindmask" "streamlocalbindunlink"
-    "exposeauthinfo" "setenv" "versionaddendum" "pidfile"))
+    "exposeauthinfo" "setenv"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -110,6 +116,18 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
   (disable-forwarding nil)
   (subsystems '())
   (log-level nil)
+  ;; Access control.  Each list holds sshd patterns and accumulates across
+  ;; lines; an empty list means the rule is not in force.
+  (allow-users '())
+  (deny-users '())
+  (allow-groups '())
+  (deny-groups '())
+  (permit-root-login nil)
+  ;; Limits and identity.  NIL means the server keeps its own default.
+  (max-auth-tries nil)
+  (max-sessions nil)
+  (pid-file nil)
+  (version-addendum nil)
   (warnings '()))
 
 ;;; ---- Errors and warnings ----
@@ -165,6 +183,15 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
 (defun ssh-server-config-port-number (line argument)
   (or (ssh-server-config-port-string argument)
       (ssh-server-config-line-error line "bad port ~A" argument)))
+
+(defun ssh-server-config-count (line argument)
+  "ARGUMENT as a non-negative decimal integer, or an error."
+  (unless (and (plusp (length argument))
+               (every #'digit-char-p argument))
+    (ssh-server-config-line-error
+     line "~A must be a non-negative number, not ~A"
+     (ssh-config-line-keyword line) argument))
+  (parse-integer argument))
 
 (defun ssh-server-config-split-host-port (line argument)
   "VALUES HOST, PORT-STRING for a sshd HOST[:PORT] argument.
@@ -354,6 +381,63 @@ Port and ListenAddress the way sshd's own command-line options do."
        (when (ssh-server-config-flag
               line (ssh-server-config-one-argument line))
          (setf (ssh-server-config-disable-forwarding config) t)))
+      ;; ---- account and connection policy ----
+      ((member keyword '("allowusers" "denyusers"
+                         "allowgroups" "denygroups")
+               :test #'string=)
+       (when (null arguments)
+         (ssh-server-config-line-error line "~A needs a pattern" keyword))
+       (let ((slot (cdr (assoc keyword
+                               '(("allowusers" . allow-users)
+                                 ("denyusers" . deny-users)
+                                 ("allowgroups" . allow-groups)
+                                 ("denygroups" . deny-groups))
+                               :test #'string=))))
+         (dolist (argument arguments)
+           (when (zerop (length argument))
+             (ssh-server-config-line-error line "empty ~A pattern" keyword))
+           ;; An empty host part after @ would match nothing at all; sshd
+           ;; rejects it, so a typo cannot quietly loosen the rule.
+           (let ((at (position #\@ argument)))
+             (when (and at (= (1+ at) (length argument)))
+               (ssh-server-config-line-error
+                line "~A pattern ~A names no host" keyword argument)))
+           (push argument (slot-value config slot)))))
+      ((string= keyword "permitrootlogin")
+       (ssh-server-config-set-once
+        config 'permit-root-login
+        (ssh-server-config-multistate
+         line (ssh-server-config-one-argument line)
+         +ssh-server-config-permit-root-login-values+ "PermitRootLogin")))
+      ((string= keyword "maxauthtries")
+       (ssh-server-config-set-once
+        config 'max-auth-tries
+        (ssh-server-config-count
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "maxsessions")
+       (ssh-server-config-set-once
+        config 'max-sessions
+        (ssh-server-config-count
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "pidfile")
+       ;; "none" disables the file, as in sshd; it is a value like any other
+       ;; for first-wins purposes, so the reader keeps the spelling and the
+       ;; writer recognises it.
+       (ssh-server-config-set-once
+        config 'pid-file (ssh-server-config-one-argument line)))
+      ((string= keyword "versionaddendum")
+       (let ((value (ssh-server-config-one-argument line)))
+         ;; sshd allows a space here: the addendum is the comment after the
+         ;; version in "SSH-2.0-name comment".  CR and LF would split the
+         ;; greeting in two, so they are the one thing refused.
+         (when (find-if (lambda (character)
+                          (member character '(#\Return #\Newline)))
+                        value)
+           (ssh-server-config-line-error
+            line "VersionAddendum must be one line"))
+         (ssh-server-config-set-once
+          config 'version-addendum
+          (if (string-equal value "none") :none value))))
       ;; ---- subsystems ----
       ((string= keyword "subsystem")
        (unless (= (length arguments) 2)
@@ -476,6 +560,10 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-host-key-files)
     (reverse-slot ssh-server-config-accept-env)
     (reverse-slot ssh-server-config-permit-open)
+    (reverse-slot ssh-server-config-allow-users)
+    (reverse-slot ssh-server-config-deny-users)
+    (reverse-slot ssh-server-config-allow-groups)
+    (reverse-slot ssh-server-config-deny-groups)
     (reverse-slot ssh-server-config-subsystems)
     (reverse-slot ssh-server-config-warnings))
   config)

@@ -45,7 +45,13 @@
    #:ssh-session-user
    #:ssh-session-client-version
    #:ssh-session-remote-address
+   #:ssh-session-auth-failures
+   #:ssh-session-auth-attempts
    #:ssh-session-close
+   #:ssh-server-max-auth-tries
+   #:ssh-server-max-sessions
+   #:ssh-server-authorize-user
+   #:ssh-server-session-channel-count
    #:ssh-server-channel
    #:ssh-server-channel-p
    #:ssh-server-channel-session
@@ -134,6 +140,15 @@
    #:ssh-server-config-disable-forwarding
    #:ssh-server-config-subsystems
    #:ssh-server-config-log-level
+   #:ssh-server-config-allow-users
+   #:ssh-server-config-deny-users
+   #:ssh-server-config-allow-groups
+   #:ssh-server-config-deny-groups
+   #:ssh-server-config-permit-root-login
+   #:ssh-server-config-max-auth-tries
+   #:ssh-server-config-max-sessions
+   #:ssh-server-config-pid-file
+   #:ssh-server-config-version-addendum
    #:ssh-server-config-warnings
    #:+ssh-server-config-directory+
    #:+ssh-server-config-default-file+
@@ -145,6 +160,8 @@
    ;; authorized_keys and AcceptEnv policy
    #:ssh-match-pattern
    #:ssh-server-env-allowed-p
+   #:ssh-server-user-allowed-p
+   #:ssh-root-login-allowed-p
    #:ssh-authorized-key-blob-p
    ;; known hosts
    #:ssh-known-host-status

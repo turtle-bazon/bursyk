@@ -16,6 +16,13 @@
   (host-keys nil)
   authorized-keys
   authorize
+  ;; Called once per (SESSION USER) before any authentication method runs;
+  ;; the answer is cached for that pair.  NIL means every user is admitted.
+  authorize-user
+  ;; sshd's defaults: six failed attempts per connection, ten session
+  ;; channels.  A program tightens or relaxes them from its config.
+  (max-auth-tries 6)
+  (max-sessions 10)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -66,6 +73,11 @@ only want to describe it."
   (authenticated nil)
   (user nil)
   (authorized-key nil)
+  ;; Userauth bookkeeping: a fresh connection starts at zero, and the first
+  ;; "none" probe is exempt from the failure count, as in sshd.
+  (auth-attempts 0)
+  (auth-failures 0)
+  (allowed-users '())
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
   (closed nil)
@@ -207,6 +219,27 @@ only want to describe it."
   "Frame and send one protocol PAYLOAD."
   (ssh-session-send-bytes session
                           (ssh-encode-packet payload (ssh-session-cipher session))))
+
+(defun ssh-session-send-payload-and-close (session payload reason)
+  "Send PAYLOAD, then close SESSION with REASON once it is on the wire.
+
+Closing immediately would discard the queued bytes, so the DISCONNECT that
+explains a policy refusal would never reach the client."
+  (let ((connection (ssh-session-connection session)))
+    (if (or (ssh-session-closed session) (null connection))
+        (ssh-session-finish session reason :close)
+        (handler-case
+            (cl-pnet:send-data
+             connection
+             (ssh-encode-packet payload (ssh-session-cipher session))
+             :on-write (lambda (count)
+                         (declare (ignore count))
+                         (ssh-session-finish session reason :close))
+             :on-error (lambda (status)
+                         (declare (ignore status))
+                         (ssh-session-finish session reason :close)))
+          (error ()
+            (ssh-session-finish session reason :close))))))
 
 (defun ssh-session-channel-for (session local-id)
   (gethash local-id (ssh-session-channels session)))

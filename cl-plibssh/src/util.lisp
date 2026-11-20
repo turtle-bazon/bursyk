@@ -98,6 +98,11 @@
   (host-keys nil)
   authorized-keys
   authorize
+  authorize-user
+  ;; sshd's defaults; NIL would mean "no limit" but the constructor always
+  ;; stores a number so a program can tighten or relax them from config.
+  (max-auth-tries 6)
+  (max-sessions 10)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -122,6 +127,14 @@
   (client-version nil)
   (user nil)
   (authenticated nil)
+  ;; Userauth bookkeeping, as in the pure backend: sshd exempts the first
+  ;; "none" probe and counts every refusal after it.
+  (auth-attempts 0)
+  (auth-failures 0)
+  (allowed-users '())
+  ;; A close decided inside a libssh message callback: the session must be
+  ;; finished after the callback returns, not while libssh still owns it.
+  (pending-close nil)
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
   (closed nil)

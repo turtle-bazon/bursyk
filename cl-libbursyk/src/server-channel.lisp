@@ -134,8 +134,26 @@ channel stays in :OPENING and client data is not expected."
       (ssh-server-channel-open-confirmation channel))
     channel))
 
+(defun ssh-server-session-channel-count (session)
+  "How many session channels SESSION still has open or opening."
+  (iter (for (id channel) in-hashtable (ssh-session-channels session))
+    (declare (ignore id))
+    (counting (and (string= (ssh-server-channel-type channel) "session")
+                   (not (eq (ssh-server-channel-state channel) :closed))))))
+
 (defun ssh-server-open-session-channel (session sender window max-packet)
-  "Accept a session channel and make it available to the application."
+  "Accept a session channel and make it available to the application.
+
+MaxSessions bounds how many may be live at once; sshd answers further opens
+with SSH_OPEN_ADMINISTRATIVELY_PROHIBITED instead of allocating a channel."
+  (let ((limit (ssh-server-max-sessions (ssh-session-server session))))
+    (when (and limit
+               (>= (ssh-server-session-channel-count session) limit))
+      (ssh-server-channel-open-failure
+       session sender 1
+       (format nil "administratively prohibited: too many sessions (~D)"
+               limit))
+      (return-from ssh-server-open-session-channel nil)))
   (let ((channel (ssh-server-register-channel
                   session "session" sender window max-packet))
         (handler (ssh-server-on-channel (ssh-session-server session))))

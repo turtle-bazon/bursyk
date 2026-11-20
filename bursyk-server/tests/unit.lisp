@@ -391,7 +391,7 @@ that ends the stream too."
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User root"))
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "PermitRootLogin no"))
+    (config-from-text "ChrootDirectory /jail"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "PasswordAuthentication yes"))
   (signals cl-pnet-ssh:ssh-server-config-error
@@ -622,3 +622,168 @@ PermitOpen db:5432")))
          (format nil "~A AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=" type))))
   (is (null (cl-pnet-ssh::ssh-authorized-key-line-blob
              "ssh-dss AAAAB3NzaC1kc3M="))))
+
+;;; ---- account policy and limits ----
+
+(test sshd-config-reads-account-and-limit-policy
+  (let ((config (config-from-text
+                 "AllowUsers alice bob
+AllowUsers carol
+DenyUsers root
+AllowGroups wheel admins
+DenyGroups banned
+PermitRootLogin prohibit-password
+MaxAuthTries 4
+MaxSessions 0
+PidFile /tmp/bursyk-test.pid
+VersionAddendum mybuild")))
+    (is (equal '("alice" "bob" "carol")
+               (cl-pnet-ssh:ssh-server-config-allow-users config)))
+    (is (equal '("root")
+               (cl-pnet-ssh:ssh-server-config-deny-users config)))
+    (is (equal '("wheel" "admins")
+               (cl-pnet-ssh:ssh-server-config-allow-groups config)))
+    (is (equal '("banned")
+               (cl-pnet-ssh:ssh-server-config-deny-groups config)))
+    (is (eq :prohibit-password
+            (cl-pnet-ssh:ssh-server-config-permit-root-login config)))
+    (is (eql 4 (cl-pnet-ssh:ssh-server-config-max-auth-tries config)))
+    (is (eql 0 (cl-pnet-ssh:ssh-server-config-max-sessions config)))
+    (is (equal "/tmp/bursyk-test.pid"
+               (cl-pnet-ssh:ssh-server-config-pid-file config)))
+    (is (equal "mybuild"
+               (cl-pnet-ssh:ssh-server-config-version-addendum config)))
+  (is (eq :none
+          (config-value #'cl-pnet-ssh:ssh-server-config-version-addendum
+                        "VersionAddendum none")))
+  (is (eq :prohibit-password
+          (config-value #'cl-pnet-ssh:ssh-server-config-permit-root-login
+                        "PermitRootLogin without-password")))
+  ;; first value wins, as everywhere else in sshd_config
+  (is (eql 3
+          (config-value #'cl-pnet-ssh:ssh-server-config-max-auth-tries
+                        "MaxAuthTries 3
+MaxAuthTries 9")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PermitRootLogin maybe"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "MaxAuthTries -1"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AllowUsers alice@"))
+  ;; "none" leaves the spelling in place for the writer to skip; a later
+  ;; PidFile must not override it, because the first value wins.
+  (is (equal "none"
+             (config-value #'cl-pnet-ssh:ssh-server-config-pid-file
+                           "PidFile none")))
+  (is (equal "none"
+             (config-value #'cl-pnet-ssh:ssh-server-config-pid-file
+                           "PidFile none
+PidFile /tmp/later.pid")))))
+
+(test allow-and-deny-lists-use-sshd-globbing
+  (let ((config (config-from-text
+                 "AllowUsers alice bob@10.0.0.0/8 carol@192.168.1.*
+DenyUsers root mallory@10.1.2.3")))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "alice" "203.0.113.9" '("users")))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "bob" "10.4.5.6" '("users")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "bob" "192.168.1.1" '("users"))))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "carol" "192.168.1.7" '("users")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "dave" "10.0.0.1" '("users"))))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "root" "10.0.0.1" '("users"))))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "mallory" "10.1.2.3" '("users"))))
+    ;; The deny list wins even when the allow list also matches.
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              (config-from-text "AllowUsers mallory
+DenyUsers mallory")
+              "mallory" "10.0.0.1" '("users")))))
+  ;; A negated address vetoes the pattern; another address is still free.
+  (let ((config (config-from-text "AllowUsers bob@!10.0.0.0/8")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "bob" "10.1.1.1" '("users"))))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "bob" "192.168.1.1" '("users")))))
+
+(test group-lists-match-any-group
+  (let ((config (config-from-text
+                 "AllowGroups wheel admins
+DenyGroups banned")))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "alice" "10.0.0.1" '("users" "wheel")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "alice" "10.0.0.1" '("users"))))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "alice" "10.0.0.1" '("wheel" "banned")))))
+  ;; Explicit denies work even when no allow list exists.
+  (let ((config (config-from-text "DenyGroups banned")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "alice" "10.0.0.1" '("banned"))))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "alice" "10.0.0.1" '("users")))))
+
+(test allow-and-deny-lists-understand-ipv6-hosts
+  (let ((config (config-from-text "DenyUsers mallory@2001:db8::/32")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "mallory" "2001:db8:0:1::5" '("users"))))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "mallory" "2001:db9::5" '("users"))))
+  (let ((config (config-from-text "AllowUsers alice@::1/128")))
+    (is (cl-pnet-ssh:ssh-server-user-allowed-p
+         config "alice" "::1" '("users")))
+    (is (not (cl-pnet-ssh:ssh-server-user-allowed-p
+              config "alice" "::2" '("users"))))))
+
+(test permit-root-login-follows-sshd-modes
+  ;; The default is prohibit-password: keys work, passwords would not.
+  (is (cl-pnet-ssh:ssh-root-login-allowed-p nil "publickey"))
+  (is (not (cl-pnet-ssh:ssh-root-login-allowed-p nil "password")))
+  (is (cl-pnet-ssh:ssh-root-login-allowed-p :prohibit-password "publickey"))
+  (is (not (cl-pnet-ssh:ssh-root-login-allowed-p :prohibit-password "password")))
+  (is (cl-pnet-ssh:ssh-root-login-allowed-p :yes "password"))
+  (is (not (cl-pnet-ssh:ssh-root-login-allowed-p :no "publickey")))
+  ;; No forced command exists in this build, so this mode refuses.
+  (is (not (cl-pnet-ssh:ssh-root-login-allowed-p
+            :forced-commands-only "publickey")))
+  (is (cl-pnet-ssh:ssh-root-login-allowed-p
+       :forced-commands-only "publickey" :force-command "id")))
+
+(test max-auth-tries-counts-failures-and-has-sshd-defaults
+  ;; The limit is stored per server; the counter is per connection.
+  (let* ((server (cl-pnet-ssh::%make-ssh-server :max-auth-tries 3))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (is (eql 3 (cl-pnet-ssh:ssh-server-max-auth-tries server)))
+    (is (zerop (cl-pnet-ssh:ssh-session-auth-failures session)))
+    (incf (cl-pnet-ssh:ssh-session-auth-failures session))
+    (is (= 1 (cl-pnet-ssh:ssh-session-auth-failures session))))
+  (is (= 6 (cl-pnet-ssh:ssh-server-max-auth-tries
+            (cl-pnet-ssh::%make-ssh-server))))
+  (is (= 10 (cl-pnet-ssh:ssh-server-max-sessions
+             (cl-pnet-ssh::%make-ssh-server))))
+  ;; The first "none" probe is free; every later failure counts.
+  (is (not (cl-pnet-ssh::ssh-server-auth-failure-counts-p 1 "none")))
+  (is (cl-pnet-ssh::ssh-server-auth-failure-counts-p 2 "none"))
+  (is (cl-pnet-ssh::ssh-server-auth-failure-counts-p 1 "publickey")))
+  
+(test max-sessions-counts-live-session-channels
+  (let* ((server (cl-pnet-ssh::%make-ssh-server :max-sessions 2))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (is (zerop (cl-pnet-ssh:ssh-server-session-channel-count session)))
+    (let ((channel (cl-pnet-ssh::%make-ssh-server-channel
+                    :session session :local-id 1 :type "session"
+                    :state :open)))
+      (setf (gethash 1 (cl-pnet-ssh::ssh-session-channels session)) channel)
+      (is (= 1 (cl-pnet-ssh:ssh-server-session-channel-count session)))
+      (setf (cl-pnet-ssh:ssh-server-channel-state channel) :closed)
+      (is (zerop (cl-pnet-ssh:ssh-server-session-channel-count session))))
+    ;; A direct-tcpip channel is not a session.
+    (let ((channel (cl-pnet-ssh::%make-ssh-server-channel
+                    :session session :local-id 2 :type "direct-tcpip"
+                    :state :open)))
+      (setf (gethash 2 (cl-pnet-ssh::ssh-session-channels session)) channel)
+      (is (zerop (cl-pnet-ssh:ssh-server-session-channel-count session))))))

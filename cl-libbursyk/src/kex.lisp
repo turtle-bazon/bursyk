@@ -37,11 +37,16 @@
 (defconstant +ssh-msg-channel-failure+ 100)
 
 ;; Disconnect reason codes (RFC 4250 section 4.2.2).
+(defconstant +ssh-disconnect-protocol-error+ 2
+  "RFC 4253 reason 2; sshd uses it for a policy disconnect such as
+MaxAuthTries, which is why the client shows it as a protocol-error
+disconnect rather than a plain application one.")
+
 (defconstant +ssh-disconnect-by-application+ 11)
 
 ;;; ---- Identification and disconnection ----
 
-(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.7"
+(defparameter +ssh-server-version+ "SSH-2.0-cl-pnet-ssh_0.0.1.8"
   "The default SSH identification string a server sends.
 
 A program identifies itself by passing SERVER-VERSION to MAKE-SSH-SERVER;
@@ -63,7 +68,23 @@ is refused here rather than corrupting the greeting on the wire."
            :detail (format nil "invalid server version ~S" version)))
   version)
 
-(defun ssh-disconnect-payload (&optional (description "client closed"))
+(defun check-version-addendum (addendum)
+  "Validate ADDENDUM, the comment appended after the identification string.
+
+sshd writes it as \"SSH-2.0-name comment\".  A CR or LF would end the
+greeting early, so only printable ASCII is accepted here; spaces are fine."
+  (unless (and (stringp addendum)
+               (plusp (length addendum))
+               (every (lambda (character)
+                        (let ((code (char-code character)))
+                          (and (<= 32 code 126))))
+                      addendum))
+    (error 'ssh-connection-error
+           :detail (format nil "invalid version addendum ~S" addendum)))
+  addendum)
+
+(defun ssh-disconnect-payload (&optional (description "client closed")
+                                        (reason +ssh-disconnect-by-application+))
   "A DISCONNECT payload: reason code, description and language tag.
 
 Both strings are length-prefixed as RFC 4253 section 11.1 requires;
@@ -71,7 +92,7 @@ SSH-STRING-OCTETS only turns text into UTF-8 bytes, so building the message
 with SSH-CONCAT around it would hand the peer the text itself as a length."
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-disconnect+)
-    (ssh-write-u32 writer +ssh-disconnect-by-application+)
+    (ssh-write-u32 writer reason)
     (ssh-write-text writer (princ-to-string description))
     (ssh-write-text writer "")
     (ssh-writer-output writer)))

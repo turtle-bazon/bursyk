@@ -133,3 +133,92 @@ than the bracket classes an ssh_config Host pattern allows."
       ((listp policy)
        (some (lambda (pattern) (ssh-match-pattern pattern name)) policy))
       (t nil))))
+
+;;; ---- AllowUsers / DenyUsers / AllowGroups / DenyGroups ----
+;;;
+;;; sshd matches these at the moment a user name first appears, before any
+;;; authentication method runs.  The list belongs to the server config, but
+;;; the matching lives here so the same rules do not have to be rebuilt by
+;;; every program that embeds the server.
+
+(defun ssh-address-pattern-match-p (address patterns)
+  "Whether ADDRESS matches PATTERNS, sshd's addr_match_list.
+
+PATTERNS is one comma-separated list.  Each element may be negated with a
+leading !, may be a CIDR network, or may be an address wildcard.  A negated
+match vetoes the whole list, as in sshd; a list of nothing but negations
+matches every address they do not veto, which is what makes
+\"!10.0.0.0/8\" mean \"anywhere else\"."
+  (let ((matched nil)
+        (positive nil))
+    (dolist (pattern (uiop:split-string patterns :separator ",")
+                     (or matched (not positive)))
+      (let ((negated (and (plusp (length pattern))
+                          (char= (char pattern 0) #\!))))
+        (unless negated
+          (setf positive t))
+        (when negated
+          (setf pattern (subseq pattern 1)))
+        (when (or (ssh-config-ipv4-cidr-match-p pattern address)
+                  (ssh-config-ipv6-cidr-match-p pattern address)
+                  (ssh-match-pattern pattern address))
+          (if negated
+              (return-from ssh-address-pattern-match-p nil)
+              (setf matched t)))))))
+
+(defun ssh-user-pattern-match-p (pattern user address)
+  "Whether USER at ADDRESS matches one AllowUsers/DenyUsers PATTERN.
+
+A pattern without @ matches the user name; one with @ matches the name and
+then the address, which sshd takes from the connection because UseDNS is
+off by default."
+  (let ((at (position #\@ pattern)))
+    (if (null at)
+        (ssh-match-pattern pattern user)
+        (and (ssh-match-pattern (subseq pattern 0 at) user)
+             (ssh-address-pattern-match-p address
+                                          (subseq pattern (1+ at)))))))
+
+(defun ssh-group-pattern-match-p (pattern groups)
+  "Whether any of GROUPS matches PATTERN, with sshd's globbing."
+  (some (lambda (group) (ssh-match-pattern pattern group)) groups))
+
+(defun ssh-server-user-allowed-p (config user address groups)
+  "Whether sshd's account lists admit USER at ADDRESS in GROUPS.
+
+sshd's order is DenyUsers, AllowUsers, DenyGroups, AllowGroups: a deny list
+wins outright, and an allow list that is present must match."
+  (let ((allow-users (ssh-server-config-allow-users config))
+        (deny-users (ssh-server-config-deny-users config))
+        (allow-groups (ssh-server-config-allow-groups config))
+        (deny-groups (ssh-server-config-deny-groups config)))
+    (and (not (some (lambda (pattern)
+                      (ssh-user-pattern-match-p pattern user address))
+                    deny-users))
+         (or (null allow-users)
+             (some (lambda (pattern)
+                     (ssh-user-pattern-match-p pattern user address))
+                   allow-users))
+         (not (some (lambda (pattern)
+                      (ssh-group-pattern-match-p pattern groups))
+                    deny-groups))
+         (or (null allow-groups)
+             (some (lambda (pattern)
+                     (ssh-group-pattern-match-p pattern groups))
+                   allow-groups)))))
+
+(defun ssh-root-login-allowed-p (mode method &key force-command)
+  "Whether a root login may proceed under PermitRootLogin MODE.
+
+METHOD is the authentication method that just succeeded.  MODE NIL keeps
+sshd's default, prohibit-password.  FORCED-COMMANDS-ONLY needs a forced
+command, which this server does not implement yet, so it refuses every
+root login rather than pretending the command would be forced."
+  (case (or mode :prohibit-password)
+    (:yes t)
+    (:no nil)
+    (:prohibit-password
+     (not (null (member method '("publickey" "hostbased" "gssapi-with-mic")
+                        :test #'string=))))
+    (:forced-commands-only (not (null force-command)))
+    (t nil)))

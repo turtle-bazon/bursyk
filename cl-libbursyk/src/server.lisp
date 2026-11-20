@@ -50,8 +50,12 @@ advertised and then fail the first KEX."
                           host-key
                           authorized-keys
                           authorize
+                          authorize-user
+                          max-auth-tries
+                          max-sessions
                           accept-env
                           server-version
+                          version-addendum
                           on-session
                           on-channel
                           on-direct-tcpip
@@ -66,11 +70,20 @@ those; ssh-ed25519, ECDSA and RSA keys are supported, and the server
 advertises every algorithm its keys can sign with.  AUTHORIZED-KEYS is an
 authorized_keys file, a list of public key blobs, or NIL.  AUTHORIZE, when
 given, is a function of (USER KEY-BLOB) and replaces AUTHORIZED-KEYS.
+AUTHORIZE-USER is a function of (SESSION USER) answering whether the
+account may try to authenticate at all; it runs before any method and its
+answer is cached for that name, which is where AllowUsers, DenyUsers and
+PermitRootLogin belong.
+
+MAX-AUTH-TRIES and MAX-SESSIONS keep sshd's defaults of 6 and 10 when NIL.
+A MaxSessions of 0 refuses every session channel, as sshd does.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.6\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.7\", so peers and logs identify it correctly.
+VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
+space, or :NONE for none.
 
 ACCEPT-ENV is T (accept every env request), a list of names, a function of
 (NAME VALUE), or NIL (refuse).  ON-SESSION runs once a client has
@@ -82,10 +95,16 @@ refuse a remote forwarding request; ON-CANCEL-TCPIP-FORWARD takes the same
 arguments and returns true once the listener is gone.  ON-ERROR receives
 (SESSION CONDITION) (SESSION is NIL for listener errors), ON-CLOSE receives
 (SESSION REASON)."
-  (let* ((software (if server-version
-                       (format nil "SSH-2.0-~A"
-                               (check-server-version server-version))
-                       +ssh-server-version+))
+  (let* ((version (if server-version
+                      (format nil "SSH-2.0-~A"
+                              (check-server-version server-version))
+                      +ssh-server-version+))
+         (addendum (and version-addendum
+                        (not (eq version-addendum :none))
+                        (check-version-addendum version-addendum)))
+         (software (if addendum
+                       (format nil "~A ~A" version addendum)
+                       version))
          (keys (ssh-server-host-key-list host-key))
          (server (%make-ssh-server
                   :address address
@@ -94,6 +113,9 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :host-keys keys
                   :authorized-keys authorized-keys
                   :authorize authorize
+                  :authorize-user authorize-user
+                  :max-auth-tries (or max-auth-tries 6)
+                  :max-sessions (or max-sessions 10)
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel

@@ -1090,11 +1090,12 @@ Returns (VALUES STDOUT STDERR STATUS)."
           (when server (ssh-server-close server))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
-(defun ssh-test-loopback-outcome (policy &key server-version)
+(defun ssh-test-loopback-outcome (policy &key server-version version-addendum)
   "Run one client handshake against a loopback server with POLICY.
 
 SERVER-VERSION, when given, is passed to MAKE-SSH-SERVER so a test can see
-the greeting the server chose.  Returns (VALUES OPENED ERROR GREETING):
+the greeting the server chose; VERSION-ADDENDUM does the same for the
+comment appended after it.  Returns (VALUES OPENED ERROR GREETING):
 OPENED is true once authentication completed, ERROR is the condition the
 client reported, and GREETING is the server's identification line as the
 client read it."
@@ -1106,6 +1107,7 @@ client read it."
          (opened nil)
          (error nil)
          (greeting nil)
+         (closed nil)
          (server nil)
          (timeout nil))
     (ensure-directories-exist server-key)
@@ -1120,7 +1122,8 @@ client read it."
            (setf server (make-ssh-server "127.0.0.1" 0
                                          :host-key server-key
                                          :authorized-keys authorized
-                                         :server-version server-version))
+                                         :server-version server-version
+                                         :version-addendum version-addendum))
            (setf timeout
                  (cl-pnet:timer-start
                   10 0
@@ -1144,8 +1147,16 @@ client read it."
                         (cl-pnet:event-loop-stop))
             :on-close (lambda (client reason)
                         (declare (ignore client reason))
+                        (setf closed t)
                         (cl-pnet:event-loop-stop)))
-           (cl-pnet:event-loop-run)
+           ;; EVENT-LOOP-STOP is delivered asynchronously, so a run started
+           ;; immediately after the previous test's run can consume the stale
+           ;; wakeup and return before touching the new connection.  Retrying
+           ;; only while nothing at all happened keeps a real timeout a
+           ;; timeout; it cannot hide a failure, because no callback ran.
+           (loop repeat 3
+                 until (or opened error closed)
+                 do (cl-pnet:event-loop-run))
            (values opened error greeting))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
@@ -1182,6 +1193,42 @@ library's default string hides which program is actually serving."
         (is (null error))
         (is (not (null opened)))
         (is (equal "SSH-2.0-bursyk-server_0.0.2.6" greeting)))))
+
+(test server-version-addendum-follows-the-version
+  "sshd's VersionAddendum is a comment after the version, not a replacement."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t)
+           :server-version "bursyk-server_0.0.2.7"
+           :version-addendum "experimental")
+        (is (null error))
+        (is (not (null opened)))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.7 experimental" greeting)))))
+
+(test version-addendum-none-leaves-the-greeting-alone
+  "sshd's \"VersionAddendum none\" appends no comment at all."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (opened error greeting)
+          (ssh-test-loopback-outcome
+           (lambda (client fingerprint key)
+             (declare (ignore client fingerprint key))
+             t)
+           :server-version "bursyk-server_0.0.2.7"
+           :version-addendum :none)
+        (is (null error))
+        (is (not (null opened)))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.7" greeting)))))
+
+(test version-addendum-is-one-printable-line
+  (is (equal "my build" (cl-pnet-ssh::check-version-addendum "my build")))
+  (signals error (cl-pnet-ssh::check-version-addendum ""))
+  (signals error (cl-pnet-ssh::check-version-addendum "bad
+newline")))
 
 (test server-version-is-checked-before-it-reaches-the-wire
   (is (equal "burst_1.2.3"
@@ -1836,3 +1883,43 @@ also covers that the verifier trims it before padding to the curve width."
                 :test #'string=)))
   (is (not (member "ssh-rsa" cl-pnet-ssh::+ssh-server-user-key-algorithms+
                    :test #'string=))))
+
+(test local-network-cidr-matching-uses-the-network-bits
+  ;; ssh_config's LocalNetwork (and sshd's AllowUsers host patterns) treat
+  ;; the prefix as the high-order bits, so a /8 must compare the first octet.
+  (is (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "10.0.0.0/8" "10.4.5.6"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "10.0.0.0/8"
+                                                      "11.4.5.6")))
+  (is (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "192.168.0.0/16"
+                                                 "192.168.1.1"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "192.168.0.0/16"
+                                                      "192.169.1.1")))
+  ;; /0 matches everything and /32 matches one address.
+  (is (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "0.0.0.0/0" "203.0.113.9"))
+  (is (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "10.4.5.6/32"
+                                                 "10.4.5.6"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv4-cidr-match-p "10.4.5.6/32"
+                                                      "10.4.5.7"))))
+
+(test ipv6-cidr-matching-for-host-patterns
+  ;; sshd's AllowUsers host part accepts IPv6 CIDRs too, and a deny list that
+  ;; silently matched nothing would fail open.
+  (is (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "2001:db8::/32"
+                                                 "2001:db8:1:2::5"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "2001:db8::/32"
+                                                      "2001:db9::1")))
+  (is (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "::1/128" "::1"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "::1/128" "::2")))
+  (is (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "fe80::/10" "fe80::1"))
+  (is (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "fe80::/10" "febf::1"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "fe80::/10" "fec0::1")))
+  (is (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "::ffff:192.168.1.0/120"
+                                                 "::ffff:192.168.1.9"))
+  (is (not (cl-pnet-ssh::ssh-config-ipv6-cidr-match-p "::ffff:192.168.1.0/120"
+                                                      "::ffff:192.168.2.9")))
+  ;; Words are hex, so a decimal-looking but invalid group is refused rather
+  ;; than read as part of something else.
+  (is (null (cl-pnet-ssh::ssh-config-ipv6-words "12345::1")))
+  (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1:2:3:4:5:6:7")))
+  (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1::2::3")))
+  (is (= 8 (length (cl-pnet-ssh::ssh-config-ipv6-words "::")))))
