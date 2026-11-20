@@ -13,12 +13,15 @@
    #:ssh-client-host-key-fingerprint
    #:ssh-client-server-version
    #:ssh-client-connect-host
+   #:*ssh-log-function*
+   #:ssh-log
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
    #:ssh-channel
    #:ssh-channel-p
    #:ssh-channel-exec
+   #:ssh-channel-subsystem
    #:ssh-channel-env
    #:ssh-channel-write
    #:ssh-channel-eof

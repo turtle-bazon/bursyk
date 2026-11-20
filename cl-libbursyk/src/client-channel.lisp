@@ -90,6 +90,15 @@ the open confirmation are queued and flushed once the peer answers."
              (ssh-write-boolean writer t)
              (ssh-write-text writer command))))
 
+(defun ssh-channel-send-subsystem (channel subsystem)
+  "Ask the peer to run SUBSYSTEM on CHANNEL's session."
+  (ssh-channel-send-message
+   channel +ssh-msg-channel-request+
+   :fields (lambda (writer)
+             (ssh-write-text writer "subsystem")
+             (ssh-write-boolean writer t)
+             (ssh-write-text writer subsystem))))
+
 (defun ssh-channel-send-env (channel name value)
   "Ask the peer to set NAME=VALUE for commands on CHANNEL's session."
   (ssh-channel-send-message
@@ -123,6 +132,16 @@ side is known to accept."
   (ecase (ssh-channel-state channel)
     (:opening (setf (ssh-channel-pending-exec channel) command))
     (:open (ssh-channel-send-exec channel command))
+    (:closing nil)
+    (:closed (error 'ssh-channel-error
+                    :channel channel :detail "channel is closed")))
+  channel)
+
+(defun ssh-channel-subsystem (channel subsystem)
+  "Run SUBSYSTEM on CHANNEL's session, or queue it until the channel opens."
+  (ecase (ssh-channel-state channel)
+    (:opening (setf (ssh-channel-pending-subsystem channel) subsystem))
+    (:open (ssh-channel-send-subsystem channel subsystem))
     (:closing nil)
     (:closed (error 'ssh-channel-error
                     :channel channel :detail "channel is closed")))
@@ -219,13 +238,17 @@ side is known to accept."
         (ssh-channel-remote-max-packet channel) (ssh-read-u32 reader)
         (ssh-channel-state channel) :open)
   (let ((env (ssh-channel-pending-env channel))
-        (exec (ssh-channel-pending-exec channel)))
+        (exec (ssh-channel-pending-exec channel))
+        (subsystem (ssh-channel-pending-subsystem channel)))
     (setf (ssh-channel-pending-env channel) nil
-          (ssh-channel-pending-exec channel) nil)
+          (ssh-channel-pending-exec channel) nil
+          (ssh-channel-pending-subsystem channel) nil)
     (iter (for (name . value) in env)
       (ssh-channel-send-env channel name value))
     (when exec
-      (ssh-channel-send-exec channel exec)))
+      (ssh-channel-send-exec channel exec))
+    (when subsystem
+      (ssh-channel-send-subsystem channel subsystem)))
   (ssh-channel-flush channel))
 
 (defun ssh-channel-handle-open-failure (channel reader)

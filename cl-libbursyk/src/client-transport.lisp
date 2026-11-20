@@ -35,8 +35,11 @@ line, and NIL while the line is still incomplete."
             (progn
               (setf (ssh-client-server-version client) line
                     (ssh-client-phase client) :kex)
+              (ssh-log "remote version ~A" line)
               :version)
-            :banner)))))
+            (progn
+              (ssh-log "remote banner ~A" line)
+              :banner))))))
 
 (defun ssh-client-advance (client)
   "Process every complete message in CLIENT's receive buffer."
@@ -124,6 +127,12 @@ its KEXINIT when the connection came up."
           (getf (ssh-client-negotiated client) :strict)
           (ssh-client-ignore-next-kex-packet client)
           (getf (ssh-client-negotiated client) :guess-wrong))
+    (let ((negotiated (ssh-client-negotiated client)))
+      (ssh-log "key exchange ~A, host key ~A, cipher ~A, mac ~A"
+               (getf negotiated :kex)
+               (getf negotiated :host-key)
+               (getf negotiated :cipher)
+               (getf negotiated :mac)))
     (ssh-client-send-kex-init client)))
 
 (defun ssh-client-send-kex-init (client)
@@ -355,6 +364,7 @@ request goes out from the callback rather than from this function's tail."
 
 (defun ssh-client-handle-auth-success (client)
   "Authenticated: let the queued channel work start."
+  (ssh-log "authenticated as ~A" (ssh-client-user client))
   (setf (ssh-client-phase client) :ready)
   (ssh-client-cancel-connect-timer client)
   (ssh-client-start-alive-timer client)
@@ -376,7 +386,9 @@ request goes out from the callback rather than from this function's tail."
   (let* ((reader (ssh-make-reader payload))
          (methods (progn (ssh-read-u8 reader) (ssh-read-name-list reader))))
     (if (ssh-client-next-signer-p client)
-        (ssh-client-send-auth-request client)
+        (progn
+          (ssh-log "publickey rejected; trying the next key")
+          (ssh-client-send-auth-request client))
         (ssh-client-fail
          client
          (make-condition 'ssh-authentication-error

@@ -126,6 +126,7 @@ ssh-authentication-error only when nothing is left to try."
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
   (let ((port (or (ssh-client-connect-port client) (ssh-client-port client))))
+    (ssh-log "connecting to ~A:~D" address port)
     (let ((connection
             (cl-pnet:tcp-connect
              address
@@ -149,11 +150,12 @@ ssh-authentication-error only when nothing is left to try."
 
 Returns CLIENT at once; the connection and every failure report through the
 client's callbacks.  CL-PNET's connect takes a numeric address, so a name
-has to be resolved first, and BALKORT-RESOLVE does that on a worker thread.
+has to be resolved first, and BURZAY does that on a worker thread.
 A ProxyCommand needs none of that: the helper is what reaches the server."
   (if (ssh-client-proxy-command client)
       (ssh-open-proxy-connection client)
       (progn
+        (ssh-log "resolving ~A" (ssh-client-connect-host client))
         (balkort.resolve:resolve-host
          (ssh-client-connect-host client)
          (lambda (address) (ssh-dial client address))
