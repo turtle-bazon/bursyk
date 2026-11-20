@@ -197,7 +197,11 @@ allowed methods; everything after it counts."
                       (not (eq (ssh-server-channel-state channel) :closed)))))
 
 (defun ssh-server-user-permitted-p (session user)
-  "Whether the application admits USER on SESSION, cached per name."
+  "Whether the application admits USER on SESSION, cached per name.
+
+The connection's Match blocks are resolved first, as sshd's getpwnamallow
+does, so the hook sees the per-connection values."
+  (ssh-session-resolve-config session user)
   (let ((hook (ssh-server-authorize-user (ssh-session-server session))))
     (if (null hook)
         t
@@ -220,7 +224,7 @@ allowed methods; everything after it counts."
 
 (defun ssh-plibssh-session-send-banner (session)
   "Send the configured Banner, as sshd does on the first auth request."
-  (let ((text (ssh-server-banner-text (ssh-session-server session))))
+  (let ((text (ssh-session-banner-text session)))
     (when text
       (let* ((octets (ssh-string-octets text))
              (string (ssh-string-new (length octets))))
@@ -244,7 +248,9 @@ the reason is recorded and the pump finishes it after the callback returns."
   (when count
     (incf (ssh-session-auth-failures session))
     (when (>= (ssh-session-auth-failures session)
-              (ssh-server-max-auth-tries (ssh-session-server session)))
+              (or (ssh-session-setting
+                   session #'ssh-server-config-max-auth-tries)
+                  (ssh-server-max-auth-tries (ssh-session-server session))))
       (setf (ssh-session-pending-close session) :auth-failures)))
   (ssh-plibssh-auth-failure message))
 
@@ -273,6 +279,9 @@ that admitted the key, and AUTHORIZATION the rest of that line's options."
          (method (ssh-message-subtype message)))
     (setf (ssh-session-user session) user)
     (when (zerop (ssh-session-auth-attempts session))
+      ;; Resolve Match blocks once the account name is known, before the
+      ;; Banner they may choose, as sshd's getpwnamallow does.
+      (ssh-session-resolve-config session user)
       (ssh-plibssh-session-send-banner session))
     (incf (ssh-session-auth-attempts session))
     (let ((count (ssh-server-auth-failure-counts-p
@@ -303,7 +312,8 @@ authentication attempt."
       (multiple-value-setq (authorized key-env authorization)
         (ssh-server-authorized-key-p
          (ssh-session-server session) user blob
-         :address (ssh-session-remote-ip session))))
+         :address (ssh-session-remote-ip session)
+         :session session)))
     (cond
       ((null key) (ssh-plibssh-session-auth-failure session message
                                                     :count count))
@@ -344,7 +354,9 @@ authentication attempt."
 
 MaxSessions bounds how many may be live at once, as in sshd: a further open
 is refused instead of allocated."
-  (let ((limit (ssh-server-max-sessions (ssh-session-server session))))
+  (let ((limit (or (ssh-session-setting
+                    session #'ssh-server-config-max-sessions)
+                   (ssh-server-max-sessions (ssh-session-server session)))))
     (when (and limit
                (>= (ssh-server-session-channel-count session) limit))
       (ssh-message-reply-default message)
@@ -417,8 +429,8 @@ is refused instead of allocated."
   "Record an accepted environment variable, or refuse it."
   (let* ((name (ssh-message-channel-request-env-name message))
          (value (ssh-message-channel-request-env-value message))
-         (server (ssh-session-server (ssh-server-channel-session channel))))
-    (if (ssh-server-env-allowed-p server name value)
+         (session (ssh-server-channel-session channel)))
+    (if (ssh-session-env-allowed-p session name value)
         (progn
           (push (cons name value) (ssh-server-channel-env channel))
           (ssh-message-channel-request-reply-success message))
@@ -830,8 +842,13 @@ terminal name and both sizes are kept."
   "Probe SESSION if it has been quiet, and disconnect once it stops answering."
   (unless (ssh-session-closed session)
     (let* ((server (ssh-session-server session))
-           (interval (ssh-server-client-alive-interval server))
-           (count-max (ssh-server-client-alive-count-max server)))
+           (interval (or (ssh-session-setting
+                          session #'ssh-server-config-client-alive-interval)
+                         (ssh-server-client-alive-interval server)))
+           (count-max (or (ssh-session-setting
+                           session
+                           #'ssh-server-config-client-alive-count-max)
+                          (ssh-server-client-alive-count-max server))))
       (when (and interval (plusp interval))
         (let ((idle (- (ssh-session-now)
                        (ssh-session-last-input-time session))))
@@ -854,8 +871,10 @@ terminal name and both sizes are kept."
 
 (defun ssh-session-start-client-alive-timer (session)
   "Start probing SESSION once authentication has finished."
-  (let ((interval (ssh-server-client-alive-interval
-                   (ssh-session-server session))))
+  (let ((interval (or (ssh-session-setting
+                       session #'ssh-server-config-client-alive-interval)
+                      (ssh-server-client-alive-interval
+                       (ssh-session-server session)))))
     (when (and interval
                (plusp interval)
                (not (ssh-session-client-alive-timer session))
@@ -997,6 +1016,8 @@ terminal name and both sizes are kept."
                           authorized-keys
                           authorize
                           authorize-user
+                          sshd-config
+                          user-groups
                           banner
                           permit-user-environment
                           set-env
@@ -1048,6 +1069,8 @@ sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :sshd-config sshd-config
+                  :user-groups user-groups
                   :banner banner
                   :permit-user-environment permit-user-environment
                   :set-env set-env

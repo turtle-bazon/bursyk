@@ -58,6 +58,16 @@
    #:ssh-server-client-alive-count-max
    #:ssh-server-permit-user-environment
    #:ssh-server-set-env
+   #:ssh-server-sshd-config
+   #:ssh-server-user-groups
+   #:ssh-session-config
+   #:ssh-session-config-user
+   #:ssh-session-effective-config
+   #:ssh-session-setting
+   #:ssh-session-resolve-config
+   #:ssh-session-banner-text
+   #:ssh-session-permit-user-environment-p
+   #:ssh-session-env-allowed-p
    #:ssh-server-authorize-user
    #:ssh-server-session-channel-count
    #:ssh-server-channel
@@ -171,6 +181,11 @@
    #:ssh-server-config-set-env
    #:ssh-server-config-version-addendum
    #:ssh-server-config-warnings
+   #:ssh-server-config-match-lines
+   #:ssh-server-config-for-connection
+   #:ssh-server-config-match-p
+   #:ssh-server-config-match-criteria
+   #:ssh-server-config-address-pattern-valid-p
    #:+ssh-server-config-directory+
    #:+ssh-server-config-default-file+
    #:+ssh-server-config-default-authorized-keys-files+

@@ -52,6 +52,8 @@ advertised and then fail the first KEX."
                           authorized-keys
                           authorize
                           authorize-user
+                          sshd-config
+                          user-groups
                           banner
                           permit-user-environment
                           set-env
@@ -86,6 +88,11 @@ account may try to authenticate at all; it runs before any method and its
 answer is cached for that name, which is where AllowUsers, DenyUsers and
 PermitRootLogin belong.
 
+SSHD-CONFIG is the parsed sshd_config whose Match blocks are resolved for
+each connection once its account name is known; USER-GROUPS is a function of
+USER returning group names for Match Group.  Without SSHD-CONFIG a server has
+only the settings given here.
+
 BANNER is sshd's Banner text, a function of no arguments returning it (so a
 file can change between connections), or NIL for none.
 
@@ -106,7 +113,7 @@ default, so a config's explicit zero is still honoured.
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.14\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.15\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -139,6 +146,8 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :sshd-config sshd-config
+                  :user-groups user-groups
                   :banner banner
                   :permit-user-environment permit-user-environment
                   :set-env set-env

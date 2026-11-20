@@ -619,17 +619,20 @@ permissive defaults."
   "Whether KEY-BLOB is listed in SOURCE, a file, a list, or one line."
   (nth-value 0 (ssh-authorized-key-blob-match source key-blob)))
 
-(defun ssh-server-authorized-key-p (server user key-blob &key address)
+(defun ssh-server-authorized-key-p (server user key-blob
+                                   &key address session)
   "Whether KEY-BLOB may log in as USER on SERVER.
 
 Returns (VALUES MATCHED ENVIRONMENTS OPTIONS) so the caller can apply the
 authorized_keys line's environment= options and enforce the rest of its
-policy.  A custom AUTHORIZE function is called with (USER KEY-BLOB ADDRESS)
-and may return the same values; ADDRESS is SESSION's peer address, which
-from= needs."
+policy.  A custom AUTHORIZE function is called with
+(USER KEY-BLOB ADDRESS SESSION) and may return the same values; ADDRESS is
+SESSION's peer address, which from= needs, and SESSION is there because
+AuthorizedKeysFile and PermitRootLogin may come from a Match block."
   (let ((authorize (ssh-server-authorize server)))
     (cond
-      ((functionp authorize) (funcall authorize user key-blob address))
+      ((functionp authorize)
+       (funcall authorize user key-blob address session))
       ((ssh-server-authorized-keys server)
        (ssh-authorized-key-blob-match (ssh-server-authorized-keys server)
                                       key-blob :address address))
@@ -646,6 +649,117 @@ from= needs."
   "SESSION's peer IP as text, or NIL when the backend did not report it."
   (let ((address (ssh-session-remote-address session)))
     (and (listp address) (getf address :address))))
+
+;;; ---- Per-connection sshd_config ----
+;;;
+;;; sshd reads its file twice: globally at startup and again per connection
+;;; once the account name is known, which is what makes Match work.  The
+;;; resolved config is kept on the session so every later decision -- the
+;;; banner, MaxAuthTries, forwarding, ForceCommand -- uses the same values.
+
+(defun ssh-session-effective-config (session)
+  "SESSION's Match-resolved sshd_config, else the server's base config."
+  (or (ssh-session-config session)
+      (let ((server (ssh-session-server session)))
+        (and server (ssh-server-sshd-config server)))))
+
+(defun ssh-session-setting (session accessor)
+  "ACCESSOR applied to SESSION's effective config, or NIL without one."
+  (let ((config (ssh-session-effective-config session)))
+    (and config (funcall accessor config))))
+
+(defun ssh-session-resolve-config (session user)
+  "Resolve SESSION's Match blocks for USER and remember the result.
+
+Runs once per user name, before authentication, as sshd's getpwnamallow
+does.  A server with no base config, or a config with no Match blocks, keeps
+the session's config NIL so the server-level settings stay in force."
+  (let* ((server (ssh-session-server session))
+         (base (ssh-server-sshd-config server)))
+    (when base
+      (unless (and (ssh-session-config session)
+                   (equal user (ssh-session-config-user session)))
+        (let ((groups-hook (ssh-server-user-groups server)))
+          (setf (ssh-session-config session)
+                (ssh-server-config-for-connection
+                 base
+                 :user user
+                 :groups (and groups-hook (funcall groups-hook user))
+                 :groups-known (not (null groups-hook))
+                 :address (ssh-session-remote-ip session)
+                 :hostname (ssh-session-remote-ip session)
+                 :local-port (ssh-server-port server)))
+          (setf (ssh-session-config-user session) user))))
+    (ssh-session-config session)))
+
+(defun ssh-read-banner-file (path)
+  "The text of sshd's Banner file at PATH, or NIL when there is none.
+
+sshd reads the file for every connection and ignores one it cannot read, one
+that is empty, and one larger than a megabyte, so a bad banner never stops a
+login."
+  (handler-case
+      (when (and (stringp path) (probe-file path))
+        (with-open-file (in path :direction :input :if-does-not-exist nil)
+          (when in
+            (let ((length (file-length in)))
+              (when (and (integerp length)
+                         (plusp length)
+                         (<= length (* 1024 1024)))
+                (let ((text (make-string length)))
+                  (read-sequence text in)
+                  text))))))
+    (error () nil)))
+
+(defun ssh-session-banner-text (session)
+  "The Banner text SESSION should send, after Match resolution.
+
+A Banner in the resolved config names a file, as in sshd_config; a banner
+handed to MAKE-SSH-SERVER is text or a function returning it, and that is
+used when no config names one."
+  (let ((configured (ssh-session-setting session
+                                         #'ssh-server-config-banner)))
+    (cond
+      ((eq configured :none) nil)
+      (configured (ssh-read-banner-file configured))
+      (t
+       (let ((server (ssh-session-server session)))
+         (when server
+           (let ((banner (ssh-server-banner server)))
+             (when banner
+               (let ((text (if (functionp banner) (funcall banner) banner)))
+                 (when (and text (plusp (length text)))
+                   text))))))))))
+
+(defun ssh-session-permit-user-environment-p (session name)
+  "Whether SESSION's PermitUserEnvironment lets the user set NAME."
+  (let* ((server (ssh-session-server session))
+         (policy (or (ssh-session-setting
+                      session
+                      #'ssh-server-config-permit-user-environment)
+                     (and server
+                          (ssh-server-permit-user-environment server)))))
+    (cond
+      ((eq policy :yes) t)
+      ((consp policy) (and (ssh-match-pattern-list policy name) t))
+      (t nil))))
+
+(defun ssh-session-env-allowed-p (session name value)
+  "Whether SESSION's AcceptEnv policy admits NAME=VALUE.
+
+A policy handed to MAKE-SSH-SERVER wins over the config file's, because it
+is what the program set directly; otherwise the Match-resolved AcceptEnv
+applies."
+  (let* ((server (ssh-session-server session))
+         (policy (or (and server (ssh-server-accept-env server))
+                     (ssh-session-setting
+                      session #'ssh-server-config-accept-env))))
+    (cond
+      ((eq policy t) t)
+      ((functionp policy) (funcall policy name value))
+      ((listp policy)
+       (some (lambda (pattern) (ssh-match-pattern pattern name)) policy))
+      (t nil))))
 
 (defun ssh-session-permits-pty-p (session)
   "Whether the key that authenticated SESSION may request a pty."
@@ -686,22 +800,34 @@ than the bracket classes an ssh_config Host pattern allows."
      (ssh-match-pattern (subseq pattern 1) (subseq text 1)))
     (t nil)))
 
-(defun ssh-match-pattern-list (patterns text)
-  "Whether TEXT matches PATTERNS, sshd's match_pattern_list(3) semantics.
+(defun ssh-match-pattern-list-state (patterns text)
+  "TEXT against PATTERNS as sshd's match_pattern_list(3): :DENIED, :MATCHED or NIL.
 
-PATTERNS may hold commas; a leading ! vetoes a match, and any other match is
-enough.  Used for PermitUserEnvironment's allowlist."
+PATTERNS may hold commas; a leading ! vetoes a match.  A veto returns
+:DENIED at once, exactly as match_pattern_list returns -1, so a caller that
+combines several strings (Match Group, say) can let the veto win."
   (let ((matched nil))
     (dolist (pattern (loop for pattern in patterns
-                           append (uiop:split-string pattern :separator ","))
-             matched)
+                           append (uiop:split-string pattern :separator ",")))
       (let ((negated (and (plusp (length pattern))
                           (char= (char pattern 0) #\!))))
         (when negated (setf pattern (subseq pattern 1)))
         (when (ssh-match-pattern pattern text)
           (if negated
-              (return-from ssh-match-pattern-list nil)
-              (setf matched t)))))))
+              (return-from ssh-match-pattern-list-state :denied)
+              (setf matched t)))))
+    (and matched :matched)))
+
+(defun ssh-match-pattern-list (patterns text)
+  "Whether TEXT matches PATTERNS, sshd's match_pattern_list(3) semantics.
+
+PATTERNS may hold commas; a leading ! vetoes a match, and any other match is
+enough.  Used for PermitUserEnvironment's allowlist."
+  (eq :matched (ssh-match-pattern-list-state patterns text)))
+
+(defun ssh-pattern-list-denied-p (patterns text)
+  "Whether TEXT matches one of PATTERNS' negated entries."
+  (eq :denied (ssh-match-pattern-list-state patterns text)))
 
 (defun ssh-server-permit-user-environment-p (server name)
   "Whether SERVER lets a user set the environment variable NAME.

@@ -101,6 +101,10 @@
   authorized-keys
   authorize
   authorize-user
+  ;; The sshd_config the connection-scoped Match blocks are resolved from,
+  ;; and a function of USER returning group names for Match Group.
+  sshd-config
+  user-groups
   ;; sshd's Banner: text, a function of no arguments returning it, or NIL.
   banner
   ;; PermitUserEnvironment: NIL and :NO permit nothing, :YES anything, and a
@@ -145,6 +149,10 @@
   ;; The rest of that line's options: no-pty, from=, command=, permitopen=
   ;; and so on.  NIL means the line had no options (every default allowed).
   (authorization nil)
+  ;; The sshd_config resolved for this connection's Match blocks, and the
+  ;; user it was resolved for.
+  (config nil)
+  (config-user nil)
   ;; Userauth bookkeeping, as in the pure backend: sshd exempts the first
   ;; "none" probe and counts every refusal after it.
   (auth-attempts 0)

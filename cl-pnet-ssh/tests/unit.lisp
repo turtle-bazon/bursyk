@@ -1426,7 +1426,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.15" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.16" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))

@@ -325,9 +325,9 @@ behaviour without this library knowing about files."
   "Send the configured Banner before the first authentication reply.
 
 RFC 4252 allows banners at any point during authentication; sshd sends one
-when the first USER AUTH REQUEST arrives, which is when the account name is
-finally known to the user."
-  (let ((text (ssh-server-banner-text (ssh-session-server session))))
+when the first USER AUTH REQUEST arrives, after the account name -- and with
+it the Match blocks -- is finally known to the server."
+  (let ((text (ssh-session-banner-text session)))
     (when text
       (let ((writer (ssh-writer)))
         (ssh-write-u8 writer +ssh-msg-userauth-banner+)
@@ -345,7 +345,9 @@ MaxAuthTries sends DISCONNECT instead of another failure."
   (when count
     (incf (ssh-session-auth-failures session))
     (when (>= (ssh-session-auth-failures session)
-              (ssh-server-max-auth-tries (ssh-session-server session)))
+              (or (ssh-session-setting
+                   session #'ssh-server-config-max-auth-tries)
+                  (ssh-server-max-auth-tries (ssh-session-server session))))
       (ssh-session-send-payload-and-close
        session
        (ssh-disconnect-payload "Too many authentication failures"
@@ -438,7 +440,8 @@ which the transport enforces for pty and forwarding requests."
         (multiple-value-bind (authorized key-env authorization)
             (ssh-server-authorized-key-p
              (ssh-session-server session) user key-blob
-             :address (ssh-session-remote-ip session))
+             :address (ssh-session-remote-ip session)
+             :session session)
           (if authorized
               (ssh-server-complete-auth session user key-blob
                                         key-env authorization)
@@ -451,7 +454,8 @@ which the transport enforces for pty and forwarding requests."
   (if (and (ssh-server-user-key-algorithm-p key-blob algorithm)
            (ssh-server-authorized-key-p
             (ssh-session-server session) user key-blob
-            :address (ssh-session-remote-ip session)))
+            :address (ssh-session-remote-ip session)
+            :session session))
       (if has-signature
           (ssh-server-handle-signed-key session user algorithm key-blob reader
                                         :count count)
@@ -465,7 +469,9 @@ which the transport enforces for pty and forwarding requests."
 
 The answer is cached per name: sshd decides this once when the name first
 appears, and running a group lookup again on every retry would only repeat
-the same answer."
+the same answer.  The connection's Match blocks are resolved first, so the
+application's answer and everything after it use the per-connection values."
+  (ssh-session-resolve-config session user)
   (let ((hook (ssh-server-authorize-user (ssh-session-server session))))
     (if (null hook)
         t
@@ -495,6 +501,9 @@ allowed methods; everything after it counts."
          (method (ssh-read-text reader)))
     (declare (ignore type))
     (when (zerop (ssh-session-auth-attempts session))
+      ;; sshd resolves the connection's Match blocks when the account name is
+      ;; first known, before it sends the Banner that they may choose.
+      (ssh-session-resolve-config session user)
       (ssh-server-send-banner session))
     (incf (ssh-session-auth-attempts session))
     (let ((count (ssh-server-auth-failure-counts-p

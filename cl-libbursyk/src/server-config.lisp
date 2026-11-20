@@ -54,6 +54,51 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
   "PermitRootLogin values; without-password is the old spelling of
 prohibit-password and means the same thing.")
 
+;;; sshd parses its file twice: global directives once at startup, and the
+;;; directives of each Match block again when a connection's account is
+;;; known.  These are the keywords OpenSSH marks SSHCFG_GLOBAL: the ones a
+;;; Match block may not contain, because they describe the process rather
+;;; than one connection.
+(defparameter +ssh-server-config-global-only-keywords+
+  '("usepam" "pamauthenticationviakbdint"
+    "port" "hostkey" "hostdsakey" "hostkeyagent" "pidfile" "modulifile"
+    "serverkeybits" "logingracetime" "keyregenerationinterval"
+    "syslogfacility" "rhostsauthentication" "hostkeyalgorithms"
+    "dsaauthentication" "kerberosorlocalpasswd" "kerberosticketcleanup"
+    "kerberosgetafstoken" "kerberostgtpassing" "afstokenpassing"
+    "gssapicleanupcredentials" "gssapistrictacceptorcheck" "checkmail"
+    "listenaddress" "addressfamily" "printmotd" "printlastlog"
+    "ignoreuserknownhosts" "xauthlocation" "strictmodes"
+    "permituserenvironment" "uselogin" "compression" "tcpkeepalive"
+    "keepalive" "ciphers" "macs" "protocol" "subsystem" "maxstartups"
+    "persourcemaxstartups" "persourcenetblocksize" "usedns"
+    "verifyreversemapping" "reversemappingcheck" "useprivilegeseparation"
+    "hostcertificate" "kexalgorithms" "versionaddendum" "fingerprinthash"
+    "securitykeyprovider")
+  "sshd_config keywords OpenSSH allows only outside a Match block.
+
+Inside a Match block sshd refuses one of these with \"Directive ... is not
+allowed within a Match block\"; so does this server, instead of accepting a
+line whose value it could not apply per connection.")
+
+(defparameter +ssh-server-config-match-attributes+
+  '(("user" . :user)
+    ("group" . :group)
+    ("host" . :host)
+    ("address" . :address)
+    ("localport" . :localport))
+  "The Match attributes this server can evaluate.
+
+OpenSSH also has LocalAddress and RDomain; this server refuses those two
+rather than treating them as always false, because it cannot read the local
+socket address and has no routing domains.")
+
+;;; The memories of the first parse: every directive read inside a Match
+;;; block, tagged with the criteria in force at that line.
+(defstruct (ssh-server-match (:constructor %make-ssh-server-match))
+  (criteria '())
+  (line nil))
+
 ;;; Keywords that are valid sshd_config but cannot change anything this
 ;;; server does.  They are accepted (so a stock file still loads) and named
 ;;; in a warning, never silently dropped.
@@ -125,6 +170,11 @@ prohibit-password and means the same thing.")
   (gateway-ports nil)
   (allow-tcp-forwarding nil)
   (disable-forwarding nil)
+  ;; DisableForwarding is the one Match keyword whose "no" is a value of its
+  ;; own rather than the absence of one, so a match block that says no must
+  ;; be able to override a global yes.  This records that the directive was
+  ;; read at all; sshd's tri-state (-1/0/1) does the same job.
+  (disable-forwarding-set-p nil)
   (subsystems '())
   (log-level nil)
   ;; Access control.  Each list holds sshd patterns and accumulates across
@@ -155,6 +205,11 @@ prohibit-password and means the same thing.")
   ;; Banner is a file read for every connection, or :none to send nothing.
   (banner nil)
   (version-addendum nil)
+  ;; Directives read inside Match blocks, in file order, as
+  ;; (SSH-SERVER-MATCH . SSH-CONFIG-LINE) pairs.  The first parse validates
+  ;; them; SSH-SERVER-CONFIG-FOR-CONNECTION applies the matching ones again
+  ;; once a connection's account is known, as sshd's second parse does.
+  (match-lines '())
   (warnings '()))
 
 ;;; ---- Errors and warnings ----
@@ -356,6 +411,209 @@ as sshd's ports_from_cmdline makes the file's Port lines fall on the floor."
       (push (cons host port)
             (ssh-server-config-listen-addresses config)))))
 
+;;; ---- Match blocks ----
+
+(defun ssh-server-config-cidr-valid-p (pattern)
+  "Whether PATTERN is a CIDR this server can match, as sshd validates one."
+  (let ((slash (position #\/ pattern)))
+    (when slash
+      (let* ((network (subseq pattern 0 slash))
+             (bits-text (subseq pattern (1+ slash)))
+             (bits (and (plusp (length bits-text))
+                        (every #'digit-char-p bits-text)
+                        (ignore-errors (parse-integer bits-text)))))
+        (and bits
+             (or (and (ssh-config-ipv4-octets network)
+                      (<= 0 bits 32))
+                 (and (ssh-config-ipv6-words network)
+                      (<= 0 bits 128))))))))
+
+(defun ssh-server-config-address-pattern-valid-p (patterns)
+  "Whether every comma-separated element of PATTERNS is usable.
+
+A CIDR must parse; every other element is an address glob, exactly the set
+addr_match_list accepts.  An empty element or a bare ! is an error."
+  (every (lambda (pattern)
+           (let* ((negated (and (plusp (length pattern))
+                                (char= (char pattern 0) #\!)))
+                  (pattern (if negated (subseq pattern 1) pattern)))
+             (and (plusp (length pattern))
+                  (or (null (position #\/ pattern))
+                      (ssh-server-config-cidr-valid-p pattern)))))
+         (uiop:split-string patterns :separator ",")))
+
+(defun ssh-server-config-match-criteria (line)
+  "LINE's Match criteria as an SSH-SERVER-MATCH, or an error.
+
+Attributes are ANDed, as sshd's match_cfg_line does; each takes one
+comma-separated pattern argument, except all, which stands alone."
+  (let ((arguments (ssh-config-line-args line))
+        (criteria '()))
+    (when (null arguments)
+      (ssh-server-config-line-error line "Match needs criteria"))
+    (loop while arguments
+      do (let ((attribute (string-downcase (pop arguments))))
+        (cond
+          ((string= attribute "all")
+           (when (or criteria arguments)
+             (ssh-server-config-line-error
+              line "'all' cannot be combined with other Match attributes"))
+           (return-from ssh-server-config-match-criteria
+             (%make-ssh-server-match :criteria '((:all)) :line line)))
+          ((string= attribute "localaddress")
+           (ssh-server-config-line-error
+            line "Match LocalAddress is not supported by this server"))
+          ((string= attribute "rdomain")
+           (ssh-server-config-line-error
+            line "Match RDomain is not supported by this server"))
+          (t
+           (let ((type (cdr (assoc attribute
+                                   +ssh-server-config-match-attributes+
+                                   :test #'string=))))
+             (unless type
+               (ssh-server-config-line-error
+                line "unsupported Match attribute ~A" attribute))
+             (let ((value (pop arguments)))
+               (when (or (null value) (zerop (length value)))
+                 (ssh-server-config-line-error
+                  line "Missing Match criteria for ~A" attribute))
+               (when (eq type :address)
+                 (unless (ssh-server-config-address-pattern-valid-p value)
+                   (ssh-server-config-line-error
+                    line "Invalid Match address argument ~A" value)))
+               (when (eq type :localport)
+                 (unless (ssh-server-config-port-string value)
+                   (ssh-server-config-line-error
+                    line "Invalid LocalPort ~A on Match line" value)))
+               (push (cons type value) criteria)))))))
+    (when (null criteria)
+      (ssh-server-config-line-error line "Match needs criteria"))
+    (%make-ssh-server-match :criteria (nreverse criteria) :line line)))
+
+(defun ssh-server-config-match-p (match
+                                  &key user groups (groups-known t)
+                                    address hostname local-port)
+  "Whether MATCH's criteria all hold for one connection.
+
+USER and GROUPS describe the account, ADDRESS and HOSTNAME the peer, and
+LOCAL-PORT the listener that accepted it.  HOSTNAME defaults to ADDRESS
+because this server's UseDNS is off, as sshd's default; HOST patterns are
+matched case-insensitively.  An attribute whose value is unavailable is an
+error, never an accidental no-match: sshd fatals in the same situation."
+  (dolist (criterion (ssh-server-match-criteria match) t)
+    (destructuring-bind (type . pattern) criterion
+      (ecase type
+        (:all t)
+        (:user
+         (unless user
+           (error 'ssh-server-config-error
+                  :path (ssh-config-line-path (ssh-server-match-line match))
+                  :line (ssh-config-line-number
+                         (ssh-server-match-line match))
+                  :detail "Match User needs a user name"))
+         (unless (ssh-match-pattern-list (list pattern) user)
+           (return-from ssh-server-config-match-p nil)))
+        (:group
+         (unless groups-known
+           (error 'ssh-server-config-error
+                  :path (ssh-config-line-path (ssh-server-match-line match))
+                  :line (ssh-config-line-number
+                         (ssh-server-match-line match))
+                  :detail "Match Group needs a user-groups callback"))
+         ;; sshd's ga_match_pattern_list: a group matching a negated pattern
+         ;; vetoes the whole block, whatever any other group matched.
+         (let ((matched nil)
+               (denied nil))
+           (dolist (group groups)
+             (cond
+               ((ssh-pattern-list-denied-p (list pattern) group)
+                (setf denied t))
+               ((ssh-match-pattern-list (list pattern) group)
+                (setf matched t))))
+           (unless (and matched (not denied))
+             (return-from ssh-server-config-match-p nil))))
+        (:host
+         (unless hostname
+           (error 'ssh-server-config-error
+                  :path (ssh-config-line-path (ssh-server-match-line match))
+                  :line (ssh-config-line-number
+                         (ssh-server-match-line match))
+                  :detail "Match Host needs a host name"))
+         (unless (ssh-match-pattern-list
+                  (list (string-downcase pattern))
+                  (string-downcase hostname))
+           (return-from ssh-server-config-match-p nil)))
+        (:address
+         (unless address
+           (error 'ssh-server-config-error
+                  :path (ssh-config-line-path (ssh-server-match-line match))
+                  :line (ssh-config-line-number
+                         (ssh-server-match-line match))
+                  :detail "Match Address needs a peer address"))
+         (unless (ssh-address-pattern-match-p address pattern)
+           (return-from ssh-server-config-match-p nil)))
+        (:localport
+         (unless local-port
+           (error 'ssh-server-config-error
+                  :path (ssh-config-line-path (ssh-server-match-line match))
+                  :line (ssh-config-line-number
+                         (ssh-server-match-line match))
+                  :detail "Match LocalPort needs a local port"))
+         (unless (= (ssh-server-config-port-string pattern) local-port)
+           (return-from ssh-server-config-match-p nil)))))))
+
+(defparameter +ssh-server-config-match-slots+
+  '(permit-root-login max-auth-tries max-sessions
+    client-alive-interval client-alive-count-max
+    force-command banner authorized-keys-files accept-env permit-open
+    gateway-ports allow-tcp-forwarding disable-forwarding set-env
+    allow-users deny-users allow-groups deny-groups)
+  "The fields a matching Match block may override.
+
+They are the per-connection settings this server stores, the same set
+sshd's copy_set_server_options merges from its second parse into the
+running options.")
+
+(defun ssh-server-config-merge-match (config overrides)
+  "CONFIG with every non-empty field of OVERRIDES copied over it."
+  (let ((copy (copy-structure config)))
+    (dolist (slot +ssh-server-config-match-slots+ copy)
+      (let ((value (slot-value overrides slot)))
+        (cond
+          ;; "DisableForwarding no" in a matching block turns off a global
+          ;; yes, so this copies the flag even when the value is NIL.
+          ((eq slot 'disable-forwarding)
+           (when (ssh-server-config-disable-forwarding-set-p overrides)
+             (setf (slot-value copy slot) value)))
+          ((not (null value))
+           (setf (slot-value copy slot) value)))))))
+
+(defun ssh-server-config-for-connection (config
+                                         &key user groups (groups-known t)
+                                           address hostname local-port)
+  "CONFIG with the Match blocks that hold for this connection applied.
+
+This is sshd's second parse: global directives are not reconsidered, and
+among the matching blocks the first obtained value wins, so a Match value
+overrides the global one while later matches cannot override it.  CONFIG
+itself is untouched; a copy is returned."
+  (if (null (ssh-server-config-match-lines config))
+      config
+      (let ((overrides (%make-ssh-server-config))
+            (matched nil))
+        (dolist (entry (ssh-server-config-match-lines config))
+          (when (ssh-server-config-match-p
+                 (car entry)
+                 :user user :groups groups :groups-known groups-known
+                 :address address :hostname (or hostname address)
+                 :local-port local-port)
+            (setf matched t)
+            (ssh-server-config-apply-line overrides (cdr entry))))
+        (if matched
+            (ssh-server-config-merge-match
+             config (ssh-server-config-finalize overrides))
+            config))))
+
 ;;; ---- Include ----
 
 (defun ssh-server-config-include-path (argument)
@@ -379,13 +637,24 @@ as sshd's ports_from_cmdline makes the file's Port lines fall on the floor."
 
 ;;; ---- Applying one directive ----
 
-(defun ssh-server-config-apply-line (config line &key cmdline)
+(defun ssh-server-config-apply-line (config line &key cmdline match)
   "Apply LINE to CONFIG, with sshd's validation and first-value-wins rule.
 
 CMDLINE is true for a -o answer, which takes precedence over the file's
-Port and ListenAddress the way sshd's own command-line options do."
+Port and ListenAddress the way sshd's own command-line options do.  MATCH is
+true while checking a line inside a Match block: a keyword OpenSSH allows
+only in the global section is refused, and so is a setting this server
+cannot apply per connection."
   (let ((keyword (ssh-config-line-keyword line))
         (arguments (ssh-config-line-args line)))
+    (when match
+      (when (member keyword +ssh-server-config-global-only-keywords+
+                    :test #'string=)
+        (ssh-server-config-line-error
+         line "~A is not allowed within a Match block" keyword))
+      (when (string= keyword "loglevel")
+        (ssh-server-config-line-error
+         line "LogLevel is not allowed within a Match block by this server; per-connection logging is not implemented")))
     (cond
       ;; ---- where to listen ----
       ((string= keyword "port")
@@ -504,9 +773,11 @@ Port and ListenAddress the way sshd's own command-line options do."
          line (ssh-server-config-one-argument line)
          +ssh-server-config-tcp-forwarding-values+ "AllowTcpForwarding")))
       ((string= keyword "disableforwarding")
-       (when (ssh-server-config-flag
-              line (ssh-server-config-one-argument line))
-         (setf (ssh-server-config-disable-forwarding config) t)))
+       (unless (ssh-server-config-disable-forwarding-set-p config)
+         (setf (ssh-server-config-disable-forwarding config)
+               (ssh-server-config-flag
+                line (ssh-server-config-one-argument line))
+               (ssh-server-config-disable-forwarding-set-p config) t)))
       ;; ---- account and connection policy ----
       ((member keyword '("allowusers" "denyusers"
                          "allowgroups" "denygroups")
@@ -642,7 +913,7 @@ Port and ListenAddress the way sshd's own command-line options do."
       ;; ---- refused ----
       ((string= keyword "match")
        (ssh-server-config-line-error
-        line "Match blocks are not supported by this server"))
+        line "Match is not allowed in a -o option"))
       ((member keyword +ssh-server-config-unsupported-keywords+
                :test #'string=)
        (ssh-server-config-line-error line "~A is not supported by this server"
@@ -652,8 +923,15 @@ Port and ListenAddress the way sshd's own command-line options do."
 
 ;;; ---- Reading files ----
 
+(defvar *ssh-server-config-match* nil
+  "The Match criteria in force while reading, or NIL in the global section.")
+
 (defun ssh-server-config-read-file (config path depth)
-  "Read PATH into CONFIG, following Include lines as they appear."
+  "Read PATH into CONFIG, following Include lines as they appear.
+
+Lines inside a Match block are recorded with their criteria and checked for
+syntax; they are not applied until a connection's account is known.  Include
+keeps the surrounding Match state, as sshd's include handling does."
   (when (> depth +ssh-config-max-depth+)
     (error 'ssh-server-config-error
            :path (namestring path)
@@ -674,11 +952,29 @@ Port and ListenAddress the way sshd's own command-line options do."
                                  :raw (ssh-config-line-remainder text)
                                  :path path
                                  :number number)))
-                     (if (string= keyword "include")
-                         (ssh-server-config-include config line depth)
-                         (progn
-                           (push line (ssh-server-config-directives config))
-                           (ssh-server-config-apply-line config line)))))))))
+                     (cond
+                       ((string= keyword "include")
+                        (ssh-server-config-include config line depth))
+                       ((string= keyword "match")
+                        (push line (ssh-server-config-directives config))
+                        (setf *ssh-server-config-match*
+                              (ssh-server-config-match-criteria line)))
+                       (*ssh-server-config-match*
+                        ;; Check the line without letting it touch the
+                        ;; global values, as sshd's inactive first parse does.
+                        (let ((check (%make-ssh-server-config)))
+                          (ssh-server-config-apply-line check line :match t)
+                          ;; Warnings about keywords with nothing to configure
+                          ;; still belong to the file as a whole.
+                          (dolist (warning (ssh-server-config-warnings check))
+                            (push warning
+                                  (ssh-server-config-warnings config))))
+                        (push line (ssh-server-config-directives config))
+                        (push (cons *ssh-server-config-match* line)
+                              (ssh-server-config-match-lines config)))
+                       (t
+                        (push line (ssh-server-config-directives config))
+                        (ssh-server-config-apply-line config line)))))))))
   config)
 
 (defun ssh-server-config-apply-option-line (config text &key (source "command line"))
@@ -726,6 +1022,7 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-allow-groups)
     (reverse-slot ssh-server-config-deny-groups)
     (reverse-slot ssh-server-config-subsystems)
+    (reverse-slot ssh-server-config-match-lines)
     (reverse-slot ssh-server-config-warnings))
   config)
 
@@ -735,7 +1032,8 @@ take precedence over it, exactly as sshd's -o does."
 OPTIONS are directive lines applied before the file, as sshd's -o does.
 PATH may be NIL, in which case only OPTIONS are read.  A missing file is an
 error: the caller decides whether a default file is optional."
-  (let ((config (%make-ssh-server-config :path path)))
+  (let ((config (%make-ssh-server-config :path path))
+        (*ssh-server-config-match* nil))
     (dolist (option options)
       (ssh-server-config-apply-option-line config option))
     (when path

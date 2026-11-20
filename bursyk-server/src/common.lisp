@@ -30,19 +30,19 @@ keeps one pair per name as sshd's child_set_env does."
       (values (subseq assignment 0 equals)
               (subseq assignment (1+ equals))))))
 
-(defun session-environment-permits-p (server name)
-  "Whether PermitUserEnvironment lets the user set NAME on SERVER."
-  (cl-pnet-ssh:ssh-server-permit-user-environment-p server name))
+(defun session-environment-permits-p (session name)
+  "Whether SESSION's PermitUserEnvironment lets the user set NAME."
+  (cl-pnet-ssh:ssh-session-permit-user-environment-p session name))
 
-(defun apply-environment-assignment (environment assignment server)
+(defun apply-environment-assignment (environment assignment session)
   "Add ASSIGNMENT to ENVIRONMENT when PermitUserEnvironment admits its name."
   (multiple-value-bind (name value)
       (environment-assignment-parts assignment)
-    (if (and name (session-environment-permits-p server name))
+    (if (and name (session-environment-permits-p session name))
         (environment-put environment name value)
         environment)))
 
-(defun read-user-environment-file (path server environment)
+(defun read-user-environment-file (path session environment)
   "ENVIRONMENT plus the assignments in the user's ~/.ssh/environment at PATH.
 
 sshd reads this file only under PermitUserEnvironment, strips leading
@@ -64,7 +64,7 @@ without =.  A missing or unreadable file means no assignments."
                                (char= (char trimmed 0) #\#))
                       do (setf environment
                                (apply-environment-assignment
-                                environment trimmed server)))
+                                environment trimmed session)))
               environment))
           environment)
     (error () environment)))
@@ -77,7 +77,9 @@ The library already applied AcceptEnv, so the pairs here are exactly the
 ones the client was allowed to send.  PermitUserEnvironment then adds the
 authorized_keys environment= options and the user's own file, and the
 administrator's SetEnv overrides both.  A pty's TERM replaces any TERM the
-client sent, as sshd sets s->term after the accepted environment."
+client sent, as sshd sets s->term after the accepted environment.  The
+Per-connection config decides which values apply, so a Match block's SetEnv
+replaces the global one here as it does in sshd."
   (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
          (server (cl-pnet-ssh:ssh-session-server session))
          (environment (copy-list (cl-pnet-ssh:ssh-server-channel-env channel))))
@@ -88,8 +90,12 @@ client sent, as sshd sets s->term after the accepted environment."
                              (cl-pnet-ssh:ssh-server-channel-pty-term channel))))
     (dolist (assignment (cl-pnet-ssh:ssh-session-key-env session))
       (setf environment
-            (apply-environment-assignment environment assignment server)))
-    (when (let ((policy (cl-pnet-ssh:ssh-server-permit-user-environment server)))
+            (apply-environment-assignment environment assignment session)))
+    (when (let ((policy (or (session-config-setting
+                             session
+                             #'cl-pnet-ssh:ssh-server-config-permit-user-environment)
+                            (cl-pnet-ssh:ssh-server-permit-user-environment
+                             server))))
             (or (eq policy :yes) (consp policy)))
       (multiple-value-bind (home uid)
           (user-home-and-uid (cl-pnet-ssh:ssh-session-user session))
@@ -99,12 +105,15 @@ client sent, as sshd sets s->term after the accepted environment."
                 (read-user-environment-file
                  (merge-pathnames ".ssh/environment"
                                   (uiop:ensure-directory-pathname home))
-                 server environment)))))
-    (dolist (assignment (cl-pnet-ssh:ssh-server-set-env server))
-      (multiple-value-bind (name value)
-          (environment-assignment-parts assignment)
-        (when name
-          (setf environment (environment-put environment name value)))))
+                 session environment)))))
+    (let ((set-env (or (session-config-setting
+                        session #'cl-pnet-ssh:ssh-server-config-set-env)
+                       (cl-pnet-ssh:ssh-server-set-env server))))
+      (dolist (assignment set-env)
+        (multiple-value-bind (name value)
+            (environment-assignment-parts assignment)
+          (when name
+            (setf environment (environment-put environment name value))))))
     environment))
 
 (defun user-shell ()

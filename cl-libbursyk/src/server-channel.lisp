@@ -146,7 +146,9 @@ channel stays in :OPENING and client data is not expected."
 
 MaxSessions bounds how many may be live at once; sshd answers further opens
 with SSH_OPEN_ADMINISTRATIVELY_PROHIBITED instead of allocating a channel."
-  (let ((limit (ssh-server-max-sessions (ssh-session-server session))))
+  (let ((limit (or (ssh-session-setting
+                    session #'ssh-server-config-max-sessions)
+                   (ssh-server-max-sessions (ssh-session-server session)))))
     (when (and limit
                (>= (ssh-server-session-channel-count session) limit))
       (ssh-server-channel-open-failure
@@ -274,9 +276,8 @@ returns NIL and is refused rather than accepted and abandoned."
 (defun ssh-server-handle-env-request (channel reader want-reply)
   (let* ((name (ssh-read-text reader))
          (value (ssh-read-text reader))
-         (ok (ssh-server-env-allowed-p
-              (ssh-session-server (ssh-server-channel-session channel))
-              name value)))
+         (session (ssh-server-channel-session channel))
+         (ok (ssh-session-env-allowed-p session name value)))
     (when ok
       (push (cons name value) (ssh-server-channel-env channel)))
     (ssh-server-channel-reply channel ok want-reply)))

@@ -19,6 +19,13 @@
   ;; Called once per (SESSION USER) before any authentication method runs;
   ;; the answer is cached for that pair.  NIL means every user is admitted.
   authorize-user
+  ;; The sshd_config the connection-scoped Match blocks are resolved from.
+  ;; NIL means the program configured the server directly and there is
+  ;; nothing to re-read per connection.
+  sshd-config
+  ;; A function of USER returning the group names used by Match Group, or
+  ;; NIL when the program has no group lookup.  sshd asks the C library.
+  user-groups
   ;; sshd's Banner: text sent before the first authentication reply, a
   ;; function of no arguments returning it (so the file can change without a
   ;; restart), or NIL for none.
@@ -95,6 +102,10 @@ only want to describe it."
   ;; The rest of that line's options: no-pty, from=, command=, permitopen=
   ;; and so on.  NIL means the line had no options (every default allowed).
   (authorization nil)
+  ;; The sshd_config resolved for this connection's Match blocks, and the
+  ;; user it was resolved for, so a retry by the same name reuses it.
+  (config nil)
+  (config-user nil)
   ;; Userauth bookkeeping: a fresh connection starts at zero, and the first
   ;; "none" probe is exempt from the failure count, as in sshd.
   (auth-attempts 0)
@@ -267,8 +278,13 @@ server was built without a value."
   "Probe SESSION if it has been quiet, and disconnect once it stops answering."
   (unless (ssh-session-closed-p session)
     (let* ((server (ssh-session-server session))
-           (interval (ssh-server-client-alive-interval server))
-           (count-max (ssh-server-client-alive-count-max server)))
+           (interval (or (ssh-session-setting
+                          session #'ssh-server-config-client-alive-interval)
+                         (ssh-server-client-alive-interval server)))
+           (count-max (or (ssh-session-setting
+                           session
+                           #'ssh-server-config-client-alive-count-max)
+                          (ssh-server-client-alive-count-max server))))
       (when (and interval (plusp interval))
         (let ((idle (- (ssh-session-now)
                        (ssh-session-last-input-time session))))
@@ -295,8 +311,10 @@ server was built without a value."
 
 (defun ssh-session-start-client-alive-timer (session)
   "Start probing SESSION once authentication has finished."
-  (let ((interval (ssh-server-client-alive-interval
-                   (ssh-session-server session))))
+  (let ((interval (or (ssh-session-setting
+                       session #'ssh-server-config-client-alive-interval)
+                      (ssh-server-client-alive-interval
+                       (ssh-session-server session)))))
     (when (and interval
                (plusp interval)
                (not (ssh-session-client-alive-timer session))

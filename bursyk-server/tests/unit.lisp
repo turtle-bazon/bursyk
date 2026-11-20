@@ -101,28 +101,28 @@ that ends the stream too."
 
 (test tcpip-forwarding-is-allowed-by-default
   (let ((bursyk-server::*options* nil))
-    (is (bursyk-server::tcpip-allowed-p "example.com" 443))
-    (is (bursyk-server::tcpip-allowed-p "127.0.0.1" 22))))
+    (is (bursyk-server::tcpip-allowed-p nil "example.com" 443))
+    (is (bursyk-server::tcpip-allowed-p nil "127.0.0.1" 22))))
 
 (test no-tcp-forwarding-refuses-every-target
   (let ((bursyk-server::*options* (list :no-tcp-forwarding t)))
-    (is (not (bursyk-server::tcpip-allowed-p "example.com" 443)))
-    (is (not (bursyk-server::tcpip-allowed-p "127.0.0.1" 22)))))
+    (is (not (bursyk-server::tcpip-allowed-p nil "example.com" 443)))
+    (is (not (bursyk-server::tcpip-allowed-p nil "127.0.0.1" 22)))))
 
 (test allow-tcpip-narrows-the-destinations
   (let ((bursyk-server::*options*
           (list :permit-open '("db.internal:5432" "*.example.com:*"
                                "[::1]:22"))))
-    (is (bursyk-server::tcpip-allowed-p "db.internal" 5432))
-    (is (not (bursyk-server::tcpip-allowed-p "db.internal" 5433)))
-    (is (bursyk-server::tcpip-allowed-p "api.example.com" 443))
-    (is (bursyk-server::tcpip-allowed-p "API.EXAMPLE.COM" 443))
-    (is (not (bursyk-server::tcpip-allowed-p "api.example.org" 443)))
-    (is (bursyk-server::tcpip-allowed-p "::1" 22))
-    (is (not (bursyk-server::tcpip-allowed-p "::1" 23)))
+    (is (bursyk-server::tcpip-allowed-p nil "db.internal" 5432))
+    (is (not (bursyk-server::tcpip-allowed-p nil "db.internal" 5433)))
+    (is (bursyk-server::tcpip-allowed-p nil "api.example.com" 443))
+    (is (bursyk-server::tcpip-allowed-p nil "API.EXAMPLE.COM" 443))
+    (is (not (bursyk-server::tcpip-allowed-p nil "api.example.org" 443)))
+    (is (bursyk-server::tcpip-allowed-p nil "::1" 22))
+    (is (not (bursyk-server::tcpip-allowed-p nil "::1" 23)))
     ;; The master switch still wins over any allow rule.
     (setf (getf bursyk-server::*options* :no-tcp-forwarding) t)
-    (is (not (bursyk-server::tcpip-allowed-p "db.internal" 5432)))))
+    (is (not (bursyk-server::tcpip-allowed-p nil "db.internal" 5432)))))
 
 (test host-port-splitting-and-validation
   (multiple-value-bind (host port)
@@ -156,19 +156,19 @@ that ends the stream too."
 (test remote-forward-bind-policy
   (let ((bursyk-server::*options* nil))
     (is (string= "127.0.0.1"
-                 (bursyk-server::remote-bind-address nil)))
+                 (bursyk-server::remote-bind-address nil nil)))
     (is (string= "127.0.0.1"
-                 (bursyk-server::remote-bind-address "localhost")))
+                 (bursyk-server::remote-bind-address nil "localhost")))
     ;; A client cannot expose a LAN address unless the server allows it.
-    (is (null (bursyk-server::remote-bind-address "0.0.0.0")))
-    (is (null (bursyk-server::remote-bind-address "192.0.2.10"))))
+    (is (null (bursyk-server::remote-bind-address nil "0.0.0.0")))
+    (is (null (bursyk-server::remote-bind-address nil "192.0.2.10"))))
   (let ((bursyk-server::*options* (list :gateway-ports t)))
     (is (string= "0.0.0.0"
-                 (bursyk-server::remote-bind-address "0.0.0.0")))
+                 (bursyk-server::remote-bind-address nil "0.0.0.0")))
     (is (string= "0.0.0.0"
-                 (bursyk-server::remote-bind-address "*")))
+                 (bursyk-server::remote-bind-address nil "*")))
     (is (string= "192.0.2.10"
-                 (bursyk-server::remote-bind-address "192.0.2.10")))))
+                 (bursyk-server::remote-bind-address nil "192.0.2.10")))))
 
 (test remote-forward-options-parse
   (let ((bursyk-server::*options* nil))
@@ -411,8 +411,6 @@ ForceCommand two")))
 
 (test sshd-config-refuses-what-this-server-cannot-honour
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "Match User root"))
-  (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "ChrootDirectory /jail"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "PasswordAuthentication yes"))
@@ -470,6 +468,226 @@ Banner /second")))
            (is (null (bursyk-server::read-banner-file
                       (merge-pathnames "no-such-banner"
                                        (uiop:temporary-directory))))))
+      (ignore-errors (delete-file path)))))
+
+;;; ---- Match blocks ----
+
+(defun effective-config (text &key user (groups nil) (groups-known t)
+                              (address "192.0.2.9") (local-port 22)
+                              (hostname nil))
+  (cl-pnet-ssh:ssh-server-config-for-connection
+   (config-from-text text)
+   :user user :groups groups :groups-known groups-known
+   :address address :hostname hostname :local-port local-port))
+
+(test match-blocks-override-global-settings
+  (let ((text "PermitRootLogin yes
+MaxAuthTries 6
+AcceptEnv LANG
+Match User alice
+  PermitRootLogin no
+  MaxAuthTries 2
+  AcceptEnv LC_*
+Match Address 192.0.2.0/24
+  AllowTcpForwarding local
+  PermitOpen db:5432
+"))
+    (let ((alice (effective-config text :user "alice"
+                                        :address "198.51.100.4")))
+      (is (eq :no (cl-pnet-ssh:ssh-server-config-permit-root-login alice)))
+      (is (eql 2 (cl-pnet-ssh:ssh-server-config-max-auth-tries alice)))
+      ;; A list set in a matching block replaces the global list, as sshd's
+      ;; copy_set_server_options does.
+      (is (equal '("LC_*")
+                 (cl-pnet-ssh:ssh-server-config-accept-env alice))))
+    (let ((bob (effective-config text :user "bob" :address "192.0.2.9")))
+      (is (eq :yes (cl-pnet-ssh:ssh-server-config-permit-root-login bob)))
+      (is (eql 6 (cl-pnet-ssh:ssh-server-config-max-auth-tries bob)))
+      (is (equal '("LANG")
+                 (cl-pnet-ssh:ssh-server-config-accept-env bob)))
+      (is (eq :local
+              (cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding bob)))
+      (is (equal '("db:5432")
+                 (cl-pnet-ssh:ssh-server-config-permit-open bob))))
+    (let ((carol (effective-config text :user "carol"
+                                         :address "198.51.100.4")))
+      (is (null (cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding carol)))
+      (is (null (cl-pnet-ssh:ssh-server-config-permit-open carol))))))
+
+(test match-can-turn-forwarding-back-on
+  ;; DisableForwarding no is a value, not the absence of one: a matching
+  ;; block must be able to turn off a global yes, as sshd's tri-state does.
+  (let ((text "DisableForwarding yes
+Match User alice
+  DisableForwarding no
+"))
+    (is (null (cl-pnet-ssh:ssh-server-config-disable-forwarding
+               (effective-config text :user "alice"))))
+    (is (eq t (cl-pnet-ssh:ssh-server-config-disable-forwarding
+               (effective-config text :user "bob")))))
+  ;; The first obtained value still wins inside a block, and globally.
+  (let ((text "DisableForwarding no
+DisableForwarding yes
+Match User alice
+  DisableForwarding no
+  DisableForwarding yes
+"))
+    (is (null (cl-pnet-ssh:ssh-server-config-disable-forwarding
+               (config-from-text text))))
+    (is (null (cl-pnet-ssh:ssh-server-config-disable-forwarding
+               (effective-config text :user "alice"))))))
+
+(test match-first-value-wins-and-criteria-are-anded
+  (let ((text "Match User alice
+  MaxAuthTries 2
+Match User alice
+  MaxAuthTries 3
+Match Address 192.0.2.0/24
+  MaxSessions 1
+Match User alice Address 192.0.2.0/24
+  ForceCommand /usr/bin/true
+"))
+    (let ((both (effective-config text :user "alice"
+                                        :address "192.0.2.9")))
+      ;; The first obtained value wins, so the second block's 3 is ignored.
+      (is (eql 2 (cl-pnet-ssh:ssh-server-config-max-auth-tries both)))
+      (is (eql 1 (cl-pnet-ssh:ssh-server-config-max-sessions both)))
+      (is (equal "/usr/bin/true"
+                 (cl-pnet-ssh:ssh-server-config-force-command both))))
+    (let ((address-only (effective-config text :user "alice"
+                                                :address "198.51.100.4")))
+      (is (eql 2 (cl-pnet-ssh:ssh-server-config-max-auth-tries address-only)))
+      ;; The address block does not match, and the combined one needs both.
+      (is (null (cl-pnet-ssh:ssh-server-config-max-sessions address-only)))
+      (is (null (cl-pnet-ssh:ssh-server-config-force-command address-only))))
+    (let ((user-only (effective-config text :user "bob"
+                                             :address "192.0.2.9")))
+      (is (null (cl-pnet-ssh:ssh-server-config-max-auth-tries user-only)))
+      (is (eql 1 (cl-pnet-ssh:ssh-server-config-max-sessions user-only))))))
+
+(test match-group-negation-and-all
+  (let ((text "Match Group wheel
+  MaxAuthTries 1
+Match Group *,!wheel
+  MaxSessions 7
+Match All
+  Banner /banner
+"))
+    (let ((wheel (effective-config text :user "bob" :groups '("wheel"))))
+      (is (eql 1 (cl-pnet-ssh:ssh-server-config-max-auth-tries wheel)))
+      ;; A negated group match vetoes the block however the other names match.
+      (is (null (cl-pnet-ssh:ssh-server-config-max-sessions wheel)))
+      (is (equal "/banner" (cl-pnet-ssh:ssh-server-config-banner wheel))))
+    (let ((other (effective-config text :user "bob" :groups '("users"))))
+      (is (null (cl-pnet-ssh:ssh-server-config-max-auth-tries other)))
+      (is (eql 7 (cl-pnet-ssh:ssh-server-config-max-sessions other))))
+    ;; Without a group callback Match Group can never be evaluated, and sshd
+    ;; treats the situation as an error rather than a silent no-match.
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (cl-pnet-ssh:ssh-server-config-for-connection
+       (config-from-text text)
+       :user "bob" :groups-known nil))))
+
+(test match-access-lists-apply-per-connection
+  (let* ((config (config-from-text "AllowUsers alice
+Match User bob
+  AllowUsers bob
+  DenyUsers mallory
+"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session-for
+           (lambda (user)
+             (let ((session (cl-pnet-ssh::%make-ssh-session
+                             :server server :user user)))
+               (setf (cl-pnet-ssh:ssh-session-remote-address session)
+                     (list :address "192.0.2.9"))
+               (cl-pnet-ssh:ssh-session-resolve-config session user)
+               session)))
+         (alice (funcall session-for "alice"))
+         (bob (funcall session-for "bob")))
+    ;; The global list still governs every user it names.
+    (is (bursyk-server::user-allowed-p alice "alice"))
+    (is (not (bursyk-server::user-allowed-p alice "bob")))
+    ;; Bob's own Match block replaces both lists for his connection.
+    (is (bursyk-server::user-allowed-p bob "bob"))
+    (is (not (bursyk-server::user-allowed-p bob "alice")))
+    (is (not (bursyk-server::user-allowed-p bob "mallory")))))
+
+(test match-host-and-localport
+  (let ((text "Match Host example.com
+  MaxSessions 3
+Match LocalPort 2222
+  MaxAuthTries 1
+"))
+    (let ((config (effective-config text :user "u"
+                                         :hostname "EXAMPLE.COM"
+                                         :local-port 2222)))
+      (is (eql 3 (cl-pnet-ssh:ssh-server-config-max-sessions config)))
+      (is (eql 1 (cl-pnet-ssh:ssh-server-config-max-auth-tries config))))
+    (let ((config (effective-config text :user "u"
+                                         :hostname "other.example.com"
+                                         :local-port 22)))
+      (is (null (cl-pnet-ssh:ssh-server-config-max-sessions config)))
+      (is (null (cl-pnet-ssh:ssh-server-config-max-auth-tries config))))))
+
+(test match-refuses-criteria-and-keywords-it-cannot-honour
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match LocalAddress 127.0.0.1"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match RDomain dmz"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match Address not-a-network/33"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match LocalPort 0"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match All User alice"))
+  ;; OpenSSH's global-only keywords are refused here with the same intent.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+ Port 2200"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+ LogLevel DEBUG"))
+  ;; PermitUserEnvironment is global-only in OpenSSH 9.2 as well.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+ PermitUserEnvironment yes"))
+  ;; An empty Match block is valid, as sshd accepts it; nothing is silently
+  ;; dropped because there is nothing in it.
+  (is (null (cl-pnet-ssh:ssh-server-config-warnings
+             (config-from-text "Match User alice"))))
+  ;; sshd's -o cannot introduce a Match block either.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (cl-pnet-ssh:ssh-server-config-load
+     nil :options '("Match=User alice"))))
+
+(test match-banner-is-read-per-connection
+  (let ((path (merge-pathnames "bursyk-match-banner.txt"
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (write-string "match banner" out))
+           (let* ((config (config-from-text
+                           (format nil "Banner /no-such-global-banner~%~
+                                        Match User alice~%~
+                                        Banner ~A~%" path)))
+                  (server (cl-pnet-ssh::%make-ssh-server
+                           :sshd-config config))
+                  (alice (cl-pnet-ssh::%make-ssh-session
+                          :server server :user "alice"))
+                  (bob (cl-pnet-ssh::%make-ssh-session
+                        :server server :user "bob")))
+             (cl-pnet-ssh:ssh-session-resolve-config alice "alice")
+             (cl-pnet-ssh:ssh-session-resolve-config bob "bob")
+             (is (equal "match banner"
+                        (cl-pnet-ssh:ssh-session-banner-text alice)))
+             ;; Bob keeps the global Banner, whose file does not exist.
+             (is (null (cl-pnet-ssh:ssh-session-banner-text bob)))))
       (ignore-errors (delete-file path)))))
 
 (test sshd-config-reads-environment-policy
@@ -535,7 +753,9 @@ BROKEN~%
 LC_ALL=C~%"))
            (let ((environment
                    (bursyk-server::read-user-environment-file
-                    path server '(("LANG" . "client")))))
+                    path
+                    (cl-pnet-ssh::%make-ssh-session :server server)
+                    '(("LANG" . "client")))))
              (is (equal "en_US.UTF-8"
                         (cdr (assoc "LANG" environment :test #'string=))))
              (is (equal "C"
@@ -779,31 +999,43 @@ HostKey /tmp/host_b")))
            "AllowTcpForwarding local
 GatewayPorts clientspecified
 PermitOpen db:5432")))
-    (is (bursyk-server::tcpip-allowed-p "db" 5432))
-    (is (not (bursyk-server::tcpip-allowed-p "web" 443)))
-    (is (not (bursyk-server::remote-forwarding-allowed-p)))
-    (is (equal "0.0.0.0" (bursyk-server::remote-bind-address "*")))
+    (is (bursyk-server::tcpip-allowed-p nil "db" 5432))
+    (is (not (bursyk-server::tcpip-allowed-p nil "web" 443)))
+    (is (not (bursyk-server::remote-forwarding-allowed-p nil)))
+    (is (equal "0.0.0.0" (bursyk-server::remote-bind-address nil "*")))
     (is (equal "10.0.0.5"
-               (bursyk-server::remote-bind-address "10.0.0.5"))))
+               (bursyk-server::remote-bind-address nil "10.0.0.5"))))
   (let ((bursyk-server::*options* nil)
         (bursyk-server::*server-config*
           (config-from-text "PermitOpen none")))
-    (is (not (bursyk-server::tcpip-allowed-p "anything" 22))))
+    (is (not (bursyk-server::tcpip-allowed-p nil "anything" 22))))
   (let ((bursyk-server::*options* nil)
         (bursyk-server::*server-config* nil))
     ;; Without a config file the defaults stay permissive.
-    (is (bursyk-server::tcpip-allowed-p "anything" 22))
-    (is (bursyk-server::remote-forwarding-allowed-p))
-    (is (equal "127.0.0.1" (bursyk-server::remote-bind-address "*")))))
+    (is (bursyk-server::tcpip-allowed-p nil "anything" 22))
+    (is (bursyk-server::remote-forwarding-allowed-p nil))
+    (is (equal "127.0.0.1" (bursyk-server::remote-bind-address nil "*")))))
 
 (test accept-env-comes-from-the-config-when-e-is-absent
   (let ((bursyk-server::*options* nil)
         (bursyk-server::*server-config*
           (config-from-text "AcceptEnv LANG LC_*")))
-    (is (equal '("LANG" "LC_*") (bursyk-server::accept-env-names))))
+    ;; The command line is empty, so the session's resolved config supplies
+    ;; AcceptEnv; the server is not handed a duplicate answer.
+    (is (null (bursyk-server::accept-env-names)))
+    (let* ((config bursyk-server::*server-config*)
+           (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+           (session (cl-pnet-ssh::%make-ssh-session
+                     :server server
+                     :config (cl-pnet-ssh:ssh-server-config-for-connection
+                              config
+                              :user "alice" :address "192.0.2.9"))))
+      (is (cl-pnet-ssh:ssh-session-env-allowed-p session "LANG" "C"))
+      (is (cl-pnet-ssh:ssh-session-env-allowed-p session "LC_ALL" "C"))))
   (let ((bursyk-server::*options* (list :accept-env '("TWO" "ONE")))
         (bursyk-server::*server-config*
           (config-from-text "AcceptEnv LANG LC_*")))
+    ;; -e is the explicit answer and wins over the file.
     (is (equal '("ONE" "TWO") (bursyk-server::accept-env-names)))))
 
 #-win32
@@ -998,19 +1230,28 @@ DenyGroups banned")))
                                                    :if-does-not-exist :create)
                  (format out "no-pty ssh-ed25519 ~A~%" blob))
                ;; The pre-authentication gate defers this mode to the key.
-               (is (bursyk-server::root-login-allowed-p "root"))
-               (let ((bursyk-server::*options*
-                       (list :authorized-keys with-command)))
+               (is (bursyk-server::root-login-allowed-p nil "root"))
+               (let* ((bursyk-server::*options*
+                        (list :authorized-keys with-command))
+                      (server (cl-pnet-ssh::%make-ssh-server
+                               :sshd-config config))
+                      (session (cl-pnet-ssh::%make-ssh-session
+                                :server server)))
                  (multiple-value-bind (matched environment authorization)
-                     (bursyk-server::authorized-keys-p "root" key)
+                     (bursyk-server::authorized-keys-p "root" key nil session)
                    (declare (ignore environment))
                    (is (not (null matched)))
                    (is (equal "id"
                               (cl-pnet-ssh:ssh-authorization-options-force-command
                                authorization)))))
-               (let ((bursyk-server::*options*
-                       (list :authorized-keys without-command)))
-                 (is (null (bursyk-server::authorized-keys-p "root" key)))))
+               (let* ((bursyk-server::*options*
+                        (list :authorized-keys without-command))
+                      (server (cl-pnet-ssh::%make-ssh-server
+                               :sshd-config config))
+                      (session (cl-pnet-ssh::%make-ssh-session
+                                :server server)))
+                 (is (null (bursyk-server::authorized-keys-p
+                            "root" key nil session)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test max-auth-tries-counts-failures-and-has-sshd-defaults
@@ -1072,7 +1313,8 @@ DenyGroups banned")))
          (config (config-from-text
                   "ForceCommand echo from-config
 Subsystem sftp /usr/lib/openssh/sftp-server"))
-         (session (cl-pnet-ssh::%make-ssh-session))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
          (channel (cl-pnet-ssh::%make-ssh-server-channel
                    :session session :local-id 1 :type "session"
                    :state :open))

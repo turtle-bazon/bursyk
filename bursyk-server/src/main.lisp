@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.14"
+(defparameter +bursyk-server-version+ "0.0.2.15"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -239,6 +239,22 @@ version rather than a generic library string.")
   "ACCESSOR applied to *SERVER-CONFIG*, or NIL without a config file."
   (and *server-config* (funcall accessor *server-config*)))
 
+(defun session-config-setting (session accessor)
+  "ACCESSOR applied to SESSION's Match-resolved config, or NIL.
+
+The library falls back to the server's base config when no Match block
+applies, so this answers the global value for an ordinary connection.  A NIL
+SESSION means there is no connection yet and the startup config is meant."
+  (let ((config (if session
+                    (cl-pnet-ssh:ssh-session-effective-config session)
+                    *server-config*)))
+    (and config (funcall accessor config))))
+
+(defun session-config (session)
+  (if session
+      (cl-pnet-ssh:ssh-session-effective-config session)
+      *server-config*))
+
 (defun config-file-path ()
   "The sshd_config to read, or NIL for none.
 
@@ -304,47 +320,54 @@ explicit -f that does not exist is an error, as in sshd."
       22))
 
 (defun accept-env-names ()
-  "The -e names, or the empty list meaning AcceptEnv's answer."
-  (or (and (getf *options* :accept-env)
-           (reverse (getf *options* :accept-env)))
-      (config-setting #'cl-pnet-ssh:ssh-server-config-accept-env)))
+  "The -e names, or NIL meaning the sshd_config's AcceptEnv applies.
 
-(defun permit-open-rules ()
+Only the command line is returned: a global AcceptEnv already reaches every
+session through the resolved config, where a Match block may replace it,
+while -e is an explicit command-line answer and must win over the file."
+  (and (getf *options* :accept-env)
+       (reverse (getf *options* :accept-env))))
+
+(defun permit-open-rules (session)
   (or (and (getf *options* :permit-open)
            (reverse (getf *options* :permit-open)))
-      (config-setting #'cl-pnet-ssh:ssh-server-config-permit-open)))
+      (session-config-setting
+       session #'cl-pnet-ssh:ssh-server-config-permit-open)))
 
-(defun forwarding-disabled-p ()
-  (config-setting #'cl-pnet-ssh:ssh-server-config-disable-forwarding))
+(defun forwarding-disabled-p (session)
+  (session-config-setting
+   session #'cl-pnet-ssh:ssh-server-config-disable-forwarding))
 
-(defun tcp-forwarding-mode ()
-  (config-setting #'cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding))
+(defun tcp-forwarding-mode (session)
+  (session-config-setting
+   session #'cl-pnet-ssh:ssh-server-config-allow-tcp-forwarding))
 
-(defun direct-tcpip-allowed-p ()
+(defun direct-tcpip-allowed-p (session)
   "Whether locally forwarded connections may be opened."
   (and (not (getf *options* :no-tcp-forwarding))
-       (not (forwarding-disabled-p))
-       (not (member (tcp-forwarding-mode) '(:no :remote)))))
+       (not (forwarding-disabled-p session))
+       (not (member (tcp-forwarding-mode session) '(:no :remote)))))
 
-(defun remote-forwarding-allowed-p ()
+(defun remote-forwarding-allowed-p (session)
   "Whether the client may ask this server to listen for it."
   (and (not (getf *options* :no-remote-forwarding))
-       (not (forwarding-disabled-p))
-       (not (member (tcp-forwarding-mode) '(:no :local)))))
+       (not (forwarding-disabled-p session))
+       (not (member (tcp-forwarding-mode session) '(:no :local)))))
 
-(defun gateway-ports-p ()
+(defun gateway-ports-p (session)
   (or (getf *options* :gateway-ports)
-      (member (config-setting #'cl-pnet-ssh:ssh-server-config-gateway-ports)
+      (member (session-config-setting
+               session #'cl-pnet-ssh:ssh-server-config-gateway-ports)
               '(:yes :clientspecified))))
 
-(defun tcpip-allowed-p (host port)
+(defun tcpip-allowed-p (session host port)
   "Whether a direct-tcpip connection to HOST:PORT may be opened.
 
 As sshd does by default, every destination is allowed.  Each --allow-tcpip
 or PermitOpen narrows that set, PermitOpen none refuses them all, and either
 one of --no-tcp-forwarding and AllowTcpForwarding no refuses everything."
-  (and (direct-tcpip-allowed-p)
-       (let ((rules (permit-open-rules)))
+  (and (direct-tcpip-allowed-p session)
+       (let ((rules (permit-open-rules session)))
          (cond
            ((null rules) t)
            ((member "none" rules :test #'string-equal) nil)
@@ -379,7 +402,7 @@ one of --no-tcp-forwarding and AllowTcpForwarding no refuses everything."
 (defun loopback-bind-address-p (address)
   (member address '("" "localhost" "127.0.0.1" "::1") :test #'string-equal))
 
-(defun remote-bind-address (requested)
+(defun remote-bind-address (session requested)
   "The address to bind for a tcpip-forward request, or NIL to refuse.
 
 Empty means loopback, as in sshd.  Any other non-loopback address is refused
@@ -389,9 +412,9 @@ client should not make by itself."
     ((or (null requested) (zerop (length requested)))
      "127.0.0.1")
     ((string= requested "*")
-     (if (gateway-ports-p) "0.0.0.0" "127.0.0.1"))
+     (if (gateway-ports-p session) "0.0.0.0" "127.0.0.1"))
     ((loopback-bind-address-p requested) "127.0.0.1")
-    ((gateway-ports-p) requested)
+    ((gateway-ports-p session) requested)
     (t nil)))
 
 (defun remote-forward-for (session bind-address bind-port)
@@ -492,10 +515,10 @@ client can half-close its target, and the reply can still come back."
 
 (defun start-remote-forward (session bind-address bind-port)
   "Listener for a client's tcpip-forward request; returns the bound port."
-  (unless (remote-forwarding-allowed-p)
+  (unless (remote-forwarding-allowed-p session)
     (log-at :error "remote forwarding refused by policy")
     (return-from start-remote-forward nil))
-  (let ((address (remote-bind-address bind-address)))
+  (let ((address (remote-bind-address session bind-address)))
     (unless address
       (log-at :error
               "refusing a remote forward bound to ~A; set GatewayPorts to allow it"
@@ -1003,7 +1026,8 @@ asked for, when it asked for anything."
   (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
          (authorization (cl-pnet-ssh:ssh-session-authorization session))
          (forced-command
-           (or (config-setting #'cl-pnet-ssh:ssh-server-config-force-command)
+           (or (session-config-setting
+                session #'cl-pnet-ssh:ssh-server-config-force-command)
                (and authorization
                     (cl-pnet-ssh:ssh-authorization-options-force-command
                      authorization))))
@@ -1193,14 +1217,15 @@ unprivileged run simple."
   (let ((uid (nth-value 1 (user-home-and-uid user))))
     (and uid (string= uid "0"))))
 
-(defun approved-authorized-key (user key-env authorization)
+(defun approved-authorized-key (session user key-env authorization)
   "The authorized-keys-p answer for a key that matched USER's file.
 
 PermitRootLogin forced-commands-only admits root only when the key that
 authenticated carries command=, which sshd checks once the key options are
 known.  Any other mode was already enforced before authentication."
   (if (and (root-uid-p user)
-           (eq (config-setting
+           (eq (session-config-setting
+                session
                 #'cl-pnet-ssh:ssh-server-config-permit-root-login)
                :forced-commands-only)
            (not (and authorization
@@ -1209,7 +1234,7 @@ known.  Any other mode was already enforced before authentication."
       (values nil nil nil)
       (values t key-env authorization)))
 
-(defun authorized-keys-p (user key-blob &optional address)
+(defun authorized-keys-p (user key-blob &optional address session)
   "Whether KEY-BLOB may log in as USER, and the environment it carries.
 
 -A names one file for every user.  Otherwise AuthorizedKeysFile decides,
@@ -1218,10 +1243,11 @@ passwd entry, the single key file of the account running the server is used,
 so an unprivileged or Windows setup keeps working.  The second value is the
 environment= options of the line that matched, which PermitUserEnvironment
 decides whether to apply; the third is the rest of the line's options,
-including from=, which ADDRESS is needed to check."
+including from=, which ADDRESS is needed to check.  SESSION supplies the
+Match-resolved AuthorizedKeysFile and PermitRootLogin when it is present."
   (labels ((approve (matched key-env authorization)
              (if matched
-                 (approved-authorized-key user key-env authorization)
+                 (approved-authorized-key session user key-env authorization)
                  (values nil nil nil))))
     (let ((global (getf *options* :authorized-keys)))
       (if global
@@ -1237,7 +1263,8 @@ including from=, which ADDRESS is needed to check."
                      :address address)
                   (approve matched key-env authorization))
                 (let ((patterns
-                        (or (config-setting
+                        (or (session-config-setting
+                             session
                              #'cl-pnet-ssh:ssh-server-config-authorized-keys-files)
                             cl-pnet-ssh:+ssh-server-config-default-authorized-keys-files+)))
                   (dolist (pattern patterns (values nil nil nil))
@@ -1261,7 +1288,7 @@ including from=, which ADDRESS is needed to check."
   "SESSION's peer address as text, or NIL when the backend did not report it."
   (getf (cl-pnet-ssh:ssh-session-remote-address session) :address))
 
-(defun root-login-allowed-p (user)
+(defun root-login-allowed-p (session user)
   "Whether PermitRootLogin admits USER at the start of authentication.
 
 A non-root user always passes.  Root under forced-commands-only also passes
@@ -1272,17 +1299,19 @@ checks after the key matches."
     (declare (ignore home))
     (or (null uid)
         (not (string= uid "0"))
-        (let ((mode (config-setting
+        (let ((mode (session-config-setting
+                     session
                      #'cl-pnet-ssh:ssh-server-config-permit-root-login)))
           (or (eq mode :forced-commands-only)
               (cl-pnet-ssh:ssh-root-login-allowed-p mode "publickey"))))))
 
 (defun user-allowed-p (session user)
   "Whether sshd's account policy admits USER from SESSION's peer."
-  (and (root-login-allowed-p user)
-       (or (null *server-config*)
+  (and (root-login-allowed-p session user)
+       (or (null (session-config session))
            (cl-pnet-ssh:ssh-server-user-allowed-p
-            *server-config* user (or (session-remote-ip session) "")
+            (session-config session) user
+            (or (session-remote-ip session) "")
             (user-groups user)))))
 
 ;;; ---- Banner ----
@@ -1356,6 +1385,8 @@ guess, so only an explicit PidFile is written."
            :host-key host-keys
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
+           :sshd-config *server-config*
+           :user-groups #'user-groups
            :permit-user-environment
            (config-setting
             #'cl-pnet-ssh:ssh-server-config-permit-user-environment)
@@ -1397,8 +1428,8 @@ guess, so only an explicit PidFile is written."
                                   session)))
            :on-direct-tcpip
            (lambda (session host port origin origin-port)
-             (declare (ignore session origin origin-port))
-             (let ((allowed (tcpip-allowed-p host port)))
+             (declare (ignore origin origin-port))
+             (let ((allowed (tcpip-allowed-p session host port)))
                (log-at :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
                        host port allowed)
                allowed))
