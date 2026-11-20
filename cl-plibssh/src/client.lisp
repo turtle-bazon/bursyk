@@ -4,7 +4,7 @@
 ;;;; first byte, and every libssh call is retried from the event loop: a call
 ;;;; that would wait returns SSH_AGAIN and the descriptor watch comes back when
 ;;;; the socket moves.  Name resolution happens off the loop through
-;;;; BALKORT-RESOLVE and the TCP connection is made here, because libssh's
+;;;; BURZAY and the TCP connection is made here, because libssh's
 ;;;; SSH_OPTIONS_HOST path would call getaddrinfo on this thread.
 
 (defconstant +ssh-eof+ -127)
@@ -600,7 +600,7 @@ helper and hands back a socketpair to watch."
         (ssh-plibssh-load-client-keys client passphrase)
         (if (ssh-client-proxy-command client)
             (ssh-plibssh-client-start-proxy client)
-            (balkort.resolve:resolve-host
+            (burzay:resolve-host
              (ssh-client-connect-host client)
              (lambda (address)
                (unless (ssh-client-closed client)

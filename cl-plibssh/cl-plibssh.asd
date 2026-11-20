@@ -7,7 +7,7 @@
                #:cl-libbursyk
                #:cl-pnet
                #:cl-pnet-sockets
-               #:balkort-resolve
+               #:burzay
                #:iterate
                #:uiop)
   :serial t

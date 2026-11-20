@@ -560,7 +560,7 @@
 (defun ssh-plibssh-server-connect-target (channel host port)
   "Connect CHANNEL to HOST:PORT without blocking, then pipe both ways."
   (handler-case
-      (balkort.resolve:resolve-host
+      (burzay:resolve-host
        host
        (lambda (address)
          (ssh-plibssh-server-dial-target channel address port))

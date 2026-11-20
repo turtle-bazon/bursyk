@@ -156,7 +156,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
       (ssh-open-proxy-connection client)
       (progn
         (ssh-log "resolving ~A" (ssh-client-connect-host client))
-        (balkort.resolve:resolve-host
+        (burzay:resolve-host
          (ssh-client-connect-host client)
          (lambda (address) (ssh-dial client address))
          (lambda (condition) (ssh-resolution-error client condition)))
