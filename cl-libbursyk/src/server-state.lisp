@@ -46,6 +46,20 @@
   (login-grace-time +ssh-server-default-login-grace-time+)
   (client-alive-interval +ssh-server-default-client-alive-interval+)
   (client-alive-count-max +ssh-server-default-client-alive-count-max+)
+  ;; MaxStartups: BEGIN:RATE:FULL, sshd's 10:30:100 by default.  A
+  ;; connection is unauthenticated from accept until its first success.
+  (max-startups-begin 10)
+  (max-startups-rate 30)
+  (max-startups-full 100)
+  ;; PerSourceMaxStartups; NIL is sshd's "none", no per-source limit.
+  (per-source-max-startups nil)
+  ;; PerSourceNetBlockSize; 32:128 treats every address by itself.
+  (per-source-net-block-size-ipv4 32)
+  (per-source-net-block-size-ipv6 128)
+  ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
+  (unused-connection-timeout 0)
+  ;; Whether accepted sockets ask the system for TCP keepalives.
+  (tcp-keep-alive t)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -117,6 +131,9 @@ only want to describe it."
   ;; whenever bytes arrive or a probe is sent, as sshd's last_client_time is.
   login-grace-timer
   client-alive-timer
+  ;; Armed while the connection has no channels open, as sshd's
+  ;; UnusedConnectionTimeout is; NIL when the setting is off or a channel is up.
+  unused-connection-timer
   (client-alive-misses 0)
   (last-input-time 0)
   (closed nil)
@@ -238,7 +255,10 @@ only want to describe it."
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
         (ssh-session-client-alive-timer session)
-        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))))
+        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))
+        (ssh-session-unused-connection-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-unused-connection-timer session))))
 
 (defun ssh-session-start-login-grace-timer (session)
   "Close SESSION if it has not authenticated in LoginGraceTime seconds.

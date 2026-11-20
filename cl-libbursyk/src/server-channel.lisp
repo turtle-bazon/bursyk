@@ -69,6 +69,7 @@ out once the client confirms."
                    :on-close on-close :on-error on-error)))
     (incf (ssh-session-next-channel-id session))
     (setf (gethash id (ssh-session-channels session)) channel)
+    (ssh-session-note-channel-change session)
     (let ((writer (ssh-writer)))
       (ssh-write-u8 writer +ssh-msg-channel-open+)
       (ssh-write-text writer "forwarded-tcpip")
@@ -130,6 +131,7 @@ channel stays in :OPENING and client data is not expected."
                    :on-close on-close :on-error on-error)))
     (incf (ssh-session-next-channel-id session))
     (setf (gethash id (ssh-session-channels session)) channel)
+    (ssh-session-note-channel-change session)
     (when confirm
       (ssh-server-channel-open-confirmation channel))
     channel))
@@ -428,6 +430,7 @@ returns NIL and is refused rather than accepted and abandoned."
     (setf (ssh-server-channel-state channel) :closed)
     (remhash (ssh-server-channel-local-id channel)
              (ssh-session-channels (ssh-server-channel-session channel)))
+    (ssh-session-note-channel-change (ssh-server-channel-session channel))
     (when (ssh-server-channel-target channel)
       ;; The target connection may already have closed; CL-PNET's close is
       ;; idempotent, so call it plainly rather than hiding other errors.

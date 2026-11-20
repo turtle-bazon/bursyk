@@ -56,6 +56,19 @@
    #:ssh-server-login-grace-time
    #:ssh-server-client-alive-interval
    #:ssh-server-client-alive-count-max
+   #:ssh-server-max-startups-begin
+   #:ssh-server-max-startups-rate
+   #:ssh-server-max-startups-full
+   #:ssh-server-per-source-max-startups
+   #:ssh-server-per-source-net-block-size-ipv4
+   #:ssh-server-per-source-net-block-size-ipv6
+   #:ssh-server-unused-connection-timeout
+   #:ssh-server-tcp-keep-alive
+   #:ssh-session-unused-connection-timer
+   #:ssh-server-connection-allowed-p
+   #:ssh-server-should-drop-connection-p
+   #:ssh-session-note-channel-change
+   #:ssh-server-unauthenticated-sessions
    #:ssh-server-permit-user-environment
    #:ssh-server-set-env
    #:ssh-server-sshd-config
@@ -173,6 +186,14 @@
    #:ssh-server-config-login-grace-time
    #:ssh-server-config-client-alive-interval
    #:ssh-server-config-client-alive-count-max
+   #:ssh-server-config-max-startups-begin
+   #:ssh-server-config-max-startups-rate
+   #:ssh-server-config-max-startups-full
+   #:ssh-server-config-per-source-max-startups
+   #:ssh-server-config-per-source-net-block-size-ipv4
+   #:ssh-server-config-per-source-net-block-size-ipv6
+   #:ssh-server-config-unused-connection-timeout
+   #:ssh-server-config-tcp-keep-alive
    #:ssh-parse-time
    #:ssh-server-config-pid-file
    #:ssh-server-config-banner

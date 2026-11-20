@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.15"
+(defparameter +bursyk-server-version+ "0.0.2.16"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1412,6 +1412,34 @@ guess, so only an explicit PidFile is written."
            :client-alive-count-max
            (config-setting
             #'cl-pnet-ssh:ssh-server-config-client-alive-count-max)
+           :max-startups
+           (list (or (config-setting
+                      #'cl-pnet-ssh:ssh-server-config-max-startups-begin)
+                     10)
+                 (or (config-setting
+                      #'cl-pnet-ssh:ssh-server-config-max-startups-rate)
+                     30)
+                 (or (config-setting
+                      #'cl-pnet-ssh:ssh-server-config-max-startups-full)
+                     100))
+           :per-source-max-startups
+           (config-setting
+            #'cl-pnet-ssh:ssh-server-config-per-source-max-startups)
+           :per-source-net-block-size
+           (list (or (config-setting
+                      #'cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv4)
+                     32)
+                 (or (config-setting
+                      #'cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv6)
+                     128))
+           :unused-connection-timeout
+           (or (config-setting
+                #'cl-pnet-ssh:ssh-server-config-unused-connection-timeout)
+               0)
+           :tcp-keep-alive
+           (not (eq (config-setting
+                     #'cl-pnet-ssh:ssh-server-config-tcp-keep-alive)
+                    :no))
            :server-version (format nil "bursyk-server_~A"
                                    +bursyk-server-version+)
            :version-addendum

@@ -142,10 +142,8 @@ socket address and has no routing domains.")
     "authorizedprincipalsfile" "authorizedprincipalscommand"
     "authorizedprincipalscommanduser"
     "trustedusercakeys" "revokedkeys" "hostcertificate"
-    "authenticationmethods" "maxstartups"
-    "persourcemaxstartups" "persourcenetblocksize"
+    "authenticationmethods"
     "channeltimeout"
-    "unusedconnectiontimeout" "tcpkeepalive"
     "ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
     "pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
@@ -192,6 +190,21 @@ socket address and has no routing domains.")
   (login-grace-time nil)
   (client-alive-interval nil)
   (client-alive-count-max nil)
+  ;; MaxStartups: BEGIN:RATE:FULL, the sshd defaults when NIL.  Only global
+  ;; directives set these, and sshd's parser lets a later line replace them.
+  (max-startups-begin nil)
+  (max-startups-rate nil)
+  (max-startups-full nil)
+  ;; PerSourceMaxStartups.  NIL is sshd's "none", no per-source limit.
+  (per-source-max-startups nil)
+  ;; PerSourceNetBlockSize, IPv4 and IPv6 prefix lengths.  NIL keeps sshd's
+  ;; 32 and 128, which treat every address by itself.
+  (per-source-net-block-size-ipv4 nil)
+  (per-source-net-block-size-ipv6 nil)
+  ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
+  (unused-connection-timeout nil)
+  ;; TCPKeepAlive: :YES or :NO; NIL keeps sshd's default of yes.
+  (tcp-keep-alive nil)
   ;; PermitUserEnvironment: NIL (unset, means no), :YES, :NO, or a list of
   ;; patterns naming the variables a user may set.
   (permit-user-environment nil)
@@ -567,6 +580,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     client-alive-interval client-alive-count-max
     force-command banner authorized-keys-files accept-env permit-open
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
+    unused-connection-timeout
     allow-users deny-users allow-groups deny-groups)
   "The fields a matching Match block may override.
 
@@ -831,6 +845,75 @@ cannot apply per connection."
         config 'client-alive-count-max
         (ssh-server-config-count
          line (ssh-server-config-one-argument line))))
+      ;; ---- startup and idle limits ----
+      ((string= keyword "maxstartups")
+       ;; sshd takes BEGIN:RATE:FULL, or one number that is both the begin
+       ;; and full value, and its later lines replace the earlier ones.
+       (let ((parts (uiop:split-string
+                     (ssh-server-config-one-argument line)
+                     :separator ":")))
+         (case (length parts)
+           (1
+            (let ((value (ssh-server-config-count line (first parts))))
+              (unless (plusp value)
+                (ssh-server-config-line-error line "Invalid MaxStartups spec"))
+              (setf (ssh-server-config-max-startups-begin config) value
+                    (ssh-server-config-max-startups-full config) value)))
+           (3
+            (let ((begin (ssh-server-config-count line (first parts)))
+                  (rate (ssh-server-config-count line (second parts)))
+                  (full (ssh-server-config-count line (third parts))))
+              (unless (and (plusp begin)
+                           (<= 1 rate 100)
+                           (plusp full)
+                           (<= begin full))
+                (ssh-server-config-line-error line "Invalid MaxStartups spec"))
+              (setf (ssh-server-config-max-startups-begin config) begin
+                    (ssh-server-config-max-startups-rate config) rate
+                    (ssh-server-config-max-startups-full config) full)))
+           (otherwise
+            (ssh-server-config-line-error line "Invalid MaxStartups spec")))))
+      ((string= keyword "persourcemaxstartups")
+       (let ((argument (ssh-server-config-one-argument line)))
+         (setf (ssh-server-config-per-source-max-startups config)
+               (unless (string-equal argument "none")
+                 (ssh-server-config-count line argument)))))
+      ((string= keyword "persourcenetblocksize")
+       (let ((parts (uiop:split-string
+                     (ssh-server-config-one-argument line)
+                     :separator ":")))
+         (unless (<= 1 (length parts) 2)
+           (ssh-server-config-line-error
+            line "Invalid PerSourceNetBlockSize spec"))
+         (let ((ipv4 (ssh-server-config-count line (first parts))))
+           (unless (<= 0 ipv4 32)
+             (ssh-server-config-line-error
+              line "Invalid PerSourceNetBlockSize spec"))
+           (setf (ssh-server-config-per-source-net-block-size-ipv4 config)
+                 ipv4))
+         (when (second parts)
+           (let ((ipv6 (ssh-server-config-count line (second parts))))
+             (unless (<= 0 ipv6 128)
+               (ssh-server-config-line-error
+                line "Invalid PerSourceNetBlockSize spec"))
+             (setf (ssh-server-config-per-source-net-block-size-ipv6 config)
+                   ipv6)))))
+      ((string= keyword "unusedconnectiontimeout")
+       (let ((argument (ssh-server-config-one-argument line)))
+         (if (string-equal argument "none")
+             ;; sshd stores 0 for "none" without the first-value test, so this
+             ;; line turns the timeout off even after an earlier value.
+             (setf (ssh-server-config-unused-connection-timeout config) 0)
+             (ssh-server-config-set-once
+              config 'unused-connection-timeout
+              (ssh-server-config-time-value line argument)))))
+      ((member keyword '("tcpkeepalive" "keepalive") :test #'string=)
+       (ssh-server-config-set-once
+        config 'tcp-keep-alive
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes
+            :no)))
       ((string= keyword "pidfile")
        ;; "none" disables the file, as in sshd; it is a value like any other
        ;; for first-wins purposes, so the reader keeps the spelling and the

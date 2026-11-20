@@ -850,6 +850,141 @@ permit_user_env_allowlist; NIL and :NO permit nothing."
        (some (lambda (pattern) (ssh-match-pattern pattern name)) policy))
       (t nil))))
 
+;;; ---- Connection limits and idle timeout ----
+;;;
+;;; sshd counts a connection as unauthenticated from accept until its first
+;;; successful userauth.  MaxStartups throttles those connections, and
+;;; PerSourceMaxStartups adds a per-network cap; UnusedConnectionTimeout then
+;;; closes an authenticated connection that opens no channel.
+
+(defun ssh-server-unauthenticated-sessions (server)
+  "The sessions SERVER has accepted but whose user has not authenticated."
+  (loop for session being the hash-values of (ssh-server-sessions server)
+        when (not (ssh-session-authenticated session))
+          collect session))
+
+(defun ssh-server-should-drop-connection-p (server startups
+                                            &key (random (random 100)))
+  "Whether sshd's MaxStartups drops a connection with STARTUPS peers waiting.
+
+STARTUPS counts the unauthenticated connections already established, which
+is the value sshd passes to should_drop_connection: below BEGIN nothing is
+dropped, at FULL everything is, and in between the chance rises linearly
+from RATE percent to 100.  RANDOM is 0-99 so a test can fix the answer."
+  (let ((begin (ssh-server-max-startups-begin server))
+        (full (ssh-server-max-startups-full server))
+        (rate (ssh-server-max-startups-rate server)))
+    (cond
+      ((< startups begin) nil)
+      ((>= startups full) t)
+      ((>= rate 100) t)
+      (t
+       (let ((probability
+               (+ rate
+                  (floor (* (- 100 rate) (- startups begin))
+                         (- full begin)))))
+         (< random probability))))))
+
+(defun ssh-server-source-session-count (sessions address ipv4-bits ipv6-bits)
+  "How many SESSIONS come from ADDRESS's masked network.
+
+ADDRESS is grouped the way sshd's PerSourceNetBlockSize says: IPV4-BITS for
+an IPv4 literal, IPV6-BITS for IPv6.  An address of neither family matches
+no peer, the same allowance sshd makes when it cannot convert the sockaddr."
+  (cond
+    ((ssh-config-ipv4-octets address)
+     (let ((cidr (format nil "~A/~D" address ipv4-bits)))
+       (count-if (lambda (session)
+                   (let ((peer (ssh-session-remote-ip session)))
+                     (and peer
+                          (ssh-config-ipv4-cidr-match-p cidr peer))))
+                 sessions)))
+    ((ssh-config-ipv6-words address)
+     (let ((cidr (format nil "~A/~D" address ipv6-bits)))
+       (count-if (lambda (session)
+                   (let ((peer (ssh-session-remote-ip session)))
+                     (and peer
+                          (ssh-config-ipv6-cidr-match-p cidr peer))))
+                 sessions)))
+    (t 0)))
+
+(defun ssh-server-connection-allowed-p (server peer-address
+                                        &key (random (random 100)))
+  "Whether SERVER may keep a newly accepted connection.
+
+PEER-ADDRESS is CL-PNET's (:ADDRESS IP :PORT PORT).  MaxStartups and
+PerSourceMaxStartups both count the unauthenticated connections already
+accepted, as sshd's startup table does, and either can refuse this one."
+  (let ((startups (ssh-server-unauthenticated-sessions server)))
+    (and (not (ssh-server-should-drop-connection-p
+               server (length startups) :random random))
+         (let ((limit (ssh-server-per-source-max-startups server)))
+           (or (null limit)
+               (< (ssh-server-source-session-count
+                   startups
+                   (getf peer-address :address)
+                   (ssh-server-per-source-net-block-size-ipv4 server)
+                   (ssh-server-per-source-net-block-size-ipv6 server))
+                  limit))))))
+
+(defun ssh-server-apply-tcp-keepalive (server fd)
+  "Turn TCP keepalives on FD on or off, as SERVER's TCPKeepAlive says.
+
+The event loop enables SO_KEEPALIVE on every accepted socket by default, so
+this only has work when the config turns it off."
+  (when fd
+    (cl-pnet-sockets:set-socket-option
+     fd cl-pnet-sockets:+sol-socket+ cl-pnet-sockets:+so-keepalive+
+     (if (ssh-server-tcp-keep-alive server) 1 0))))
+
+(defun ssh-server-session-open-channel-p (session)
+  "Whether SESSION has a channel still open or opening."
+  (loop for channel being the hash-values of (ssh-session-channels session)
+        thereis (not (eq (ssh-server-channel-state channel) :closed))))
+
+(defun ssh-session-unused-connection-timeout (session)
+  "SESSION's UnusedConnectionTimeout in seconds, or 0 for none."
+  (or (ssh-session-setting
+       session #'ssh-server-config-unused-connection-timeout)
+      (ssh-server-unused-connection-timeout (ssh-session-server session))))
+
+(defun ssh-session-stop-unused-timer (session)
+  "Disarm SESSION's UnusedConnectionTimeout, if it is armed."
+  (setf (ssh-session-unused-connection-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-unused-connection-timer session))))
+
+(defun ssh-session-start-unused-timer (session)
+  "Arm SESSION's UnusedConnectionTimeout when no channel is open.
+
+sshd starts the clock once authentication finishes and restarts it whenever
+the last channel closes; a timeout with a channel still open never fires."
+  (ssh-session-stop-unused-timer session)
+  (let ((seconds (ssh-session-unused-connection-timeout session)))
+    (when (and seconds
+               (plusp seconds)
+               (ssh-session-authenticated session)
+               (not (ssh-session-closed session)))
+      (setf (ssh-session-unused-connection-timer session)
+            (cl-pnet:timer-start
+             seconds 0
+             (lambda ()
+               (setf (ssh-session-unused-connection-timer session) nil)
+               (when (and (not (ssh-session-closed session))
+                          (not (ssh-server-session-open-channel-p session)))
+                 (ssh-session-finish
+                  session "terminating inactive connection" :close))))))))
+
+(defun ssh-session-note-channel-change (session)
+  "React to SESSION's channels opening or closing.
+
+An open channel suspends UnusedConnectionTimeout; once the last one closes,
+the full timeout starts again."
+  (unless (ssh-session-closed session)
+    (if (ssh-server-session-open-channel-p session)
+        (ssh-session-stop-unused-timer session)
+        (ssh-session-start-unused-timer session))))
+
 ;;; ---- AllowUsers / DenyUsers / AllowGroups / DenyGroups ----
 ;;;
 ;;; sshd matches these at the moment a user name first appears, before any

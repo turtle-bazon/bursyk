@@ -119,6 +119,19 @@
   (login-grace-time +ssh-server-default-login-grace-time+)
   (client-alive-interval +ssh-server-default-client-alive-interval+)
   (client-alive-count-max +ssh-server-default-client-alive-count-max+)
+  ;; MaxStartups: BEGIN:RATE:FULL, sshd's 10:30:100 by default.
+  (max-startups-begin 10)
+  (max-startups-rate 30)
+  (max-startups-full 100)
+  ;; PerSourceMaxStartups; NIL is sshd's "none".
+  (per-source-max-startups nil)
+  ;; PerSourceNetBlockSize; 32:128 treats every address by itself.
+  (per-source-net-block-size-ipv4 32)
+  (per-source-net-block-size-ipv6 128)
+  ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
+  (unused-connection-timeout 0)
+  ;; Whether accepted sockets ask the system for TCP keepalives.
+  (tcp-keep-alive t)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -161,6 +174,9 @@
   ;; Connection timers, matching the pure backend's fields.
   login-grace-timer
   client-alive-timer
+  ;; Armed while the connection has no channels open, as sshd's
+  ;; UnusedConnectionTimeout is.
+  unused-connection-timer
   (client-alive-misses 0)
   (last-input-time 0)
   ;; A close decided inside a libssh message callback: the session must be

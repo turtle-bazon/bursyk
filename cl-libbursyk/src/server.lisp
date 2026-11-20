@@ -12,6 +12,25 @@
 
 (defun ssh-server-accept-session (server connection)
   "Create SESSION for a freshly accepted CONNECTION and start its greeting."
+  (let ((peer (cl-pnet:connection-peer-address connection)))
+    (unless (ssh-server-connection-allowed-p server peer)
+      (ssh-log "drop connection from ~A past MaxStartups or PerSourceMaxStartups"
+               (getf peer :address))
+      ;; sshd writes a short notice before closing; it is best effort, so a
+      ;; failed send simply closes the socket too.
+      (unless (cl-pnet:send-data
+               connection (format nil "Exceeded MaxStartups~C~C"
+                                  #\Return #\Linefeed)
+               :on-write (lambda (count)
+                           (declare (ignore count))
+                           (cl-pnet:close-connection connection))
+               :on-error (lambda (status)
+                           (declare (ignore status))
+                           (cl-pnet:close-connection connection)))
+        (cl-pnet:close-connection connection))
+      (return-from ssh-server-accept-session nil)))
+  (ssh-server-apply-tcp-keepalive
+   server (cl-pnet:connection-fileno connection))
   (let ((session (%make-ssh-session
                   :server server
                   :connection connection
@@ -62,6 +81,11 @@ advertised and then fail the first KEX."
                           login-grace-time
                           client-alive-interval
                           client-alive-count-max
+                          (max-startups '(10 30 100))
+                          per-source-max-startups
+                          (per-source-net-block-size '(32 128))
+                          (unused-connection-timeout 0)
+                          (tcp-keep-alive t)
                           accept-env
                           server-version
                           version-addendum
@@ -110,10 +134,21 @@ probes) and CLIENT-ALIVE-COUNT-MAX is ClientAliveCountMax (default 3); a
 count of 0 probes forever without disconnecting.  A NIL argument keeps the
 default, so a config's explicit zero is still honoured.
 
+MAX-STARTUPS is sshd's MaxStartups as (BEGIN RATE FULL), default
+(10 30 100): connections above BEGIN are dropped with a rising chance, and
+above FULL always.  PER-SOURCE-MAX-STARTUPS caps unauthenticated connections
+from one network, with PER-SOURCE-NET-BLOCK-SIZE (IPV4 IPV6, default
+(32 128)) saying how much of the address groups peers; NIL means no such
+cap, sshd's "none".
+
+UNUSED-CONNECTION-TIMEOUT closes an authenticated connection that has had
+no channel open for that many seconds; 0, the default, never closes one.
+TCP-KEEP-ALIVE (default T) controls SO_KEEPALIVE on accepted sockets.
+
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.15\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.16\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -162,6 +197,16 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :client-alive-count-max
                   (or client-alive-count-max
                       +ssh-server-default-client-alive-count-max+)
+                  :max-startups-begin (first max-startups)
+                  :max-startups-rate (second max-startups)
+                  :max-startups-full (third max-startups)
+                  :per-source-max-startups per-source-max-startups
+                  :per-source-net-block-size-ipv4
+                  (first per-source-net-block-size)
+                  :per-source-net-block-size-ipv6
+                  (second per-source-net-block-size)
+                  :unused-connection-timeout unused-connection-timeout
+                  :tcp-keep-alive tcp-keep-alive
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel

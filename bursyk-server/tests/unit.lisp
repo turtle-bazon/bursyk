@@ -844,6 +844,264 @@ LoginGraceTime 10")))
     (is (= 5 (cl-pnet-ssh:ssh-server-client-alive-interval server)))
     (is (= 0 (cl-pnet-ssh:ssh-server-client-alive-count-max server)))))
 
+(test sshd-config-reads-startup-limits
+  "MaxStartups, PerSource* and UnusedConnectionTimeout follow sshd's syntax."
+  (let ((config (config-from-text
+                 "MaxStartups 5:50:20
+PerSourceMaxStartups 3
+PerSourceNetBlockSize 24:64
+UnusedConnectionTimeout 30
+TCPKeepAlive no")))
+    (is (= 5 (cl-pnet-ssh:ssh-server-config-max-startups-begin config)))
+    (is (= 50 (cl-pnet-ssh:ssh-server-config-max-startups-rate config)))
+    (is (= 20 (cl-pnet-ssh:ssh-server-config-max-startups-full config)))
+    (is (= 3 (cl-pnet-ssh:ssh-server-config-per-source-max-startups config)))
+    (is (= 24
+           (cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv4
+            config)))
+    (is (= 64
+           (cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv6
+            config)))
+    (is (= 30
+           (cl-pnet-ssh:ssh-server-config-unused-connection-timeout config)))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-tcp-keep-alive config))))
+  ;; Absent directives stay NIL, so the server keeps sshd's 10:30:100,
+  ;; "none", 32:128, none and yes.
+  (let ((config (config-from-text "")))
+    (is (null (cl-pnet-ssh:ssh-server-config-max-startups-begin config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-per-source-max-startups config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-unused-connection-timeout
+               config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-tcp-keep-alive config))))
+  ;; One MaxStartups number is both the begin and full value; the rate keeps
+  ;; sshd's default of 30.
+  (let ((config (config-from-text "MaxStartups 7")))
+    (is (= 7 (cl-pnet-ssh:ssh-server-config-max-startups-begin config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-max-startups-rate config)))
+    (is (= 7 (cl-pnet-ssh:ssh-server-config-max-startups-full config))))
+  ;; MaxStartups is global-only and a later line replaces the earlier one.
+  (let ((config (config-from-text
+                 "MaxStartups 5:50:20
+MaxStartups 10:30:100")))
+    (is (= 10 (cl-pnet-ssh:ssh-server-config-max-startups-begin config)))
+    (is (= 30 (cl-pnet-ssh:ssh-server-config-max-startups-rate config)))
+    (is (= 100 (cl-pnet-ssh:ssh-server-config-max-startups-full config))))
+  ;; "none" turns the per-source limit off and UnusedConnectionTimeout off.
+  (let ((config (config-from-text
+                 "PerSourceMaxStartups none
+UnusedConnectionTimeout none")))
+    (is (null (cl-pnet-ssh:ssh-server-config-per-source-max-startups config)))
+    (is (= 0
+           (cl-pnet-ssh:ssh-server-config-unused-connection-timeout config))))
+  ;; UnusedConnectionTimeout is a time, and "none" wins even after a value,
+  ;; as sshd's own special case stores zero without the first-value test.
+  (is (= 90 (config-value
+             #'cl-pnet-ssh:ssh-server-config-unused-connection-timeout
+             "UnusedConnectionTimeout 1m30s")))
+  (is (= 5 (config-value
+            #'cl-pnet-ssh:ssh-server-config-unused-connection-timeout
+            "UnusedConnectionTimeout 5
+UnusedConnectionTimeout 10")))
+  (is (= 0 (config-value
+            #'cl-pnet-ssh:ssh-server-config-unused-connection-timeout
+            "UnusedConnectionTimeout 30
+UnusedConnectionTimeout none")))
+  ;; TCPKeepAlive's old spelling is the same directive.
+  (is (eq :yes (config-value
+                #'cl-pnet-ssh:ssh-server-config-tcp-keep-alive
+                "KeepAlive yes")))
+  (is (eq :no (config-value
+               #'cl-pnet-ssh:ssh-server-config-tcp-keep-alive
+               "TCPKeepAlive no
+TCPKeepAlive yes")))
+  ;; PerSourceNetBlockSize names IPv4, and optionally IPv6.
+  (let ((config (config-from-text "PerSourceNetBlockSize 24")))
+    (is (= 24
+           (cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv4
+            config)))
+    (is (null
+         (cl-pnet-ssh:ssh-server-config-per-source-net-block-size-ipv6
+          config))))
+  ;; The startup limits are global-only in sshd 9.2.
+  (dolist (keyword '("MaxStartups 10" "PerSourceMaxStartups 5"
+                     "PerSourceNetBlockSize 24" "TCPKeepAlive no"))
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (config-from-text
+       (format nil "Match User alice~%~A" keyword))))
+  ;; UnusedConnectionTimeout is per connection and allowed in a Match.
+  (let* ((config (config-from-text
+                  "UnusedConnectionTimeout 30
+Match User alice
+ UnusedConnectionTimeout 1m"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (alice (cl-pnet-ssh::%make-ssh-session
+                 :server server :user "alice"))
+         (bob (cl-pnet-ssh::%make-ssh-session
+               :server server :user "bob")))
+    (cl-pnet-ssh:ssh-session-resolve-config alice "alice")
+    (cl-pnet-ssh:ssh-session-resolve-config bob "bob")
+    (is (= 60 (cl-pnet-ssh::ssh-session-unused-connection-timeout alice)))
+    (is (= 30 (cl-pnet-ssh::ssh-session-unused-connection-timeout bob))))
+  ;; Bad values are reported instead of silently replaced by defaults.
+  (dolist (bad '("MaxStartups" "MaxStartups 0" "MaxStartups 10:0:20"
+                 "MaxStartups 30:50:20" "MaxStartups 10:30"
+                 "MaxStartups 10:30:20:5" "MaxStartups nope"
+                 "PerSourceMaxStartups -1" "PerSourceMaxStartups many"
+                 "PerSourceNetBlockSize 33" "PerSourceNetBlockSize 24:129"
+                 "PerSourceNetBlockSize 24:64:128" "PerSourceNetBlockSize x"
+                 "UnusedConnectionTimeout nope" "UnusedConnectionTimeout -1"
+                 "TCPKeepAlive maybe"))
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (config-from-text bad))))
+
+(test server-startup-limits-keep-sshd-defaults
+  "A server built without limit values uses sshd's 10:30:100 and friends."
+  (let ((server (cl-pnet-ssh::%make-ssh-server)))
+    (is (= 10 (cl-pnet-ssh:ssh-server-max-startups-begin server)))
+    (is (= 30 (cl-pnet-ssh:ssh-server-max-startups-rate server)))
+    (is (= 100 (cl-pnet-ssh:ssh-server-max-startups-full server)))
+    (is (null (cl-pnet-ssh:ssh-server-per-source-max-startups server)))
+    (is (= 32 (cl-pnet-ssh:ssh-server-per-source-net-block-size-ipv4 server)))
+    (is (= 128
+           (cl-pnet-ssh:ssh-server-per-source-net-block-size-ipv6 server)))
+    (is (= 0 (cl-pnet-ssh:ssh-server-unused-connection-timeout server)))
+    (is (cl-pnet-ssh:ssh-server-tcp-keep-alive server)))
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :max-startups-begin 5
+                 :max-startups-rate 50
+                 :max-startups-full 20
+                 :per-source-max-startups 3
+                 :per-source-net-block-size-ipv4 24
+                 :per-source-net-block-size-ipv6 64
+                 :unused-connection-timeout 30
+                 :tcp-keep-alive nil)))
+    (is (= 5 (cl-pnet-ssh:ssh-server-max-startups-begin server)))
+    (is (= 50 (cl-pnet-ssh:ssh-server-max-startups-rate server)))
+    (is (= 20 (cl-pnet-ssh:ssh-server-max-startups-full server)))
+    (is (= 3 (cl-pnet-ssh:ssh-server-per-source-max-startups server)))
+    (is (= 24 (cl-pnet-ssh:ssh-server-per-source-net-block-size-ipv4 server)))
+    (is (= 64 (cl-pnet-ssh:ssh-server-per-source-net-block-size-ipv6 server)))
+    (is (= 30 (cl-pnet-ssh:ssh-server-unused-connection-timeout server)))
+    (is (not (cl-pnet-ssh:ssh-server-tcp-keep-alive server)))))
+
+(test max-startups-drops-with-sshd-probability
+  "MaxStartups starts dropping at BEGIN and takes everything at FULL."
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :max-startups-begin 10
+                 :max-startups-rate 30
+                 :max-startups-full 100)))
+    ;; Below the begin value every connection is accepted.
+    (is (not (cl-pnet-ssh::ssh-server-should-drop-connection-p
+              server 9 :random 0)))
+    ;; At FULL and above every connection is dropped.
+    (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+         server 100 :random 0))
+    (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+         server 101 :random 99))
+    ;; At BEGIN the chance is exactly RATE percent.
+    (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+         server 10 :random 29))
+    (is (not (cl-pnet-ssh::ssh-server-should-drop-connection-p
+              server 10 :random 30)))
+    ;; Halfway to FULL the chance has risen linearly, to 65 percent here.
+    (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+         server 55 :random 64))
+    (is (not (cl-pnet-ssh::ssh-server-should-drop-connection-p
+              server 55 :random 65)))
+    ;; A single MaxStartups value makes BEGIN and FULL the same.
+    (let ((single (cl-pnet-ssh::%make-ssh-server
+                   :max-startups-begin 7
+                   :max-startups-rate 30
+                   :max-startups-full 7)))
+      (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+           single 7 :random 99))))
+  ;; A rate of 100 means every connection at or above BEGIN is dropped.
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :max-startups-begin 5
+                 :max-startups-rate 100
+                 :max-startups-full 50)))
+    (is (cl-pnet-ssh::ssh-server-should-drop-connection-p
+         server 5 :random 99))))
+
+(test per-source-limit-counts-masked-addresses
+  "PerSourceMaxStartups groups peers by PerSourceNetBlockSize."
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :max-startups-begin 100
+                 :max-startups-full 100
+                 :per-source-max-startups 2
+                 :per-source-net-block-size-ipv4 24
+                 :per-source-net-block-size-ipv6 32))
+        (sessions nil))
+    (flet ((add (address)
+             (let ((session (cl-pnet-ssh::%make-ssh-session
+                             :server server
+                             :remote-address (list :address address
+                                                   :port 2200))))
+               (push session sessions)
+               (setf (gethash session
+                              (cl-pnet-ssh::ssh-server-sessions server))
+                     session)
+               session)))
+      (add "192.0.2.1")
+      (add "192.0.2.2")
+      (add "198.51.100.1")
+      ;; Two peers share 192.0.2.0/24 even though their addresses differ.
+      (is (= 2 (cl-pnet-ssh::ssh-server-source-session-count
+                sessions "192.0.2.9" 24 128)))
+      (is (= 1 (cl-pnet-ssh::ssh-server-source-session-count
+                sessions "198.51.100.9" 24 128)))
+      ;; The third connection from that /24 is refused; another network is
+      ;; unaffected.
+      (is (not (cl-pnet-ssh:ssh-server-connection-allowed-p
+                server '(:address "192.0.2.9" :port 2200))))
+      (is (cl-pnet-ssh:ssh-server-connection-allowed-p
+           server '(:address "203.0.113.9" :port 2200))))
+    ;; A wider IPv6 prefix groups two different IPv6 subnets.
+    (let ((session (cl-pnet-ssh::%make-ssh-session
+                    :server server
+                    :remote-address '(:address "2001:db8:1::1" :port 2200))))
+      (setf (gethash session (cl-pnet-ssh::ssh-server-sessions server))
+            session)
+      (is (= 1 (cl-pnet-ssh::ssh-server-source-session-count
+                (list session) "2001:db8:2::1" 32 32))))
+    ;; No per-source limit means every network is allowed.
+    (let ((unlimited (cl-pnet-ssh::%make-ssh-server
+                      :max-startups-begin 100
+                      :max-startups-full 100)))
+      (is (cl-pnet-ssh:ssh-server-connection-allowed-p
+           unlimited '(:address "192.0.2.9" :port 2200))))))
+
+(test unused-connection-timer-tracks-open-channels
+  "UnusedConnectionTimeout counts every open channel, not just sessions."
+  (let* ((server (cl-pnet-ssh::%make-ssh-server
+                  :unused-connection-timeout 30))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session :state :open)))
+    (is (= 30 (cl-pnet-ssh::ssh-session-unused-connection-timeout session)))
+    (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session)) channel)
+    (is (cl-pnet-ssh::ssh-server-session-open-channel-p session))
+    (setf (cl-pnet-ssh::ssh-server-channel-state channel) :closed)
+    (is (not (cl-pnet-ssh::ssh-server-session-open-channel-p session))))
+  ;; A Match block narrows the timeout per connection.
+  (let* ((config (config-from-text
+                  "UnusedConnectionTimeout 30
+Match Address 192.0.2.0/24
+ UnusedConnectionTimeout 5"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (near (cl-pnet-ssh::%make-ssh-session
+                :server server :user "alice"))
+         (far (cl-pnet-ssh::%make-ssh-session
+               :server server :user "alice")))
+    (setf (cl-pnet-ssh::ssh-session-remote-address near)
+          '(:address "192.0.2.7" :port 2200)
+          (cl-pnet-ssh::ssh-session-remote-address far)
+          '(:address "203.0.113.7" :port 2200))
+    (cl-pnet-ssh:ssh-session-resolve-config near "alice")
+    (cl-pnet-ssh:ssh-session-resolve-config far "alice")
+    (is (= 5 (cl-pnet-ssh::ssh-session-unused-connection-timeout near)))
+    (is (= 30 (cl-pnet-ssh::ssh-session-unused-connection-timeout far)))))
+
 (test sshd-config-takes-the-first-value-it-obtains
   (let ((config (config-from-text
                  "LogLevel VERBOSE

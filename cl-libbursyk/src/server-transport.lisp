@@ -431,7 +431,10 @@ which the transport enforces for pty and forwarding requests."
   (ssh-server-send-auth-success session)
   (ssh-session-start-client-alive-timer session)
   (when (ssh-server-on-session (ssh-session-server session))
-    (funcall (ssh-server-on-session (ssh-session-server session)) session)))
+    (funcall (ssh-server-on-session (ssh-session-server session)) session))
+  ;; sshd starts UnusedConnectionTimeout when authentication finishes, before
+  ;; the client has had a chance to open a channel.
+  (ssh-session-note-channel-change session))
 
 (defun ssh-server-handle-signed-key (session user algorithm key-blob reader
                                     &key (count t))

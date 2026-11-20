@@ -271,7 +271,9 @@ that admitted the key, and AUTHORIZATION the rest of that line's options."
   (ssh-message-auth-reply-success message 0)
   (ssh-session-start-client-alive-timer session)
   (when (ssh-server-on-session (ssh-session-server session))
-    (funcall (ssh-server-on-session (ssh-session-server session)) session)))
+    (funcall (ssh-server-on-session (ssh-session-server session)) session))
+  ;; sshd starts UnusedConnectionTimeout once authentication finishes.
+  (ssh-session-note-channel-change session))
 
 (defun ssh-plibssh-session-handle-auth (session message)
   "Answer one USER AUTH REQUEST from MESSAGE."
@@ -338,6 +340,7 @@ authentication attempt."
                    :remote-address (ssh-session-remote-address session))))
     (incf (ssh-session-next-channel-id session))
     (setf (gethash id (ssh-session-channels session)) channel)
+    (ssh-session-note-channel-change session)
     channel))
 
 (defun ssh-plibssh-session-handle-open (session message)
@@ -667,6 +670,7 @@ terminal name and both sizes are kept."
     (remhash (ssh-server-channel-local-id channel)
              (ssh-session-channels
               (ssh-server-channel-session channel)))
+    (ssh-session-note-channel-change (ssh-server-channel-session channel))
     (ssh-plibssh-server-channel-close-target channel)
     (let ((handle (ssh-server-channel-handle channel)))
       (setf (ssh-server-channel-handle channel) nil)
@@ -807,7 +811,10 @@ terminal name and both sizes are kept."
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
         (ssh-session-client-alive-timer session)
-        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))))
+        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))
+        (ssh-session-unused-connection-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-unused-connection-timer session))))
 
 (defun ssh-session-start-login-grace-timer (session)
   "Close SESSION if it has not authenticated in LoginGraceTime seconds."
@@ -994,6 +1001,14 @@ terminal name and both sizes are kept."
       (ssh-plibssh-session-pump session)
       session)))
 
+(defun ssh-plibssh-refuse-connection (fd)
+  "Send sshd's MaxStartups notice on FD, best effort, and close it."
+  (let ((notice (format nil "Exceeded MaxStartups~C~C"
+                        #\Return #\Linefeed)))
+    (cffi:with-foreign-string (buffer notice)
+      (cl-pnet-sockets:c-send fd buffer (length notice) 0)))
+  (cl-pnet-sockets:c-close fd))
+
 (defun ssh-plibssh-server-accept-loop (server)
   "Drain every waiting connection on SERVER's listener."
   (loop
@@ -1003,7 +1018,16 @@ terminal name and both sizes are kept."
         (return))
       (cl-pnet-sockets:set-nonblocking fd)
       (handler-case
-          (ssh-plibssh-server-accept server fd)
+          (let ((peer (ssh-plibssh-peer-address fd)))
+            (if (ssh-server-connection-allowed-p server peer)
+                (progn
+                  (ssh-server-apply-tcp-keepalive server fd)
+                  (ssh-plibssh-server-accept server fd))
+                (progn
+                  (ssh-log
+                   "drop connection from ~A past MaxStartups or PerSourceMaxStartups"
+                   (getf peer :address))
+                  (ssh-plibssh-refuse-connection fd))))
         (error (condition)
           (when (ssh-server-on-error server)
             (funcall (ssh-server-on-error server) nil condition)))))))
@@ -1026,6 +1050,11 @@ terminal name and both sizes are kept."
                           login-grace-time
                           client-alive-interval
                           client-alive-count-max
+                          (max-startups '(10 30 100))
+                          per-source-max-startups
+                          (per-source-net-block-size '(32 128))
+                          (unused-connection-timeout 0)
+                          (tcp-keep-alive t)
                           accept-env
                           server-version
                           version-addendum
@@ -1049,7 +1078,11 @@ reach the child through the application, which reads the session record.
 
 LOGIN-GRACE-TIME, CLIENT-ALIVE-INTERVAL and CLIENT-ALIVE-COUNT-MAX carry
 sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
-120, 0 and 3."
+120, 0 and 3.
+
+MAX-STARTUPS, PER-SOURCE-MAX-STARTUPS, PER-SOURCE-NET-BLOCK-SIZE,
+UNUSED-CONNECTION-TIMEOUT and TCP-KEEP-ALIVE are the pure backend's, with
+the same meanings and defaults."
   (let* ((keys (mapcar (lambda (value)
                          (if (typep value 'ssh-private-key)
                              value
@@ -1085,6 +1118,16 @@ sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
                   :client-alive-count-max
                   (or client-alive-count-max
                       +ssh-server-default-client-alive-count-max+)
+                  :max-startups-begin (first max-startups)
+                  :max-startups-rate (second max-startups)
+                  :max-startups-full (third max-startups)
+                  :per-source-max-startups per-source-max-startups
+                  :per-source-net-block-size-ipv4
+                  (first per-source-net-block-size)
+                  :per-source-net-block-size-ipv6
+                  (second per-source-net-block-size)
+                  :unused-connection-timeout unused-connection-timeout
+                  :tcp-keep-alive tcp-keep-alive
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel
