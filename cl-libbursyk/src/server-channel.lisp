@@ -89,6 +89,7 @@ out once the client confirms."
         (ssh-server-channel-remote-window channel) (ssh-read-u32 reader)
         (ssh-server-channel-remote-max-packet channel) (ssh-read-u32 reader)
         (ssh-server-channel-state channel) :open)
+  (ssh-server-channel-start-inactivity-timeout channel)
   (ssh-server-channel-flush channel))
 
 (defun ssh-server-channel-handle-open-failure (channel reader)
@@ -133,7 +134,8 @@ channel stays in :OPENING and client data is not expected."
     (setf (gethash id (ssh-session-channels session)) channel)
     (ssh-session-note-channel-change session)
     (when confirm
-      (ssh-server-channel-open-confirmation channel))
+      (ssh-server-channel-open-confirmation channel)
+      (ssh-server-channel-start-inactivity-timeout channel))
     channel))
 
 (defun ssh-server-session-channel-count (session)
@@ -244,6 +246,9 @@ The thunk runs after the success reply, so output a shell writes cannot
 overtake the reply that opened it.  Returning NIL refuses the request."
   (let* ((handler (ssh-server-channel-on-shell channel))
          (start (and handler (funcall handler channel))))
+    ;; sshd labels the channel before running the shell, even if starting it
+    ;; fails; the label selects ChannelTimeout from here on.
+    (ssh-server-channel-set-x-type channel "session:shell")
     (ssh-server-channel-reply channel (not (null start)) want-reply)
     (when start (funcall start))))
 
@@ -256,7 +261,9 @@ returns NIL and is refused rather than accepted and abandoned."
          (handler (ssh-server-channel-on-subsystem channel))
          (start (and handler (funcall handler channel name))))
     (when start
-      (setf (ssh-server-channel-subsystem channel) name))
+      (setf (ssh-server-channel-subsystem channel) name)
+      (ssh-server-channel-set-x-type
+       channel (format nil "session:subsystem:~A" name)))
     (ssh-server-channel-reply channel (not (null start)) want-reply)
     (when start (funcall start))))
 
@@ -288,6 +295,8 @@ returns NIL and is refused rather than accepted and abandoned."
   (let ((command (ssh-read-text reader))
         (handler (ssh-server-channel-on-exec channel)))
     (setf (ssh-server-channel-command channel) command)
+    ;; sshd labels the channel before do_exec, success or not.
+    (ssh-server-channel-set-x-type channel "session:command")
     (ssh-server-channel-reply channel (not (null handler)) want-reply)
     (when handler
       (funcall handler channel command))))
@@ -368,6 +377,7 @@ returns NIL and is refused rather than accepted and abandoned."
   (ssh-server-channel-queue channel data)
   (when on-done
     (push on-done (ssh-server-channel-write-callbacks channel)))
+  (ssh-server-channel-note-activity channel)
   (ssh-server-channel-flush channel)
   channel)
 
@@ -378,6 +388,7 @@ returns NIL and is refused rather than accepted and abandoned."
    :fields (lambda (writer)
              (ssh-write-u32 writer 1)
              (ssh-write-string writer (ssh-ensure-octets data))))
+  (ssh-server-channel-note-activity channel)
   (when on-done (funcall on-done))
   channel)
 
@@ -416,6 +427,7 @@ returns NIL and is refused rather than accepted and abandoned."
                    (if (= (ssh-read-u32 reader) 1) :stderr :other)
                    :stdin))
          (data (ssh-read-string reader)))
+    (ssh-server-channel-note-activity channel)
     (decf (ssh-server-channel-local-window channel) (length data))
     (ssh-server-channel-adjust-window channel (length data))
     (cond
@@ -443,6 +455,18 @@ returns NIL and is refused rather than accepted and abandoned."
   (unless (ssh-server-channel-sent-close channel)
     (setf (ssh-server-channel-sent-close channel) t)
     (ssh-server-channel-send-message channel +ssh-msg-channel-close+))
+  (ssh-server-channel-finish channel))
+
+(defun ssh-server-channel-force-close (channel)
+  "End CHANNEL at once, as sshd's channel_force_close does for an idle one.
+
+The client is told with CHANNEL_CLOSE when the channel had a remote id, and
+the application's ON-CLOSE runs immediately instead of waiting for the
+client's half of the handshake."
+  (when (member (ssh-server-channel-state channel) '(:open :closing))
+    (unless (ssh-server-channel-sent-close channel)
+      (setf (ssh-server-channel-sent-close channel) t)
+      (ssh-server-channel-send-message channel +ssh-msg-channel-close+)))
   (ssh-server-channel-finish channel))
 
 (defun ssh-server-channel-half-close-target (channel)
@@ -529,6 +553,7 @@ reader."
   (when (eq (ssh-server-channel-state channel) :opening)
     (setf (ssh-server-channel-state channel) :open)
     (ssh-server-channel-open-confirmation channel)
+    (ssh-server-channel-start-inactivity-timeout channel)
     (ssh-server-channel-flush channel)))
 
 (defun ssh-server-dial-target (channel address port)

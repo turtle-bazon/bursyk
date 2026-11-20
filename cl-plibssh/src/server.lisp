@@ -341,6 +341,7 @@ authentication attempt."
     (incf (ssh-session-next-channel-id session))
     (setf (gethash id (ssh-session-channels session)) channel)
     (ssh-session-note-channel-change session)
+    (ssh-server-channel-start-inactivity-timeout channel)
     channel))
 
 (defun ssh-plibssh-session-handle-open (session message)
@@ -470,6 +471,8 @@ terminal name and both sizes are kept."
   (let ((command (ssh-message-channel-request-command message))
         (handler (ssh-server-channel-on-exec channel)))
     (setf (ssh-server-channel-command channel) command)
+    ;; sshd labels the channel before do_exec, success or not.
+    (ssh-server-channel-set-x-type channel "session:command")
     (if handler
         (progn
           (ssh-message-channel-request-reply-success message)
@@ -480,6 +483,9 @@ terminal name and both sizes are kept."
   "Ask the application for the login shell thunk, then answer and run it."
   (let* ((handler (ssh-server-channel-on-shell channel))
          (start (and handler (funcall handler channel))))
+    ;; sshd labels the channel before running the shell, even if starting it
+    ;; fails; the label selects ChannelTimeout from here on.
+    (ssh-server-channel-set-x-type channel "session:shell")
     (if start
         (progn
           (ssh-message-channel-request-reply-success message)
@@ -496,6 +502,8 @@ terminal name and both sizes are kept."
     (if start
         (progn
           (ssh-message-channel-request-reply-success message)
+          (ssh-server-channel-set-x-type
+           channel (format nil "session:subsystem:~A" name))
           (funcall start))
         (ssh-message-reply-default message))))
 
@@ -611,6 +619,7 @@ terminal name and both sizes are kept."
                    handle buffer +ssh-read-chunk+ (if stderr 1 0))))
           (cond
             ((plusp rc)
+             (ssh-server-channel-note-activity channel)
              (ssh-plibssh-server-channel-dispatch
               channel (ssh-plibssh-fill-octets buffer rc) stderr))
             ((or (zerop rc) (= rc +ssh-eof+)) (return))
@@ -678,6 +687,19 @@ terminal name and both sizes are kept."
     (when (ssh-server-channel-on-close channel)
       (funcall (ssh-server-channel-on-close channel) channel))))
 
+(defun ssh-server-channel-force-close (channel)
+  "End CHANNEL at once, as sshd's channel_force_close does for an idle one.
+
+libssh sends the CHANNEL_CLOSE itself; the record is then released and the
+application's ON-CLOSE runs without waiting for the peer's half."
+  (let ((handle (ssh-server-channel-handle channel)))
+    (when (and handle
+               (not (ssh-server-channel-sent-close channel))
+               (member (ssh-server-channel-state channel) '(:open :closing)))
+      (ssh-plibssh-channel-close handle)
+      (setf (ssh-server-channel-sent-close channel) t)))
+  (ssh-plibssh-server-channel-finish channel))
+
 (defun ssh-plibssh-server-channel-fail (channel condition)
   "Report CONDITION, then close CHANNEL."
   (when (ssh-server-channel-on-error channel)
@@ -698,6 +720,7 @@ terminal name and both sizes are kept."
     (error 'ssh-channel-error :channel channel :detail "channel is closed"))
   (when (ssh-plibssh-channel-usable-p channel)
     (ssh-plibssh-server-channel-queue channel data nil)
+    (ssh-server-channel-note-activity channel)
     (when on-done
       (push on-done (ssh-server-channel-write-callbacks channel)))
     (ssh-plibssh-server-channel-flush channel))
@@ -709,6 +732,7 @@ terminal name and both sizes are kept."
     (error 'ssh-channel-error :channel channel :detail "channel is closed"))
   (when (ssh-plibssh-channel-usable-p channel)
     (ssh-plibssh-server-channel-queue channel data t)
+    (ssh-server-channel-note-activity channel)
     (when on-done
       (push on-done (ssh-server-channel-write-callbacks channel)))
     (ssh-plibssh-server-channel-flush channel))
@@ -807,14 +831,17 @@ terminal name and both sizes are kept."
   nil)
 
 (defun ssh-session-stop-timers (session)
-  "Disarm SESSION's login-grace and client-alive timers, once."
+  "Disarm SESSION's login-grace, client-alive and channel timers, once."
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
         (ssh-session-client-alive-timer session)
         (ssh-session-cancel-timer (ssh-session-client-alive-timer session))
         (ssh-session-unused-connection-timer session)
         (ssh-session-cancel-timer
-         (ssh-session-unused-connection-timer session))))
+         (ssh-session-unused-connection-timer session))
+        (ssh-session-channel-timeout-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-channel-timeout-timer session))))
 
 (defun ssh-session-start-login-grace-timer (session)
   "Close SESSION if it has not authenticated in LoginGraceTime seconds."
@@ -1066,6 +1093,7 @@ this program's error, because a configured list is meant exactly as written."
                           per-source-max-startups
                           (per-source-net-block-size '(32 128))
                           (unused-connection-timeout 0)
+                          channel-timeouts
                           (tcp-keep-alive t)
                           accept-env
                           server-version
@@ -1094,7 +1122,8 @@ sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
 
 MAX-STARTUPS, PER-SOURCE-MAX-STARTUPS, PER-SOURCE-NET-BLOCK-SIZE,
 UNUSED-CONNECTION-TIMEOUT and TCP-KEEP-ALIVE are the pure backend's, with
-the same meanings and defaults."
+the same meanings and defaults.  CHANNEL-TIMEOUTS is sshd's ChannelTimeout
+list, applied by the same inactivity accounting as the pure backend."
   (let* ((required-rsa-size
            (and sshd-config
                 (ssh-server-config-required-rsa-size sshd-config)))
@@ -1151,6 +1180,7 @@ the same meanings and defaults."
                   :per-source-net-block-size-ipv6
                   (second per-source-net-block-size)
                   :unused-connection-timeout unused-connection-timeout
+                  :channel-timeouts channel-timeouts
                   :tcp-keep-alive tcp-keep-alive
                   :accept-env accept-env
                   :on-session on-session

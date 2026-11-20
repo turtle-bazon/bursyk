@@ -143,7 +143,6 @@ socket address and has no routing domains.")
     "authorizedprincipalscommanduser"
     "trustedusercakeys" "revokedkeys" "hostcertificate"
     "authenticationmethods"
-    "channeltimeout"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
     "streamlocalbindmask" "streamlocalbindunlink"
@@ -212,6 +211,10 @@ socket address and has no routing domains.")
   (per-source-net-block-size-ipv6 nil)
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout nil)
+  ;; ChannelTimeout as (TYPE-PATTERN . SECONDS) pairs in the order the
+  ;; winning line gave them, or :NONE for an explicit "none" that disables
+  ;; every channel timeout.  NIL means the directive was absent.
+  (channel-timeouts nil)
   ;; TCPKeepAlive: :YES or :NO; NIL keeps sshd's default of yes.
   (tcp-keep-alive nil)
   ;; PermitUserEnvironment: NIL (unset, means no), :YES, :NO, or a list of
@@ -372,6 +375,22 @@ anything sshd would refuse, including a negative or out-of-range value."
       (ssh-server-config-line-error
        line "~A needs a time value, not ~A"
        (ssh-config-line-keyword line) argument)))
+
+(defun ssh-server-config-channel-timeout-pair (line argument)
+  "VALUES TYPE-PATTERN SECONDS for one ChannelTimeout TYPE=INTERVAL argument.
+
+The type may contain wildcards, as sshd's match_pattern allows, but must not
+be empty.  INTERVAL uses sshd's time syntax and may be zero, which disables
+that type's timeout."
+  (let ((equals (position #\= argument)))
+    (when (or (null equals) (zerop equals))
+      (ssh-server-config-line-error
+       line "invalid channel timeout ~A" argument))
+    (let ((seconds (ssh-parse-time (subseq argument (1+ equals)))))
+      (unless seconds
+        (ssh-server-config-line-error
+         line "invalid channel timeout ~A" argument))
+      (values (subseq argument 0 equals) seconds))))
 
 (defun ssh-server-config-split-host-port (line argument)
   "VALUES HOST, PORT-STRING for a sshd HOST[:PORT] argument.
@@ -602,7 +621,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     force-command banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
-    unused-connection-timeout
+    unused-connection-timeout channel-timeouts
     allow-users deny-users allow-groups deny-groups)
   "The fields a matching Match block may override.
 
@@ -1006,6 +1025,30 @@ cannot apply per connection."
              (ssh-server-config-set-once
               config 'unused-connection-timeout
               (ssh-server-config-time-value line argument)))))
+      ((string= keyword "channeltimeout")
+       ;; sshd keeps the first ChannelTimeout line as a whole: its pairs are
+       ;; tried in order, and a later line cannot add to or replace them.
+       ;; Every line is still validated, so a typo late in the file is fatal.
+       ;; "none" must stand alone and means no channel times out.
+       (when (null arguments)
+         (ssh-server-config-line-error
+          line "ChannelTimeout needs an argument"))
+       (if (string-equal (first arguments) "none")
+           (progn
+             (when (rest arguments)
+               (ssh-server-config-line-error
+                line "ChannelTimeout \"none\" argument must appear alone"))
+             (unless (ssh-server-config-channel-timeouts config)
+               (setf (ssh-server-config-channel-timeouts config) :none)))
+           (let ((pairs
+                   (mapcar (lambda (argument)
+                             (multiple-value-bind (type seconds)
+                                 (ssh-server-config-channel-timeout-pair
+                                  line argument)
+                               (cons type seconds)))
+                           arguments)))
+             (unless (ssh-server-config-channel-timeouts config)
+               (setf (ssh-server-config-channel-timeouts config) pairs)))))
       ((member keyword '("tcpkeepalive" "keepalive") :test #'string=)
        (ssh-server-config-set-once
         config 'tcp-keep-alive

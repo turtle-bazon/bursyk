@@ -58,6 +58,10 @@
   (per-source-net-block-size-ipv6 128)
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout 0)
+  ;; ChannelTimeout: (TYPE-PATTERN . SECONDS) pairs, in the order the winning
+  ;; line gave them, or :NONE when the directive disables every timeout.
+  ;; A Match block's value replaces this one for that connection.
+  (channel-timeouts nil)
   ;; Whether accepted sockets ask the system for TCP keepalives.
   (tcp-keep-alive t)
   (accept-env nil)
@@ -134,6 +138,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   ;; Armed while the connection has no channels open, as sshd's
   ;; UnusedConnectionTimeout is; NIL when the setting is off or a channel is up.
   unused-connection-timer
+  ;; Armed for the earliest ChannelTimeout deadline across the session's
+  ;; open channels; activity moves the deadlines without rearming it.
+  channel-timeout-timer
   (client-alive-misses 0)
   (last-input-time 0)
   (closed nil)
@@ -146,6 +153,13 @@ present after RequiredRSASize, for callers that only want to describe it."
   local-id
   (remote-id nil)
   (type "session")
+  ;; sshd's extended type, which ChannelTimeout selects on: session:shell,
+  ;; session:command or session:subsystem:NAME.  NIL means TYPE itself.
+  (x-type nil)
+  ;; Seconds of inactivity before this channel is closed, 0 for none, and the
+  ;; monotonic time of the last byte read or written (0 before it opens).
+  (inactive-timeout 0)
+  (last-used 0)
   (open-extra (make-array 0 :element-type '(unsigned-byte 8)))
   (state :opening)
   (remote-window 0)
@@ -251,14 +265,17 @@ present after RequiredRSASize, for callers that only want to describe it."
   nil)
 
 (defun ssh-session-stop-timers (session)
-  "Disarm SESSION's login-grace and client-alive timers, once."
+  "Disarm SESSION's login-grace, client-alive and channel timers, once."
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
         (ssh-session-client-alive-timer session)
         (ssh-session-cancel-timer (ssh-session-client-alive-timer session))
         (ssh-session-unused-connection-timer session)
         (ssh-session-cancel-timer
-         (ssh-session-unused-connection-timer session))))
+         (ssh-session-unused-connection-timer session))
+        (ssh-session-channel-timeout-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-channel-timeout-timer session))))
 
 (defun ssh-session-start-login-grace-timer (session)
   "Close SESSION if it has not authenticated in LoginGraceTime seconds.

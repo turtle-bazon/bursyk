@@ -1456,6 +1456,128 @@ share the test, so each must dispatch the same channel requests."
       (is (not (ssh-session-permits-tcpip-forward-p
                 session "example.com" 8080))))))
 
+(test server-channel-timeout-closes-idle-channels
+  "ChannelTimeout selects on sshd's extended type, first pattern wins."
+  (let* ((config (ssh-server-config-load
+                  nil
+                  :options '("ChannelTimeout session:command=5 session:*=30")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (closed nil)
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session
+                   :local-id 0
+                   :remote-id 0
+                   :state :open
+                   :on-close (lambda (channel) (setf closed channel)))))
+    (unwind-protect
+         (progn
+           (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session))
+                 channel)
+           ;; The clock starts when the channel opens, as in sshd, but
+           ;; "session:*" does not match the unlabeled "session" type.
+           (cl-pnet-ssh::ssh-server-channel-start-inactivity-timeout channel)
+           (is (= 0 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                     channel)))
+           (is (plusp (cl-pnet-ssh::ssh-server-channel-last-used channel)))
+           (cl-pnet-ssh::ssh-server-channel-set-x-type
+            channel "session:command")
+           (is (= 5 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                     channel)))
+           (is (plusp (cl-pnet-ssh::ssh-server-channel-last-used channel)))
+           ;; The same list's later pattern handles the other session type.
+           (cl-pnet-ssh::ssh-server-channel-set-x-type
+            channel "session:shell")
+           (is (= 30 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                      channel)))
+           ;; Moving bytes resets the clock.
+           (setf (cl-pnet-ssh::ssh-server-channel-last-used channel) 1)
+           (cl-pnet-ssh::ssh-server-channel-note-activity channel)
+           (is (> (cl-pnet-ssh::ssh-server-channel-last-used channel) 1))
+           ;; Pretend 31 seconds passed with no bytes and run the wakeup.
+           (setf (cl-pnet-ssh::ssh-server-channel-last-used channel)
+                 (- (cl-pnet-ssh::ssh-session-now) 31))
+           (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
+           (is (eq :closed
+                   (cl-pnet-ssh::ssh-server-channel-state channel)))
+           (is (eq channel closed)))
+      (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session)))
+  ;; A zero interval disables the type, and "none" disables every type.
+  (dolist (options '(("ChannelTimeout session:*=0")
+                     ("ChannelTimeout none")))
+    (let* ((config (ssh-server-config-load nil :options options))
+           (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+           (session (cl-pnet-ssh::%make-ssh-session :server server))
+           (channel (cl-pnet-ssh::%make-ssh-server-channel
+                     :session session :state :open)))
+      (unwind-protect
+           (progn
+             (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session))
+                   channel)
+             (cl-pnet-ssh::ssh-server-channel-set-x-type
+              channel "session:command")
+             (is (= 0 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                       channel)))
+             (setf (cl-pnet-ssh::ssh-server-channel-last-used channel)
+                   (- (cl-pnet-ssh::ssh-session-now) 100))
+             (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
+             (is (eq :open
+                     (cl-pnet-ssh::ssh-server-channel-state channel))))
+        (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session)))))
+
+(test server-channel-timeout-base-type-and-relabeling
+  "ChannelTimeout picks the base type at open and only re-resolves on labels."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("ChannelTimeout session=2")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session :local-id 0 :remote-id 0 :state :open)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session))
+                 channel)
+           ;; "session=2" matches the plain type, so the clock is running
+           ;; from the moment the channel opened, before any request.
+           (cl-pnet-ssh::ssh-server-channel-start-inactivity-timeout channel)
+           (is (= 2 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                     channel)))
+           ;; Labeling re-resolves the limit but, as sshd's
+           ;; channel_set_xtype does, leaves the activity clock alone.
+           (let ((started (cl-pnet-ssh::ssh-server-channel-last-used channel)))
+             (cl-pnet-ssh::ssh-server-channel-set-x-type
+              channel "session:command")
+             (is (= 0 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                       channel)))
+             (is (= started (cl-pnet-ssh::ssh-server-channel-last-used
+                             channel)))))
+      (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session)))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("ChannelTimeout session:*=5")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel
+                   :session session :local-id 0 :remote-id 0 :state :open)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session))
+                 channel)
+           (cl-pnet-ssh::ssh-server-channel-start-inactivity-timeout channel)
+           (is (= 0 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                     channel)))
+           ;; The label arrives after the channel has already been idle for
+           ;; ten seconds, so the five-second limit is already past.
+           (setf (cl-pnet-ssh::ssh-server-channel-last-used channel)
+                 (- (cl-pnet-ssh::ssh-session-now) 10))
+           (cl-pnet-ssh::ssh-server-channel-set-x-type
+            channel "session:command")
+           (is (= 5 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+                     channel)))
+           (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
+           (is (eq :closed
+                   (cl-pnet-ssh::ssh-server-channel-state channel))))
+      (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
+
 (test server-loopback-exec-multiple-host-keys
   ;; The server advertises several key types and the client picks the one it
   ;; prefers; the KEX must succeed whichever key is chosen.
@@ -1664,7 +1786,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.18" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.19" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))

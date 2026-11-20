@@ -1036,6 +1036,86 @@ Match User alice
     (signals cl-pnet-ssh:ssh-server-config-error
       (config-from-text bad))))
 
+(test sshd-config-reads-channel-timeouts
+  "ChannelTimeout is sshd's TYPE=TIME list, parsed whole on the first line."
+  (let ((config (config-from-text
+                 "ChannelTimeout session:*=5m direct-tcpip=10 session:subsystem:sftp=0")))
+    (is (equal '(("session:*" . 300) ("direct-tcpip" . 10)
+                 ("session:subsystem:sftp" . 0))
+               (cl-pnet-ssh:ssh-server-config-channel-timeouts config))))
+  ;; sshd's time syntax applies to each interval.
+  (is (equal '(("session:*" . 5400))
+             (cl-pnet-ssh:ssh-server-config-channel-timeouts
+              (config-from-text "ChannelTimeout session:*=1h30m"))))
+  ;; The first line is the whole answer, even when a later one adds a type.
+  (is (equal '(("session:*" . 300))
+             (cl-pnet-ssh:ssh-server-config-channel-timeouts
+              (config-from-text
+               "ChannelTimeout session:*=5m
+ChannelTimeout direct-tcpip=10"))))
+  ;; "none" must stand alone and disables every timeout; an earlier "none"
+  ;; also keeps a later line from taking effect, as sshd's array does.
+  (is (eq :none
+          (cl-pnet-ssh:ssh-server-config-channel-timeouts
+           (config-from-text "ChannelTimeout none"))))
+  (is (eq :none
+          (cl-pnet-ssh:ssh-server-config-channel-timeouts
+           (config-from-text
+            "ChannelTimeout none
+ChannelTimeout session:*=5m"))))
+  ;; A zero interval is kept as a value, not treated as absence.
+  (is (equal '(("session:*" . 0))
+             (cl-pnet-ssh:ssh-server-config-channel-timeouts
+              (config-from-text "ChannelTimeout session:*=0"))))
+  ;; Malformed types and intervals are errors, not silently dropped.
+  (dolist (bad '("ChannelTimeout"
+                 "ChannelTimeout none direct-tcpip=10"
+                 "ChannelTimeout =5"
+                 "ChannelTimeout session:*"
+                 "ChannelTimeout session:*="
+                 "ChannelTimeout session:*=-1"
+                 "ChannelTimeout session:*=5x"
+                 ;; A later line is ignored for values but still validated.
+                 "ChannelTimeout session:*=5m
+ChannelTimeout session:*=bogus"))
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (config-from-text bad))))
+
+(test match-blocks-read-per-connection-channel-timeouts
+  "A Match ChannelTimeout replaces the global list for that connection."
+  (let* ((config (config-from-text
+                  "ChannelTimeout session:*=5m
+Match Address 192.0.2.0/24
+ ChannelTimeout direct-tcpip=10"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (near (cl-pnet-ssh::%make-ssh-session
+                :server server :user "alice"))
+         (far (cl-pnet-ssh::%make-ssh-session
+               :server server :user "alice")))
+    (setf (cl-pnet-ssh::ssh-session-remote-address near)
+          '(:address "192.0.2.7" :port 2200)
+          (cl-pnet-ssh::ssh-session-remote-address far)
+          '(:address "203.0.113.7" :port 2200))
+    (cl-pnet-ssh:ssh-session-resolve-config near "alice")
+    (cl-pnet-ssh:ssh-session-resolve-config far "alice")
+    (is (equal '(("direct-tcpip" . 10))
+               (cl-pnet-ssh::ssh-session-channel-timeouts near)))
+    (is (equal '(("session:*" . 300))
+               (cl-pnet-ssh::ssh-session-channel-timeouts far))))
+  ;; An explicit "none" in the block turns the global timeouts off.
+  (let* ((config (config-from-text
+                  "ChannelTimeout session:*=5m
+Match Address 192.0.2.0/24
+ ChannelTimeout none"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "alice")))
+    (setf (cl-pnet-ssh::ssh-session-remote-address session)
+          '(:address "192.0.2.7" :port 2200))
+    (cl-pnet-ssh:ssh-session-resolve-config session "alice")
+    (is (eq :none
+            (cl-pnet-ssh::ssh-session-channel-timeouts session)))))
+
 (test server-startup-limits-keep-sshd-defaults
   "A server built without limit values uses sshd's 10:30:100 and friends."
   (let ((server (cl-pnet-ssh::%make-ssh-server)))

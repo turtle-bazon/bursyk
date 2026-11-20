@@ -130,6 +130,8 @@
   (per-source-net-block-size-ipv6 128)
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout 0)
+  ;; ChannelTimeout: (TYPE-PATTERN . SECONDS) pairs, or :NONE to disable.
+  (channel-timeouts nil)
   ;; Whether accepted sockets ask the system for TCP keepalives.
   (tcp-keep-alive t)
   (accept-env nil)
@@ -177,6 +179,8 @@
   ;; Armed while the connection has no channels open, as sshd's
   ;; UnusedConnectionTimeout is.
   unused-connection-timer
+  ;; Armed for the earliest ChannelTimeout deadline across the open channels.
+  channel-timeout-timer
   (client-alive-misses 0)
   (last-input-time 0)
   ;; A close decided inside a libssh message callback: the session must be
@@ -193,6 +197,12 @@
   local-id
   (remote-id nil)
   (type "session")
+  ;; sshd's extended type, which ChannelTimeout selects on.
+  (x-type nil)
+  ;; Seconds of inactivity before this channel is closed, 0 for none, and the
+  ;; monotonic time of the last byte read or written.
+  (inactive-timeout 0)
+  (last-used 0)
   (state :opening)
   remote-address
   target

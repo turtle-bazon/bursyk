@@ -85,6 +85,7 @@ advertised and then fail the first KEX."
                           per-source-max-startups
                           (per-source-net-block-size '(32 128))
                           (unused-connection-timeout 0)
+                          channel-timeouts
                           (tcp-keep-alive t)
                           accept-env
                           server-version
@@ -143,12 +144,15 @@ cap, sshd's "none".
 
 UNUSED-CONNECTION-TIMEOUT closes an authenticated connection that has had
 no channel open for that many seconds; 0, the default, never closes one.
+CHANNEL-TIMEOUTS is sshd's ChannelTimeout list, as (TYPE-PATTERN . SECONDS)
+pairs or :NONE: an open channel that moves no bytes for the first matching
+type's interval is closed.
 TCP-KEEP-ALIVE (default T) controls SO_KEEPALIVE on accepted sockets.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.17\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.18\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -209,6 +213,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :per-source-net-block-size-ipv6
                   (second per-source-net-block-size)
                   :unused-connection-timeout unused-connection-timeout
+                  :channel-timeouts channel-timeouts
                   :tcp-keep-alive tcp-keep-alive
                   :accept-env accept-env
                   :on-session on-session

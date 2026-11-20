@@ -63,6 +63,7 @@
    #:ssh-server-per-source-net-block-size-ipv4
    #:ssh-server-per-source-net-block-size-ipv6
    #:ssh-server-unused-connection-timeout
+   #:ssh-server-channel-timeouts
    #:ssh-server-tcp-keep-alive
    #:ssh-session-unused-connection-timer
    #:ssh-server-connection-allowed-p
@@ -200,6 +201,7 @@
    #:ssh-server-config-per-source-net-block-size-ipv4
    #:ssh-server-config-per-source-net-block-size-ipv6
    #:ssh-server-config-unused-connection-timeout
+   #:ssh-server-config-channel-timeouts
    #:ssh-server-config-tcp-keep-alive
    #:ssh-parse-time
    #:ssh-server-config-pid-file

@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.17"
+(defparameter +bursyk-server-version+ "0.0.2.18"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1436,6 +1436,9 @@ guess, so only an explicit PidFile is written."
            (or (config-setting
                 #'cl-pnet-ssh:ssh-server-config-unused-connection-timeout)
                0)
+           :channel-timeouts
+           (config-setting
+            #'cl-pnet-ssh:ssh-server-config-channel-timeouts)
            :tcp-keep-alive
            (not (eq (config-setting
                      #'cl-pnet-ssh:ssh-server-config-tcp-keep-alive)

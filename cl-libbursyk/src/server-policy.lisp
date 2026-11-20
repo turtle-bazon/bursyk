@@ -1044,15 +1044,122 @@ the last channel closes; a timeout with a channel still open never fires."
                  (ssh-session-finish
                   session "terminating inactive connection" :close))))))))
 
+(defun ssh-session-channel-timeouts (session)
+  "SESSION's effective ChannelTimeout value.
+
+A Match block's list, including :NONE, replaces the server's; NIL keeps the
+server value.  :NONE is an explicit directive that disables every timeout."
+  (let ((timeouts (ssh-session-setting
+                   session #'ssh-server-config-channel-timeouts)))
+    (if (null timeouts)
+        (ssh-server-channel-timeouts (ssh-session-server session))
+        timeouts)))
+
+(defun ssh-server-channel-resolve-timeout (channel)
+  "CHANNEL's inactivity limit in seconds, or 0 when no pattern matches.
+
+The first ChannelTimeout pattern matching the channel's extended type wins,
+as sshd's lookup_timeout returns the first match.  Until a session request
+labels the channel, its plain type is what sshd matches, so \"session=2\"
+starts counting at open while \"session:*=2\" waits for the label."
+  (let ((timeouts (ssh-session-channel-timeouts
+                   (ssh-server-channel-session channel))))
+    (when (consp timeouts)
+      (let ((type (or (ssh-server-channel-x-type channel)
+                      (ssh-server-channel-type channel))))
+        (loop for (pattern . seconds) in timeouts
+              when (ssh-match-pattern pattern type)
+                return seconds)))))
+
+(defun ssh-server-channel-refresh-inactivity-timeout (channel)
+  "Re-resolve CHANNEL's limit after its extended type changes.
+
+sshd's channel_set_xtype only recomputes the deadline; the activity clock
+keeps running from the last byte, so a channel that has been idle longer than
+the new limit is closed on the next wakeup."
+  (when (eq (ssh-server-channel-state channel) :open)
+    (setf (ssh-server-channel-inactive-timeout channel)
+          (or (ssh-server-channel-resolve-timeout channel) 0))
+    (ssh-session-refresh-channel-timeout-timer
+     (ssh-server-channel-session channel))))
+
+(defun ssh-server-channel-start-inactivity-timeout (channel)
+  "Start CHANNEL's inactivity clock from now.
+
+sshd starts it when the channel becomes usable: at open confirmation for an
+incoming or forwarded channel, and when its target connects for direct-tcpip."
+  (when (eq (ssh-server-channel-state channel) :open)
+    (setf (ssh-server-channel-last-used channel) (ssh-session-now))
+    (ssh-server-channel-refresh-inactivity-timeout channel)))
+
+(defun ssh-server-channel-set-x-type (channel type)
+  "Give CHANNEL sshd's extended type and re-resolve its inactivity limit."
+  (setf (ssh-server-channel-x-type channel) type)
+  (ssh-server-channel-refresh-inactivity-timeout channel))
+
+(defun ssh-server-channel-note-activity (channel)
+  "Move CHANNEL's inactivity deadline to now."
+  (when (eq (ssh-server-channel-state channel) :open)
+    (setf (ssh-server-channel-last-used channel) (ssh-session-now))))
+
+(defun ssh-session-stop-channel-timeout-timer (session)
+  "Disarm SESSION's ChannelTimeout timer."
+  (setf (ssh-session-channel-timeout-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-channel-timeout-timer session))))
+
+(defun ssh-session-refresh-channel-timeout-timer (session)
+  "Arm SESSION's timer for the earliest open-channel inactivity deadline.
+
+One timer per connection is enough: activity only moves a channel's
+LAST-USED, so a timer that fires early simply recomputes and rearms."
+  (let ((earliest nil)
+        (now (ssh-session-now))
+        (timeouts (ssh-session-channel-timeouts session)))
+    (when (and (not (ssh-session-closed session)) (consp timeouts))
+      (loop for channel being the hash-values of
+              (ssh-session-channels session)
+            do (let ((deadline (+ (ssh-server-channel-last-used channel)
+                                  (ssh-server-channel-inactive-timeout
+                                   channel))))
+                 (when (and (eq (ssh-server-channel-state channel) :open)
+                            (plusp (ssh-server-channel-inactive-timeout channel))
+                            (or (null earliest) (< deadline earliest)))
+                   (setf earliest deadline)))))
+    (ssh-session-stop-channel-timeout-timer session)
+    (when earliest
+      (setf (ssh-session-channel-timeout-timer session)
+            (cl-pnet:timer-start
+             (max 0.05 (- earliest now)) 0
+             (lambda ()
+               (setf (ssh-session-channel-timeout-timer session) nil)
+               (ssh-session-channel-timeout-tick session)))))))
+
+(defun ssh-session-channel-timeout-tick (session)
+  "Close every open channel whose ChannelTimeout has expired."
+  (unless (ssh-session-closed session)
+    (let ((now (ssh-session-now)))
+      (dolist (channel (iter (for (id channel) in-hashtable
+                                    (ssh-session-channels session))
+                        (collect channel)))
+        (when (and (eq (ssh-server-channel-state channel) :open)
+                   (plusp (ssh-server-channel-inactive-timeout channel))
+                   (>= now (+ (ssh-server-channel-last-used channel)
+                              (ssh-server-channel-inactive-timeout channel))))
+          (ssh-server-channel-force-close channel))))
+    (ssh-session-refresh-channel-timeout-timer session)))
+
 (defun ssh-session-note-channel-change (session)
   "React to SESSION's channels opening or closing.
 
 An open channel suspends UnusedConnectionTimeout; once the last one closes,
-the full timeout starts again."
+the full timeout starts again.  A new open channel also shortens the
+ChannelTimeout wakeup when its deadline comes first."
   (unless (ssh-session-closed session)
     (if (ssh-server-session-open-channel-p session)
         (ssh-session-stop-unused-timer session)
-        (ssh-session-start-unused-timer session))))
+        (ssh-session-start-unused-timer session))
+    (ssh-session-refresh-channel-timeout-timer session)))
 
 ;;; ---- AllowUsers / DenyUsers / AllowGroups / DenyGroups ----
 ;;;
