@@ -167,8 +167,11 @@ came up."
   (let ((offers (ssh-parse-kexinit-payload payload)))
     (setf (ssh-session-client-kexinit session) payload
           (ssh-session-negotiated session) (ssh-server-negotiate session offers)
+          ;; Only the first KEXINIT carries the strict-KEX marker; once the
+          ;; connection is strict it stays strict through every rekey.
           (ssh-session-strict-kex session)
-          (getf (ssh-session-negotiated session) :strict)
+          (or (ssh-session-strict-kex session)
+              (getf (ssh-session-negotiated session) :strict))
           (ssh-session-ignore-next-kex-packet session)
           (getf (ssh-session-negotiated session) :guess-wrong))))
 

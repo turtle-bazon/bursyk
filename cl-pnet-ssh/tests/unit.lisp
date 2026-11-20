@@ -269,6 +269,47 @@
   (skip "the pure client transport is not built"))
 
 #-ssh-backend-ffi
+(test strict-kex-survives-a-rekey
+  "The strict-KEX marker appears only in the first KEXINIT.
+OpenSSH keeps resetting sequence numbers at every NEWKEYS, so dropping the
+flag at a rekey would make the two sides count packets differently."
+  (flet ((strict-after (initial negotiated)
+           (let ((client (cl-pnet-ssh::%make-ssh-client)))
+             (setf (cl-pnet-ssh::ssh-client-strict-kex client) initial)
+             (let ((original-negotiate
+                     (symbol-function 'cl-pnet-ssh::ssh-negotiate))
+                   (original-send
+                     (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'cl-pnet-ssh::ssh-negotiate)
+                            (lambda (offers)
+                              (declare (ignore offers))
+                              (list :kex "curve25519-sha256"
+                                    :host-key "ssh-ed25519"
+                                    :cipher-c2s "chacha20-poly1305@openssh.com"
+                                    :cipher-s2c "chacha20-poly1305@openssh.com"
+                                    :mac-c2s "hmac-sha2-256"
+                                    :mac-s2c "hmac-sha2-256"
+                                    :compression "none"
+                                    :strict negotiated)))
+                      (setf (symbol-function
+                             'cl-pnet-ssh::ssh-client-send-payload)
+                            (lambda (client payload)
+                              (declare (ignore client payload))
+                              t))
+                      (cl-pnet-ssh::ssh-client-handle-kexinit
+                       client (ssh-make-kexinit-payload))
+                      (cl-pnet-ssh::ssh-client-strict-kex client))
+                 (setf (symbol-function 'cl-pnet-ssh::ssh-negotiate)
+                       original-negotiate
+                       (symbol-function
+                        'cl-pnet-ssh::ssh-client-send-payload)
+                       original-send))))))
+    (is (eq t (strict-after nil t)))
+    (is (eq t (strict-after t nil)))
+    (is (null (strict-after nil nil)))))
+
 (test disconnect-description-is-a-wire-string
   ;; RFC 4253 section 11.1: reason, then a length-prefixed description and
   ;; language tag.  Sending the description as bare UTF-8 makes the peer read

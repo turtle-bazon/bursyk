@@ -2,7 +2,7 @@
   :description "SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.0"
+  :version "0.0.1.1"
   :depends-on ((:feature (:not :ssh-backend-ffi) #:cl-libbursyk)
                (:feature :ssh-backend-ffi #:cl-plibssh)
                #:cl-pnet

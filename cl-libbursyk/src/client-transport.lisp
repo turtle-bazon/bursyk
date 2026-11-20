@@ -123,8 +123,12 @@ its KEXINIT when the connection came up."
   (let ((offers (ssh-parse-kexinit-payload payload)))
     (setf (ssh-client-server-kexinit client) payload
           (ssh-client-negotiated client) (ssh-negotiate offers)
+          ;; Strict KEX is negotiated once.  A rekey's KEXINIT leaves the
+          ;; marker out, but the connection stays strict, so neither side may
+          ;; forget it or the sequence resets at NEWKEYS stop matching.
           (ssh-client-strict-kex client)
-          (getf (ssh-client-negotiated client) :strict)
+          (or (ssh-client-strict-kex client)
+              (getf (ssh-client-negotiated client) :strict))
           (ssh-client-ignore-next-kex-packet client)
           (getf (ssh-client-negotiated client) :guess-wrong))
     (let ((negotiated (ssh-client-negotiated client)))
