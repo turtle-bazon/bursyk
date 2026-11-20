@@ -10,7 +10,8 @@
     :accept-env nil :allow nil :subsystem nil
     :no-tcp-forwarding nil :permit-open nil
     :no-remote-forwarding nil :gateway-ports nil
-    :config-file nil :option nil :verbose 0 :quiet nil)
+    :config-file nil :option nil :login-grace-time nil
+    :verbose 0 :quiet nil)
   "The command line as parsed.
 
 A NIL value means the option was not given, so an sshd_config setting can
@@ -63,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.9"
+(defparameter +bursyk-server-version+ "0.0.2.10"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -75,9 +76,10 @@ version rather than a generic library string.")
 (defun usage ()
   (format *error-output*
           "usage: bursyk-server [-a ADDRESS] [-p PORT] [-f SSHD_CONFIG]~%~
-           ~15@T[-H HOST_KEY]... [-A AUTHORIZED_KEYS] [-e NAME]...~%~
-           ~15@T[-c PREFIX]... [-S NAME=PATH]... [-o KEYWORD=VALUE]...~%~
-           ~15@T[-v]... [-q] [--no-tcp-forwarding]~%~
+           ~15@T[-g LOGIN_GRACE_TIME] [-H HOST_KEY]... [-A AUTHORIZED_KEYS]~%~
+           ~15@T[-e NAME]... [-c PREFIX]... [-S NAME=PATH]...~%~
+           ~15@T[-o KEYWORD=VALUE]... [-v]... [-q]~%~
+           ~15@T[--no-tcp-forwarding]~%~
            ~15@T[--allow-tcpip HOST:PORT]... [--no-remote-forwarding]~%~
            ~15@T[--gateway-ports] [-V]~%~
            ~15@T-f none reads no config; the default is ~A~%~
@@ -112,6 +114,8 @@ version rather than a generic library string.")
         ((member name '("--allow-tcpip" "--permit-open") :test #'string=)
          :permit-open)
         ((member name '("-f" "--config") :test #'string=) :config-file)
+        ((member name '("-g" "--login-grace-time") :test #'string=)
+         :login-grace-time)
         ((member name '("-o" "--option") :test #'string=) :option)
         ((member name '("-v" "--verbose") :test #'string=) :verbose)
         ((member name '("-q" "--quiet") :test #'string=) :quiet)
@@ -181,6 +185,13 @@ version rather than a generic library string.")
         (unless (and port (<= 1 port 65535))
           (fail "not a port number: ~A" value))
         port))))
+
+(defun command-line-login-grace-time ()
+  "The -g grace period in seconds, or NIL when -g was not given."
+  (let ((value (getf *options* :login-grace-time)))
+    (when value
+      (or (cl-pnet-ssh:ssh-parse-time value)
+          (fail "not a time value: ~A" value)))))
 
 (defun command-allowed-p (command)
   "Whether COMMAND starts with one of the --command prefixes."
@@ -1285,6 +1296,16 @@ guess, so only an explicit PidFile is written."
            (config-setting #'cl-pnet-ssh:ssh-server-config-max-auth-tries)
            :max-sessions
            (config-setting #'cl-pnet-ssh:ssh-server-config-max-sessions)
+           :login-grace-time
+           (or (command-line-login-grace-time)
+               (config-setting
+                #'cl-pnet-ssh:ssh-server-config-login-grace-time))
+           :client-alive-interval
+           (config-setting
+            #'cl-pnet-ssh:ssh-server-config-client-alive-interval)
+           :client-alive-count-max
+           (config-setting
+            #'cl-pnet-ssh:ssh-server-config-client-alive-count-max)
            :server-version (format nil "bursyk-server_~A"
                                    +bursyk-server-version+)
            :version-addendum
@@ -1313,9 +1334,9 @@ guess, so only an explicit PidFile is written."
            (lambda (session bind-address bind-port)
              (cancel-remote-forward session bind-address bind-port))
            :on-close (lambda (session reason)
-                       (declare (ignore reason))
-                       (log-at :info "closed session for ~A"
-                               (cl-pnet-ssh:ssh-session-user session))
+                       (log-at :info "closed session for ~A: ~A"
+                               (cl-pnet-ssh:ssh-session-user session)
+                               reason)
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session

@@ -552,6 +552,56 @@ LC_ALL=C~%"))
       ;; There is one entry per name.
       (is (= 1 (count "LANG" environment :key #'car :test #'string=))))))
 
+(test sshd-config-reads-connection-timers
+  "LoginGraceTime and ClientAlive* carry sshd's time syntax and defaults."
+  (let ((config (config-from-text
+                 "LoginGraceTime 1m30s
+ClientAliveInterval 15
+ClientAliveCountMax 0")))
+    (is (= 90 (cl-pnet-ssh:ssh-server-config-login-grace-time config)))
+    (is (= 15 (cl-pnet-ssh:ssh-server-config-client-alive-interval config)))
+    (is (= 0
+           (cl-pnet-ssh:ssh-server-config-client-alive-count-max config))))
+  ;; An absent directive stays NIL so MAKE-SSH-SERVER keeps sshd's default;
+  ;; an explicit zero is a value and must not be confused with absence.
+  (is (null (config-value
+             #'cl-pnet-ssh:ssh-server-config-login-grace-time "")))
+  (is (= 0 (config-value
+            #'cl-pnet-ssh:ssh-server-config-login-grace-time
+            "LoginGraceTime 0")))
+  ;; The first value obtained wins, as with every other sshd keyword.
+  (is (= 5 (config-value
+            #'cl-pnet-ssh:ssh-server-config-login-grace-time
+            "LoginGraceTime 5
+LoginGraceTime 10")))
+  ;; sshd's convtime forms: units, a bare number, and concatenation.
+  (is (= 90 (cl-pnet-ssh:ssh-parse-time "1m30s")))
+  (is (= 604800 (cl-pnet-ssh:ssh-parse-time "1w")))
+  (is (= 90 (cl-pnet-ssh:ssh-parse-time "90")))
+  (is (= 2 (cl-pnet-ssh:ssh-parse-time "+2")))
+  (is (= 0 (cl-pnet-ssh:ssh-parse-time "0")))
+  (dolist (bad '("" "1x" "-1" "1m30q" "m" "1m 30s"))
+    (is (null (cl-pnet-ssh:ssh-parse-time bad))))
+  (dolist (bad '("LoginGraceTime nope" "LoginGraceTime -1"
+                 "ClientAliveInterval 1x" "ClientAliveCountMax 1s"
+                 "ClientAliveCountMax -1"))
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (config-from-text bad))))
+
+(test server-connection-timers-keep-sshd-defaults
+  "A server built without timer values uses sshd's 120, 0 and 3."
+  (let ((server (cl-pnet-ssh::%make-ssh-server)))
+    (is (= 120 (cl-pnet-ssh:ssh-server-login-grace-time server)))
+    (is (= 0 (cl-pnet-ssh:ssh-server-client-alive-interval server)))
+    (is (= 3 (cl-pnet-ssh:ssh-server-client-alive-count-max server))))
+  (let ((server (cl-pnet-ssh::%make-ssh-server
+                 :login-grace-time 0
+                 :client-alive-interval 5
+                 :client-alive-count-max 0)))
+    (is (= 0 (cl-pnet-ssh:ssh-server-login-grace-time server)))
+    (is (= 5 (cl-pnet-ssh:ssh-server-client-alive-interval server)))
+    (is (= 0 (cl-pnet-ssh:ssh-server-client-alive-count-max server)))))
+
 (test sshd-config-takes-the-first-value-it-obtains
   (let ((config (config-from-text
                  "LogLevel VERBOSE

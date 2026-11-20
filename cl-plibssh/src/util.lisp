@@ -112,6 +112,9 @@
   ;; stores a number so a program can tighten or relax them from config.
   (max-auth-tries 6)
   (max-sessions 10)
+  (login-grace-time +ssh-server-default-login-grace-time+)
+  (client-alive-interval +ssh-server-default-client-alive-interval+)
+  (client-alive-count-max +ssh-server-default-client-alive-count-max+)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -144,6 +147,11 @@
   (auth-attempts 0)
   (auth-failures 0)
   (allowed-users '())
+  ;; Connection timers, matching the pure backend's fields.
+  login-grace-timer
+  client-alive-timer
+  (client-alive-misses 0)
+  (last-input-time 0)
   ;; A close decided inside a libssh message callback: the session must be
   ;; finished after the callback returns, not while libssh still owns it.
   (pending-close nil)

@@ -52,6 +52,9 @@
    #:ssh-session-close
    #:ssh-server-max-auth-tries
    #:ssh-server-max-sessions
+   #:ssh-server-login-grace-time
+   #:ssh-server-client-alive-interval
+   #:ssh-server-client-alive-count-max
    #:ssh-server-permit-user-environment
    #:ssh-server-set-env
    #:ssh-server-authorize-user
@@ -151,6 +154,10 @@
    #:ssh-server-config-permit-root-login
    #:ssh-server-config-max-auth-tries
    #:ssh-server-config-max-sessions
+   #:ssh-server-config-login-grace-time
+   #:ssh-server-config-client-alive-interval
+   #:ssh-server-config-client-alive-count-max
+   #:ssh-parse-time
    #:ssh-server-config-pid-file
    #:ssh-server-config-banner
    #:ssh-server-config-permit-user-environment

@@ -33,6 +33,12 @@
   ;; channels.  A program tightens or relaxes them from its config.
   (max-auth-tries 6)
   (max-sessions 10)
+  ;; sshd's connection timers, in seconds.  LoginGraceTime bounds the whole
+  ;; unauthenticated phase; ClientAliveInterval of zero sends no probes, and
+  ;; ClientAliveCountMax of zero never disconnects.
+  (login-grace-time +ssh-server-default-login-grace-time+)
+  (client-alive-interval +ssh-server-default-client-alive-interval+)
+  (client-alive-count-max +ssh-server-default-client-alive-count-max+)
   (accept-env nil)
   (on-session nil)
   (on-channel nil)
@@ -93,6 +99,12 @@ only want to describe it."
   (allowed-users '())
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
+  ;; Connection timers.  LAST-INPUT-TIME is monotonic seconds and is moved
+  ;; whenever bytes arrive or a probe is sent, as sshd's last_client_time is.
+  login-grace-timer
+  client-alive-timer
+  (client-alive-misses 0)
+  (last-input-time 0)
   (closed nil)
   (close-reason nil)
   (window 2097152)
@@ -191,12 +203,117 @@ only want to describe it."
           (:close (when (ssh-server-channel-on-close channel)
                     (funcall (ssh-server-channel-on-close channel) channel))))))))
 
+;;; ---- Connection timers ----
+;;;
+;;; LoginGraceTime bounds the time before authentication, and ClientAlive*
+;;; probe an authenticated peer that has gone quiet.  Both run from the event
+;;; loop's own timers so nothing here blocks.
+
+(defun ssh-session-now ()
+  "Monotonic time in seconds, for the connection timers."
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun ssh-session-cancel-timer (timer)
+  "Stop TIMER when it is set, answering NIL for the caller to store."
+  (when timer
+    (cl-pnet:timer-stop timer))
+  nil)
+
+(defun ssh-session-stop-timers (session)
+  "Disarm SESSION's login-grace and client-alive timers, once."
+  (setf (ssh-session-login-grace-timer session)
+        (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
+        (ssh-session-client-alive-timer session)
+        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))))
+
+(defun ssh-session-start-login-grace-timer (session)
+  "Close SESSION if it has not authenticated in LoginGraceTime seconds.
+
+Zero means no limit, and sshd's default of 120 seconds applies when the
+server was built without a value."
+  (let ((seconds (ssh-server-login-grace-time (ssh-session-server session))))
+    (when (and seconds
+               (plusp seconds)
+               (not (ssh-session-login-grace-timer session))
+               (not (ssh-session-closed-p session)))
+      (setf (ssh-session-login-grace-timer session)
+            (cl-pnet:timer-start
+             seconds 0
+             (lambda ()
+               (setf (ssh-session-login-grace-timer session) nil)
+               (unless (or (ssh-session-closed-p session)
+                           (ssh-session-authenticated session))
+                 ;; sshd leaves no disconnect behind: the alarm exits and the
+                 ;; socket simply closes.
+                 (ssh-session-finish session
+                                     "Timeout before authentication"
+                                     :close))))))))
+
+(defun ssh-session-schedule-client-alive (session delay)
+  "Arm SESSION's next client-alive probe after DELAY seconds."
+  (when (and (not (ssh-session-closed-p session))
+             (not (ssh-session-client-alive-timer session)))
+    (setf (ssh-session-client-alive-timer session)
+          (cl-pnet:timer-start
+           (max 0.05 delay) 0
+           (lambda ()
+             (setf (ssh-session-client-alive-timer session) nil)
+             (ssh-session-client-alive-tick session))))))
+
+(defun ssh-session-client-alive-tick (session)
+  "Probe SESSION if it has been quiet, and disconnect once it stops answering."
+  (unless (ssh-session-closed-p session)
+    (let* ((server (ssh-session-server session))
+           (interval (ssh-server-client-alive-interval server))
+           (count-max (ssh-server-client-alive-count-max server)))
+      (when (and interval (plusp interval))
+        (let ((idle (- (ssh-session-now)
+                       (ssh-session-last-input-time session))))
+          (if (< idle interval)
+              ;; Activity arrived while we waited; give it the rest of the
+              ;; interval before deciding the peer is quiet.
+              (ssh-session-schedule-client-alive
+               session (- interval idle))
+              ;; sshd increments before it compares, so with the default of
+              ;; three a peer is dropped on the fourth quiet probe.
+              (progn
+                (incf (ssh-session-client-alive-misses session))
+                (if (and (plusp count-max)
+                         (> (ssh-session-client-alive-misses session)
+                            count-max))
+                    (ssh-session-finish
+                     session "Timeout, client not responding" :close)
+                    (progn
+                      (ssh-session-send-keepalive session)
+                      (setf (ssh-session-last-input-time session)
+                            (ssh-session-now))
+                      (ssh-session-schedule-client-alive session
+                                                         interval))))))))))
+
+(defun ssh-session-start-client-alive-timer (session)
+  "Start probing SESSION once authentication has finished."
+  (let ((interval (ssh-server-client-alive-interval
+                   (ssh-session-server session))))
+    (when (and interval
+               (plusp interval)
+               (not (ssh-session-client-alive-timer session))
+               (not (ssh-session-closed-p session)))
+      (setf (ssh-session-last-input-time session) (ssh-session-now)
+            (ssh-session-client-alive-misses session) 0)
+      (ssh-session-schedule-client-alive session interval))))
+
+(defun ssh-session-note-input (session)
+  "Record that SESSION's peer sent bytes, resetting its keepalive misses."
+  (setf (ssh-session-last-input-time session) (ssh-session-now)
+        (ssh-session-client-alive-misses session) 0))
+
 (defun ssh-session-finish (session reason kind)
   "Close SESSION once, reporting REASON through the callback KIND selects."
   (unless (ssh-session-closed session)
     (setf (ssh-session-closed session) t
           (ssh-session-phase session) :closed
           (ssh-session-close-reason session) reason)
+    (ssh-session-stop-timers session)
     (ssh-session-terminate-channels session reason kind)
     (ssh-session-close-connection session)
     (let ((server (ssh-session-server session)))

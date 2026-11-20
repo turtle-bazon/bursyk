@@ -20,6 +20,7 @@
     (setf (gethash connection (ssh-server-connections server)) session
           (gethash session (ssh-server-sessions server)) session)
     (ssh-server-connected session connection)
+    (ssh-session-start-login-grace-timer session)
     session))
 
 (defun ssh-server-host-key-list (host-key)
@@ -56,6 +57,9 @@ advertised and then fail the first KEX."
                           set-env
                           max-auth-tries
                           max-sessions
+                          login-grace-time
+                          client-alive-interval
+                          client-alive-count-max
                           accept-env
                           server-version
                           version-addendum
@@ -89,10 +93,16 @@ override the user's own environment.
 MAX-AUTH-TRIES and MAX-SESSIONS keep sshd's defaults of 6 and 10 when NIL.
 A MaxSessions of 0 refuses every session channel, as sshd does.
 
+LOGIN-GRACE-TIME is sshd's LoginGraceTime in seconds (default 120); 0 means
+no limit.  CLIENT-ALIVE-INTERVAL is ClientAliveInterval (default 0, no
+probes) and CLIENT-ALIVE-COUNT-MAX is ClientAliveCountMax (default 3); a
+count of 0 probes forever without disconnecting.  A NIL argument keeps the
+default, so a config's explicit zero is still honoured.
+
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
 program should pass its real name and version, such as
-\"bursyk-server_0.0.2.9\", so peers and logs identify it correctly.
+\"bursyk-server_0.0.2.10\", so peers and logs identify it correctly.
 VERSION-ADDENDUM is sshd's VersionAddendum: a comment appended after a
 space, or :NONE for none.
 
@@ -130,6 +140,15 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :set-env set-env
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
+                  :login-grace-time
+                  (or login-grace-time
+                      +ssh-server-default-login-grace-time+)
+                  :client-alive-interval
+                  (or client-alive-interval
+                      +ssh-server-default-client-alive-interval+)
+                  :client-alive-count-max
+                  (or client-alive-count-max
+                      +ssh-server-default-client-alive-count-max+)
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel

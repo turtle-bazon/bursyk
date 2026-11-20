@@ -27,6 +27,18 @@ authorized_keys2 is deprecated but OpenSSH still reads it by default.")
     ("debug1" . :debug1) ("debug2" . :debug2) ("debug3" . :debug3))
   "LogLevel names, as sshd spells them.")
 
+(defparameter +ssh-server-default-login-grace-time+ 120
+  "sshd's default LoginGraceTime in seconds.")
+
+(defparameter +ssh-server-default-client-alive-interval+ 0
+  "sshd's default ClientAliveInterval; zero sends no probes.")
+
+(defparameter +ssh-server-default-client-alive-count-max+ 3
+  "sshd's default ClientAliveCountMax; zero never disconnects.")
+
+(defparameter +ssh-server-max-time-value+ 2147483647
+  "Largest time value sshd's convtime accepts, because it uses int.")
+
 (defparameter +ssh-server-config-gateway-ports-values+
   '(("no" . :no) ("yes" . :yes) ("clientspecified" . :clientspecified)))
 
@@ -86,8 +98,8 @@ prohibit-password and means the same thing.")
     "authorizedprincipalscommanduser"
     "trustedusercakeys" "revokedkeys" "hostcertificate"
     "authenticationmethods" "maxstartups"
-    "persourcemaxstartups" "persourcenetblocksize" "logingracetime"
-    "clientaliveinterval" "clientalivecountmax" "channeltimeout"
+    "persourcemaxstartups" "persourcenetblocksize"
+    "channeltimeout"
     "unusedconnectiontimeout" "tcpkeepalive"
     "ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
     "pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes"
@@ -125,6 +137,11 @@ prohibit-password and means the same thing.")
   ;; Limits and identity.  NIL means the server keeps its own default.
   (max-auth-tries nil)
   (max-sessions nil)
+  ;; Time limits in seconds.  NIL means the directive was absent, so
+  ;; MAKE-SSH-SERVER keeps sshd's default; zero is a value of its own.
+  (login-grace-time nil)
+  (client-alive-interval nil)
+  (client-alive-count-max nil)
   ;; PermitUserEnvironment: NIL (unset, means no), :YES, :NO, or a list of
   ;; patterns naming the variables a user may set.
   (permit-user-environment nil)
@@ -211,6 +228,57 @@ carrying = or a space cannot be passed to execve safely."
      line "~A must be a non-negative number, not ~A"
      (ssh-config-line-keyword line) argument))
   (parse-integer argument))
+
+(defun ssh-parse-time (value)
+  "VALUE as sshd's convtime reads a time, in seconds, or NIL.
+
+A time is one or more decimal numbers, each followed by an optional unit:
+s, m, h, d or w for seconds, minutes, hours, days and weeks.  A bare number
+is seconds, so \"90\", \"1m30s\" and \"2W\" all work.  NIL is answered for
+anything sshd would refuse, including a negative or out-of-range value."
+  (when (and (stringp value) (plusp (length value)))
+    (let ((position 0)
+          (total 0)
+          (length (length value)))
+      (loop
+        (when (>= position length)
+          (return-from ssh-parse-time
+            (if (<= total +ssh-server-max-time-value+) total nil)))
+        ;; sshd's convtime is strtol-based and accepts a leading plus on
+        ;; each component.
+        (when (char= (char value position) #\+)
+          (incf position))
+        (let ((start position))
+          (loop while (and (< position length)
+                           (digit-char-p (char value position)))
+                do (incf position))
+          (when (= position start)
+            (return-from ssh-parse-time nil))
+          (let ((number (parse-integer value :start start :end position))
+                (multiplier 1))
+            (when (< position length)
+              (let ((unit (char-downcase (char value position))))
+                (incf position)
+                (case unit
+                  (#\s nil)
+                  (#\m (setf multiplier 60))
+                  (#\h (setf multiplier (* 60 60)))
+                  (#\d (setf multiplier (* 60 60 24)))
+                  (#\w (setf multiplier (* 60 60 24 7)))
+                  (t (return-from ssh-parse-time nil)))))
+            (when (> number (floor +ssh-server-max-time-value+
+                                   multiplier))
+              (return-from ssh-parse-time nil))
+            (incf total (* number multiplier))
+            (when (> total +ssh-server-max-time-value+)
+              (return-from ssh-parse-time nil))))))))
+
+(defun ssh-server-config-time-value (line argument)
+  "ARGUMENT as a time in seconds, or an error naming LINE."
+  (or (ssh-parse-time argument)
+      (ssh-server-config-line-error
+       line "~A needs a time value, not ~A"
+       (ssh-config-line-keyword line) argument)))
 
 (defun ssh-server-config-split-host-port (line argument)
   "VALUES HOST, PORT-STRING for a sshd HOST[:PORT] argument.
@@ -471,6 +539,21 @@ Port and ListenAddress the way sshd's own command-line options do."
       ((string= keyword "maxsessions")
        (ssh-server-config-set-once
         config 'max-sessions
+        (ssh-server-config-count
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "logingracetime")
+       (ssh-server-config-set-once
+        config 'login-grace-time
+        (ssh-server-config-time-value
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "clientaliveinterval")
+       (ssh-server-config-set-once
+        config 'client-alive-interval
+        (ssh-server-config-time-value
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "clientalivecountmax")
+       (ssh-server-config-set-once
+        config 'client-alive-count-max
         (ssh-server-config-count
          line (ssh-server-config-one-argument line))))
       ((string= keyword "pidfile")

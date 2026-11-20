@@ -82,6 +82,7 @@ and NIL while the line is still incomplete."
     (if (null data)
         (ssh-session-finish session :peer-closed :close)
         (progn
+          (ssh-session-note-input session)
           (ssh-session-buffer-append session data)
           (ssh-server-advance session)))))
 
@@ -420,7 +421,10 @@ PermitUserEnvironment."
         (ssh-session-key-env session) key-env
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
+  (setf (ssh-session-login-grace-timer session)
+        (ssh-session-cancel-timer (ssh-session-login-grace-timer session)))
   (ssh-server-send-auth-success session)
+  (ssh-session-start-client-alive-timer session)
   (when (ssh-server-on-session (ssh-session-server session))
     (funcall (ssh-server-on-session (ssh-session-server session)) session)))
 
@@ -552,3 +556,16 @@ it got, which differs from the request only when the client asked for port
       (t
        (when want-reply
          (ssh-server-send-global-reply session nil))))))
+
+(defun ssh-session-send-keepalive (session)
+  "Send OpenSSH's keepalive@openssh.com global request with a reply wanted.
+
+The reply proves the peer is alive; any inbound packet resets the miss
+count, so the content of the reply does not matter.  A global request is
+used whether or not a channel is open, which keeps the probe out of the
+application's channel callbacks."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-global-request+)
+    (ssh-write-text writer "keepalive@openssh.com")
+    (ssh-write-boolean writer t)
+    (ssh-session-send-payload session (ssh-writer-output writer))))

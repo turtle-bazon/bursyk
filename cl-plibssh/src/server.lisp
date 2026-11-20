@@ -103,6 +103,7 @@
   "Advance SESSION as far as its descriptor allows."
   (when (and (ssh-session-handle session)
              (not (ssh-session-closed session)))
+    (ssh-session-note-input session)
     (handler-case
         (progn
           (case (ssh-session-phase session)
@@ -258,7 +259,10 @@ that admitted the key."
         (ssh-session-key-env session) key-env
         (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
+  (setf (ssh-session-login-grace-timer session)
+        (ssh-session-cancel-timer (ssh-session-login-grace-timer session)))
   (ssh-message-auth-reply-success message 0)
+  (ssh-session-start-client-alive-timer session)
   (when (ssh-server-on-session (ssh-session-server session))
     (funcall (ssh-server-on-session (ssh-session-server session)) session)))
 
@@ -695,6 +699,107 @@ is refused instead of allocated."
                          :detail (format nil "could not connect to ~A:~D"
                                          address port))))))
 
+;;; ---- Connection timers ----
+;;;
+;;; The same policy as the pure backend, driven from the event loop.  libssh
+;;; itself is asked to send the probe, which is its keepalive@openssh.com
+;;; global request.
+
+(defun ssh-session-now ()
+  "Monotonic time in seconds, for the connection timers."
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun ssh-session-cancel-timer (timer)
+  "Stop TIMER when it is set, answering NIL for the caller to store."
+  (when timer
+    (cl-pnet:timer-stop timer))
+  nil)
+
+(defun ssh-session-stop-timers (session)
+  "Disarm SESSION's login-grace and client-alive timers, once."
+  (setf (ssh-session-login-grace-timer session)
+        (ssh-session-cancel-timer (ssh-session-login-grace-timer session))
+        (ssh-session-client-alive-timer session)
+        (ssh-session-cancel-timer (ssh-session-client-alive-timer session))))
+
+(defun ssh-session-start-login-grace-timer (session)
+  "Close SESSION if it has not authenticated in LoginGraceTime seconds."
+  (let ((seconds (ssh-server-login-grace-time (ssh-session-server session))))
+    (when (and seconds
+               (plusp seconds)
+               (not (ssh-session-login-grace-timer session))
+               (not (ssh-session-closed session)))
+      (setf (ssh-session-login-grace-timer session)
+            (cl-pnet:timer-start
+             seconds 0
+             (lambda ()
+               (setf (ssh-session-login-grace-timer session) nil)
+               (unless (or (ssh-session-closed session)
+                           (ssh-session-authenticated session))
+                 (ssh-session-finish session
+                                     "Timeout before authentication"
+                                     :close))))))))
+
+(defun ssh-session-schedule-client-alive (session delay)
+  "Arm SESSION's next client-alive probe after DELAY seconds."
+  (when (and (not (ssh-session-closed session))
+             (not (ssh-session-client-alive-timer session)))
+    (setf (ssh-session-client-alive-timer session)
+          (cl-pnet:timer-start
+           (max 0.05 delay) 0
+           (lambda ()
+             (setf (ssh-session-client-alive-timer session) nil)
+             (ssh-session-client-alive-tick session))))))
+
+(defun ssh-session-client-alive-tick (session)
+  "Probe SESSION if it has been quiet, and disconnect once it stops answering."
+  (unless (ssh-session-closed session)
+    (let* ((server (ssh-session-server session))
+           (interval (ssh-server-client-alive-interval server))
+           (count-max (ssh-server-client-alive-count-max server)))
+      (when (and interval (plusp interval))
+        (let ((idle (- (ssh-session-now)
+                       (ssh-session-last-input-time session))))
+          (if (< idle interval)
+              (ssh-session-schedule-client-alive
+               session (- interval idle))
+              (progn
+                (incf (ssh-session-client-alive-misses session))
+                (if (and (plusp count-max)
+                         (> (ssh-session-client-alive-misses session)
+                            count-max))
+                    (ssh-session-finish
+                     session "Timeout, client not responding" :close)
+                    (progn
+                      (ssh-session-send-keepalive session)
+                      (setf (ssh-session-last-input-time session)
+                            (ssh-session-now))
+                      (ssh-session-schedule-client-alive session
+                                                         interval))))))))))
+
+(defun ssh-session-start-client-alive-timer (session)
+  "Start probing SESSION once authentication has finished."
+  (let ((interval (ssh-server-client-alive-interval
+                   (ssh-session-server session))))
+    (when (and interval
+               (plusp interval)
+               (not (ssh-session-client-alive-timer session))
+               (not (ssh-session-closed session)))
+      (setf (ssh-session-last-input-time session) (ssh-session-now)
+            (ssh-session-client-alive-misses session) 0)
+      (ssh-session-schedule-client-alive session interval))))
+
+(defun ssh-session-note-input (session)
+  "Record that SESSION's peer sent bytes, resetting its keepalive misses."
+  (setf (ssh-session-last-input-time session) (ssh-session-now)
+        (ssh-session-client-alive-misses session) 0))
+
+(defun ssh-session-send-keepalive (session)
+  "Ask libssh for its keepalive@openssh.com global request."
+  (let ((handle (ssh-session-handle session)))
+    (when handle
+      (ssh-send-keepalive handle))))
+
 ;;; ---- Session termination ----
 
 (defun ssh-plibssh-session-terminate-channels (session kind reason)
@@ -737,6 +842,7 @@ is refused instead of allocated."
     (setf (ssh-session-closed session) t
           (ssh-session-phase session) :closed
           (ssh-session-close-reason session) reason)
+    (ssh-session-stop-timers session)
     (let ((server (ssh-session-server session)))
       (when server
         (remhash session (ssh-server-sessions server))))
@@ -782,6 +888,7 @@ is refused instead of allocated."
                    :detail (format nil "could not attach a session: ~A"
                                    detail)))))
       (setf (gethash session (ssh-server-sessions server)) session)
+      (ssh-session-start-login-grace-timer session)
       (setf (ssh-session-watcher session)
             (cl-pnet:fd-watch
              fd
@@ -820,6 +927,9 @@ is refused instead of allocated."
                           set-env
                           max-auth-tries
                           max-sessions
+                          login-grace-time
+                          client-alive-interval
+                          client-alive-count-max
                           accept-env
                           server-version
                           version-addendum
@@ -839,7 +949,11 @@ without a path is refused here.  SERVER-VERSION is the part of the greeting
 after \"SSH-2.0-\"; libssh adds that prefix itself.
 
 PERMIT-USER-ENVIRONMENT and SET-ENV carry sshd's same-named settings; they
-reach the child through the application, which reads the session record."
+reach the child through the application, which reads the session record.
+
+LOGIN-GRACE-TIME, CLIENT-ALIVE-INTERVAL and CLIENT-ALIVE-COUNT-MAX carry
+sshd's connection timers in seconds; a NIL argument keeps sshd's defaults of
+120, 0 and 3."
   (let* ((keys (mapcar (lambda (value)
                          (if (typep value 'ssh-private-key)
                              value
@@ -864,6 +978,15 @@ reach the child through the application, which reads the session record."
                   :set-env set-env
                   :max-auth-tries (or max-auth-tries 6)
                   :max-sessions (or max-sessions 10)
+                  :login-grace-time
+                  (or login-grace-time
+                      +ssh-server-default-login-grace-time+)
+                  :client-alive-interval
+                  (or client-alive-interval
+                      +ssh-server-default-client-alive-interval+)
+                  :client-alive-count-max
+                  (or client-alive-count-max
+                      +ssh-server-default-client-alive-count-max+)
                   :accept-env accept-env
                   :on-session on-session
                   :on-channel on-channel

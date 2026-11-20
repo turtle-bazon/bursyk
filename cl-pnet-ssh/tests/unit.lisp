@@ -1222,11 +1222,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.9"
+           :server-version "bursyk-server_0.0.2.10"
            :version-addendum "experimental")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.9 experimental" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.10 experimental" greeting)))))
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
@@ -1237,11 +1237,11 @@ library's default string hides which program is actually serving."
            (lambda (client fingerprint key)
              (declare (ignore client fingerprint key))
              t)
-           :server-version "bursyk-server_0.0.2.9"
+           :server-version "bursyk-server_0.0.2.10"
            :version-addendum :none)
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-bursyk-server_0.0.2.9" greeting)))))
+        (is (equal "SSH-2.0-bursyk-server_0.0.2.10" greeting)))))
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
@@ -1257,7 +1257,7 @@ Disconnect immediately if you are not an operator.
 ")
         (is (null error))
         (is (not (null opened)))
-        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.10" greeting))
+        (is (equal "SSH-2.0-cl-pnet-ssh_0.0.1.11" greeting))
         (is (equal "Authorized use only.
 Disconnect immediately if you are not an operator.
 " banner)))))
