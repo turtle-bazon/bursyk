@@ -2706,6 +2706,34 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test revoked-host-keys-parse
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "RevokedHostKeys /tmp/one")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "RevokedHostKeys /tmp/two"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal '("/tmp/one" "/tmp/two")
+               (mapcar #'namestring
+                       (reverse
+                        (ssh-config-options-revoked-host-keys options))))))
+  ;; NONE clears the list, as ssh's oRevokedHostKeys does.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "RevokedHostKeys /tmp/one")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "RevokedHostKeys none"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-revoked-host-keys options)))))
+
 (test ca-signature-algorithms-parses
   (flet ((parameters (line)
            (let* ((config
@@ -3899,6 +3927,44 @@ too, and a refused policy never calls it."
     (is (= 0 (ssh-read-u32 reader)))
     ;; Nothing is sent before the transport is ready.
     (is (eq :connecting (cl-pnet-ssh:ssh-client-phase client)))))
+
+(test client-refuses-a-revoked-host-key
+  "RevokedHostKeys refuses a listed host key, and an unreadable list fails
+closed rather than being ignored."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-revoked"))
+             (key-path (merge-pathnames "host_key" directory))
+             (revoked (merge-pathnames "revoked_keys" directory))
+             (missing (merge-pathnames "missing_keys" directory)))
+        (ensure-directories-exist key-path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring key-path)))
+               (let* ((private (ssh-load-private-key key-path))
+                      (blob (ssh-public-key-blob-of private)))
+                 (with-open-file (out revoked :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                   (with-open-file (in
+                                    (merge-pathnames "host_key.pub" directory))
+                     (write-line (read-line in) out)))
+                 (flet ((client (&rest arguments)
+                          (apply #'cl-pnet-ssh::%make-ssh-client
+                                 :host "example.org"
+                                 :known-hosts '()
+                                 :host-key-policy :insecure
+                                 arguments)))
+                   (signals ssh-host-key-error
+                     (cl-pnet-ssh::ssh-client-verify-host-key
+                      (client :revoked-host-keys (list revoked)) blob))
+                   (signals ssh-host-key-error
+                     (cl-pnet-ssh::ssh-client-verify-host-key
+                      (client :revoked-host-keys (list missing)) blob))
+                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
+                              (client :revoked-host-keys '()) blob))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test client-host-certificate-obeys-ca-signature-algorithms
   "A host certificate is trusted only when its CA signature algorithm is

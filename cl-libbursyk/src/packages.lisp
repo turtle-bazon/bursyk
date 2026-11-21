@@ -145,6 +145,7 @@
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts
    #:ssh-config-options-global-known-hosts
+   #:ssh-config-options-revoked-host-keys
    #:ssh-config-options-strict-host-key-checking
    #:ssh-config-options-send-env
    #:ssh-config-options-proxy-jump

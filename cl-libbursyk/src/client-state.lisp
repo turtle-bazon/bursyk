@@ -57,6 +57,8 @@
   ;; CASignatureAlgorithms: signature algorithms a host certificate's CA may
   ;; use.  NIL means this build's default, which excludes SHA-1 ssh-rsa.
   (ca-signature-algorithms nil)
+  ;; RevokedHostKeys: files whose host keys and certificates may not be used.
+  (revoked-host-keys '())
   ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
   ;; authentication key, as ssh's RequiredRSASize directive sets it.
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

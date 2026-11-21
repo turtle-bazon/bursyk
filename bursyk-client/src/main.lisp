@@ -1979,6 +1979,12 @@ peer that connected to it; NIL refuses the channel."
      (or (cl-pnet-ssh:ssh-config-options-known-hosts options)
          (and (getf *options* :known-hosts)
               (list (getf *options* :known-hosts)))))
+    (let ((revoked (reverse
+                    (cl-pnet-ssh:ssh-config-options-revoked-host-keys
+                     options))))
+      (when revoked
+        (format t "revokedhostkeys~{ ~A~}~%"
+                (mapcar #'namestring revoked))))
     (format t "stricthostkeychecking ~A~%"
             (or (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
                  options)

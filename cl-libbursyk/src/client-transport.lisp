@@ -341,6 +341,20 @@ certificate, its plain key or its CA refuses it without that fallback."
                            "the host key for ~A has an RSA modulus below RequiredRSASize"
                            (ssh-client-host-spec client))
            :fingerprint (ssh-key-fingerprint host-key)))
+  (let ((revoked
+          (handler-case
+              (ssh-key-revoked-p host-key
+                                 (ssh-client-revoked-host-keys client))
+            (ssh-revoked-keys-error (condition)
+              (error 'ssh-host-key-error
+                     :detail (format nil "cannot check RevokedHostKeys: ~A"
+                                     condition)
+                     :fingerprint (ssh-key-fingerprint host-key))))))
+    (when revoked
+      (error 'ssh-host-key-error
+             :detail (format nil "the host key for ~A is revoked"
+                             (ssh-client-host-spec client))
+             :fingerprint (ssh-key-fingerprint host-key))))
   (let ((certificate (and (ssh-certificate-blob-p host-key)
                           (ssh-certificate-parse host-key))))
     (cond

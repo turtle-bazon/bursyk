@@ -50,6 +50,9 @@ relative Include is anchored here.")
   (identities-only nil)
   (known-hosts nil)
   (global-known-hosts nil)
+  ;; RevokedHostKeys: files of host keys and certificates that may not be
+  ;; used, in the order read; NONE clears the list.
+  (revoked-host-keys '())
   (strict-host-key-checking nil)
   (host-key-algorithms nil)
   (pubkey-accepted-algorithms nil)
@@ -324,14 +327,18 @@ the caller can treat the '[' literally."
                        (t (write-char character out))))
                    (write-char character out))))))
 
-(defun ssh-config-path-value (line options context)
-  "A path argument with %, $ and ~ expanded."
+(defun ssh-config-path-argument (value options context)
+  "VALUE as a pathname with %, $ and ~ expanded."
   (let ((value (ssh-config-expand-variables
-                (ssh-config-expand-tokens (ssh-config-arg line) options context))))
+                (ssh-config-expand-tokens value options context))))
     (let ((value (ssh-config-expand-home value)))
       (if (ssh-config-absolute-path-p value)
           (pathname value)
           (merge-pathnames value (user-homedir-pathname))))))
+
+(defun ssh-config-path-value (line options context)
+  "A path argument with %, $ and ~ expanded."
+  (ssh-config-path-argument (ssh-config-arg line) options context))
 
 (defun ssh-config-include-path (argument &key (user-config t))
   "An Include argument as a pathname, relative ones anchored like OpenSSH.
@@ -788,6 +795,16 @@ understand them rather than silently match nothing."
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
                   (if (eq paths :none) nil paths))))))
+      ((string= keyword "revokedhostkeys")
+       ;; Unlike most keywords this accumulates, and NONE clears what came
+       ;; before it, as ssh's oRevokedHostKeys does.
+       (let ((values (ssh-config-line-args line)))
+         (if (and (= 1 (length values))
+                  (string-equal (first values) "none"))
+             (setf (ssh-config-options-revoked-host-keys options) nil)
+             (dolist (value values)
+               (push (ssh-config-path-argument value options context)
+                     (ssh-config-options-revoked-host-keys options))))))
       ((string= keyword "stricthostkeychecking")
        (ssh-config-set-once
         seen options :strict-host-key-checking
@@ -986,8 +1003,8 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
-                         "stricthostkeychecking" "connecttimeout"
-                         "addressfamily" "batchmode")
+                         "revokedhostkeys" "stricthostkeychecking"
+                         "connecttimeout" "addressfamily" "batchmode")
                :test #'string=)
        (ssh-config-apply-policy line options seen context))
       ((member keyword '("ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
