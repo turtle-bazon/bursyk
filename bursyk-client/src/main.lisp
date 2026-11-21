@@ -1117,7 +1117,14 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
     (dolist (name (cl-pnet-ssh:ssh-client-send-env client))
       (let ((value (uiop:getenv name)))
         (when value
-          (cl-pnet-ssh:ssh-channel-env *channel* name value)))))
+          (cl-pnet-ssh:ssh-channel-env *channel* name value))))
+    (dolist (assignment (cl-pnet-ssh:ssh-client-set-env client))
+      (let ((equals (position #\= assignment)))
+        (when equals
+          (cl-pnet-ssh:ssh-channel-env
+           *channel*
+           (subseq assignment 0 equals)
+           (subseq assignment (1+ equals)))))))
   (if (request-tty-p client command-given-p)
       (start-pty-session *channel* command command-given-p)
       (cond
@@ -2039,6 +2046,8 @@ peer that connected to it; NIL refuses the channel."
                 "no"))
     (print-list-option "sendenv"
                        (cl-pnet-ssh:ssh-config-options-send-env options))
+    (print-list-option "setenv"
+                       (cl-pnet-ssh:ssh-config-options-set-env options))
     (print-list-option
      "localforward"
      (reverse (cl-pnet-ssh:ssh-config-options-local-forwards options)))

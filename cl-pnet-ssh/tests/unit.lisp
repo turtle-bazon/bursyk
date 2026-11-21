@@ -2730,6 +2730,43 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test setenv-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "SetEnv FOO=bar BAZ=qux")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "SetEnv LATER=ignored"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    ;; ssh keeps the first active SetEnv line.
+    (is (equal '("FOO=bar" "BAZ=qux")
+               (ssh-config-options-set-env options))))
+  ;; A duplicate name within the line keeps the first assignment.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "SetEnv A=1 A=2 B=3"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal '("A=1" "B=3")
+               (ssh-config-options-set-env options))))
+  ;; An assignment without '=' is a configuration error.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "SetEnv NOEQUALS"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test tcp-keepalive-parses
   (flet ((value (line)
            (let* ((config

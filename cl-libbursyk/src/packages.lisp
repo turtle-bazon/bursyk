@@ -10,6 +10,7 @@
    #:ssh-client-phase
    #:ssh-client-config-options
    #:ssh-client-send-env
+   #:ssh-client-set-env
    #:ssh-client-host-key-fingerprint
    #:ssh-client-server-version
    #:ssh-client-banner
@@ -149,6 +150,7 @@
    #:ssh-config-options-revoked-host-keys
    #:ssh-config-options-strict-host-key-checking
    #:ssh-config-options-send-env
+   #:ssh-config-options-set-env
    #:ssh-config-options-proxy-jump
    #:ssh-config-options-proxy-command
    #:ssh-config-options-address-family

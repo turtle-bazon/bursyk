@@ -174,6 +174,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  (revoked-host-keys '())
                                  hash-known-hosts
                                  (tcp-keep-alive t)
+                                 set-env
                                  (required-rsa-size
                                   +ssh-rsa-minimum-modulus-size+))
   "The CLIENT structure, before any connection exists."
@@ -198,6 +199,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
                     :tcp-keep-alive tcp-keep-alive
+                    :set-env set-env
                     :required-rsa-size required-rsa-size
                     :on-open on-open
                     :on-error on-error
@@ -261,6 +263,7 @@ is applied here, before any request names a key the configuration forbade."
                              (revoked-host-keys '())
                              hash-known-hosts
                              (tcp-keep-alive t)
+                             set-env
                              (required-rsa-size
                               +ssh-rsa-minimum-modulus-size+)
                              on-open on-error on-close on-forwarded-tcpip
@@ -322,6 +325,7 @@ role-neutral."
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
                            :tcp-keep-alive tcp-keep-alive
+                           :set-env set-env
                            :required-rsa-size required-rsa-size)
    private-key agent passphrase))
 

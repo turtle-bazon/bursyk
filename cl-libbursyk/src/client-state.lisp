@@ -63,6 +63,8 @@
   (hash-known-hosts nil)
   ;; TCPKeepAlive: keep the transport's keepalive probes on, ssh's default.
   (tcp-keep-alive t)
+  ;; SetEnv: NAME=VALUE assignments to send on every session.
+  (set-env nil)
   ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
   ;; authentication key, as ssh's RequiredRSASize directive sets it.
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

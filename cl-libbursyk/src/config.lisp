@@ -76,6 +76,9 @@ relative Include is anchored here.")
   (kbd-interactive-authentication nil)
   (number-of-password-prompts nil)
   (send-env nil)
+  ;; SetEnv: NAME=VALUE pairs sent to the server on every session, in the
+  ;; order the first active SetEnv line named them.
+  (set-env nil)
   (proxy-jump nil)
   (proxy-command nil)
   (rekey-limit nil)
@@ -914,6 +917,25 @@ understand them rather than silently match nothing."
        (setf (ssh-config-options-send-env options)
              (append (ssh-config-options-send-env options)
                      (ssh-config-line-args line))))
+      ((string= keyword "setenv")
+       ;; ssh keeps the first active SetEnv line and ignores duplicates by
+       ;; variable name, so the same shape is used here.
+       (ssh-config-set-once
+        seen options :set-env
+        (lambda (options)
+          (let ((assignments (ssh-config-line-args line)))
+            (dolist (assignment assignments)
+              (unless (find #\= assignment)
+                (error (ssh-config-line-error line "Invalid SetEnv ~S"
+                                              assignment))))
+            (setf (ssh-config-options-set-env options)
+                  (remove-duplicates
+                   assignments
+                   :test #'string=
+                   :from-end t
+                   :key (lambda (assignment)
+                          (subseq assignment 0
+                                  (position #\= assignment)))))))))
       ((member keyword '("localforward" "remoteforward" "dynamicforward")
                :test #'string=)
        ;; Keep the tokens as written for callers that want them, and also
@@ -1041,6 +1063,7 @@ understand them rather than silently match nothing."
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
+                         "setenv"
                          "preferredauthentications" "pubkeyauthentication"
                          "passwordauthentication"
                          "kbdinteractiveauthentication"
