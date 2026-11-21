@@ -8,6 +8,12 @@
   "CLIENT's TCP connection is up: greet and offer our KEXINIT."
   (setf (ssh-client-connection client) connection
         (ssh-client-phase client) :version)
+  (unless (ssh-client-tcp-keep-alive client)
+    (let ((fd (cl-pnet:connection-fileno connection)))
+      (when fd
+        (cl-pnet-sockets:set-socket-option
+         fd cl-pnet-sockets:+sol-socket+
+         cl-pnet-sockets:+so-keepalive+ 0))))
   (ssh-client-send-bytes
    client
    (ssh-string-octets (concatenate 'string

@@ -2730,6 +2730,23 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test tcp-keepalive-parses
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (ssh-config-options-tcp-keep-alive options))))
+    (is (eq t (value "TCPKeepAlive yes")))
+    (is (null (value "TCPKeepAlive no")))
+    ;; KeepAlive is the old spelling of the same keyword.
+    (is (null (value "KeepAlive no")))
+    (is (eq t (value "Port 22")))))
+
 (test exit-on-forward-failure-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

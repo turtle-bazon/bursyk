@@ -61,6 +61,8 @@
   (revoked-host-keys '())
   ;; HashKnownHosts: write new known_hosts entries as salted hashes.
   (hash-known-hosts nil)
+  ;; TCPKeepAlive: keep the transport's keepalive probes on, ssh's default.
+  (tcp-keep-alive t)
   ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
   ;; authentication key, as ssh's RequiredRSASize directive sets it.
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

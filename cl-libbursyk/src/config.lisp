@@ -84,6 +84,8 @@ relative Include is anchored here.")
   (forward-x11-trusted nil)
   (gateway-ports nil)
   (exit-on-forward-failure nil)
+  ;; TCPKeepAlive defaults to yes, as it does in ssh.
+  (tcp-keep-alive t)
   ;; RequiredRSASize: the smallest RSA modulus this client will use for a
   ;; host key or an authentication key; OpenSSH's default is 1024.
   (required-rsa-size nil)
@@ -972,6 +974,8 @@ understand them rather than silently match nothing."
         ((string= keyword "exitonforwardfailure")
          (setf (ssh-config-options-exit-on-forward-failure options)
                (boolean)))
+        ((member keyword '("tcpkeepalive" "keepalive") :test #'string=)
+         (setf (ssh-config-options-tcp-keep-alive options) (boolean)))
         ((string= keyword "refuseconnection")
          ;; ssh treats this as fatal while the active block is read, so a
          ;; managed configuration can stop a connection before it starts.
@@ -1032,6 +1036,7 @@ understand them rather than silently match nothing."
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
                          "gatewayports" "exitonforwardfailure"
+                         "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"

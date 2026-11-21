@@ -151,6 +151,7 @@ MAKE-SSH-CLIENT's own defaults."
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
         (ssh-config-options-hash-known-hosts options)
+        :tcp-keep-alive (ssh-config-options-tcp-keep-alive options)
         :ca-signature-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-ca-signature-algorithms
@@ -437,6 +438,7 @@ uses whichever of the two it saw first instead of chaining them."
            :ca-signature-algorithms (getf parameters :ca-signature-algorithms)
            :revoked-host-keys (getf parameters :revoked-host-keys)
            :hash-known-hosts (getf parameters :hash-known-hosts)
+           :tcp-keep-alive (getf parameters :tcp-keep-alive)
            :required-rsa-size (getf parameters :required-rsa-size)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)
