@@ -76,6 +76,9 @@
   ;; Server-initiated forwarded-tcpip channels: the application maps the
   ;; remote bind address and port to the local target to dial.
   (on-forwarded-tcpip nil)
+  ;; A function of (CLIENT PATH) returning a setup function of CHANNEL for a
+  ;; server-initiated forwarded-streamlocal channel, or NIL to refuse.
+  (on-forwarded-streamlocal nil)
   (on-open nil)
   (on-error nil)
   (on-close nil)

@@ -397,7 +397,8 @@ uses whichever of the two it saw first instead of chaining them."
 (defun ssh-config-launch-client (parameters options
                                  connect-host connect-port
                                  on-open on-error on-close
-                                 &key on-forwarded-tcpip)
+                                 &key on-forwarded-tcpip
+                                   on-forwarded-streamlocal)
   "Make the client PARAMETERS describes and remember OPTIONS on it."
   (let ((client
           (make-ssh-client
@@ -426,7 +427,8 @@ uses whichever of the two it saw first instead of chaining them."
            :on-open on-open
            :on-error on-error
            :on-close on-close
-           :on-forwarded-tcpip on-forwarded-tcpip)))
+           :on-forwarded-tcpip on-forwarded-tcpip
+           :on-forwarded-streamlocal on-forwarded-streamlocal)))
     (setf (ssh-client-config-options client) options)
     client))
 
@@ -473,7 +475,9 @@ the destination's user and port do not apply to it."
     (values tunnel (ssh-config-tunnel-listen tunnel))))
 
 (defun ssh-config-start-chain (hops overrides target-options target-parameters
-                               on-open on-error on-close)
+                               on-open on-error on-close
+                               &key on-forwarded-tcpip
+                                 on-forwarded-streamlocal)
   "Build every jump client and the target, and return the target client.
 
 The listeners exist before the clients that dial them, so the whole chain
@@ -502,7 +506,9 @@ in the tunnel's buffers."
                (when on-error (funcall on-error client condition)))
              (lambda (client reason)
                (ssh-config-chain-close chain)
-               (when on-close (funcall on-close client reason))))))
+               (when on-close (funcall on-close client reason)))
+             :on-forwarded-tcpip on-forwarded-tcpip
+             :on-forwarded-streamlocal on-forwarded-streamlocal)))
       (setf (ssh-config-chain-target chain) target)
       (when (ssh-config-chain-error chain)
         (ssh-client-fail target (ssh-config-chain-error chain)))
@@ -510,7 +516,8 @@ in the tunnel's buffers."
 
 (defun ssh-config-finish-client (host options hops overrides
                                  on-open on-error on-close
-                                 &key proxy-command on-forwarded-tcpip)
+                                 &key proxy-command on-forwarded-tcpip
+                                   on-forwarded-streamlocal)
   "Build the target client for HOST, directly or through HOPS."
   (let ((target (ssh-config-client-parameters
                  host options
@@ -530,11 +537,15 @@ in the tunnel's buffers."
                   (ssh-config-hop-parameters
                    (car entry) (cdr entry) overrides))
                 hops)
-        overrides options target on-open on-error on-close))
+        overrides options target on-open on-error on-close
+        :on-forwarded-tcpip on-forwarded-tcpip
+        :on-forwarded-streamlocal on-forwarded-streamlocal))
       (t
        (ssh-config-launch-client target options nil nil
                                  on-open on-error on-close
-                                 :on-forwarded-tcpip on-forwarded-tcpip)))))
+                                 :on-forwarded-tcpip on-forwarded-tcpip
+                                 :on-forwarded-streamlocal
+                                 on-forwarded-streamlocal)))))
 
 ;;; ---- Entry point ----
 
@@ -552,7 +563,8 @@ in the tunnel's buffers."
 (defun ssh-config-build-client (source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
-                                &key on-forwarded-tcpip)
+                                &key on-forwarded-tcpip
+                                  on-forwarded-streamlocal)
   "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT."
   (handler-case
       (let ((command (ssh-config-proxy-command options proxy-command)))
@@ -567,7 +579,9 @@ in the tunnel's buffers."
                      host options hops overrides
                      on-open on-error on-close
                      :proxy-command command
-                     :on-forwarded-tcpip on-forwarded-tcpip)))
+                     :on-forwarded-tcpip on-forwarded-tcpip
+                     :on-forwarded-streamlocal
+                     on-forwarded-streamlocal)))
          fail))
     (error (condition) (funcall fail condition))))
 
@@ -575,7 +589,8 @@ in the tunnel's buffers."
     (host &key config original-host user port private-key agent passphrase
               known-hosts host-key-policy host-key-callback proxy-jump
               proxy-command exec-matcher options on-client on-config-error
-              on-open on-error on-close on-forwarded-tcpip)
+              on-open on-error on-close on-forwarded-tcpip
+              on-forwarded-streamlocal)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -609,7 +624,9 @@ failures."
        (ssh-config-build-client source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
-                                :on-forwarded-tcpip on-forwarded-tcpip))
+                                :on-forwarded-tcpip on-forwarded-tcpip
+                                :on-forwarded-streamlocal
+                                on-forwarded-streamlocal))
      :on-error (lambda (condition) (funcall fail condition)))
     (when (and (not finished) (null on-client))
       (error 'ssh-config-error

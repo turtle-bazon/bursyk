@@ -201,6 +201,74 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test stream-local-forwarding-specifications-parse
+  ;; -L local_socket:remote_socket
+  (let ((forward
+          (burs::parse-local-forward "/tmp/local.sock:/tmp/remote.sock")))
+    (is (equal "/tmp/local.sock" (burs::forward-bind-path forward)))
+    (is (equal "/tmp/remote.sock" (burs::forward-target-path forward)))
+    (is (null (burs::forward-bind-port forward)))
+    (is (null (burs::forward-port forward))))
+  ;; -L port:remote_socket
+  (let ((forward (burs::parse-local-forward "18082:/tmp/remote.sock")))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (null (burs::forward-bind-path forward)))
+    (is (equal "/tmp/remote.sock" (burs::forward-target-path forward))))
+  ;; -L local_socket:host:hostport
+  (let ((forward
+          (burs::parse-local-forward "/tmp/local.sock:example.org:80")))
+    (is (equal "/tmp/local.sock" (burs::forward-bind-path forward)))
+    (is (equal "example.org" (burs::forward-host forward)))
+    (is (= 80 (burs::forward-port forward))))
+  ;; -L bind_address:port:remote_socket
+  (let ((forward
+          (burs::parse-local-forward "127.0.0.1:18082:/tmp/remote.sock")))
+    (is (equal "127.0.0.1" (burs::forward-bind-address forward)))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (equal "/tmp/remote.sock" (burs::forward-target-path forward))))
+  ;; -R remote_socket:local_socket
+  (let ((forward
+          (burs::parse-remote-forward "/tmp/remote.sock:/tmp/local.sock")))
+    (is (equal "/tmp/remote.sock" (burs::forward-bind-path forward)))
+    (is (equal "/tmp/local.sock" (burs::forward-target-path forward))))
+  ;; -R port:local_socket
+  (let ((forward (burs::parse-remote-forward "18082:/tmp/local.sock")))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (equal "/tmp/local.sock" (burs::forward-target-path forward))))
+  ;; -R remote_socket:host:hostport
+  (let ((forward
+          (burs::parse-remote-forward "/tmp/remote.sock:example.org:80")))
+    (is (equal "/tmp/remote.sock" (burs::forward-bind-path forward)))
+    (is (equal "example.org" (burs::forward-host forward)))
+    (is (= 80 (burs::forward-port forward)))))
+
+(test config-stream-local-forwards-use-paths
+  (let ((forward
+          (burs::parse-config-local-forward
+           "/tmp/local.sock /tmp/remote.sock")))
+    (is (equal "/tmp/local.sock" (burs::forward-bind-path forward)))
+    (is (equal "/tmp/remote.sock" (burs::forward-target-path forward))))
+  (let ((forward
+          (burs::parse-config-local-forward "18082 /tmp/remote.sock")))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (equal "/tmp/remote.sock" (burs::forward-target-path forward))))
+  (let ((forward
+          (burs::parse-config-local-forward
+           "/tmp/local.sock example.org:80")))
+    (is (equal "/tmp/local.sock" (burs::forward-bind-path forward)))
+    (is (equal "example.org" (burs::forward-host forward)))
+    (is (= 80 (burs::forward-port forward))))
+  (let ((forward
+          (burs::parse-config-remote-forward
+           "/tmp/remote.sock /tmp/local.sock")))
+    (is (equal "/tmp/remote.sock" (burs::forward-bind-path forward)))
+    (is (equal "/tmp/local.sock" (burs::forward-target-path forward))))
+  (let ((forward
+          (burs::parse-config-remote-forward
+           "18082 /tmp/local.sock")))
+    (is (= 18082 (burs::forward-bind-port forward)))
+    (is (equal "/tmp/local.sock" (burs::forward-target-path forward)))))
+
 (test config-local-forward-uses-the-two-word-form
   (let ((forward (burs::parse-config-local-forward "18082 127.0.0.1:22")))
     (is (null (burs::forward-bind-address forward)))

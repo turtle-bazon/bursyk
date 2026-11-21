@@ -684,9 +684,13 @@ session down."
 (defstruct (forward (:constructor %make-forward))
   bind-address
   bind-port
+  bind-path
   host
   port
-  listener)
+  target-path
+  listener
+  listener-fd
+  listener-watcher)
 
 (defstruct (forward-tunnel (:constructor %make-forward-tunnel))
   forward
@@ -737,48 +741,97 @@ session down."
       (fail "invalid port ~S in forwarding specification ~A" text spec))
     port))
 
-(defun parse-local-forward (spec)
-  "SPEC as a FORWARD for [bind_address:]port:host:hostport."
+(defun path-field-p (text)
+  "Whether TEXT names a Unix socket, as OpenSSH decides: it contains \"/\"."
+  (find #\/ text))
+
+(defun make-parsed-forward (spec remote-p &key bind-address bind-port bind-path
+                                            host port target-path)
+  "A FORWARD for a parsed SPEC, or FAIL when it names no usable endpoint.
+
+OpenSSH's rule is used: a forwarding specification needs a target port or
+socket path, and a listener that is a socket path or a port.  Only a remote
+forward may ask for port 0, which leaves the choice to the server."
+  (unless (or target-path (and port (plusp port)))
+    (fail "~A: forwarding needs a target port or socket path" spec))
+  (unless (or bind-path
+              (and bind-port
+                   (if remote-p (<= 0 bind-port) (plusp bind-port))))
+    (fail "~A: forwarding needs a listener port or socket path" spec))
+  (%make-forward :bind-address bind-address
+                 :bind-port bind-port
+                 :bind-path bind-path
+                 :host host
+                 :port port
+                 :target-path target-path))
+
+(defun parse-forward-spec (spec remote-p)
+  "SPEC as a FORWARD for ssh's colon-separated -L or -R syntax.
+
+The fields follow OpenSSH's parse_forward: a field containing a slash is a
+Unix socket path, anything else is an address or port."
   (let ((fields (split-forward-fields spec)))
-    (cond
-      ((= (length fields) 3)
-       (destructuring-bind (port host hostport) fields
-         (when (null (parse-integer hostport :junk-allowed t))
-           (fail "~A: streaming to a unix socket is not implemented" spec))
-         (%make-forward :bind-port (forwarding-port port spec)
-                        :host host
-                        :port (forwarding-port hostport spec))))
-      ((= (length fields) 4)
+    (case (length fields)
+      (2
+       (destructuring-bind (first second) fields
+         (cond
+           ;; local_socket:remote_socket
+           ((and (path-field-p first) (path-field-p second))
+            (make-parsed-forward spec remote-p
+                                 :bind-path first :target-path second))
+           ;; port:remote_socket
+           ((path-field-p second)
+            (make-parsed-forward spec remote-p
+                                 :bind-port (forwarding-port first spec)
+                                 :target-path second))
+           (t
+            ;; bind_address:port, the dynamic form; never a -L or -R.
+            (make-parsed-forward spec remote-p
+                                 :bind-address (and (plusp (length first))
+                                                    first)
+                                 :bind-port (forwarding-port second spec))))))
+      (3
+       (destructuring-bind (first second third) fields
+         (cond
+           ;; local_socket:host:hostport
+           ((path-field-p first)
+            (make-parsed-forward spec remote-p
+                                 :bind-path first
+                                 :host second
+                                 :port (forwarding-port third spec)))
+           ;; bind_address:port:remote_socket
+           ((path-field-p third)
+            (make-parsed-forward spec remote-p
+                                 :bind-address (and (plusp (length first))
+                                                    first)
+                                 :bind-port (forwarding-port second spec)
+                                 :target-path third))
+           ;; port:host:hostport
+           (t
+            (make-parsed-forward spec remote-p
+                                 :bind-port (forwarding-port first spec)
+                                 :host second
+                                 :port (forwarding-port third spec))))))
+      (4
        (destructuring-bind (bind port host hostport) fields
-         (%make-forward :bind-address (if (plusp (length bind)) bind nil)
-                        :bind-port (forwarding-port port spec)
-                        :host host
-                        :port (forwarding-port hostport spec))))
-      ((= (length fields) 2)
-       (fail "~A: streaming to a unix socket is not implemented" spec))
+         (make-parsed-forward spec remote-p
+                              :bind-address (and (plusp (length bind)) bind)
+                              :bind-port (forwarding-port port spec)
+                              :host host
+                              :port (forwarding-port hostport spec))))
       (t
        (fail "invalid forwarding specification ~A" spec)))))
 
-(defun parse-remote-forward (spec)
-  "SPEC as a FORWARD for [bind_address:]port:host:hostport.
+(defun parse-local-forward (spec)
+  "SPEC as a FORWARD for ssh's -L forms, including Unix-socket paths."
+  (parse-forward-spec spec nil))
 
-A remote forward names the listener on the server (BIND-ADDRESS/BIND-PORT)
-and the target this client dials (HOST/PORT), which is the reverse of -L."
-  (let ((fields (split-forward-fields spec)))
-    (cond
-      ((= (length fields) 3)
-       (destructuring-bind (port host hostport) fields
-         (%make-forward :bind-port (forwarding-port port spec)
-                        :host host
-                        :port (forwarding-port hostport spec))))
-      ((= (length fields) 4)
-       (destructuring-bind (bind port host hostport) fields
-         (%make-forward :bind-address (if (plusp (length bind)) bind nil)
-                        :bind-port (forwarding-port port spec)
-                        :host host
-                        :port (forwarding-port hostport spec))))
-      (t
-       (fail "invalid remote forwarding specification ~A" spec)))))
+(defun parse-remote-forward (spec)
+  "SPEC as a FORWARD for ssh's -R forms, including Unix-socket paths.
+
+A remote forward names the listener on the server (BIND-ADDRESS/BIND-PORT
+or BIND-PATH) and the target this client dials (HOST/PORT or TARGET-PATH)."
+  (parse-forward-spec spec t))
 
 (defun parse-dynamic-forward (spec)
   "SPEC as a DYNAMIC-FORWARD for [bind_address:]port."
@@ -811,52 +864,47 @@ and the target this client dials (HOST/PORT), which is the reverse of -L."
       (fail "~A must be host:port" spec))
     (values host (forwarding-port port spec))))
 
-(defun parse-config-local-forward (spec)
-  "SPEC as a FORWARD for ssh_config's \"[bind_address:]port host:hostport\".
+(defun parse-config-forward (spec remote-p)
+  "SPEC as a FORWARD for ssh_config's two-word LocalForward/RemoteForward.
 
-A LocalForward line in a config file has two words, unlike -L's single
-colon-separated argument, so both spellings are accepted here.  A one-word
-line is handled as the command-line form, which is what a user who wrote
--L's syntax into the file meant."
+The listener may be [bind_address:]port or a socket path; the target may be
+host:hostport or a socket path.  A one-word line is taken as the command
+line's colon-separated form."
   (let ((words (uiop:split-string spec :separator '(#\Space #\Tab))))
     (if (/= 2 (length words))
-        (parse-local-forward spec)
+        (parse-forward-spec spec remote-p)
         (destructuring-bind (listen target) words
-          (multiple-value-bind (first second) (split-host-port listen)
-            (let (bind port)
-              (if second
-                  (setf bind first port second)
-                  (setf port first))
-              (multiple-value-bind (host hostport) (split-host-port target)
-                (unless (and hostport (plusp (length hostport)))
-                  (fail "~A: streaming to a unix socket is not implemented"
-                        spec))
-                (%make-forward
-                 :bind-address (and bind (plusp (length bind)) bind)
-                 :bind-port (forwarding-port port spec)
-                 :host host
-                 :port (forwarding-port hostport spec)))))))))
+          (let (bind port bind-path host hostport target-path)
+            (if (path-field-p listen)
+                (setf bind-path listen)
+                (multiple-value-bind (first second) (split-host-port listen)
+                  (if second
+                      (setf bind (and (plusp (length first)) first)
+                            port (forwarding-port second spec))
+                      (setf port (forwarding-port first spec)))))
+            (if (path-field-p target)
+                (setf target-path target)
+                (multiple-value-bind (target-host target-port)
+                    (split-host-port target)
+                  (unless (and target-port (plusp (length target-port)))
+                    (fail "~A must be host:port or a socket path" spec))
+                  (setf host target-host
+                        hostport (forwarding-port target-port spec))))
+            (make-parsed-forward spec remote-p
+                                 :bind-address bind
+                                 :bind-port port
+                                 :bind-path bind-path
+                                 :host host
+                                 :port hostport
+                                 :target-path target-path))))))
+
+(defun parse-config-local-forward (spec)
+  "SPEC as a FORWARD for ssh_config's two-word LocalForward form."
+  (parse-config-forward spec nil))
 
 (defun parse-config-remote-forward (spec)
-  "SPEC as a FORWARD for ssh_config's \"[bind_address:]port host:hostport\"."
-  (let ((words (uiop:split-string spec :separator '(#\Space #\Tab))))
-    (if (/= 2 (length words))
-        (parse-remote-forward spec)
-        (destructuring-bind (listen target) words
-          (multiple-value-bind (first second) (split-host-port listen)
-            (let (bind port)
-              (if second
-                  (setf bind first port second)
-                  (setf port first))
-              (multiple-value-bind (host hostport) (split-host-port target)
-                (unless (and hostport (plusp (length hostport)))
-                  (fail "~A: streaming to a unix socket is not implemented"
-                        spec))
-                (%make-forward
-                 :bind-address (and bind (plusp (length bind)) bind)
-                 :bind-port (forwarding-port port spec)
-                 :host host
-                 :port (forwarding-port hostport spec)))))))))
+  "SPEC as a FORWARD for ssh_config's two-word RemoteForward form."
+  (parse-config-forward spec t))
 
 ;;; ---- Session ----
 
@@ -1173,8 +1221,231 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
       (setf (forward-tunnel-channel tunnel) nil)
       (ignore-errors (cl-pnet-ssh:ssh-channel-close channel)))))
 
+;;; ---- client stream-local tunnels ----
+;;;
+;;; A -L or -R forward can carry a Unix-domain socket instead of TCP.  The
+;;; application owns that descriptor and bridges it to the SSH channel, just
+;;; as the server does for its direct/forwarded streamlocal channels.
+
+(defstruct (client-streamlocal (:constructor %make-client-streamlocal))
+  channel
+  path
+  fd
+  read-watcher
+  write-watcher
+  (pending (make-array 0 :element-type '(unsigned-byte 8)
+                         :adjustable t :fill-pointer 0))
+  (offset 0)
+  (input-closed nil)
+  (output-closed nil)
+  (shutdown-done nil)
+  (closed nil))
+
+(defun client-streamlocal-close (bridge)
+  "Close BRIDGE's socket and watchers once."
+  (unless (client-streamlocal-closed bridge)
+    (setf (client-streamlocal-closed bridge) t)
+    (when (client-streamlocal-read-watcher bridge)
+      (cl-pnet:fd-unwatch (client-streamlocal-read-watcher bridge))
+      (setf (client-streamlocal-read-watcher bridge) nil))
+    (when (client-streamlocal-write-watcher bridge)
+      (cl-pnet:fd-unwatch (client-streamlocal-write-watcher bridge))
+      (setf (client-streamlocal-write-watcher bridge) nil))
+    (let ((fd (client-streamlocal-fd bridge)))
+      (when (and fd (not (minusp fd)))
+        (ignore-errors (cl-pnet-sockets:close-open-fd fd))
+        (setf (client-streamlocal-fd bridge) nil)))))
+
+(defun client-streamlocal-shutdown-input (bridge)
+  "Shut the socket's write side once the channel's queued data has drained."
+  (when (and (client-streamlocal-input-closed bridge)
+             (not (client-streamlocal-shutdown-done bridge))
+             (zerop (fill-pointer (client-streamlocal-pending bridge))))
+    (setf (client-streamlocal-shutdown-done bridge) t)
+    (let ((fd (client-streamlocal-fd bridge)))
+      (when (and fd (not (minusp fd)))
+        (ignore-errors (cl-pnet-sockets:c-shutdown fd 1))))))
+
+(defun client-streamlocal-flush (bridge)
+  "Send BRIDGE's queued channel data to the Unix socket."
+  (unless (or (client-streamlocal-closed bridge)
+              (client-streamlocal-input-closed bridge))
+    (let* ((fd (client-streamlocal-fd bridge))
+           (pending (client-streamlocal-pending bridge))
+           (offset (client-streamlocal-offset bridge))
+           (failed nil))
+      (loop while (< offset (fill-pointer pending))
+            do (multiple-value-bind (count error)
+                   (cl-pnet-sockets:write-octets fd pending :start offset)
+                 (cond
+                   ((plusp count) (incf offset count))
+                   ((member error '(4 11)) (return))
+                   (t (setf failed error) (return)))))
+      (setf (client-streamlocal-offset bridge) offset)
+      (cond
+        (failed
+         (client-streamlocal-close bridge)
+         (ignore-errors
+           (cl-pnet-ssh:ssh-channel-close
+            (client-streamlocal-channel bridge))))
+        ((>= offset (fill-pointer pending))
+         (setf (fill-pointer pending) 0
+               (client-streamlocal-offset bridge) 0)
+         (when (client-streamlocal-write-watcher bridge)
+           (cl-pnet:fd-unwatch (client-streamlocal-write-watcher bridge))
+           (setf (client-streamlocal-write-watcher bridge) nil))
+         (client-streamlocal-shutdown-input bridge))
+        (t
+         (unless (client-streamlocal-write-watcher bridge)
+           (setf (client-streamlocal-write-watcher bridge)
+                 (cl-pnet:fd-watch
+                  fd :on-writable
+                  (lambda (watcher)
+                    (declare (ignore watcher))
+                    (setf (client-streamlocal-write-watcher bridge) nil)
+                    (client-streamlocal-flush bridge))))))))))
+
+(defun client-streamlocal-on-data (bridge data)
+  "Queue channel DATA for the Unix socket."
+  (unless (or (client-streamlocal-closed bridge)
+              (client-streamlocal-input-closed bridge))
+    (let ((pending (client-streamlocal-pending bridge)))
+      (loop for octet across data
+            do (vector-push-extend octet pending)))
+    (client-streamlocal-flush bridge)))
+
+(defun client-streamlocal-on-eof (bridge)
+  "The channel sent EOF: drain what it queued, then shut the socket's writer."
+  (unless (client-streamlocal-closed bridge)
+    (setf (client-streamlocal-input-closed bridge) t)
+    (client-streamlocal-shutdown-input bridge)
+    (when (client-streamlocal-output-closed bridge)
+      (ignore-errors
+        (cl-pnet-ssh:ssh-channel-close
+         (client-streamlocal-channel bridge))))))
+
+(defun client-streamlocal-on-readable (bridge)
+  "Read the Unix socket and send what it yields to the channel."
+  (unless (client-streamlocal-closed bridge)
+    (multiple-value-bind (data count error)
+        (cl-pnet-sockets:read-octets (client-streamlocal-fd bridge) 4096)
+      (cond
+        ((plusp count)
+         (ignore-errors
+           (cl-pnet-ssh:ssh-channel-write
+            (client-streamlocal-channel bridge) data)))
+        ;; A spurious readiness notification is not an error.
+        ((and (minusp count) (member error '(4 11))) nil)
+        ((or (zerop count) (member error '(5 104 111)))
+         ;; EOF, EIO on a closed peer, ECONNRESET or ECONNREFUSED.
+         (setf (client-streamlocal-output-closed bridge) t)
+         (when (client-streamlocal-read-watcher bridge)
+           (cl-pnet:fd-unwatch (client-streamlocal-read-watcher bridge))
+           (setf (client-streamlocal-read-watcher bridge) nil))
+         (ignore-errors
+           (cl-pnet-ssh:ssh-channel-eof
+            (client-streamlocal-channel bridge)))
+         (when (client-streamlocal-input-closed bridge)
+           (ignore-errors
+             (cl-pnet-ssh:ssh-channel-close
+              (client-streamlocal-channel bridge)))))
+        (t
+         (client-streamlocal-close bridge)
+         (ignore-errors
+           (cl-pnet-ssh:ssh-channel-close
+            (client-streamlocal-channel bridge))))))))
+
+(defun client-streamlocal-install (bridge)
+  "Route CHANNEL's traffic through BRIDGE."
+  (let ((channel (client-streamlocal-channel bridge)))
+    (setf (cl-pnet-ssh:ssh-channel-on-data channel)
+          (lambda (channel data kind)
+            (declare (ignore channel kind))
+            (client-streamlocal-on-data bridge data))
+          (cl-pnet-ssh:ssh-channel-on-eof channel)
+          (lambda (channel)
+            (declare (ignore channel))
+            (client-streamlocal-on-eof bridge))
+          (cl-pnet-ssh:ssh-channel-on-close channel)
+          (lambda (channel reason)
+            (declare (ignore channel reason))
+            (client-streamlocal-close bridge)))))
+
+(defun client-streamlocal-connected (bridge)
+  "BRIDGE's socket is connected: watch it and send anything already queued."
+  (setf (client-streamlocal-read-watcher bridge)
+        (cl-pnet:fd-watch
+         (client-streamlocal-fd bridge)
+         :on-readable
+         (lambda (watcher)
+           (declare (ignore watcher))
+           (client-streamlocal-on-readable bridge))))
+  (client-streamlocal-flush bridge))
+
+(defun client-streamlocal-connect-failed (bridge errno)
+  "Report that BRIDGE's socket refused its connect, then close both ends."
+  (unless (getf *options* :quiet)
+    (format *error-output*
+            "burs: cannot connect to ~A: ~A~%"
+            (client-streamlocal-path bridge)
+            (cl-pnet-sockets:c-strerror errno)))
+  (client-streamlocal-close bridge)
+  (ignore-errors
+    (cl-pnet-ssh:ssh-channel-close (client-streamlocal-channel bridge))))
+
+(defun open-client-streamlocal (channel path)
+  "Connect CHANNEL to the local Unix socket PATH."
+  (multiple-value-bind (fd state)
+      (cl-pnet-sockets:connect-unix path)
+    (if (null fd)
+        (progn
+          (unless (getf *options* :quiet)
+            (format *error-output*
+                    "burs: cannot connect to ~A: ~A~%"
+                    path (cl-pnet-sockets:c-strerror state)))
+          (ignore-errors (cl-pnet-ssh:ssh-channel-close channel)))
+        (let ((bridge (%make-client-streamlocal
+                       :channel channel :fd fd :path path)))
+          (client-streamlocal-install bridge)
+          (if (eq state :connected)
+              (client-streamlocal-connected bridge)
+              (setf (client-streamlocal-write-watcher bridge)
+                    (cl-pnet:fd-watch
+                     fd :on-writable
+                     (lambda (watcher)
+                       (declare (ignore watcher))
+                       (setf (client-streamlocal-write-watcher bridge) nil)
+                       (multiple-value-bind (errno answered)
+                           (cl-pnet-sockets:socket-error fd)
+                         (if (and answered (zerop errno))
+                             (client-streamlocal-connected bridge)
+                             (client-streamlocal-connect-failed
+                              bridge errno)))))))
+          bridge))))
+
+(defun open-forward-target-channel (client forward
+                                    &key on-data on-open on-eof on-close
+                                      on-error)
+  "Open the direct channel that carries FORWARD to the peer.
+
+The target is a Unix socket when FORWARD names one and TCP otherwise."
+  (if (forward-target-path forward)
+      (cl-pnet-ssh:ssh-open-direct-streamlocal
+       client (forward-target-path forward)
+       :on-data on-data :on-open on-open :on-eof on-eof
+       :on-close on-close :on-error on-error)
+      (cl-pnet-ssh:ssh-open-direct-tcpip
+       client (forward-host forward) (forward-port forward)
+       :on-data on-data :on-open on-open :on-eof on-eof
+       :on-close on-close :on-error on-error)))
+
+(defun forward-target-name (forward)
+  "A human-readable name for what FORWARD dials."
+  (or (forward-target-path forward)
+      (format nil "~A:~D" (forward-host forward) (forward-port forward))))
+
 (defun open-forward-channel (client tunnel &key on-open on-error)
-  "Open a direct-tcpip channel for TUNNEL and start bridging bytes.
+  "Open a direct channel for TUNNEL and start bridging bytes.
 
 ON-OPEN runs once the peer confirms the channel.  ON-ERROR, when given,
 replaces the usual diagnostic for a failed open; either way the tunnel is
@@ -1185,15 +1456,14 @@ closed afterwards."
                  (funcall on-error condition)
                  (unless (getf *options* :quiet)
                    (format *error-output*
-                           "burs: forward to ~A:~D failed: ~A~%"
-                           (forward-host forward)
-                           (forward-port forward)
+                           "burs: forward to ~A failed: ~A~%"
+                           (forward-target-name forward)
                            condition)))
              (forward-close tunnel)))
       (handler-case
           (let ((channel
-                  (cl-pnet-ssh:ssh-open-direct-tcpip
-                   client (forward-host forward) (forward-port forward)
+                  (open-forward-target-channel
+                   client forward
                    :on-data (lambda (channel data kind)
                               (declare (ignore channel kind))
                               (forward-send tunnel data))
@@ -1221,7 +1491,72 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun start-local-streamlocal-forward (client forward)
+  "Listen on FORWARD's local Unix socket and bridge accepted peers.
+
+StreamLocalBindUnlink and StreamLocalBindMask are honoured here, as ssh
+does when it binds a local forwarding socket."
+  (let* ((path (forward-bind-path forward))
+         (options (cl-pnet-ssh:ssh-client-config-options client))
+         (unlink (and options
+                      (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
+                       options)))
+         (mask (or (and options
+                        (cl-pnet-ssh:ssh-config-options-streamlocal-bind-mask
+                         options))
+                   #o177))
+         (listener
+           (handler-case
+               (cl-pnet-sockets:listen-unix path :unlink unlink :mask mask)
+             (error () nil))))
+    (unless listener
+      (unless (getf *options* :quiet)
+        (format *error-output*
+                "burs: cannot listen on ~A for -L~%" path))
+      (finish 255))
+    (setf (forward-listener-fd forward) listener
+          (forward-listener-watcher forward)
+          (cl-pnet:fd-watch
+           listener :on-readable
+           (lambda (watcher)
+             (declare (ignore watcher))
+             (loop for fd = (cl-pnet-sockets:accept-socket listener)
+                   while fd
+                   do (cl-pnet-sockets:set-nonblocking fd)
+                      (let ((bridge (%make-client-streamlocal :fd fd :path path)))
+                        (handler-case
+                            (let ((channel
+                                    (open-forward-target-channel
+                                     client forward
+                                     :on-data
+                                     (lambda (channel data kind)
+                                       (declare (ignore channel kind))
+                                       (client-streamlocal-on-data bridge data))
+                                     :on-eof
+                                     (lambda (channel)
+                                       (declare (ignore channel))
+                                       (client-streamlocal-on-eof bridge))
+                                     :on-close
+                                     (lambda (channel reason)
+                                       (declare (ignore channel reason))
+                                       (client-streamlocal-close bridge))
+                                     :on-error
+                                     (lambda (channel condition)
+                                       (declare (ignore channel condition))
+                                       (client-streamlocal-close bridge)))))
+                              (setf (client-streamlocal-channel bridge) channel)
+                              (client-streamlocal-connected bridge))
+                          (error ()
+                            (client-streamlocal-close bridge))))))))
+    (push forward *forwards*)
+    (log-line "local streamlocal forward ~A to ~A"
+              path (forward-target-name forward))
+    forward))
+
 (defun start-local-forward (client forward)
+  (when (forward-bind-path forward)
+    (return-from start-local-forward
+      (start-local-streamlocal-forward client forward)))
   (let* ((options (cl-pnet-ssh:ssh-client-config-options client))
          (address (or (forward-bind-address forward)
                       (if (gateway-ports-p options)
@@ -1454,8 +1789,59 @@ peer that connected to it; NIL refuses the channel."
         (values (forward-host forward) (forward-port forward))
         (values nil nil))))
 
+(defun attach-client-tcp-target (channel forward)
+  "Bridge a server-initiated streamlocal channel to FORWARD's TCP target."
+  (setf (cl-pnet-ssh:ssh-channel-on-error channel)
+        (lambda (channel condition)
+          (declare (ignore condition))
+          (ignore-errors (cl-pnet-ssh:ssh-channel-close channel))))
+  (cl-pnet-ssh:ssh-client-connect-forward-target
+   channel (forward-host forward) (forward-port forward)))
+
+(defun forwarded-streamlocal-target (client path)
+  "Setup function for a server-initiated forwarded-streamlocal channel."
+  (declare (ignore client))
+  (let ((forward
+          (find-if (lambda (candidate)
+                     (and (forward-bind-path candidate)
+                          (string= (forward-bind-path candidate) path)))
+                   *remote-forwards*)))
+    (and forward
+         (lambda (channel)
+           (if (forward-target-path forward)
+               (open-client-streamlocal channel (forward-target-path forward))
+               (attach-client-tcp-target channel forward))))))
+
+(defun start-streamlocal-remote-forward (client forward)
+  "Ask the server to listen on FORWARD's Unix socket."
+  (push forward *remote-forwards*)
+  (cl-pnet-ssh:ssh-client-send-global-request
+   client "streamlocal-forward@openssh.com"
+   :fields (lambda (writer)
+             (cl-pnet-ssh::ssh-write-text writer
+                                          (forward-bind-path forward)))
+   :on-success
+   (lambda (reader)
+     (declare (ignore reader))
+     (log-line "remote streamlocal forward ~A to ~A"
+               (forward-bind-path forward)
+               (or (forward-target-path forward)
+                   (format nil "~A:~D"
+                           (forward-host forward) (forward-port forward)))))
+   :on-failure
+   (lambda ()
+     (setf *remote-forwards* (delete forward *remote-forwards*))
+     (unless (getf *options* :quiet)
+       (format *error-output*
+               "burs: remote streamlocal forward ~A was refused~%"
+               (forward-bind-path forward)))))
+  forward)
+
 (defun start-remote-forward (client forward)
   "Ask CLIENT's server to listen for FORWARD and relay to this machine."
+  (when (forward-bind-path forward)
+    (return-from start-remote-forward
+      (start-streamlocal-remote-forward client forward)))
   (let ((address (or (forward-bind-address forward) ""))
         (port (forward-bind-port forward)))
     (push forward *remote-forwards*)
@@ -1514,7 +1900,14 @@ peer that connected to it; NIL refuses the channel."
   (dolist (forward *forwards*)
     (when (forward-listener forward)
       (ignore-errors (cl-pnet:close-listener (forward-listener forward)))
-      (setf (forward-listener forward) nil)))
+      (setf (forward-listener forward) nil))
+    (when (forward-listener-watcher forward)
+      (cl-pnet:fd-unwatch (forward-listener-watcher forward))
+      (setf (forward-listener-watcher forward) nil))
+    (when (forward-listener-fd forward)
+      (ignore-errors
+        (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
+      (setf (forward-listener-fd forward) nil)))
   (setf *forwards* nil)
   (setf *remote-forwards* nil)
   (let ((tunnels '()))
@@ -1671,6 +2064,7 @@ of calling back in the middle of authentication."
                 (check-config-supported client))
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
+   :on-forwarded-streamlocal #'forwarded-streamlocal-target
    :on-open
    (lambda (client)
      (show-banner client)

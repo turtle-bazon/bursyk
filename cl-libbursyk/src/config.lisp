@@ -76,6 +76,10 @@ relative Include is anchored here.")
   (forward-x11 nil)
   (forward-x11-trusted nil)
   (gateway-ports nil)
+  ;; StreamLocalBindMask and StreamLocalBindUnlink for Unix-socket listeners
+  ;; this client creates; OpenSSH's defaults are 0177 and no.
+  (streamlocal-bind-mask nil)
+  (streamlocal-bind-unlink nil)
   (local-forwards nil)
   (remote-forwards nil)
   (dynamic-forwards nil)
@@ -928,6 +932,16 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
+        ((string= keyword "streamlocalbindmask")
+         (let ((mask (handler-case (parse-integer value :radix 8)
+                       (error () nil))))
+           (unless (and mask (<= 0 mask #o777))
+             (error (ssh-config-line-error
+                     line "invalid StreamLocalBindMask ~S" value)))
+           (setf (ssh-config-options-streamlocal-bind-mask options) mask)))
+        ((string= keyword "streamlocalbindunlink")
+         (setf (ssh-config-options-streamlocal-bind-unlink options)
+               (boolean)))
         ((string= keyword "requesttty")
          (setf (ssh-config-options-request-tty options) (string-downcase value)))
         ((string= keyword "preferredauthentications")
@@ -969,7 +983,8 @@ understand them rather than silently match nothing."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "gatewayports" "requesttty" "tag"
+                         "gatewayports" "streamlocalbindmask"
+                         "streamlocalbindunlink" "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
                          "preferredauthentications" "pubkeyauthentication"
                          "passwordauthentication"

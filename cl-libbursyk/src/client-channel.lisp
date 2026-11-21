@@ -82,6 +82,20 @@ runs once the peer has confirmed the channel, before any of its data."
                       :on-data on-data :on-open on-open :on-eof on-eof
                       :on-close on-close :on-error on-error)))
 
+(defun ssh-open-direct-streamlocal (client path
+                                    &key on-data on-open on-eof on-close
+                                      on-error)
+  "Ask the peer to connect to the Unix socket PATH and carry its bytes."
+  (let ((writer (ssh-writer)))
+    (ssh-write-text writer path)
+    ;; Reserved for future owner/mode information.
+    (ssh-write-text writer "")
+    (ssh-write-u32 writer 0)
+    (ssh-open-channel client "direct-streamlocal@openssh.com"
+                      :open-extra (ssh-writer-output writer)
+                      :on-data on-data :on-open on-open :on-eof on-eof
+                      :on-close on-close :on-error on-error)))
+
 ;;; ---- Requests ----
 
 (defun ssh-channel-send-exec (channel command)
@@ -240,6 +254,9 @@ side is known to accept."
       ((string= type "forwarded-tcpip")
        (ssh-client-accept-forwarded-tcpip client reader sender window
                                           max-packet))
+      ((string= type "forwarded-streamlocal@openssh.com")
+       (ssh-client-accept-forwarded-streamlocal client reader sender window
+                                                max-packet))
       (t
        (ssh-client-send-channel-open-failure
         client sender (format nil "unsupported channel type ~A" type))))))
@@ -292,8 +309,42 @@ side is known to accept."
             (ssh-client-connect-forward-target channel host port)
             channel)))))
 
+(defun ssh-client-accept-forwarded-streamlocal (client reader sender window
+                                                max-packet)
+  "Accept a forwarded-streamlocal channel and let the application bridge it.
+
+The handler is a function of (CLIENT PATH) returning a setup function of
+CHANNEL, or NIL to refuse the request."
+  (let* ((path (ssh-read-text reader))
+         (reserved (ssh-read-text reader))
+         (handler (ssh-client-on-forwarded-streamlocal client))
+         (setup (and handler (funcall handler client path))))
+    (declare (ignore reserved))
+    (if (null setup)
+        (progn
+          (ssh-log "refusing forwarded-streamlocal for ~A" path)
+          (ssh-client-send-channel-open-failure
+           client sender
+           (format nil "forwarded-streamlocal for ~A was not requested" path)))
+        (let* ((id (ssh-client-next-channel-id client))
+               (channel (%make-ssh-channel
+                         :client client
+                         :local-id id
+                         :remote-id sender
+                         :type "forwarded-streamlocal@openssh.com"
+                         :state :open
+                         :remote-window window
+                         :remote-max-packet max-packet
+                         :local-window (ssh-client-window client)
+                         :local-max-packet (ssh-client-max-packet client))))
+          (incf (ssh-client-next-channel-id client))
+          (setf (gethash id (ssh-client-channels client)) channel)
+          (ssh-client-confirm-channel channel)
+          (funcall setup channel)
+          channel))))
+
 (defun ssh-client-connect-forward-target (channel host port)
-  "Connect a forwarded-tcpip CHANNEL to HOST:PORT without blocking."
+  "Connect a forwarded CHANNEL to HOST:PORT without blocking."
   (handler-case
       (burzay:resolve-host
        host
@@ -474,18 +525,21 @@ side is known to accept."
                (incf (ssh-channel-remote-window channel) (ssh-read-u32 reader))
                (ssh-channel-flush channel))
               (#.+ssh-msg-channel-data+
-               (if (string= (ssh-channel-type channel) "forwarded-tcpip")
+               ;; A channel whose local target the library dialled carries
+               ;; its bytes straight there; anything else belongs to the
+               ;; application, which may bridge it to its own descriptor.
+               (if (ssh-channel-target channel)
                    (ssh-client-channel-write-target channel reader)
                    (ssh-channel-handle-data channel reader nil)))
               (#.+ssh-msg-channel-extended-data+
                (ssh-channel-handle-data channel reader t))
               (#.+ssh-msg-channel-eof+
                (setf (ssh-channel-eof-received channel) t)
-               (if (string= (ssh-channel-type channel) "forwarded-tcpip")
+               (if (ssh-channel-target channel)
                    (ssh-client-channel-half-close-target channel)
                    (when (ssh-channel-on-eof channel)
                      (funcall (ssh-channel-on-eof channel) channel)))
-               (when (and (string= (ssh-channel-type channel) "forwarded-tcpip")
+               (when (and (ssh-channel-target channel)
                           (ssh-channel-target-eof channel))
                  (ssh-channel-close channel)))
               (#.+ssh-msg-channel-close+

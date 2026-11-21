@@ -2706,6 +2706,30 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test stream-local-bind-options-parse
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "StreamLocalBindMask 0177")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "StreamLocalBindUnlink yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (= #o177 (ssh-config-options-streamlocal-bind-mask options)))
+    (is (eq t (ssh-config-options-streamlocal-bind-unlink options))))
+  ;; Unset means the caller supplies OpenSSH's defaults: 0177 and no.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "Port 22"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-streamlocal-bind-mask options)))
+    (is (null (ssh-config-options-streamlocal-bind-unlink options)))))
+
 (test user-config-values-come-before-the-system-file
   (let* ((system
            (cl-pnet-ssh::%make-ssh-config
@@ -3813,6 +3837,85 @@ too, and a refused policy never calls it."
                (cl-pnet-ssh:ssh-server-channel-type channel)))
     (is (equal "/tmp/sock"
                (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))))
+
+(test client-opens-a-direct-streamlocal-channel
+  "The client's open carries the socket path and the two reserved fields."
+  (let* ((client (cl-pnet-ssh::%make-ssh-client))
+         (channel (ssh-open-direct-streamlocal client "/tmp/sock"))
+         (reader (ssh-make-reader
+                  (cl-pnet-ssh::ssh-channel-open-extra channel))))
+    (is (equal "direct-streamlocal@openssh.com"
+               (cl-pnet-ssh::ssh-channel-type channel)))
+    (is (equal "/tmp/sock" (ssh-read-text reader)))
+    (is (equal "" (ssh-read-text reader)))
+    (is (= 0 (ssh-read-u32 reader)))
+    ;; Nothing is sent before the transport is ready.
+    (is (eq :connecting (cl-pnet-ssh:ssh-client-phase client)))))
+
+(test client-accepts-a-forwarded-streamlocal-channel
+  "A requested path is accepted and handed to the application's setup hook;
+an unrequested one is refused with a CHANNEL_OPEN_FAILURE."
+  (flet ((open-message (path)
+           (let ((writer (ssh-writer)))
+             (ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-channel-open+)
+             (ssh-write-text writer "forwarded-streamlocal@openssh.com")
+             (ssh-write-u32 writer 7)
+             (ssh-write-u32 writer 2097152)
+             (ssh-write-u32 writer 32768)
+             (ssh-write-text writer path)
+             (ssh-write-text writer "")
+             (ssh-write-u32 writer 0)
+             (ssh-writer-output writer))))
+    (let* ((client (cl-pnet-ssh::%make-ssh-client))
+           (seen '())
+           (setup-channel nil)
+           (sent '()))
+      (setf (cl-pnet-ssh::ssh-client-on-forwarded-streamlocal client)
+            (lambda (client path)
+              (declare (ignore client))
+              (push path seen)
+              (lambda (channel) (setf setup-channel channel))))
+      (let ((original (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                     (lambda (client payload)
+                       (declare (ignore client))
+                       (push payload sent)
+                       t))
+               (cl-pnet-ssh::ssh-client-handle-channel-message
+                client (open-message "/tmp/sock")))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                original)))
+      (is (equal '("/tmp/sock") seen))
+      (is (not (null setup-channel)))
+      (is (equal "forwarded-streamlocal@openssh.com"
+                 (cl-pnet-ssh::ssh-channel-type setup-channel)))
+      (is (eq :open (cl-pnet-ssh::ssh-channel-state setup-channel)))
+      ;; The confirmation names the server's sender id.
+      (let ((reader (ssh-make-reader (first sent))))
+        (is (= cl-pnet-ssh::+ssh-msg-channel-open-confirmation+
+               (ssh-read-u8 reader)))
+        (is (= 7 (ssh-read-u32 reader)))))
+    ;; With no handler the path is refused and no channel is created.
+    (let* ((client (cl-pnet-ssh::%make-ssh-client))
+           (sent '()))
+      (let ((original (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                     (lambda (client payload)
+                       (declare (ignore client))
+                       (push payload sent)
+                       t))
+               (cl-pnet-ssh::ssh-client-handle-channel-message
+                client (open-message "/tmp/other.sock")))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                original)))
+      (is (null (cl-pnet-ssh::ssh-client-channel-for client 0)))
+      (let ((reader (ssh-make-reader (first sent))))
+        (is (= cl-pnet-ssh::+ssh-msg-channel-open-failure+ (ssh-read-u8 reader)))
+        (is (= 7 (ssh-read-u32 reader)))))))
 
 (test server-accepts-a-hostbased-request
   "A hostbased request is verified with the client host key and handed to

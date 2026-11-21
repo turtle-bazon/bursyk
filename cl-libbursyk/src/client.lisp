@@ -167,6 +167,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                server-alive-interval server-alive-count-max
                                proxy-command
                                on-open on-error on-close on-forwarded-tcpip
+                               on-forwarded-streamlocal
                                &key kex-algorithms host-key-algorithms
                                  ciphers macs pubkey-accepted-algorithms)
   "The CLIENT structure, before any connection exists."
@@ -190,7 +191,8 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :on-open on-open
                     :on-error on-error
                     :on-close on-close
-                    :on-forwarded-tcpip on-forwarded-tcpip))
+                    :on-forwarded-tcpip on-forwarded-tcpip
+                    :on-forwarded-streamlocal on-forwarded-streamlocal))
 
 (defun ssh-filter-signers (signers patterns)
   "SIGNERS whose type matches one of PATTERNS, or SIGNERS when PATTERNS is NIL."
@@ -238,7 +240,8 @@ is applied here, before any request names a key the configuration forbade."
                              proxy-command
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
-                             on-open on-error on-close on-forwarded-tcpip)
+                             on-open on-error on-close on-forwarded-tcpip
+                             on-forwarded-streamlocal)
   "Connect to HOST as USER, authenticate, return at once.
 
 HOST is the name HOST-KEY checks and KNOWN-HOSTS records; it is resolved
@@ -270,6 +273,9 @@ unknown key; HOST-KEY-CALLBACK is the same function under a clearer name.
 Callbacks: ON-OPEN (CLIENT) runs once authenticated, ON-ERROR (CLIENT
 CONDITION) once on failure, ON-CLOSE (CLIENT REASON) once on a clean close.
 Channels may be opened before ON-OPEN; their opens are queued.
+ON-FORWARDED-STREAMLOCAL (CLIENT PATH) answers a server-initiated
+Unix-socket forward, returning a function of CHANNEL that bridges it, or NIL
+to refuse.
 
 Only the client role uses this entry point; the protocol core beneath it is
 role-neutral."
@@ -282,6 +288,7 @@ role-neutral."
                            server-alive-interval server-alive-count-max
                            proxy-command
                            on-open on-error on-close on-forwarded-tcpip
+                           on-forwarded-streamlocal
                            :kex-algorithms kex-algorithms
                            :host-key-algorithms host-key-algorithms
                            :ciphers ciphers

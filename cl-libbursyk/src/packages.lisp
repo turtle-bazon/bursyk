@@ -20,6 +20,8 @@
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
+   #:ssh-open-direct-streamlocal
+   #:ssh-client-connect-forward-target
    #:ssh-client-send-global-request
    #:ssh-channel
    #:ssh-channel-p
@@ -31,6 +33,10 @@
    #:ssh-channel-close
    #:ssh-channel-exit-status
    #:ssh-channel-exit-signal
+   #:ssh-channel-on-data
+   #:ssh-channel-on-eof
+   #:ssh-channel-on-close
+   #:ssh-channel-on-error
    ;; server
    #:make-ssh-server
    #:ssh-server
@@ -145,6 +151,8 @@
    #:ssh-config-options-proxy-command
    #:ssh-config-options-address-family
    #:ssh-config-options-gateway-ports
+   #:ssh-config-options-streamlocal-bind-mask
+   #:ssh-config-options-streamlocal-bind-unlink
    #:ssh-config-options-local-forwards
    #:ssh-config-options-remote-forwards
    #:ssh-config-options-dynamic-forwards
