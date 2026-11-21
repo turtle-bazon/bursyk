@@ -2730,6 +2730,46 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test ipqos-parses
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (values (ssh-config-options-ip-qos-interactive options)
+                     (ssh-config-options-ip-qos-bulk options)))))
+    (multiple-value-bind (interactive bulk) (value "IPQoS af21 cs1")
+      (is (= #x48 interactive))
+      (is (= #x20 bulk)))
+    ;; One value applies to both session kinds.
+    (multiple-value-bind (interactive bulk) (value "IPQoS ef")
+      (is (= #xb8 interactive))
+      (is (= #xb8 bulk)))
+    (multiple-value-bind (interactive bulk) (value "IPQoS none")
+      (is (eq :none interactive))
+      (is (eq :none bulk)))
+    (multiple-value-bind (interactive bulk) (value "IPQoS 46 none")
+      (declare (ignore bulk))
+      (is (= 46 interactive)))
+    ;; The defaults are ef and none.
+    (multiple-value-bind (interactive bulk) (value "Port 22")
+      (is (= #xb8 interactive))
+      (is (eq :none bulk))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "IPQoS loud"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test fingerprints-obey-the-hash-choice
   (let ((blob (ssh-random-octets 32)))
     (is (eql 0 (search "SHA256:" (ssh-key-fingerprint blob))))

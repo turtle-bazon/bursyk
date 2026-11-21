@@ -63,6 +63,10 @@
   (hash-known-hosts nil)
   ;; FingerprintHash: the digest used when showing a key fingerprint.
   (fingerprint-hash :sha256)
+  ;; IPQoS: DSCP values for interactive and bulk traffic; :NONE leaves the
+  ;; operating system default.
+  (ip-qos-interactive #xb8)
+  (ip-qos-bulk :none)
   ;; TCPKeepAlive: keep the transport's keepalive probes on, ssh's default.
   (tcp-keep-alive t)
   ;; SetEnv: NAME=VALUE assignments to send on every session.

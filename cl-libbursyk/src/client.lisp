@@ -192,6 +192,8 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  (revoked-host-keys '())
                                  hash-known-hosts
                                  (fingerprint-hash :sha256)
+                                 (ip-qos-interactive #xb8)
+                                 (ip-qos-bulk :none)
                                  (tcp-keep-alive t)
                                  set-env
                                  (connection-attempts 1)
@@ -219,6 +221,8 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
                     :fingerprint-hash fingerprint-hash
+                    :ip-qos-interactive ip-qos-interactive
+                    :ip-qos-bulk ip-qos-bulk
                     :tcp-keep-alive tcp-keep-alive
                     :set-env set-env
                     :connection-attempts connection-attempts
@@ -285,6 +289,8 @@ is applied here, before any request names a key the configuration forbade."
                              (revoked-host-keys '())
                              hash-known-hosts
                              (fingerprint-hash :sha256)
+                             (ip-qos-interactive #xb8)
+                             (ip-qos-bulk :none)
                              (tcp-keep-alive t)
                              set-env
                              (connection-attempts 1)
@@ -349,6 +355,8 @@ role-neutral."
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
                            :fingerprint-hash fingerprint-hash
+                           :ip-qos-interactive ip-qos-interactive
+                           :ip-qos-bulk ip-qos-bulk
                            :tcp-keep-alive tcp-keep-alive
                            :set-env set-env
                            :connection-attempts connection-attempts

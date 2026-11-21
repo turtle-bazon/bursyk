@@ -2171,6 +2171,17 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (flet ((ip-qos-name (value)
+             (cond
+               ((eq value :none) "none")
+               (t (or (car (rassoc value cl-pnet-ssh::+ssh-config-ip-qos-names+
+                                   :test #'eql))
+                      (format nil "0x~2,'0x" value))))))
+      (format t "ipqos ~A ~A~%"
+              (ip-qos-name
+               (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
+              (ip-qos-name
+               (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
     (format t "fingerprinthash ~A~%"
             (string-upcase
              (symbol-name
@@ -2359,6 +2370,8 @@ of calling back in the middle of authentication."
          (setf command (expand-remote-command client remote)
                command-given-p t)))
      (show-banner client)
+     (cl-pnet-ssh:ssh-client-set-ip-qos
+      client (request-tty-p client command-given-p))
      (start-forwards client)
      (when (and (config-local-command client)
                 (permit-local-command-p client))

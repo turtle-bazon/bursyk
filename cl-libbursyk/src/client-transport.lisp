@@ -4,10 +4,26 @@
 ;;;; userauth, then dispatch to channels. Everything runs from cl-pnet
 ;;;; callbacks, so no function here waits for the peer.
 
+(defun ssh-client-set-ip-qos (client interactive-p)
+  "Apply CLIENT's IPQoS DSCP value for an interactive or bulk session."
+  (let ((value (if interactive-p
+                   (ssh-client-ip-qos-interactive client)
+                   (ssh-client-ip-qos-bulk client)))
+        (connection (ssh-client-connection client)))
+    (when (and connection (integerp value))
+      (let ((fd (cl-pnet:connection-fileno connection)))
+        (when fd
+          (cl-pnet-sockets:set-socket-option
+           fd cl-pnet-sockets:+ipproto-ip+
+           cl-pnet-sockets:+ip-tos+ value))))))
+
 (defun ssh-client-connected (client connection)
   "CLIENT's TCP connection is up: greet and offer our KEXINIT."
   (setf (ssh-client-connection client) connection
         (ssh-client-phase client) :version)
+  ;; The session type is not known yet; the application may raise this to
+  ;; the interactive value once it decides whether to request a pty.
+  (ssh-client-set-ip-qos client nil)
   (unless (ssh-client-tcp-keep-alive client)
     (let ((fd (cl-pnet:connection-fileno connection)))
       (when fd

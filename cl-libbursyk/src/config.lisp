@@ -92,6 +92,10 @@ relative Include is anchored here.")
   (forward-x11 nil)
   (forward-x11-trusted nil)
   (gateway-ports nil)
+  ;; IPQoS: the DSCP value for interactive and bulk sessions; :NONE means
+  ;; the operating system default.  ssh's defaults are ef and none.
+  (ip-qos-interactive #xb8)
+  (ip-qos-bulk :none)
   (exit-on-forward-failure nil)
   ;; PermitRemoteOpen: NIL or :ANY permits every remote-forward target,
   ;; :NONE permits none, and a list holds (HOST . PORT) entries where either
@@ -961,9 +965,51 @@ understand them rather than silently match nothing."
           (setf (ssh-config-options-rekey-limit options)
                 (ssh-config-line-args line))))))))
 
+(defparameter +ssh-config-ip-qos-names+
+  '(("af11" . #x28) ("af12" . #x30) ("af13" . #x38)
+    ("af21" . #x48) ("af22" . #x50) ("af23" . #x58)
+    ("af31" . #x68) ("af32" . #x70) ("af33" . #x78)
+    ("af41" . #x88) ("af42" . #x90) ("af43" . #x98)
+    ("cs0" . #x00) ("cs1" . #x20) ("cs2" . #x40) ("cs3" . #x60)
+    ("cs4" . #x80) ("cs5" . #xa0) ("cs6" . #xc0) ("cs7" . #xe0)
+    ("ef" . #xb8) ("le" . #x04) ("va" . #xb0))
+  "IPQoS names and their DSCP values.")
+
+(defun ssh-config-ip-qos-value (line value)
+  "VALUE as an IPQoS DSCP integer or :NONE."
+  (let ((name (string-downcase value)))
+    (cond
+      ((string= name "none") :none)
+      ((member name '("lowdelay" "throughput" "reliability")
+               :test #'string=)
+       ;; ssh ignores the deprecated names and uses the system default.
+       :none)
+      ((cdr (assoc name +ssh-config-ip-qos-names+ :test #'string=)))
+      (t
+       (let ((number (handler-case (parse-integer value)
+                       (error () nil))))
+         (unless (and number (<= 0 number 255))
+           (error (ssh-config-line-error line "invalid IPQoS ~S" value)))
+         number)))))
+
 (defun ssh-config-apply-session (line options seen)
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
+      ((string= keyword "ipqos")
+       (ssh-config-set-once
+        seen options :ip-qos
+        (lambda (options)
+          (let ((arguments (ssh-config-line-args line)))
+            (unless (<= 1 (length arguments) 2)
+              (error (ssh-config-line-error line "invalid IPQoS arguments")))
+            (let ((interactive (ssh-config-ip-qos-value
+                                line (first arguments))))
+              (setf (ssh-config-options-ip-qos-interactive options)
+                    interactive
+                    (ssh-config-options-ip-qos-bulk options)
+                    (if (second arguments)
+                        (ssh-config-ip-qos-value line (second arguments))
+                        interactive)))))))
       ((string= keyword "sendenv")
        (setf (ssh-config-options-send-env options)
              (append (ssh-config-options-send-env options)
@@ -1190,7 +1236,7 @@ understand them rather than silently match nothing."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "gatewayports" "exitonforwardfailure"
+                         "gatewayports" "ipqos" "exitonforwardfailure"
                          "permitremoteopen" "clearallforwardings"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"

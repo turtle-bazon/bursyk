@@ -26,6 +26,7 @@
    #:ssh-open-direct-tcpip
    #:ssh-open-direct-streamlocal
    #:ssh-client-connect-forward-target
+   #:ssh-client-set-ip-qos
    #:ssh-client-send-global-request
    #:ssh-channel
    #:ssh-channel-p
@@ -160,6 +161,8 @@
    #:ssh-config-options-proxy-command
    #:ssh-config-options-address-family
    #:ssh-config-options-gateway-ports
+   #:ssh-config-options-ip-qos-interactive
+   #:ssh-config-options-ip-qos-bulk
    #:ssh-config-options-exit-on-forward-failure
    #:ssh-config-options-clear-all-forwardings
    #:ssh-config-options-permit-remote-open

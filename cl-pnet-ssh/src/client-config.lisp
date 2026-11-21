@@ -155,6 +155,9 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-hash-known-hosts options)
         :fingerprint-hash
         (or (ssh-config-options-fingerprint-hash options) :sha256)
+        :ip-qos-interactive
+        (ssh-config-options-ip-qos-interactive options)
+        :ip-qos-bulk (ssh-config-options-ip-qos-bulk options)
         :tcp-keep-alive (ssh-config-options-tcp-keep-alive options)
         :set-env (ssh-config-options-set-env options)
         :connection-attempts
@@ -446,6 +449,8 @@ uses whichever of the two it saw first instead of chaining them."
            :revoked-host-keys (getf parameters :revoked-host-keys)
            :hash-known-hosts (getf parameters :hash-known-hosts)
            :fingerprint-hash (getf parameters :fingerprint-hash)
+           :ip-qos-interactive (getf parameters :ip-qos-interactive)
+           :ip-qos-bulk (getf parameters :ip-qos-bulk)
            :tcp-keep-alive (getf parameters :tcp-keep-alive)
            :set-env (getf parameters :set-env)
            :connection-attempts (getf parameters :connection-attempts)
