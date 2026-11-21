@@ -2036,6 +2036,9 @@ peer that connected to it; NIL refuses the channel."
      (or (cl-pnet-ssh:ssh-config-options-known-hosts options)
          (and (getf *options* :known-hosts)
               (list (getf *options* :known-hosts)))))
+    (format t "connectionattempts ~D~%"
+            (or (cl-pnet-ssh:ssh-config-options-connection-attempts options)
+                1))
     (format t "tcpkeepalive ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-tcp-keep-alive options)
                 "yes"

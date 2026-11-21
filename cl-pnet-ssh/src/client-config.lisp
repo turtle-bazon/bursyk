@@ -153,6 +153,8 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-hash-known-hosts options)
         :tcp-keep-alive (ssh-config-options-tcp-keep-alive options)
         :set-env (ssh-config-options-set-env options)
+        :connection-attempts
+        (or (ssh-config-options-connection-attempts options) 1)
         :ca-signature-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-ca-signature-algorithms
@@ -441,6 +443,7 @@ uses whichever of the two it saw first instead of chaining them."
            :hash-known-hosts (getf parameters :hash-known-hosts)
            :tcp-keep-alive (getf parameters :tcp-keep-alive)
            :set-env (getf parameters :set-env)
+           :connection-attempts (getf parameters :connection-attempts)
            :required-rsa-size (getf parameters :required-rsa-size)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)

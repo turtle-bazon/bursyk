@@ -65,6 +65,7 @@ relative Include is anchored here.")
   (macs nil)
   (compression nil)
   (connect-timeout nil)
+  (connection-attempts nil)
   (server-alive-interval nil)
   (server-alive-count-max nil)
   (bind-address nil)
@@ -840,6 +841,13 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-connect-timeout options)
                 (ssh-config-seconds line (ssh-config-arg line))))))
+      ((string= keyword "connectionattempts")
+       (ssh-config-set-once
+        seen options :connection-attempts
+        (lambda (options)
+          (setf (ssh-config-options-connection-attempts options)
+                (ssh-config-integer line (ssh-config-arg line)
+                                    :minimum 1)))))
       ((string= keyword "addressfamily")
        (ssh-config-set-once
         seen options :address-family
@@ -1059,7 +1067,8 @@ understand them rather than silently match nothing."
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
                          "hashknownhosts" "revokedhostkeys"
                          "stricthostkeychecking"
-                         "connecttimeout" "addressfamily" "batchmode")
+                         "connecttimeout" "connectionattempts"
+                         "addressfamily" "batchmode")
                :test #'string=)
        (ssh-config-apply-policy line options seen context))
       ((member keyword '("ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"

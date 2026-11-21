@@ -79,7 +79,11 @@
   connect-timeout
   server-alive-interval
   (server-alive-count-max 3)
+  ;; ConnectionAttempts: how many times a failed TCP connect is retried.
+  (connection-attempts 1)
+  (connection-attempt 0)
   connect-timer
+  retry-timer
   alive-timer
   (alive-misses 0)
   (channels (make-hash-table :test #'eql))
@@ -178,6 +182,8 @@
   "Disarm CLIENT's connect timeout and keepalive timer, once."
   (setf (ssh-client-connect-timer client)
         (ssh-client-cancel-timer (ssh-client-connect-timer client))
+        (ssh-client-retry-timer client)
+        (ssh-client-cancel-timer (ssh-client-retry-timer client))
         (ssh-client-alive-timer client)
         (ssh-client-cancel-timer (ssh-client-alive-timer client))))
 

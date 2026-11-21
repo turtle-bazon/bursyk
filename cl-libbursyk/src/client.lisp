@@ -106,14 +106,32 @@ ssh-authentication-error only when nothing is left to try."
       (t (funcall on-error (ssh-no-key-condition))))))
 
 (defun ssh-connect-error (client status)
-  (ssh-client-fail
-   client
-   (make-condition 'ssh-connection-error
-                   :detail (format nil "could not connect to ~A:~D (~A)"
-                                   (ssh-client-connect-host client)
-                                   (or (ssh-client-connect-port client)
-                                       (ssh-client-port client))
-                                   status))))
+  "Report a failed connect, retrying while ConnectionAttempts remain."
+  (let ((attempt (1+ (ssh-client-connection-attempt client)))
+        (limit (ssh-client-connection-attempts client)))
+    (if (< attempt limit)
+        (progn
+          (setf (ssh-client-connection-attempt client) attempt)
+          (ssh-log "connect failed (~A); trying again (~D/~D)"
+                   status attempt limit)
+          ;; ssh gives every attempt its own ConnectTimeout.
+          (ssh-client-cancel-connect-timer client)
+          (ssh-client-start-connect-timer client)
+          (setf (ssh-client-retry-timer client)
+                (cl-pnet:timer-start
+                 1 0
+                 (lambda ()
+                   (setf (ssh-client-retry-timer client) nil)
+                   (unless (ssh-client-closed client)
+                     (ssh-open-connection client))))))
+        (ssh-client-fail
+         client
+         (make-condition 'ssh-connection-error
+                         :detail (format nil "could not connect to ~A:~D (~A)"
+                                         (ssh-client-connect-host client)
+                                         (or (ssh-client-connect-port client)
+                                             (ssh-client-port client))
+                                         status))))))
 
 (defun ssh-resolution-error (client condition)
   (ssh-client-fail
@@ -175,6 +193,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  hash-known-hosts
                                  (tcp-keep-alive t)
                                  set-env
+                                 (connection-attempts 1)
                                  (required-rsa-size
                                   +ssh-rsa-minimum-modulus-size+))
   "The CLIENT structure, before any connection exists."
@@ -200,6 +219,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :hash-known-hosts hash-known-hosts
                     :tcp-keep-alive tcp-keep-alive
                     :set-env set-env
+                    :connection-attempts connection-attempts
                     :required-rsa-size required-rsa-size
                     :on-open on-open
                     :on-error on-error
@@ -264,6 +284,7 @@ is applied here, before any request names a key the configuration forbade."
                              hash-known-hosts
                              (tcp-keep-alive t)
                              set-env
+                             (connection-attempts 1)
                              (required-rsa-size
                               +ssh-rsa-minimum-modulus-size+)
                              on-open on-error on-close on-forwarded-tcpip
@@ -326,6 +347,7 @@ role-neutral."
                            :hash-known-hosts hash-known-hosts
                            :tcp-keep-alive tcp-keep-alive
                            :set-env set-env
+                           :connection-attempts connection-attempts
                            :required-rsa-size required-rsa-size)
    private-key agent passphrase))
 
