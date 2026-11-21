@@ -200,6 +200,12 @@
    #:ssh-server-config-allow-tcp-forwarding
    #:ssh-server-config-allow-streamlocal-forwarding
    #:ssh-server-config-streamlocal-bind-mask
+   #:ssh-server-config-hostbased-authentication
+   #:ssh-server-config-hostbased-accepted-algorithms
+   #:ssh-server-config-hostbased-uses-name-from-packet-only
+   #:ssh-server-config-ignore-rhosts
+   #:ssh-server-config-ignore-user-known-hosts
+   #:ssh-server-config-strict-modes
    #:ssh-server-config-streamlocal-bind-unlink
    #:ssh-server-config-disable-forwarding
    #:ssh-server-config-subsystems

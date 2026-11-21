@@ -263,7 +263,7 @@ that admitted the key, and AUTHORIZATION the rest of that line's options."
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
         (ssh-session-auth-info-lines session)
-        (list (ssh-server-auth-info-line key-blob))
+        (list (ssh-server-auth-info-line "publickey" key-blob))
         (ssh-session-key-env session) key-env
         (ssh-session-authorization session) authorization
         (ssh-session-authenticated session) t
@@ -1082,6 +1082,7 @@ this program's error, because a configured list is meant exactly as written."
                           authorized-keys
                           authorize
                           authorize-user
+                          hostbased-key-allowed
                           sshd-config
                           user-groups
                           banner
@@ -1164,6 +1165,7 @@ list, applied by the same inactivity accounting as the pure backend."
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :hostbased-key-allowed hostbased-key-allowed
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

@@ -116,6 +116,7 @@
   authorized-keys
   authorize
   authorize-user
+  (hostbased-key-allowed nil)
   ;; The sshd_config the connection-scoped Match blocks are resolved from,
   ;; and a function of USER returning group names for Match Group.
   sshd-config

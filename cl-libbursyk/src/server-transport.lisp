@@ -402,13 +402,13 @@ every attempt fail rather than quietly falling back to publickey."
           (ssh-octets= used key-blob))
         (ssh-session-auth-used-keys session)))
 
-(defun ssh-server-record-auth-success (session key-blob)
-  "Record KEY-BLOB as a completed method and add its ExposeAuthInfo line."
+(defun ssh-server-record-auth-success (session method key-blob)
+  "Record METHOD with KEY-BLOB and add its ExposeAuthInfo line."
   (setf (ssh-session-auth-used-keys session)
         (cons key-blob (ssh-session-auth-used-keys session))
         (ssh-session-auth-info-lines session)
         (append (ssh-session-auth-info-lines session)
-                (list (ssh-server-auth-info-line key-blob)))))
+                (list (ssh-server-auth-info-line method key-blob)))))
 
 (defun ssh-server-send-auth-failure (session &key (count t) partial)
   "Refuse the current attempt and name the methods that may continue.
@@ -492,7 +492,7 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
          (error () nil))))
 
 (defun ssh-server-auth-method-succeeded
-    (session user key-blob key-env authorization)
+    (session method user key-blob key-env authorization)
   "Record one successful publickey and either finish or ask for the next.
 
 Without AuthenticationMethods this is the whole login.  With it, the method
@@ -505,10 +505,10 @@ already used for a method is never accepted again."
       ((eq lists :impossible)
        (ssh-server-send-auth-failure session))
       ((null lists)
-       (ssh-server-record-auth-success session key-blob)
+       (ssh-server-record-auth-success session method key-blob)
        (ssh-server-complete-auth session user key-blob key-env authorization))
       ((not (some (lambda (list)
-                    (and list (string= (first list) "publickey")))
+                    (and list (string= (first list) method)))
                   lists))
        ;; No remaining list starts with this method; do not advance.
        (ssh-server-send-auth-failure session))
@@ -522,7 +522,7 @@ already used for a method is never accepted again."
            (ssh-server-send-auth-failure session)
            (return-from ssh-server-auth-method-succeeded nil))
          (let ((remaining (mapcar #'rest lists)))
-           (ssh-server-record-auth-success session key-blob)
+           (ssh-server-record-auth-success session method key-blob)
            (setf (ssh-session-auth-merged-options session) merged
                  (ssh-session-auth-merged-key-env session)
                  (append (ssh-session-auth-merged-key-env session) key-env))
@@ -570,8 +570,8 @@ which the transport enforces for pty and forwarding requests."
              :address (ssh-session-remote-ip session)
              :session session)
           (if authorized
-              (ssh-server-auth-method-succeeded session user key-blob
-                                                key-env authorization)
+              (ssh-server-auth-method-succeeded
+               session "publickey" user key-blob key-env authorization)
               (ssh-server-send-auth-failure session :count count)))
         (ssh-server-send-auth-failure session :count count))))
 
@@ -620,6 +620,67 @@ can test keys without burning its authentication budget; later ones do."
          (ssh-server-send-pk-ok session algorithm key-blob)))
     (t
      (ssh-server-publickey-failure session has-signature count))))
+
+(defun ssh-server-hostbased-signed-data
+    (session user algorithm key-blob chost cuser)
+  "The octets a hostbased request signs: session id then the request."
+  (let ((writer (ssh-writer)))
+    (ssh-write-string writer (ssh-session-session-id session))
+    (ssh-write-u8 writer +ssh-msg-userauth-request+)
+    (ssh-write-text writer user)
+    (ssh-write-text writer "ssh-connection")
+    (ssh-write-text writer "hostbased")
+    (ssh-write-text writer algorithm)
+    (ssh-write-string writer key-blob)
+    (ssh-write-text writer chost)
+    (ssh-write-text writer cuser)
+    (ssh-writer-output writer)))
+
+(defun ssh-server-hostbased-signature-valid-p
+    (session user algorithm key-blob chost cuser signature)
+  "Whether SIGNATURE covers SESSION's hostbased request."
+  (handler-case
+      (multiple-value-bind (signature-algorithm signature-bytes)
+          (ssh-parse-signature-blob signature)
+        (declare (ignore signature-bytes))
+        (and (string= signature-algorithm
+                      (ssh-certificate-userauth-signature-algorithm algorithm))
+             (ssh-public-key-signature-valid-p
+              (ssh-key-plain-blob key-blob) signature
+              (ssh-server-hostbased-signed-data
+               session user algorithm key-blob chost cuser))))
+    (error () nil)))
+
+(defun ssh-server-handle-hostbased (session user reader &key (count t))
+  "Handle one hostbased authentication attempt."
+  (let* ((algorithm (ssh-read-text reader))
+         (key-blob (ssh-read-string reader))
+         (chost (ssh-read-text reader))
+         (cuser (ssh-read-text reader))
+         (signature (ssh-read-string reader))
+         (hook (ssh-server-hostbased-key-allowed
+                (ssh-session-server session)))
+         (algorithms
+           (or (ssh-session-setting
+                session
+                #'ssh-server-config-hostbased-accepted-algorithms)
+               +ssh-server-host-key-preference+))
+         (enabled
+           (eq (ssh-session-setting
+                session #'ssh-server-config-hostbased-authentication)
+               :yes)))
+    (if (and enabled
+             (member algorithm algorithms :test #'string=)
+             (ssh-session-user-key-length-p session key-blob)
+             (not (ssh-server-revoked-key-p
+                   (ssh-session-server session) session key-blob))
+             hook
+             (ssh-server-hostbased-signature-valid-p
+              session user algorithm key-blob chost cuser signature)
+             (funcall hook session user cuser chost key-blob))
+        (ssh-server-auth-method-succeeded
+         session "hostbased" user key-blob nil nil)
+        (ssh-server-send-auth-failure session :count count))))
 
 (defun ssh-server-user-permitted-p (session user)
   "Whether the application admits USER on SESSION.
@@ -690,6 +751,8 @@ allowed methods; everything after it counts."
                (key-blob (ssh-read-string reader)))
            (ssh-server-handle-publickey session user algorithm key-blob reader
                                         has-signature :count count)))
+        ((string= method "hostbased")
+         (ssh-server-handle-hostbased session user reader :count count))
         (t (ssh-server-send-auth-failure session :count count))))))
 
 (defun ssh-server-send-global-reply (session success-p &optional fields)

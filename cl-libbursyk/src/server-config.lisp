@@ -68,14 +68,14 @@ prohibit-password and means the same thing.")
     "kerberosgetafstoken" "kerberostgtpassing" "afstokenpassing"
     "gssapicleanupcredentials" "gssapistrictacceptorcheck" "checkmail"
     "listenaddress" "addressfamily" "printmotd" "printlastlog"
-    "ignoreuserknownhosts" "xauthlocation" "strictmodes"
+    "xauthlocation"
     "permituserenvironment" "uselogin" "compression" "tcpkeepalive"
     "keepalive" "ciphers" "macs" "protocol" "maxstartups"
     "persourcemaxstartups" "persourcenetblocksize"
     "persourcepenalties" "persourcepenaltyexemptlist" "usedns"
     "verifyreversemapping" "reversemappingcheck" "useprivilegeseparation"
     "hostcertificate" "kexalgorithms" "versionaddendum" "fingerprinthash"
-    "securitykeyprovider")
+    "securitykeyprovider" "ignoreuserknownhosts" "strictmodes")
   "sshd_config keywords OpenSSH allows only outside a Match block.
 
 Inside a Match block sshd refuses one of these with \"Directive ... is not
@@ -110,14 +110,11 @@ socket address and has no routing domains.")
     "usedns" "securitykeyprovider" "gssapicleanupcredentials"
     "gssapistrictacceptorcheck" "kerberosorlocalpasswd"
     "kerberosticketcleanup" "kerberosgetafstoken"
-    "hostbasedusesnamefrompacketonly" "authorizedkeysfile2"
+    "authorizedkeysfile2"
     ;; 10.6 directives that describe OpenSSH's privsep helpers or features
     ;; this server refuses outright (PAM, GSSAPI, agent forwarding).
     "sshdauthpath" "sshdsessionpath" "pamservicename"
-    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"
-    ;; These configure hostbased authentication, which this server refuses,
-    ;; so their values cannot change anything.
-    "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"))
+    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
@@ -132,11 +129,8 @@ socket address and has no routing domains.")
     ("skeyauthentication" . "no")
     ("usepam" . "no")
     ("permitemptypasswords" . "no")
-    ("hostbasedauthentication" . "no")
     ("gssapiauthentication" . "no")
     ("kerberosauthentication" . "no")
-    ("strictmodes" . "no")
-    ("ignorerhosts" . "yes")
     ("permittty" . "yes")
     ("permituserrc" . "yes")
     ("compression" . "no")))
@@ -209,6 +203,16 @@ socket address and has no routing domains.")
   ;; AllowStreamLocalForwarding: :YES, :NO, :LOCAL or :REMOTE.  NIL leaves
   ;; this server's own default, which refuses stream-local forwarding.
   (allow-streamlocal-forwarding nil)
+  ;; HostbasedAuthentication and its policy.  The flags use :YES/:NO so a
+  ;; Match block can override a global value; NIL means sshd's default.
+  (hostbased-authentication nil)
+  (hostbased-accepted-algorithms nil)
+  (hostbased-uses-name-from-packet-only nil)
+  ;; IgnoreRhosts: :YES, :NO or :SHOSTS-ONLY.  IgnoreUserKnownHosts and
+  ;; StrictModes are global.
+  (ignore-rhosts nil)
+  (ignore-user-known-hosts nil)
+  (strict-modes nil)
   ;; StreamLocalBindMask and StreamLocalBindUnlink for remote Unix-socket
   ;; listeners; sshd's defaults are 0177 and no.
   (streamlocal-bind-mask nil)
@@ -695,6 +699,8 @@ error, never an accidental no-match: sshd fatals in the same situation."
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems log-level
+    hostbased-authentication hostbased-accepted-algorithms
+    hostbased-uses-name-from-packet-only ignore-rhosts
     gateway-ports allow-tcp-forwarding allow-streamlocal-forwarding
     streamlocal-bind-mask streamlocal-bind-unlink
     disable-forwarding set-env
@@ -924,6 +930,45 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'authorized-principals-command-user
         (ssh-server-config-one-argument line)))
+      ((string= keyword "hostbasedauthentication")
+       (ssh-server-config-set-once
+        config 'hostbased-authentication
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((member keyword '("hostbasedacceptedalgorithms"
+                         "hostbasedacceptedkeytypes")
+               :test #'string=)
+       (ssh-server-config-set-once
+        config 'hostbased-accepted-algorithms
+        (ssh-server-config-resolve-algorithms
+         line arguments +ssh-server-host-key-preference+
+         (ssh-config-line-keyword line)
+         :all +ssh-server-host-key-all-algorithms+)))
+      ((string= keyword "hostbasedusesnamefrompacketonly")
+       (ssh-server-config-set-once
+        config 'hostbased-uses-name-from-packet-only
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "ignorerhosts")
+       (ssh-server-config-set-once
+        config 'ignore-rhosts
+        (ssh-server-config-multistate
+         line (ssh-server-config-one-argument line)
+         '(("yes" . :yes) ("no" . :no) ("shosts-only" . :shosts-only))
+         "IgnoreRhosts")))
+      ((string= keyword "ignoreuserknownhosts")
+       (ssh-server-config-set-once
+        config 'ignore-user-known-hosts
+        (ssh-server-config-flag
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "strictmodes")
+       (ssh-server-config-set-once
+        config 'strict-modes
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
       ((string= keyword "casignaturealgorithms")
        ;; Like PubkeyAcceptedAlgorithms this names signatures, not key types;
        ;; a plain name this build cannot verify stops startup instead of

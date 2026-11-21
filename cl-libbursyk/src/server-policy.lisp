@@ -1144,7 +1144,7 @@ certificate is checked both through itself and through its CA key."
   (let ((config (ssh-session-effective-config session)))
     (and config (funcall accessor config))))
 
-(defparameter +ssh-server-enabled-auth-methods+ '("publickey")
+(defparameter +ssh-server-enabled-auth-methods+ '("publickey" "hostbased")
   "Authentication methods this server can complete.
 
 AuthenticationMethods is valid with any OpenSSH method name, but a list that
@@ -1181,12 +1181,12 @@ method lists, each in the order it must be completed."
                      lists)
              :impossible))))))
 
-(defun ssh-server-auth-info-line (key-blob)
-  "The ExposeAuthInfo line for KEY-BLOB, as sshd's sshkey_format_text."
+(defun ssh-server-auth-info-line (method key-blob)
+  "The ExposeAuthInfo line for METHOD and KEY-BLOB."
   (multiple-value-bind (type data)
       (ssh-public-key-parts key-blob)
     (declare (ignore data))
-    (format nil "publickey ~A ~A" type (ssh-octets-base64 key-blob))))
+    (format nil "~A ~A ~A" method type (ssh-octets-base64 key-blob))))
 
 (defun ssh-session-log-enabled-p (session)
   "Whether SESSION's effective LogLevel asks for protocol detail.

@@ -127,6 +127,7 @@ presented."
                           authorized-keys
                           authorize
                           authorize-user
+                          hostbased-key-allowed
                           sshd-config
                           user-groups
                           banner
@@ -254,6 +255,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user
+                  :hostbased-key-allowed hostbased-key-allowed
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

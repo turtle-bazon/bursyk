@@ -23,6 +23,10 @@
   ;; Called once per (SESSION USER) before any authentication method runs;
   ;; the answer is cached for that pair.  NIL means every user is admitted.
   authorize-user
+  ;; Hostbased authentication: a function of
+  ;; (SESSION USER CLIENT-USER CLIENT-HOST KEY-BLOB) answering whether the
+  ;; client host and its rhosts/known_hosts entry admit USER.
+  (hostbased-key-allowed nil)
   ;; The sshd_config the connection-scoped Match blocks are resolved from.
   ;; NIL means the program configured the server directly and there is
   ;; nothing to re-read per connection.

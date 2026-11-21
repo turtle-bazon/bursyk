@@ -2922,13 +2922,6 @@ GSSAPIDelegateCredentials no
 AgentSocketPath /run/agent.sock
 WarnWeakCrypto no")))
     (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
-  ;; Hostbased and stream-local settings configure protocols this server
-  ;; refuses, so they are accepted with a warning rather than rejected.
-  (let ((config (config-from-text
-                 "HostbasedAcceptedAlgorithms ssh-ed25519
-StreamLocalBindMask 0177
-StreamLocalBindUnlink yes")))
-    (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
   ;; A host-key agent would change which keys are presented, so it is
   ;; refused rather than ignored.
   (signals cl-pnet-ssh:ssh-server-config-error
@@ -3226,3 +3219,104 @@ Match User alice
             (cl-pnet-ssh:ssh-server-config-streamlocal-bind-unlink alice)))
     (is (= #o177
            (cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask bob)))))
+
+(test sshd-config-reads-hostbased-authentication
+  "HostbasedAuthentication and its policy fields are parsed and Match-aware."
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-hostbased-authentication
+           "HostbasedAuthentication yes")))
+  (is (eq :no
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-hostbased-authentication
+           "HostbasedAuthentication no")))
+  (is (equal '("ssh-ed25519" "rsa-sha2-512")
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-hostbased-accepted-algorithms
+              "HostbasedAcceptedAlgorithms ssh-ed25519,rsa-sha2-512")))
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-hostbased-uses-name-from-packet-only
+           "HostbasedUsesNameFromPacketOnly yes")))
+  (is (eq :no
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-ignore-rhosts
+           "IgnoreRhosts no")))
+  (is (eq :shosts-only
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-ignore-rhosts
+           "IgnoreRhosts shosts-only")))
+  (is (eq t
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-ignore-user-known-hosts
+           "IgnoreUserKnownHosts yes")))
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-strict-modes
+           "StrictModes yes")))
+  (is (eq :no
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-strict-modes
+           "StrictModes no")))
+  (let* ((config (config-from-text
+                  "HostbasedAuthentication no
+Match User alice
+  HostbasedAuthentication yes"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (eq :yes
+            (cl-pnet-ssh:ssh-server-config-hostbased-authentication alice)))
+    (is (eq :no
+            (cl-pnet-ssh:ssh-server-config-hostbased-authentication bob)))))
+
+(test hostbased-rhosts-file-rules
+  "Rhosts lines match host or IP, an optional user, and negations."
+  (let ((path (merge-pathnames "bursyk-rhosts-test"
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (write-string
+              "client.example turtle
+-other.example turtle
+192.0.2.1
++ ignored
+" out))
+           (is (eq :allow
+                   (bursyk-server::rhosts-file-decision
+                    path "client.example" "192.0.2.9" "turtle" "turtle")))
+           (is (eq :deny
+                   (bursyk-server::rhosts-file-decision
+                    path "other.example" "192.0.2.9" "turtle" "turtle")))
+           (is (eq :allow
+                   (bursyk-server::rhosts-file-decision
+                    path "third.example" "192.0.2.1" "turtle" "turtle")))
+           (is (null
+                (bursyk-server::rhosts-file-decision
+                 path "third.example" "192.0.2.9" "turtle" "turtle"))))
+      (ignore-errors (delete-file path)))))
+
+(test hostbased-known-host-check-uses-known-hosts
+  "A hostbased client host key must be known for the lookup name."
+  (let* ((key (revoked-test-key 31))
+         (other (revoked-test-key 32))
+         (type (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts key)))
+         (path (revoked-test-file
+                (format nil "client.example ~A ~A~%"
+                        type (cl-pnet-ssh:ssh-octets-base64 key))))
+         (config (config-from-text "IgnoreUserKnownHosts yes"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (unwind-protect
+         (let ((bursyk-server::*hostbased-system-known-hosts* (list path)))
+           (is (bursyk-server::hostbased-known-host-p
+                session "client.example" key))
+           (is (not (bursyk-server::hostbased-known-host-p
+                     session "other.example" key)))
+           (is (not (bursyk-server::hostbased-known-host-p
+                     session "client.example" other))))
+      (ignore-errors (delete-file path)))))

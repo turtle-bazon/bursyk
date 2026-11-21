@@ -3813,3 +3813,73 @@ too, and a refused policy never calls it."
                (cl-pnet-ssh:ssh-server-channel-type channel)))
     (is (equal "/tmp/sock"
                (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))))
+
+(test server-accepts-a-hostbased-request
+  "A hostbased request is verified with the client host key and handed to
+the application's trust hook."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased"))
+             (key-path (merge-pathnames "host_key" directory)))
+        (ensure-directories-exist key-path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring key-path)))
+               (let* ((private (ssh-load-private-key key-path))
+                      (blob (ssh-public-key-blob-of private))
+                      (session-id
+                        (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 9))
+                      (run
+                        (lambda (config allowed)
+                          (let* ((server
+                                   (cl-pnet-ssh::%make-ssh-server
+                                    :sshd-config config
+                                    :hostbased-key-allowed
+                                    (lambda (session user cuser chost key)
+                                      (declare (ignore session user cuser
+                                                       chost key))
+                                      allowed)))
+                                 (session
+                                   (cl-pnet-ssh::%make-ssh-session
+                                    :server server
+                                    :session-id session-id))
+                                 (signed
+                                   (cl-pnet-ssh::ssh-server-hostbased-signed-data
+                                    session "turtle" "ssh-ed25519" blob
+                                    "client.example" "turtle"))
+                                 (signature
+                                   (cl-pnet-ssh::ssh-ed25519-signature-blob
+                                    private signed))
+                                 (writer (cl-pnet-ssh:ssh-writer)))
+                            (cl-pnet-ssh:ssh-write-u8
+                             writer cl-pnet-ssh::+ssh-msg-userauth-request+)
+                            (cl-pnet-ssh:ssh-write-text writer "turtle")
+                            (cl-pnet-ssh:ssh-write-text writer "ssh-connection")
+                            (cl-pnet-ssh:ssh-write-text writer "hostbased")
+                            (cl-pnet-ssh:ssh-write-text writer "ssh-ed25519")
+                            (cl-pnet-ssh:ssh-write-string writer blob)
+                            (cl-pnet-ssh:ssh-write-text writer "client.example")
+                            (cl-pnet-ssh:ssh-write-text writer "turtle")
+                            (cl-pnet-ssh:ssh-write-string writer signature)
+                            (cl-pnet-ssh::ssh-server-handle-userauth-request
+                             session (cl-pnet-ssh:ssh-writer-output writer))
+                            (cl-pnet-ssh::ssh-session-authenticated
+                             session)))))
+                 (is (funcall
+                      run
+                      (ssh-server-config-load
+                       nil :options '("HostbasedAuthentication yes"))
+                      t))
+                 (is (not (funcall
+                           run
+                           (ssh-server-config-load
+                            nil :options '("HostbasedAuthentication yes"))
+                           nil)))
+                 (is (not (funcall
+                           run
+                           (ssh-server-config-load
+                            nil :options '("HostbasedAuthentication no"))
+                           t)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))

@@ -68,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.34"
+(defparameter +bursyk-server-version+ "0.0.2.35"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1703,6 +1703,186 @@ unprivileged run simple."
   (let ((uid (nth-value 1 (user-home-and-uid user))))
     (and uid (string= uid "0"))))
 
+;;; ---- Hostbased authentication ----
+;;;
+;;; The library verifies the client host's signature; this program decides
+;;; whether the host and the client user are trusted, using sshd's rhosts
+;;; and known_hosts rules.
+
+(defvar *hostbased-system-rhosts*
+  '("/etc/hosts.equiv" "/etc/ssh/shosts.equiv")
+  "The system-wide rhosts files, in sshd's order.")
+
+(defvar *hostbased-system-known-hosts*
+  '("/etc/ssh/ssh_known_hosts" "/etc/ssh/ssh_known_hosts2")
+  "The system-wide known_hosts files used by hostbased authentication.")
+
+(defun rhosts-line-decision (line host ip client-user server-user)
+  "Whether LINE allows or denies CLIENT-USER from HOST/IP.
+
+Returns :ALLOW, :DENY or NIL.  A leading + or - negates or wildcards an
+entry; netgroups (@) and empty wildcards are ignored, as sshd does."
+  (let* ((trimmed (string-trim '(#\Space #\Tab #\Return) line))
+         (hash (position #\# trimmed))
+         (text (string-trim '(#\Space #\Tab)
+                            (if hash (subseq trimmed 0 hash) trimmed))))
+    (when (plusp (length text))
+      (let ((fields (remove "" (uiop:split-string
+                                text :separator '(#\Space #\Tab))
+                            :test #'string=)))
+        (when (<= 1 (length fields) 2)
+          (let ((host-field (first fields))
+                (user-field (or (second fields) server-user))
+                (negated nil))
+            (when (and (plusp (length host-field))
+                       (member (char host-field 0) '(#\- #\+)))
+              (setf negated (char= (char host-field 0) #\-))
+              (setf host-field (subseq host-field 1)))
+            (when (and (plusp (length user-field))
+                       (member (char user-field 0) '(#\- #\+)))
+              (setf negated (or negated
+                                (char= (char user-field 0) #\-)))
+              (setf user-field (subseq user-field 1)))
+            (when (and (plusp (length host-field))
+                       (plusp (length user-field))
+                       (not (char= (char host-field 0) #\@))
+                       (not (char= (char user-field 0) #\@))
+                       (or (string-equal host-field host)
+                           (string= host-field ip))
+                       (string= user-field client-user))
+              (if negated :deny :allow))))))))
+
+(defun rhosts-file-decision (path host ip client-user server-user)
+  "The first decision in PATH, or NIL when no line matches."
+  (handler-case
+      (when (probe-file path)
+        (dolist (line (uiop:read-file-lines path))
+          (let ((decision
+                  (rhosts-line-decision
+                   line host ip client-user server-user)))
+            (when decision (return decision)))))
+    (error () nil)))
+
+(defun strict-rhosts-file-p (path user-uid)
+  "Whether PATH is a regular file owned by root or USER-UID and not writable
+by group or others."
+  #+sbcl
+  (handler-case
+      (let* ((stat (sb-posix:stat path))
+             (mode (sb-posix:stat-mode stat))
+             (uid (sb-posix:stat-uid stat)))
+        (and (sb-posix:s-isreg mode)
+             (or (zerop uid)
+                 (and user-uid
+                      (string= (princ-to-string uid) user-uid)))
+             (zerop (logand mode #o022))))
+    (error () nil))
+  #-sbcl
+  (declare (ignore path user-uid))
+  #-sbcl
+  nil)
+
+(defun strict-home-directory-p (home user-uid)
+  "Whether HOME is a directory owned by root or USER-UID and not writable
+by group or others."
+  #+sbcl
+  (handler-case
+      (let* ((stat (sb-posix:stat home))
+             (mode (sb-posix:stat-mode stat))
+             (uid (sb-posix:stat-uid stat)))
+        (and (sb-posix:s-isdir mode)
+             (or (zerop uid)
+                 (and user-uid
+                      (string= (princ-to-string uid) user-uid)))
+             (zerop (logand mode #o022))))
+    (error () nil))
+  #-sbcl
+  (declare (ignore home user-uid))
+  #-sbcl
+  nil)
+
+(defun hostbased-rhosts-allowed-p (session user client-user host ip)
+  "Whether sshd's rhosts files admit CLIENT-USER at HOST/IP for USER."
+  (multiple-value-bind (home uid) (user-home-and-uid user)
+    (when home
+      (let* ((ignore (or (session-config-setting
+                          session
+                          #'cl-pnet-ssh:ssh-server-config-ignore-rhosts)
+                         :yes))
+             (strict (let ((value (session-config-setting
+                                   session
+                                   #'cl-pnet-ssh:ssh-server-config-strict-modes)))
+                       (not (eq value :no))))
+             (server-user user)
+             (directory (uiop:ensure-directory-pathname home))
+             (system-files
+               (unless (root-uid-p user)
+                 *hostbased-system-rhosts*))
+             (user-files
+               (unless (eq ignore :yes)
+                 (if (eq ignore :shosts-only)
+                     (list (merge-pathnames ".shosts" directory))
+                     (list (merge-pathnames ".shosts" directory)
+                           (merge-pathnames ".rhosts" directory))))))
+        (and (or (not strict) (strict-home-directory-p home uid))
+             (or (some (lambda (path)
+                         (eq :allow (rhosts-file-decision
+                                     path host ip client-user server-user)))
+                       system-files)
+                 (and user-files
+                      (some (lambda (path)
+                              (and (or (not strict)
+                                       (strict-rhosts-file-p path uid))
+                                   (eq :allow
+                                       (rhosts-file-decision
+                                        path host ip
+                                        client-user server-user))))
+                            user-files))))))))
+
+(defun hostbased-known-host-p (session lookup key-blob)
+  "Whether KEY-BLOB is a known host key for LOOKUP."
+  (when (cl-pnet-ssh:ssh-certificate-blob-p key-blob)
+    ;; Host certificates would need their CA and principal checked here.
+    (return-from hostbased-known-host-p nil))
+  (let* ((user-file
+           (unless (session-config-setting
+                    session
+                    #'cl-pnet-ssh:ssh-server-config-ignore-user-known-hosts)
+             (multiple-value-bind (home uid)
+                 (user-home-and-uid (cl-pnet-ssh:ssh-session-user session))
+               (declare (ignore uid))
+               (and home
+                    (merge-pathnames ".ssh/known_hosts"
+                                     (uiop:ensure-directory-pathname home))))))
+         (files (append *hostbased-system-known-hosts*
+                        (when user-file
+                          (list user-file)))))
+    (some (lambda (path)
+            (eq :match
+                (cl-pnet-ssh:ssh-known-host-status path lookup key-blob)))
+          files)))
+
+(defun hostbased-key-allowed-p (session user client-user client-host key-blob)
+  "Whether the client host and its rhosts/known_hosts entry admit USER.
+
+Without UseDNS the server resolves the peer to its IP, so unless
+HostbasedUsesNameFromPacketOnly is set, the IP is what known_hosts and the
+rhosts files are matched against."
+  (let* ((packet-only
+           (eq (session-config-setting
+                session
+                #'cl-pnet-ssh:ssh-server-config-hostbased-uses-name-from-packet-only)
+               :yes))
+         (peer (session-remote-ip session))
+         (claimed (string-right-trim "." client-host))
+         (lookup (if packet-only claimed (or peer "")))
+         (host (if packet-only claimed (or peer "")))
+         (ip (or peer "")))
+    (and (not (zerop (length lookup)))
+         (hostbased-rhosts-allowed-p
+          session user client-user host ip)
+         (hostbased-known-host-p session lookup key-blob))))
+
 ;;; ---- Certificate authentication ----
 ;;;
 ;;; A certificate adds a CA signature and a principal list to an ordinary
@@ -2233,6 +2413,7 @@ guess, so only an explicit PidFile is written."
            :host-certificate (host-certificate-files)
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
+           :hostbased-key-allowed #'hostbased-key-allowed-p
            :sshd-config *server-config*
            :user-groups #'user-groups
            :permit-user-environment
