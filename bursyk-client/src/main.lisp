@@ -2367,6 +2367,10 @@ peer that connected to it; NIL refuses the channel."
                  options)
                 "yes"
                 "no"))
+    (format t "verifyhostkeydns ~A~%"
+            (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
+                   options)
+              (:yes "yes") (:ask "ask") (t "no")))
     (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
       (when alias
         (format t "hostkeyalias ~A~%" alias)))

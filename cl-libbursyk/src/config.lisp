@@ -76,6 +76,10 @@ relative Include is anchored here.")
   (fingerprint-hash nil)
   (visual-host-key nil)
   (check-host-ip nil)
+  ;; VerifyHostKeyDNS: :YES accepts a matching SSHFP record only when the
+  ;; answer was DNSSEC-validated; :ASK looks records up but always leaves the
+  ;; decision to known_hosts; :NO skips DNS.
+  (verify-host-key-dns nil)
   ;; RevokedHostKeys: files of host keys and certificates that may not be
   ;; used, in the order read; NONE clears the list.
   (revoked-host-keys '())
@@ -978,6 +982,22 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-check-host-ip options)
                 (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "verifyhostkeydns")
+       (ssh-config-set-once
+        seen options :verify-host-key-dns
+        (lambda (options)
+          (let ((value (string-downcase (ssh-config-arg line))))
+            (setf (ssh-config-options-verify-host-key-dns options)
+                  (cond ((member value '("yes" "true" "on")
+                                 :test #'string=)
+                         :yes)
+                        ((member value '("no" "false" "off")
+                                 :test #'string=)
+                         :no)
+                        ((string= value "ask") :ask)
+                        (t
+                         (error (ssh-config-line-error
+                                 line "invalid VerifyHostKeyDNS ~S" value)))))))))
       ((string= keyword "visualhostkey")
        (ssh-config-set-once
         seen options :visual-host-key
@@ -1388,7 +1408,7 @@ understand them rather than silently match nothing."
                          "hashknownhosts" "knownhostscommand"
                          "updatehostkeys"
                          "fingerprinthash"
-                         "visualhostkey" "checkhostip"
+                         "visualhostkey" "checkhostip" "verifyhostkeydns"
                          "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"

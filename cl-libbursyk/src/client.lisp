@@ -202,14 +202,64 @@ ssh-authentication-error only when nothing is left to try."
                     (format nil "~A.~A" host domain)))
               (ssh-client-canonical-domains client)))))
 
+(defun ssh-client-dns-host (client)
+  "The name SSHFP records are looked up under."
+  (or (ssh-client-host-key-host client) (ssh-client-host client)))
+
+(defun ssh-client-host-key-dns-needed-p (client)
+  "Whether CLIENT should look up SSHFP records before connecting."
+  (let ((host (ssh-client-dns-host client)))
+    (and (null (ssh-client-host-key-dns-queried client))
+         (member (ssh-client-verify-host-key-dns client) '(:yes :ask))
+         (ssh-client-host-key-dns-resolver client)
+         host
+         (not (burzay:numeric-address-p host)))))
+
+(defun ssh-client-query-host-key-dns (client done)
+  "Ask for CLIENT's SSHFP records, then call DONE.
+
+The query runs on the event loop.  Any failure is only logged and DONE runs
+anyway: VerifyHostKeyDNS supplements known_hosts and must not turn a DNS
+outage into a refusal to connect."
+  (setf (ssh-client-host-key-dns-queried client) t)
+  (handler-case
+      (funcall (ssh-client-host-key-dns-resolver client)
+               (ssh-client-dns-host client)
+               (lambda (records secure)
+                 (unless (ssh-client-closed-p client)
+                   (setf (ssh-client-host-key-dns-records client) records
+                         (ssh-client-host-key-dns-secure client) secure)
+                   (when records
+                     (ssh-log "found ~D SSHFP record~:P for ~A~:[ (insecure)~;~]"
+                              (length records) (ssh-client-dns-host client)
+                              secure))
+                   (funcall done)))
+               (lambda (condition)
+                 (unless (ssh-client-closed-p client)
+                   (ssh-log "SSHFP lookup failed: ~A" condition)
+                   (funcall done))))
+    (error (condition)
+      (ssh-log "SSHFP lookup failed: ~A" condition)
+      (funcall done))))
+
 (defun ssh-open-connection (client)
-  "Resolve CONNECT-HOST without blocking the loop, then dial it.
+  "Look up SSHFP records, then open CLIENT's transport.
 
 Returns CLIENT at once; the connection and every failure report through the
-client's callbacks.  CL-PNET's connect takes a numeric address, so a name
-has to be resolved first, and BURZAY does that on a worker thread.
-CanonicalDomains candidates are tried before the name itself.  A
-ProxyCommand needs none of that: the helper is what reaches the server."
+client's callbacks."
+  (if (ssh-client-host-key-dns-needed-p client)
+      (ssh-client-query-host-key-dns
+       client (lambda () (ssh-open-transport client)))
+      (ssh-open-transport client))
+  client)
+
+(defun ssh-open-transport (client)
+  "Resolve CONNECT-HOST without blocking the loop, then dial it.
+
+CL-PNET's connect takes a numeric address, so a name has to be resolved
+first, and BURZAY does that on a worker thread.  CanonicalDomains candidates
+are tried before the name itself.  A ProxyCommand needs none of that: the
+helper is what reaches the server."
   (if (ssh-client-proxy-command client)
       (ssh-open-proxy-connection client)
       (let ((resolve (or (ssh-client-resolver client) #'burzay:resolve-host))
@@ -248,8 +298,7 @@ ProxyCommand needs none of that: the helper is what reaches the server."
                   (ssh-log "resolving ~A" original)
                   (funcall resolve original (dial original)
                            (lambda (condition)
-                             (ssh-resolution-error client condition)))))))
-        client)))
+                             (ssh-resolution-error client condition))))))))))
 
 (defun ssh-make-client-record (host connect-host host-key-host port connect-port
                                user known-hosts policy connect-timeout
@@ -276,6 +325,8 @@ ProxyCommand needs none of that: the helper is what reaches the server."
                                  (fingerprint-hash :sha256)
                                  visual-host-key
                                  check-host-ip
+                                 (verify-host-key-dns :no)
+                                 host-key-dns-resolver
                                  (ip-qos-interactive #xb8)
                                  (ip-qos-bulk :none)
                                  (tcp-keep-alive t)
@@ -319,6 +370,8 @@ ProxyCommand needs none of that: the helper is what reaches the server."
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
                     :check-host-ip check-host-ip
+                    :verify-host-key-dns verify-host-key-dns
+                    :host-key-dns-resolver host-key-dns-resolver
                     :ip-qos-interactive ip-qos-interactive
                     :ip-qos-bulk ip-qos-bulk
                     :tcp-keep-alive tcp-keep-alive
@@ -441,6 +494,8 @@ is applied here, before any request names a key the configuration forbade."
                              (fingerprint-hash :sha256)
                              visual-host-key
                              check-host-ip
+                             (verify-host-key-dns :no)
+                             (host-key-dns-resolver #'ssh-dns-resolve-sshfp)
                              (ip-qos-interactive #xb8)
                              (ip-qos-bulk :none)
                              (tcp-keep-alive t)
@@ -477,6 +532,13 @@ SERVER-ALIVE-COUNT-MAX unanswered intervals (default 3).
 HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of
 (CLIENT FINGERPRINT KEY-BLOB) that returns true to trust and record an
 unknown key; HOST-KEY-CALLBACK is the same function under a clearer name.
+
+VERIFY-HOST-KEY-DNS is :NO, :YES or :ASK.  With :YES, a matching SSHFP record
+whose answer carries the DNSSEC authenticated-data bit trusts the host key
+without known_hosts; :ASK looks the records up but never accepts on its own.
+HOST-KEY-DNS-RESOLVER, when given, is a function of (HOST ON-SUCCESS
+ON-ERROR); ON-SUCCESS receives the record list and the DNSSEC flag, and the
+default resolver queries the system nameserver through CL-PNET-DNS.
 
 Callbacks: ON-OPEN (CLIENT) runs once authenticated, ON-ERROR (CLIENT
 CONDITION) once on failure, ON-CLOSE (CLIENT REASON) once on a clean close.
@@ -522,6 +584,8 @@ role-neutral."
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key
                            :check-host-ip check-host-ip
+                           :verify-host-key-dns verify-host-key-dns
+                           :host-key-dns-resolver host-key-dns-resolver
                            :ip-qos-interactive ip-qos-interactive
                            :ip-qos-bulk ip-qos-bulk
                            :tcp-keep-alive tcp-keep-alive

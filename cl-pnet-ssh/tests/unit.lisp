@@ -1128,7 +1128,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
                               &key (host-key-policy :accept-new)
                                 hostbased-key canonicalize-hostname
-                                canonical-domains resolver)
+                                canonical-domains resolver
+                                verify-host-key-dns host-key-dns-resolver)
   "Start a client against SERVER and return the command's exit status.
 
 HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
@@ -1155,6 +1156,8 @@ certificate was trusted rather than added on first use."
             :canonicalize-hostname (or canonicalize-hostname :no)
             :canonical-domains canonical-domains
             :resolver resolver
+            :verify-host-key-dns (or verify-host-key-dns :no)
+            :host-key-dns-resolver host-key-dns-resolver
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -2804,6 +2807,227 @@ newline")))
     (ssh-config-resolve config "alias"
                         :on-options (lambda (value) (setf options value)))
     (is (null (ssh-config-options-fork-after-authentication options)))))
+
+(test verify-host-key-dns-parses
+  (flet ((value (text)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line text))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options (lambda (v) (setf options v)))
+             (ssh-config-options-verify-host-key-dns options))))
+    (is (eq :yes (value "VerifyHostKeyDNS yes")))
+    (is (eq :no (value "VerifyHostKeyDNS no")))
+    (is (eq :ask (value "VerifyHostKeyDNS ask")))
+    (is (null (value "Port 22"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "VerifyHostKeyDNS sometimes"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
+(defun ssh-test-sshfp-records (key &key (digest-type 2))
+  "KEY's public half as one SSHFP record."
+  (let ((blob (ssh-public-key-blob-of key)))
+    (list (list (cl-pnet-ssh::ssh-sshfp-algorithm blob)
+                digest-type
+                (cl-pnet-ssh::ssh-sshfp-digest blob digest-type)))))
+
+(defun ssh-test-dns-client (key records secure &key (mode :yes))
+  "A client whose only route to trust is the SSHFP RECORDS."
+  (let ((directory (ssh-test-directory "cl-pnet-ssh-dns")))
+    (ensure-directories-exist (merge-pathnames "known_hosts" directory))
+    (cl-pnet-ssh::%make-ssh-client
+     :host "host.test"
+     :known-hosts (list (merge-pathnames "known_hosts" directory))
+     :host-key-policy :strict
+     :verify-host-key-dns mode
+     :host-key-dns-records records
+     :host-key-dns-secure secure)))
+
+(defun ssh-test-delete-dns-client (client)
+  (ignore-errors
+    (uiop:delete-directory-tree
+     (merge-pathnames "" (first (cl-pnet-ssh::ssh-client-known-hosts client)))
+     :validate t)))
+
+(test client-accepts-a-secure-sshfp-record
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-sshfp"))
+             (path (merge-pathnames "host_key" directory)))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring path)))
+               (let* ((key (ssh-load-private-key path))
+                      (blob (ssh-public-key-blob-of key))
+                      (client (ssh-test-dns-client
+                               key (ssh-test-sshfp-records key) t)))
+                 (unwind-protect
+                      (progn
+                        (is (eq t (cl-pnet-ssh::ssh-client-verify-host-key
+                                   client blob)))
+                        (is (cl-pnet-ssh::ssh-client-host-key-known client))
+                        (is (cl-pnet-ssh::ssh-client-host-key-dns-accepted
+                             client)))
+                   (ssh-test-delete-dns-client client))
+                 ;; An insecure answer never grants trust, and neither does
+                 ;; an ask-mode secure match.
+                 (dolist (case (list (list nil :yes) (list t :ask)))
+                   (destructuring-bind (secure mode) case
+                     (let ((client (ssh-test-dns-client
+                                    key (ssh-test-sshfp-records key)
+                                    secure :mode mode)))
+                       (unwind-protect
+                            (signals ssh-host-key-error
+                              (cl-pnet-ssh::ssh-client-verify-host-key
+                               client blob))
+                         (ssh-test-delete-dns-client client)))))
+                 ;; A secure record for another key is a mismatch.
+                 (let* ((other (merge-pathnames "other_key" directory))
+                        (client nil))
+                   (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                     "-f" (namestring other)))
+                   (setf client
+                         (ssh-test-dns-client
+                          key (ssh-test-sshfp-records
+                               (ssh-load-private-key other))
+                          t))
+                   (unwind-protect
+                        (signals ssh-host-key-error
+                          (cl-pnet-ssh::ssh-client-verify-host-key
+                           client blob))
+                     (ssh-test-delete-dns-client client)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test sshfp-dns-query-reads-a-secure-record
+  "The default resolver sends an SSHFP query and reads the AD bit."
+  (let* ((server (cl-pnet:udp-listen "127.0.0.1" 0))
+         (connection (and server
+                          (cl-pnet::%make-connection :backend cl-pnet:*backend*
+                                                     :handle server)))
+         (port (and connection (cl-pnet:socket-bound-port connection)))
+         (rdata (vector 4 2 1 2 3 4))
+         (result nil)
+         (secure nil)
+         (failure nil)
+         (done nil)
+         (server-error nil))
+    (unwind-protect
+         (progn
+           (is (not (null server)))
+           (cl-pnet:udp-recv
+            server
+            (lambda (data peer)
+              (handler-case
+                  (let* ((query (cl-pnet-dns:decode-dns-message data))
+                         (question (first (cl-pnet-dns:dns-message-questions
+                                           query)))
+                         (response
+                           (cl-pnet-dns:make-dns-message
+                            :id (cl-pnet-dns:dns-message-id query)
+                            :flags (logior #x8180 #x0020)
+                            :questions (list question)
+                            :answers
+                            (list (cl-pnet-dns:make-dns-rr
+                                   :name (cl-pnet-dns:dns-question-name question)
+                                   :type 44 :class 1 :ttl 60
+                                   :rdata rdata)))))
+                    (is (= 44 (cl-pnet-dns:dns-question-type question)))
+                    (cl-pnet:udp-send server
+                                      (cl-pnet-dns:encode-dns-message response)
+                                      peer))
+                (error (condition)
+                  (setf server-error condition done t)))))
+           (let ((cl-pnet-ssh::*ssh-dns-server* "127.0.0.1")
+                 (cl-pnet-ssh::*ssh-dns-port* port))
+             (cl-pnet-ssh::ssh-dns-resolve-sshfp
+              "sshfp.test"
+              (lambda (records secure-p)
+                (setf result records secure secure-p done t))
+              (lambda (condition)
+                (setf failure condition done t))))
+           (loop repeat 10000 until done do (cl-pnet:event-loop-run-once))
+           (is (null server-error))
+           (is (null failure))
+           (is (not (null done)))
+           (is (eq t secure))
+           (is (= 1 (length result)))
+           (is (equalp (subseq rdata 2) (third (first result))))
+           (is (= 4 (first (first result))))
+           (is (= 2 (second (first result)))))
+      (when server (ignore-errors (cl-pnet:udp-close server))))))
+
+(test client-loopback-sshfp-trust
+  "A strict client trusts an unknown host only through a secure SSHFP record."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-sshfp-loop"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil)
+             (dns-hosts nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (let ((records (ssh-test-sshfp-records
+                               (ssh-load-private-key server-key))))
+                 (setf server
+                       (make-ssh-server
+                        "127.0.0.1" 0
+                        :host-key server-key
+                        :authorized-keys authorized
+                        :on-channel
+                        (lambda (channel)
+                          (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                                (lambda (channel command)
+                                  (ssh-test-run-command channel command))))))
+                 (let ((status
+                         (ssh-test-loopback-run
+                          server client-key known-hosts stdout stderr
+                          :host-key-policy :strict
+                          :canonicalize-hostname :yes
+                          :canonical-domains '("example")
+                          :resolver
+                          (lambda (host on-success on-error)
+                            (if (string= host "short.example")
+                                (funcall on-success "127.0.0.1")
+                                (funcall on-error
+                                         (make-condition
+                                          'simple-error
+                                          :format-control "unexpected ~A"
+                                          :format-arguments (list host)))))
+                          :verify-host-key-dns :yes
+                          :host-key-dns-resolver
+                          (lambda (host on-success on-error)
+                            (declare (ignore on-error))
+                            (push host dns-hosts)
+                            (funcall on-success records t)))))
+                   (is (equal "hello" (get-output-stream-string stdout)))
+                   (is (equal "oops" (get-output-stream-string stderr)))
+                   (is (eql 3 status))
+                   (is (equal '("short") dns-hosts)))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test canonicalize-hostname-parses
   (let* ((config

@@ -87,6 +87,13 @@
   (visual-host-key nil)
   ;; CheckHostIP: also look up and record the peer's numeric address.
   (check-host-ip nil)
+  ;; VerifyHostKeyDNS and the SSHFP records fetched before connecting.
+  (verify-host-key-dns :no)
+  (host-key-dns-resolver nil)
+  (host-key-dns-records nil)
+  (host-key-dns-secure nil)
+  (host-key-dns-queried nil)
+  (host-key-dns-accepted nil)
   (remote-address nil)
   (host-key-ip-checked nil)
   ;; Whether the host key was already trusted before this connection; ssh

@@ -349,6 +349,50 @@ or its CA."
         (ssh-client-known-hosts-command-revoked-p
          client host blobs host-key))))
 
+(defun ssh-sshfp-algorithm (key-blob)
+  "The SSHFP algorithm number for KEY-BLOB, or NIL when DNS cannot name it."
+  (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+    (declare (ignore data))
+    (cond
+      ((string= type "ssh-rsa") 1)
+      ((string= type "ssh-dss") 2)
+      ((and (> (length type) (length "ecdsa-sha2-"))
+            (string= "ecdsa-sha2-" type
+                     :end2 (length "ecdsa-sha2-")))
+       3)
+      ((string= type "ssh-ed25519") 4)
+      ((string= type "ssh-ed448") 6)
+      (t nil))))
+
+(defun ssh-sshfp-digest (key-blob digest-type)
+  "KEY-BLOB's SSHFP digest for DIGEST-TYPE, or NIL when unsupported."
+  (case digest-type
+    (1 (ssh-hash :sha1 key-blob))
+    (2 (ssh-hash :sha256 key-blob))
+    (t nil)))
+
+(defun ssh-client-sshfp-status (client host-key)
+  "How HOST-KEY compares with CLIENT's SSHFP records.
+
+Returns (VALUES STATUS SECURE) where STATUS is :MATCH when a record names
+this key, :MISMATCH when records exist but none names it, and :NONE when no
+usable record was fetched.  SECURE is the DNSSEC authenticated-data result."
+  (let ((records (ssh-client-host-key-dns-records client))
+        (algorithm (ssh-sshfp-algorithm (ssh-key-plain-blob host-key)))
+        (status :none))
+    (when (and records algorithm)
+      (dolist (record records)
+        (when (= algorithm (first record))
+          (let ((digest (ssh-sshfp-digest
+                         (ssh-key-plain-blob host-key) (second record))))
+            (when digest
+              (if (and (= (length digest) (length (third record)))
+                       (every #'= digest (third record)))
+                  (setf status :match)
+                  (when (eq status :none)
+                    (setf status :mismatch))))))))
+    (values status (ssh-client-host-key-dns-secure client))))
+
 (defun ssh-client-verify-host-key-main (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal.
 
@@ -396,21 +440,41 @@ certificate, its plain key or its CA refuses it without that fallback."
        (ssh-client-verify-host-key
         client (ssh-certificate-plain-blob certificate)))
       (t
-       (let* ((host (ssh-client-host-spec client))
-              (status (ssh-client-known-host-status client host-key))
-              (fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
-         (ecase status
-           (:match
-            (setf (ssh-client-host-key-known client) t)
-            t)
-           (:mismatch
-            (error 'ssh-host-key-error
-                   :detail (format nil "the host key for ~A changed" host)
-                   :fingerprint fingerprint))
-           (:unknown
-            (setf (ssh-client-host-key-known client) nil)
-            (ssh-client-accept-unknown-host-key
-             client host-key fingerprint))))))))
+       (let ((host (ssh-client-host-spec client))
+             (fingerprint (ssh-key-fingerprint
+                           host-key (ssh-client-fingerprint-hash client))))
+         (multiple-value-bind (dns-status secure)
+             (ssh-client-sshfp-status client host-key)
+           (case dns-status
+             (:match
+              (if secure
+                  (ssh-log "matching host key fingerprint for ~A found in DNS (secure)"
+                           host)
+                  (ssh-log "matching host key fingerprint for ~A found in DNS, but the answer is not DNSSEC-validated"
+                           host)))
+             (:mismatch
+              (ssh-log "mismatching host key fingerprint for ~A found in DNS"
+                       host)))
+           (when (and (eq dns-status :match)
+                      secure
+                      (eq (ssh-client-verify-host-key-dns client) :yes))
+             (setf (ssh-client-host-key-known client) t
+                   (ssh-client-host-key-dns-accepted client) t)
+             (ssh-log "host key for ~A verified by DNS SSHFP" host)
+             (return-from ssh-client-verify-host-key-main t)))
+         (let ((status (ssh-client-known-host-status client host-key)))
+           (ecase status
+             (:match
+              (setf (ssh-client-host-key-known client) t)
+              t)
+             (:mismatch
+              (error 'ssh-host-key-error
+                     :detail (format nil "the host key for ~A changed" host)
+                     :fingerprint fingerprint))
+             (:unknown
+              (setf (ssh-client-host-key-known client) nil)
+              (ssh-client-accept-unknown-host-key
+               client host-key fingerprint)))))))))
 
 (defun ssh-client-expand-known-hosts-command (client host host-key command)
   "Expand the ssh % tokens in a KnownHostsCommand string."
@@ -569,7 +633,8 @@ certificate, its plain key or its CA refuses it without that fallback."
 (defun ssh-client-verify-host-key (client host-key)
   "Check HOST-KEY's policy and, when configured, its address entry."
   (prog1 (ssh-client-verify-host-key-main client host-key)
-    (ssh-client-check-host-address client host-key)))
+    (unless (ssh-client-host-key-dns-accepted client)
+      (ssh-client-check-host-address client host-key))))
 
 (defun ssh-client-accept-unknown-host-key (client host-key fingerprint)
   "Decide what to do with a host key never seen before."

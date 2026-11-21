@@ -2,7 +2,7 @@
   :description "Tests for cl-pnet-ssh"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :depends-on (#:cl-pnet-ssh #:cl-pnet #:fiveam)
+  :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-dns #:cl-pnet-dns-plain #:fiveam)
   :serial t
   :components ((:module "tests"
                 :serial t
