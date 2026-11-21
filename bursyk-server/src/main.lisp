@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.20"
+(defparameter +bursyk-server-version+ "0.0.2.21"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1378,6 +1378,80 @@ users.  A command that cannot run is logged and authorizes nothing."
         (log-at :error "AuthorizedPrincipalsCommand failed: ~A" condition)
         nil))))
 
+(defun authorized-keys-command-lines
+    (command command-user user home uid key-blob)
+  "The authorized_keys lines AuthorizedKeysCommand prints for KEY-BLOB, or NIL.
+
+The command is run as COMMAND-USER, which this build can only do when that
+is the account running the server: there is no privilege separation to switch
+users.  A command that cannot run, or that exits nonzero, authorizes nothing,
+as sshd's user_key_command_allowed2 does."
+  (let ((arguments
+          (handler-case (split-command-arguments command)
+            (error (condition)
+              (log-at :error
+                      "AuthorizedKeysCommand is not a valid command: ~A"
+                      condition)
+              (return-from authorized-keys-command-lines nil)))))
+    (unless (plusp (length arguments))
+      (log-at :error "AuthorizedKeysCommand names no program")
+      (return-from authorized-keys-command-lines nil))
+    (unless command-user
+      (log-at :error
+              "No user for AuthorizedKeysCommand specified, skipping")
+      (return-from authorized-keys-command-lines nil))
+    (unless (string= (expand-command-tokens command-user
+                                            (list (cons #\u user)))
+                     (current-user-name))
+      (log-at :error
+              "AuthorizedKeysCommandUser ~A is not supported: this server cannot switch users"
+              command-user)
+      (return-from authorized-keys-command-lines nil))
+    (let* ((substitutions
+             (list
+              (cons #\% "%")
+              ;; %C needs the local endpoint, which the server does not
+              ;; record, so it is left as written rather than guessed.
+              (cons #\U (or uid ""))
+              (cons #\u user)
+              (cons #\h (or home ""))
+              (cons #\t (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts
+                                      key-blob)))
+              ;; sshd's %f is the plain key's fingerprint even when a
+              ;; certificate is offered, while %k is the whole blob.
+              (cons #\f (cl-pnet-ssh:ssh-key-fingerprint
+                         (cl-pnet-ssh:ssh-key-plain-blob key-blob)))
+              (cons #\k (cl-pnet-ssh:ssh-octets-base64 key-blob))
+              ;; No routing domains are implemented, so %D is empty, as it
+              ;; is for an sshd without routing domain support.
+              (cons #\D "")))
+           (program (first arguments))
+           ;; sshd passes the target user name when the command names no
+           ;; argument of its own.
+           (program-arguments
+             (if (rest arguments)
+                 (mapcar (lambda (argument)
+                           (expand-command-tokens argument substitutions))
+                         (rest arguments))
+                 (list user))))
+      (handler-case
+          (multiple-value-bind (output error-output status)
+              (uiop:run-program (cons program program-arguments)
+                                :output :string
+                                :error-output :string
+                                :ignore-error-status t)
+            (declare (ignore error-output))
+            (if (zerop status)
+                (uiop:split-string output :separator '(#\Newline))
+                (progn
+                  (log-at :error
+                          "AuthorizedKeysCommand exited with status ~D"
+                          status)
+                  nil)))
+        (error (condition)
+          (log-at :error "AuthorizedKeysCommand failed: ~A" condition)
+          nil)))))
+
 (defun read-text-file (path)
   "PATH's text, or an empty string when it cannot be read.
 
@@ -1453,7 +1527,9 @@ Match-resolved AuthorizedKeysFile and PermitRootLogin when it is present.
 
 A certificate is first checked against cert-authority lines in the same
 files, then against TrustedUserCAKeys with AuthorizedPrincipalsFile or
-AuthorizedPrincipalsCommand deciding the principal."
+AuthorizedPrincipalsCommand deciding the principal.  Only when neither
+authorizes the key does AuthorizedKeysCommand run, and its output is read
+as the same authorized_keys format."
   (labels ((approve (matched key-env authorization)
              (if matched
                  (approved-authorized-key session user key-env authorization)
@@ -1524,7 +1600,23 @@ AuthorizedPrincipalsCommand deciding the principal."
                          (expand-authorized-keys-path pattern user home uid)
                          certificate))))))))
       (when certificate
-        (try-trusted-ca certificate)))
+        (try-trusted-ca certificate))
+      ;; sshd tries AuthorizedKeysCommand after both the files and the
+      ;; trusted CAs, so a key found in either is not looked for there.
+      (let ((command
+              (certificate-config-value
+               session
+               #'cl-pnet-ssh:ssh-server-config-authorized-keys-command))
+            (command-user
+              (certificate-config-value
+               session
+               #'cl-pnet-ssh:ssh-server-config-authorized-keys-command-user)))
+        (when command
+          (multiple-value-bind (home uid) (user-home-and-uid user)
+            (let ((lines (authorized-keys-command-lines
+                          command command-user user home uid key-blob)))
+              (when lines
+                (try-key-source lines certificate)))))))
     (values nil nil nil)))
 
 ;;; ---- Account policy ----

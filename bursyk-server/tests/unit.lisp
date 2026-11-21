@@ -2349,3 +2349,259 @@ certificate's plain key, its serial, or its key ID."
                          krl))))
           (ignore-errors
             (uiop:delete-directory-tree directory :validate t))))))
+
+;;; ---- AuthorizedKeysCommand ----
+
+(test sshd-config-reads-authorizedkeyscommand
+  "AuthorizedKeysCommand keeps its arguments, needs an absolute program and
+a user, may be disabled with none, and is a per-connection Match setting."
+  (is (equal "/usr/local/bin/find-keys %u"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authorized-keys-command
+              "AuthorizedKeysCommand /usr/local/bin/find-keys %u
+AuthorizedKeysCommandUser keys")))
+  (is (equal "keys"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authorized-keys-command-user
+              "AuthorizedKeysCommand /usr/local/bin/find-keys
+AuthorizedKeysCommandUser keys")))
+  ;; The first line wins, but a later line is still validated.
+  (is (equal "/first"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authorized-keys-command
+              "AuthorizedKeysCommand /first
+AuthorizedKeysCommand /second
+AuthorizedKeysCommandUser keys")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text
+     "AuthorizedKeysCommand /first
+AuthorizedKeysCommand not-absolute
+AuthorizedKeysCommandUser keys"))
+  ;; none needs no user and disables the command.
+  (is (eq :none
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-authorized-keys-command
+           "AuthorizedKeysCommand none")))
+  ;; sshd refuses a program that is not an absolute path, and a command
+  ;; with no account to run it as.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text
+     "AuthorizedKeysCommand find-keys
+AuthorizedKeysCommandUser keys"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AuthorizedKeysCommand /usr/local/bin/find-keys"))
+  ;; A Match block may name the command, and none there disables a global
+  ;; command while the inherited user stays in place.
+  (let* ((config (config-from-text
+                  "AuthorizedKeysCommand /global/keys
+AuthorizedKeysCommandUser keys
+Match User alice
+  AuthorizedKeysCommand /alice/keys
+Match User bob
+  AuthorizedKeysCommand none"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal "/alice/keys"
+               (cl-pnet-ssh:ssh-server-config-authorized-keys-command alice)))
+    (is (equal "keys"
+               (cl-pnet-ssh:ssh-server-config-authorized-keys-command-user
+                alice)))
+    (is (eq :none
+            (cl-pnet-ssh:ssh-server-config-authorized-keys-command bob)))))
+
+#-win32
+(defun authorized-keys-command-temp-path (prefix)
+  "An unused path under the temporary directory."
+  (merge-pathnames
+   (format nil "bursyk-~A-~D-~D" prefix (get-universal-time) (random 1000000))
+   (uiop:temporary-directory)))
+
+#-win32
+(defun authorized-keys-command-script (body)
+  "A temporary executable shell script running BODY."
+  (let ((path (authorized-keys-command-temp-path "authorized-keys")))
+    (with-open-file (stream path :direction :output :if-exists :supersede
+                                 :if-does-not-exist :create)
+      (format stream "#!/bin/sh~%~A~%" body))
+    (uiop:run-program (list "chmod" "700" (namestring path)))
+    path))
+
+#-win32
+(test authorized-keys-command-supplies-a-key
+  "The command's output is read as authorized_keys, its tokens expand, and
+its options are applied like a file's."
+  (let* ((user (bursyk-server::current-user-name))
+         (key (revoked-test-key 21))
+         (other (revoked-test-key 22))
+         (line (format nil "ssh-ed25519 ~A"
+                       (cl-pnet-ssh:ssh-octets-base64 key)))
+         (args (authorized-keys-command-temp-path "command-args"))
+         (output (authorized-keys-command-temp-path "command-out")))
+    (unwind-protect
+         (progn
+           (with-open-file (stream output :direction :output
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+             (format stream "command=\"echo hi\" ~A~%" line))
+           (let* ((script
+                    (authorized-keys-command-script
+                     (format nil "printf '%s\\n' \"$@\" > ~A~%cat ~A"
+                             (namestring args) (namestring output))))
+                  (config
+                    (config-from-text
+                     (format nil "AuthorizedKeysCommand ~A %u %U %t %f %k %% %D~%AuthorizedKeysCommandUser ~A"
+                             (namestring script) user))))
+             (multiple-value-bind (home uid)
+                 (bursyk-server::user-home-and-uid user)
+               (declare (ignore home))
+               (let ((bursyk-server::*server-config* config)
+                     (bursyk-server::*options* nil))
+                 (multiple-value-bind (matched environment authorization)
+                     (bursyk-server::authorized-keys-p
+                      user key "127.0.0.1")
+                   (declare (ignore environment))
+                   (is (not (null matched)))
+                   (is (string=
+                        "echo hi"
+                        (cl-pnet-ssh:ssh-authorization-options-force-command
+                         authorization)))
+                   ;; sshd's tokens for this command.
+                   (is (equal (list user
+                                    (or uid "")
+                                    "ssh-ed25519"
+                                    (cl-pnet-ssh:ssh-key-fingerprint key)
+                                    (cl-pnet-ssh:ssh-octets-base64 key)
+                                    "%"
+                                    "")
+                              (uiop:read-file-lines args)))
+                   ;; A key the command does not print is not authorized.
+                   (is (null (bursyk-server::authorized-keys-p
+                              user other "127.0.0.1")))))))
+      (ignore-errors (delete-file args))
+      (ignore-errors (delete-file output))))))
+
+#-win32
+(test authorized-keys-command-runs-after-the-key-files
+  "A key found in AuthorizedKeysFile is not looked for in the command, and
+a command that exits nonzero authorizes nothing even if it printed the key."
+  (let* ((user (bursyk-server::current-user-name))
+         (key (revoked-test-key 23))
+         (line (format nil "ssh-ed25519 ~A"
+                       (cl-pnet-ssh:ssh-octets-base64 key)))
+         (marker (authorized-keys-command-temp-path "command-ran"))
+         (output (authorized-keys-command-temp-path "command-keys"))
+         (keys-file (revoked-test-file (format nil "~A~%" line))))
+    (unwind-protect
+         (progn
+           (with-open-file (stream output :direction :output
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+             (format stream "~A~%" line))
+           (let* ((script
+                    (authorized-keys-command-script
+                     (format nil "printf ran > ~A" (namestring marker))))
+                  (config
+                    (config-from-text
+                     (format nil "AuthorizedKeysFile ~A~%AuthorizedKeysCommand ~A~%AuthorizedKeysCommandUser ~A"
+                             (namestring keys-file)
+                             (namestring script) user))))
+             (let ((bursyk-server::*server-config* config)
+                   (bursyk-server::*options* nil))
+               (is (not (null (bursyk-server::authorized-keys-p
+                               user key "127.0.0.1"))))
+               (is (not (probe-file marker)))))
+           ;; A nonzero exit discards a matching line.
+           (let* ((script
+                    (authorized-keys-command-script
+                     (format nil "cat ~A; exit 1" (namestring output))))
+                  (config
+                    (config-from-text
+                     (format nil "AuthorizedKeysCommand ~A~%AuthorizedKeysCommandUser ~A"
+                             (namestring script) user))))
+             (let ((bursyk-server::*server-config* config)
+                   (bursyk-server::*options* nil))
+               (is (null (bursyk-server::authorized-keys-p
+                          user key "127.0.0.1"))))))
+      (ignore-errors (delete-file keys-file))
+      (ignore-errors (delete-file marker))
+      (ignore-errors (delete-file output)))))
+
+#-win32
+(test authorized-keys-command-refuses-a-missing-or-different-user
+  "Without a user, or with an account this server cannot switch to, the
+command yields no keys.  A command with no argument gets the user's name."
+  (let* ((user (bursyk-server::current-user-name))
+         (key (revoked-test-key 24))
+         (line (format nil "ssh-ed25519 ~A"
+                       (cl-pnet-ssh:ssh-octets-base64 key)))
+         (script (authorized-keys-command-script
+                  (format nil "printf '%s\\n' '~A'" line)))
+         (args (authorized-keys-command-temp-path "command-args"))
+         (recorder
+           (authorized-keys-command-script
+            (format nil "printf '%s\\n' \"$@\" > ~A; printf '%s\\n' '~A'"
+                    (namestring args) line))))
+    (unwind-protect
+         (progn
+           (is (null (bursyk-server::authorized-keys-command-lines
+                      (namestring script) nil user nil nil key)))
+           (is (null (bursyk-server::authorized-keys-command-lines
+                      (namestring script) "not-the-server-account"
+                      user nil nil key)))
+           (is (not (null (bursyk-server::authorized-keys-command-lines
+                           (namestring recorder) user user nil nil key))))
+           (is (equal (list user) (uiop:read-file-lines args))))
+      (ignore-errors (delete-file script))
+      (ignore-errors (delete-file recorder))
+      (ignore-errors (delete-file args)))))
+
+#-win32
+(test authorized-keys-command-can-name-a-certificate-authority
+  "A cert-authority line printed by the command admits a certificate when
+no file or TrustedUserCAKeys does."
+  (if (not (certificate-test-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (certificate-test-directory "bursyk-command-cert"))
+             (ca (merge-pathnames "ca" directory))
+             (user-key (merge-pathnames "user" directory))
+             (ca-pub (merge-pathnames "ca.pub" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring ca))
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring user-key))
+               (certificate-test-keygen
+                "-q" "-s" (namestring ca) "-I" "server-id"
+                "-n" "turtle" "-V" "-1m:+52w"
+                (namestring (merge-pathnames "user.pub" directory)))
+               (let* ((cert-blob
+                        (certificate-test-key-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (ca-line
+                        (with-open-file (stream ca-pub)
+                          (read-line stream)))
+                      (output
+                        (revoked-test-file
+                         (format nil "cert-authority ~A~%" ca-line)))
+                      (script
+                        (authorized-keys-command-script
+                         (format nil "cat ~A" (namestring output))))
+                      (config
+                        (config-from-text
+                         (format nil "AuthorizedKeysCommand ~A~%AuthorizedKeysCommandUser ~A"
+                                 (namestring script)
+                                 (bursyk-server::current-user-name)))))
+                 (unwind-protect
+                      (let ((bursyk-server::*server-config* config)
+                            (bursyk-server::*options* nil))
+                        (is (not (null (bursyk-server::authorized-keys-p
+                                        "turtle" cert-blob "127.0.0.1"))))
+                        ;; Another user is not the certificate's principal.
+                        (is (null (bursyk-server::authorized-keys-p
+                                   "other" cert-blob "127.0.0.1"))))
+                   (ignore-errors (delete-file output)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))

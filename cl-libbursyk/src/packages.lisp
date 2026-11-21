@@ -175,6 +175,8 @@
    #:ssh-server-config-authorized-principals-command
    #:ssh-server-config-authorized-principals-command-user
    #:ssh-server-config-ca-signature-algorithms
+   #:ssh-server-config-authorized-keys-command
+   #:ssh-server-config-authorized-keys-command-user
    #:ssh-server-config-revoked-keys
    #:ssh-server-config-accept-env
    #:ssh-server-config-permit-open

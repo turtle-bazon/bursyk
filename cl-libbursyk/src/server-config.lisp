@@ -137,7 +137,6 @@ socket address and has no routing domains.")
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
   '("chrootdirectory"
-    "authorizedkeyscommand" "authorizedkeyscommanduser"
     "hostcertificate"
     "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
@@ -167,6 +166,12 @@ socket address and has no routing domains.")
   (authorized-principals-command nil)
   (authorized-principals-command-user nil)
   (ca-signature-algorithms nil)
+  ;; AuthorizedKeysCommand prints authorized_keys lines for the offered key;
+  ;; sshd runs it after AuthorizedKeysFile and requires the account named by
+  ;; AuthorizedKeysCommandUser.  This build has no privilege separation, so
+  ;; only the server's own account can be used.
+  (authorized-keys-command nil)
+  (authorized-keys-command-user nil)
   ;; RevokedKeys is a list of files holding public keys that may not log
   ;; in, or :none.  sshd keeps the first line's list and validates later
   ;; ones; the files are read for each authentication attempt, so a KRL can
@@ -637,6 +642,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     trusted-user-ca-keys authorized-principals-file
     authorized-principals-command authorized-principals-command-user
     ca-signature-algorithms revoked-keys
+    authorized-keys-command authorized-keys-command-user
     allow-users deny-users allow-groups deny-groups)
   "The fields a matching Match block may override.
 
@@ -762,6 +768,24 @@ cannot apply per connection."
             ;; authenticating, so "none" may sit beside real files.
             (setf (ssh-server-config-authorized-keys-files config)
                   (mapcar #'ssh-config-expand-home arguments))))))
+      ((string= keyword "authorizedkeyscommand")
+       (let ((value (ssh-config-line-raw line)))
+         (when (zerop (length value))
+           (ssh-server-config-line-error
+            line "AuthorizedKeysCommand needs a command"))
+         ;; sshd's parse_command: the program must be an absolute path, or
+         ;; the word "none" to leave no command.
+         (unless (or (char= (char value 0) #\/)
+                     (string-equal value "none"))
+           (ssh-server-config-line-error
+            line "AuthorizedKeysCommand must be an absolute path"))
+         (ssh-server-config-set-once
+          config 'authorized-keys-command
+          (if (string-equal value "none") :none value))))
+      ((string= keyword "authorizedkeyscommanduser")
+       (ssh-server-config-set-once
+        config 'authorized-keys-command-user
+        (ssh-server-config-one-argument line)))
       ((string= keyword "revokedkeys")
        ;; sshd's parse_filenames: one line may list several files, "none" must
        ;; appear alone, and only the first list is kept -- but every line is
@@ -1319,6 +1343,21 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-warnings))
   config)
 
+(defun ssh-server-config-check-authorized-keys-command (config)
+  "Refuse AuthorizedKeysCommand without AuthorizedKeysCommandUser.
+
+This is sshd's startup check.  A Match block can still set the command and
+inherit a user from the global section, so the check is made on the global
+config once it has been read rather than per line."
+  (let ((command (ssh-server-config-authorized-keys-command config)))
+    (when (and command
+               (not (eq command :none))
+               (null (ssh-server-config-authorized-keys-command-user config)))
+      (error 'ssh-server-config-error
+             :path (and (ssh-server-config-path config)
+                        (namestring (ssh-server-config-path config)))
+             :detail "AuthorizedKeysCommand set without AuthorizedKeysCommandUser"))))
+
 (defun ssh-server-config-load (path &key options)
   "Parse the sshd_config at PATH into an SSH-SERVER-CONFIG.
 
@@ -1335,4 +1374,6 @@ error: the caller decides whether a default file is optional."
                :path (namestring path)
                :detail "cannot read the server config"))
       (ssh-server-config-read-file config path 0))
-    (ssh-server-config-finalize config)))
+    (ssh-server-config-finalize config)
+    (ssh-server-config-check-authorized-keys-command config)
+    config))
