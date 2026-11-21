@@ -165,6 +165,14 @@ MAKE-SSH-CLIENT's own defaults."
          +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms")
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
+        :canonicalize-hostname
+        (ssh-config-options-canonicalize-hostname options)
+        :canonical-domains
+        (ssh-config-options-canonical-domains options)
+        :canonicalize-max-dots
+        (ssh-config-options-canonicalize-max-dots options)
+        :canonicalize-fallback-local
+        (ssh-config-options-canonicalize-fallback-local options)
         :update-host-keys
         (or (ssh-config-options-update-host-keys options)
             (if (ssh-config-options-known-hosts options) :no :yes))
@@ -472,6 +480,11 @@ uses whichever of the two it saw first instead of chaining them."
            :hostbased-accepted-algorithms
            (getf parameters :hostbased-accepted-algorithms)
            :hostbased-keys (getf parameters :hostbased-keys)
+           :canonicalize-hostname (getf parameters :canonicalize-hostname)
+           :canonical-domains (getf parameters :canonical-domains)
+           :canonicalize-max-dots (getf parameters :canonicalize-max-dots)
+           :canonicalize-fallback-local
+           (getf parameters :canonicalize-fallback-local)
            :update-host-keys (getf parameters :update-host-keys)
            :fingerprint-hash (getf parameters :fingerprint-hash)
            :visual-host-key (getf parameters :visual-host-key)

@@ -42,6 +42,12 @@ relative Include is anchored here.")
 
 (defstruct (ssh-config-options (:constructor %make-ssh-config-options))
   (hostname nil)
+  ;; CanonicalizeHostname and its search rules.
+  (canonicalize-hostname :no)
+  (canonical-domains '())
+  (canonicalize-max-dots 1)
+  (canonicalize-fallback-local t)
+  (canonicalize-permitted-cnames '())
   (user nil)
   (port nil)
   (identity-files nil)
@@ -794,6 +800,43 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-user options)
                 (ssh-config-expand-variables (ssh-config-arg line))))))
+      ((string= keyword "canonicalizehostname")
+       (ssh-config-set-once
+        seen options :canonicalize-hostname
+        (lambda (options)
+          (let ((value (string-downcase (ssh-config-arg line))))
+            (unless (member value '("yes" "no" "always" "none")
+                            :test #'string=)
+              (error (ssh-config-line-error line
+                                            "invalid CanonicalizeHostname ~S"
+                                            value)))
+            (setf (ssh-config-options-canonicalize-hostname options)
+                  (intern (string-upcase value) :keyword))))))
+      ((string= keyword "canonicaldomains")
+       (ssh-config-set-once
+        seen options :canonical-domains
+        (lambda (options)
+          (setf (ssh-config-options-canonical-domains options)
+                (ssh-config-line-args line)))))
+      ((string= keyword "canonicalizemaxdots")
+       (ssh-config-set-once
+        seen options :canonicalize-max-dots
+        (lambda (options)
+          (setf (ssh-config-options-canonicalize-max-dots options)
+                (ssh-config-integer line (ssh-config-arg line)
+                                    :minimum 0)))))
+      ((string= keyword "canonicalizefallbacklocal")
+       (ssh-config-set-once
+        seen options :canonicalize-fallback-local
+        (lambda (options)
+          (setf (ssh-config-options-canonicalize-fallback-local options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "canonicalizepermittedcnames")
+       (ssh-config-set-once
+        seen options :canonicalize-permitted-cnames
+        (lambda (options)
+          (setf (ssh-config-options-canonicalize-permitted-cnames options)
+                (ssh-config-line-args line)))))
       ((string= keyword "hostkeyalias")
        (ssh-config-set-once
         seen options :host-key-alias
@@ -1328,7 +1371,10 @@ understand them rather than silently match nothing."
   "Apply one non-block directive when the current block is selected."
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
-      ((member keyword '("hostname" "port" "user" "hostkeyalias")
+      ((member keyword '("hostname" "port" "user" "hostkeyalias"
+                         "canonicalizehostname" "canonicaldomains"
+                         "canonicalizemaxdots" "canonicalizefallbacklocal"
+                         "canonicalizepermittedcnames")
                :test #'string=)
        (ssh-config-apply-address line options seen context))
       ((member keyword '("identityfile" "certificatefile" "identityagent"

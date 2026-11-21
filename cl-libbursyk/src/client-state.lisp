@@ -65,6 +65,12 @@
   (known-hosts-command nil)
   ;; AddKeysToAgent: :YES adds file-loaded keys to the agent.
   (add-keys-to-agent :no)
+  ;; CanonicalizeHostname and the resolver used to try its candidates.
+  (canonicalize-hostname :no)
+  (canonical-domains '())
+  (canonicalize-max-dots 1)
+  (canonicalize-fallback-local t)
+  (resolver nil)
   ;; HostbasedAuthentication: a readable host key and the method state.
   (hostbased-authentication nil)
   (hostbased-accepted-algorithms nil)

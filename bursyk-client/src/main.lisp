@@ -2353,6 +2353,20 @@ peer that connected to it; NIL refuses the channel."
                        host)))
     (format t "host ~A~%" host)
     (format t "hostname ~A~%" hostname)
+    (format t "canonicalizehostname ~A~%"
+            (string-downcase
+             (symbol-name
+              (cl-pnet-ssh:ssh-config-options-canonicalize-hostname options))))
+    (print-list-option
+     "canonicaldomains"
+     (cl-pnet-ssh:ssh-config-options-canonical-domains options))
+    (format t "canonicalizemaxdots ~D~%"
+            (cl-pnet-ssh:ssh-config-options-canonicalize-max-dots options))
+    (format t "canonicalizefallbacklocal ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-canonicalize-fallback-local
+                 options)
+                "yes"
+                "no"))
     (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
       (when alias
         (format t "hostkeyalias ~A~%" alias)))

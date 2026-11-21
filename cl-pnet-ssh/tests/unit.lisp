@@ -1127,7 +1127,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
                               &key (host-key-policy :accept-new)
-                                hostbased-key)
+                                hostbased-key canonicalize-hostname
+                                canonical-domains resolver)
   "Start a client against SERVER and return the command's exit status.
 
 HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
@@ -1143,7 +1144,7 @@ certificate was trusted rather than added on first use."
                     (setf (second state) :timed-out)
                     (cl-pnet:event-loop-stop))))
            (make-ssh-client
-            "127.0.0.1"
+            (if canonicalize-hostname "short" "127.0.0.1")
             :port (ssh-server-port server)
             :user "tester"
             :private-key client-key
@@ -1151,6 +1152,9 @@ certificate was trusted rather than added on first use."
             :host-key-policy host-key-policy
             :hostbased-authentication (and hostbased-key t)
             :hostbased-keys (and hostbased-key (list hostbased-key))
+            :canonicalize-hostname (or canonicalize-hostname :no)
+            :canonical-domains canonical-domains
+            :resolver resolver
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -2800,6 +2804,85 @@ newline")))
     (ssh-config-resolve config "alias"
                         :on-options (lambda (value) (setf options value)))
     (is (null (ssh-config-options-fork-after-authentication options)))))
+
+(test canonicalize-hostname-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname always")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example.org example.net")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeMaxDots 2")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeFallbackLocal no"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq :always (ssh-config-options-canonicalize-hostname options)))
+    (is (equal '("example.org" "example.net")
+               (ssh-config-options-canonical-domains options)))
+    (is (= 2 (ssh-config-options-canonicalize-max-dots options)))
+    (is (null (ssh-config-options-canonicalize-fallback-local options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq :no (ssh-config-options-canonicalize-hostname options)))
+    (is (= 1 (ssh-config-options-canonicalize-max-dots options)))
+    (is (eq t (ssh-config-options-canonicalize-fallback-local options)))))
+
+(test client-loopback-canonical-domains
+  "A short name is found by appending CanonicalDomains."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-canon-loop"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      :authorized-keys authorized
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((status
+                       (ssh-test-loopback-run
+                        server client-key known-hosts stdout stderr
+                        :host-key-policy :insecure
+                        :canonicalize-hostname :yes
+                        :canonical-domains '("example")
+                        :resolver
+                        (lambda (host on-success on-error)
+                          (if (string= host "short.example")
+                              (funcall on-success "127.0.0.1")
+                              (funcall on-error
+                                       (make-condition
+                                        'simple-error
+                                        :format-control "unexpected ~A"
+                                        :format-arguments (list host))))))))
+                 (is (equal "hello" (get-output-stream-string stdout)))
+                 (is (eql 3 status))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test hostbased-configuration-parses
   (let* ((config

@@ -186,21 +186,69 @@ ssh-authentication-error only when nothing is left to try."
                                            port))))))
   client)
 
+(defun ssh-canonicalize-candidates (client)
+  "The names CanonicalDomains adds to CONNECT-HOST, or NIL to skip."
+  (let ((mode (ssh-client-canonicalize-hostname client))
+        (host (ssh-client-connect-host client)))
+    (when (and (member mode '(:yes :always))
+               (or (eq mode :always)
+                   (null (ssh-client-proxy-command client)))
+               (or (eq mode :always)
+                   (<= (count #\. host)
+                       (ssh-client-canonicalize-max-dots client))))
+      (mapcar (lambda (domain)
+                (if (zerop (length domain))
+                    (concatenate 'string host ".")
+                    (format nil "~A.~A" host domain)))
+              (ssh-client-canonical-domains client)))))
+
 (defun ssh-open-connection (client)
   "Resolve CONNECT-HOST without blocking the loop, then dial it.
 
 Returns CLIENT at once; the connection and every failure report through the
 client's callbacks.  CL-PNET's connect takes a numeric address, so a name
 has to be resolved first, and BURZAY does that on a worker thread.
-A ProxyCommand needs none of that: the helper is what reaches the server."
+CanonicalDomains candidates are tried before the name itself.  A
+ProxyCommand needs none of that: the helper is what reaches the server."
   (if (ssh-client-proxy-command client)
       (ssh-open-proxy-connection client)
-      (progn
-        (ssh-log "resolving ~A" (ssh-client-connect-host client))
-        (burzay:resolve-host
-         (ssh-client-connect-host client)
-         (lambda (address) (ssh-dial client address))
-         (lambda (condition) (ssh-resolution-error client condition)))
+      (let ((resolve (or (ssh-client-resolver client) #'burzay:resolve-host))
+            (original (ssh-client-connect-host client)))
+        (labels ((dial (name)
+                   (lambda (address)
+                     (setf (ssh-client-connect-host client) name)
+                     (ssh-dial client address)))
+                 (try (names)
+                   (if names
+                       (progn
+                         (ssh-log "resolving ~A" (first names))
+                         (funcall resolve (first names)
+                                  (dial (first names))
+                                  (lambda (condition)
+                                    (declare (ignore condition))
+                                    (try (rest names)))))
+                       (if (ssh-client-canonicalize-fallback-local client)
+                           (progn
+                             (ssh-log "resolving ~A" original)
+                             (funcall resolve original (dial original)
+                                      (lambda (condition)
+                                        (ssh-resolution-error
+                                         client condition))))
+                           (ssh-resolution-error
+                            client
+                            (make-condition
+                             'simple-error
+                             :format-control
+                             "no CanonicalDomains candidate resolved ~A"
+                             :format-arguments (list original)))))))
+          (let ((candidates (ssh-canonicalize-candidates client)))
+            (if candidates
+                (try candidates)
+                (progn
+                  (ssh-log "resolving ~A" original)
+                  (funcall resolve original (dial original)
+                           (lambda (condition)
+                             (ssh-resolution-error client condition)))))))
         client)))
 
 (defun ssh-make-client-record (host connect-host host-key-host port connect-port
@@ -219,6 +267,11 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
+                                 (canonicalize-hostname :no)
+                                 (canonical-domains '())
+                                 (canonicalize-max-dots 1)
+                                 (canonicalize-fallback-local t)
+                                 resolver
                                  (update-host-keys :yes)
                                  (fingerprint-hash :sha256)
                                  visual-host-key
@@ -257,6 +310,11 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
                     :hostbased-keys hostbased-keys
+                    :canonicalize-hostname canonicalize-hostname
+                    :canonical-domains canonical-domains
+                    :canonicalize-max-dots canonicalize-max-dots
+                    :canonicalize-fallback-local canonicalize-fallback-local
+                    :resolver resolver
                     :update-host-keys update-host-keys
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
@@ -374,6 +432,11 @@ is applied here, before any request names a key the configuration forbade."
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
+                             (canonicalize-hostname :no)
+                             (canonical-domains '())
+                             (canonicalize-max-dots 1)
+                             (canonicalize-fallback-local t)
+                             resolver
                              (update-host-keys :yes)
                              (fingerprint-hash :sha256)
                              visual-host-key
@@ -449,6 +512,12 @@ role-neutral."
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms
                            :hostbased-keys hostbased-keys
+                           :canonicalize-hostname canonicalize-hostname
+                           :canonical-domains canonical-domains
+                           :canonicalize-max-dots canonicalize-max-dots
+                           :canonicalize-fallback-local
+                           canonicalize-fallback-local
+                           :resolver resolver
                            :update-host-keys update-host-keys
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key

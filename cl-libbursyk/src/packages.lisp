@@ -155,6 +155,11 @@
    #:ssh-config-options-hostbased-keys
    #:ssh-config-options-enable-ssh-keysign
    #:ssh-config-options-host-key-alias
+   #:ssh-config-options-canonicalize-hostname
+   #:ssh-config-options-canonical-domains
+   #:ssh-config-options-canonicalize-max-dots
+   #:ssh-config-options-canonicalize-fallback-local
+   #:ssh-config-options-canonicalize-permitted-cnames
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts
    #:ssh-config-options-global-known-hosts
