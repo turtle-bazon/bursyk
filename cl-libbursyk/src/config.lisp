@@ -120,6 +120,11 @@ relative Include is anchored here.")
   (session-type nil)
   (stdin-null nil)
   (tag nil)
+  ;; LogLevel and LogVerbose: how much this client logs, and per-area
+  ;; overrides.  LogVerbose is accepted for ssh_config compatibility; this
+  ;; client has no per-area log categories to turn up.
+  (log-level nil)
+  (log-verbose nil)
   (extra nil))
 
 (defun ssh-default-user ()
@@ -1105,6 +1110,18 @@ understand them rather than silently match nothing."
            (setf (ssh-config-options-remote-command options)
                  (let ((raw (ssh-config-line-raw line)))
                    (if (and raw (plusp (length raw))) raw value)))))
+        ((string= keyword "loglevel")
+         (let ((level (string-downcase value)))
+           (unless (member level '("quiet" "fatal" "error" "info" "verbose"
+                                   "debug" "debug1" "debug2" "debug3")
+                           :test #'string=)
+             (error (ssh-config-line-error line "invalid LogLevel ~S"
+                                           value)))
+           (setf (ssh-config-options-log-level options) level)))
+        ((string= keyword "logverbose")
+         (unless (ssh-config-options-log-verbose options)
+           (setf (ssh-config-options-log-verbose options)
+                 (ssh-config-line-args line))))
         ((string= keyword "sessiontype")
          (let ((value (string-downcase value)))
            (unless (member value '("none" "subsystem" "default")
@@ -1164,6 +1181,7 @@ understand them rather than silently match nothing."
                          "refuseconnection" "requiredrsasize"
                          "remotecommand" "localcommand"
                          "permitlocalcommand"
+                         "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"

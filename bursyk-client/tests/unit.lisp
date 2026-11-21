@@ -201,6 +201,23 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test log-level-settings-map
+  (multiple-value-bind (quiet verbose) (burs::log-level-settings "quiet")
+    (is (eq t quiet))
+    (is (zerop verbose)))
+  (multiple-value-bind (quiet verbose) (burs::log-level-settings "error")
+    (is (eq t quiet))
+    (is (zerop verbose)))
+  (multiple-value-bind (quiet verbose) (burs::log-level-settings "debug")
+    (is (not quiet))
+    (is (= 1 verbose)))
+  (multiple-value-bind (quiet verbose) (burs::log-level-settings "debug3")
+    (is (not quiet))
+    (is (= 3 verbose)))
+  (multiple-value-bind (quiet verbose) (burs::log-level-settings "info")
+    (is (not quiet))
+    (is (zerop verbose))))
+
 (test local-command-reads-the-config
   (let* ((client (cl-pnet-ssh::%make-ssh-client))
          (options (cl-pnet-ssh::%make-ssh-config-options

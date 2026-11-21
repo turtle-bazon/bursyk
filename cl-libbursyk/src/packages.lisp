@@ -174,6 +174,8 @@
    #:ssh-config-options-request-tty
    #:ssh-config-options-local-command
    #:ssh-config-options-permit-local-command
+   #:ssh-config-options-log-level
+   #:ssh-config-options-log-verbose
    #:ssh-config-options-remote-command
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null

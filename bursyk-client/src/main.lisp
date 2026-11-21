@@ -623,7 +623,8 @@ session down."
               cl-pnet-ssh:*ssh-log-function* nil)))))
 
 (defun start-logging ()
-  (when (getf *options* :log-file)
+  (when (and (getf *options* :log-file)
+             (null *log-stream*))
     (setf *log-stream*
           (handler-case
               (open (getf *options* :log-file)
@@ -1497,6 +1498,33 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun config-log-level (client)
+  "CLIENT's LogLevel as a lowercase name, or NIL."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options (cl-pnet-ssh:ssh-config-options-log-level options))))
+
+(defun log-level-settings (level)
+  "VALUES QUIET VERBOSE for a LogLevel name."
+  (cond
+    ((member level '("quiet" "fatal" "error") :test #'string=)
+     (values t 0))
+    ((member level '("verbose" "debug" "debug1") :test #'string=)
+     (values nil 1))
+    ((string= level "debug2") (values nil 2))
+    ((string= level "debug3") (values nil 3))
+    (t (values nil 0))))
+
+(defun apply-config-log-level (client)
+  "Adopt CLIENT's LogLevel when the command line did not set one."
+  (let ((level (config-log-level client)))
+    (when (and level
+               (zerop (getf *options* :verbose 0))
+               (not (getf *options* :quiet)))
+      (multiple-value-bind (quiet verbose) (log-level-settings level)
+        (setf (getf *options* :quiet) quiet
+              (getf *options* :verbose) verbose)
+        (start-logging)))))
+
 (defun config-local-command (client)
   "CLIENT's LocalCommand as written, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2143,6 +2171,12 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (format t "loglevel ~A~%"
+            (string-upcase
+             (or (cl-pnet-ssh:ssh-config-options-log-level options)
+                 "info")))
+    (dolist (line (cl-pnet-ssh:ssh-config-options-log-verbose options))
+      (format t "logverbose ~A~%" line))
     (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
       (when local
         (format t "localcommand ~A~%" local)))
@@ -2306,6 +2340,7 @@ of calling back in the middle of authentication."
    :exec-matcher #'match-exec
    :on-client (lambda (client)
                 (setf *client* client)
+                (apply-config-log-level client)
                 (check-config-supported client))
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
