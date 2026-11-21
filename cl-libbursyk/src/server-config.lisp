@@ -70,7 +70,7 @@ prohibit-password and means the same thing.")
     "listenaddress" "addressfamily" "printmotd" "printlastlog"
     "ignoreuserknownhosts" "xauthlocation" "strictmodes"
     "permituserenvironment" "uselogin" "compression" "tcpkeepalive"
-    "keepalive" "ciphers" "macs" "protocol" "subsystem" "maxstartups"
+    "keepalive" "ciphers" "macs" "protocol" "maxstartups"
     "persourcemaxstartups" "persourcenetblocksize" "usedns"
     "verifyreversemapping" "reversemappingcheck" "useprivilegeseparation"
     "hostcertificate" "kexalgorithms" "versionaddendum" "fingerprinthash"
@@ -109,7 +109,11 @@ socket address and has no routing domains.")
     "usedns" "securitykeyprovider" "gssapicleanupcredentials"
     "gssapistrictacceptorcheck" "kerberosorlocalpasswd"
     "kerberosticketcleanup" "kerberosgetafstoken"
-    "hostbasedusesnamefrompacketonly" "authorizedkeysfile2"))
+    "hostbasedusesnamefrompacketonly" "authorizedkeysfile2"
+    ;; 10.6 directives that describe OpenSSH's privsep helpers or features
+    ;; this server refuses outright (PAM, GSSAPI, agent forwarding).
+    "sshdauthpath" "sshdsessionpath" "pamservicename"
+    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
@@ -139,7 +143,11 @@ socket address and has no routing domains.")
   '("chrootdirectory"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
-    "streamlocalbindmask" "streamlocalbindunlink"))
+    "streamlocalbindmask" "streamlocalbindunlink"
+    ;; 10.6: these change connection refusal or rate limiting, so accepting
+    ;; them without their behaviour would be unsafe.
+    "persourcepenalties" "persourcepenaltyexemptlist"
+    "refuseconnection"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -666,7 +674,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     client-alive-interval client-alive-count-max
     force-command banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
-    authentication-methods
+    authentication-methods subsystems
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     expose-auth-info
     unused-connection-timeout channel-timeouts

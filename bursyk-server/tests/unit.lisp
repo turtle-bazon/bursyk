@@ -1154,6 +1154,10 @@ Match User alice
     (is (equal '(("session:*" . 300) ("direct-tcpip" . 10)
                  ("session:subsystem:sftp" . 0))
                (cl-pnet-ssh:ssh-server-config-channel-timeouts config))))
+  ;; 10.6's connection-wide timeout and its single session type.
+  (is (equal '(("global" . 600) ("session" . 300))
+             (cl-pnet-ssh:ssh-server-config-channel-timeouts
+              (config-from-text "ChannelTimeout global=10m session=5m"))))
   ;; sshd's time syntax applies to each interval.
   (is (equal '(("session:*" . 5400))
              (cl-pnet-ssh:ssh-server-config-channel-timeouts
@@ -1854,6 +1858,21 @@ DenyGroups banned")))
                             ("echo forced" nil))
                           (nreverse started))))
           (setf (symbol-function 'bursyk-server::start-command) original))))))
+
+(test match-subsystem-overrides-the-global-list
+  "10.6 allows Subsystem in Match; a matching block replaces the global list."
+  (let* ((config (config-from-text
+                  "Subsystem sftp /global/sftp
+Match User alice
+  Subsystem sftp /alice/sftp"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal '(("sftp" . "/alice/sftp"))
+               (cl-pnet-ssh:ssh-server-config-subsystems alice)))
+    (is (equal '(("sftp" . "/global/sftp"))
+               (cl-pnet-ssh:ssh-server-config-subsystems bob)))))
 
 (test admin-forced-command-wins-over-the-keys
   "ForceCommand replaces exec, shell and subsystem, and outranks command=."
@@ -2884,3 +2903,21 @@ list; its arguments expand the certificate's tokens."
                         "publickey ssh-ed25519 BBBB")
                       (uiop:read-file-lines path))))
       (bursyk-server::delete-auth-info-file session))))
+
+(test sshd-config-recognises-the-10.6-additions
+  "10.6 directives this server cannot honour fail clearly, while those that
+only describe OpenSSH's own helpers are accepted and warned about."
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PerSourcePenalties yes"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PerSourcePenaltyExemptList 127.0.0.1/32"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RefuseConnection yes"))
+  (let ((config (config-from-text
+                 "SshdSessionPath /usr/libexec/sshd-session
+SshdAuthPath /usr/libexec/sshd-auth
+PAMServiceName sshd
+GSSAPIDelegateCredentials no
+AgentSocketPath /run/agent.sock
+WarnWeakCrypto no")))
+    (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config))))))

@@ -1523,21 +1523,43 @@ server value.  :NONE is an explicit directive that disables every timeout."
         (ssh-server-channel-timeouts (ssh-session-server session))
         timeouts)))
 
+(defun ssh-channel-type-matches-p (pattern type)
+  "Whether ChannelTimeout PATTERN selects channel TYPE.
+
+OpenSSH 10.6 uses the single name \"session\" for every session channel,
+while 9.x names session:shell, session:command and session:subsystem:*.
+Accept both so an older sshd_config keeps its meaning.  \"global\" is a
+connection-wide timeout and never selects one channel."
+  (cond
+    ((string= pattern "global") nil)
+    ((string= pattern "session")
+     (or (string= type "session")
+         (let ((prefix "session:"))
+           (and (>= (length type) (length prefix))
+                (string= prefix type :end2 (length prefix))))))
+    (t (ssh-match-pattern pattern type))))
+
 (defun ssh-server-channel-resolve-timeout (channel)
   "CHANNEL's inactivity limit in seconds, or 0 when no pattern matches.
 
 The first ChannelTimeout pattern matching the channel's extended type wins,
 as sshd's lookup_timeout returns the first match.  Until a session request
 labels the channel, its plain type is what sshd matches, so \"session=2\"
-starts counting at open while \"session:*=2\" waits for the label."
+starts counting at open and, in 10.6, keeps applying after the label."
   (let ((timeouts (ssh-session-channel-timeouts
                    (ssh-server-channel-session channel))))
     (when (consp timeouts)
       (let ((type (or (ssh-server-channel-x-type channel)
                       (ssh-server-channel-type channel))))
         (loop for (pattern . seconds) in timeouts
-              when (ssh-match-pattern pattern type)
+              when (ssh-channel-type-matches-p pattern type)
                 return seconds)))))
+
+(defun ssh-session-global-channel-timeout (session)
+  "SESSION's global ChannelTimeout in seconds, or NIL when none is set."
+  (let ((timeouts (ssh-session-channel-timeouts session)))
+    (when (consp timeouts)
+      (cdr (assoc "global" timeouts :test #'string=)))))
 
 (defun ssh-server-channel-refresh-inactivity-timeout (channel)
   "Re-resolve CHANNEL's limit after its extended type changes.
@@ -1593,7 +1615,24 @@ LAST-USED, so a timer that fires early simply recomputes and rearms."
                  (when (and (eq (ssh-server-channel-state channel) :open)
                             (plusp (ssh-server-channel-inactive-timeout channel))
                             (or (null earliest) (< deadline earliest)))
-                   (setf earliest deadline)))))
+                   (setf earliest deadline))))
+      ;; A global timeout runs from the newest activity on any open channel.
+      (let ((global (ssh-session-global-channel-timeout session))
+            (latest nil))
+        (when (and global (plusp global))
+          (loop for channel being the hash-values of
+                  (ssh-session-channels session)
+                when (and (eq (ssh-server-channel-state channel) :open)
+                          (plusp (ssh-server-channel-last-used channel)))
+                  do (setf latest
+                           (if latest
+                               (max latest (ssh-server-channel-last-used
+                                            channel))
+                               (ssh-server-channel-last-used channel))))
+          (when latest
+            (let ((deadline (+ latest global)))
+              (when (or (null earliest) (< deadline earliest))
+                (setf earliest deadline)))))))
     (ssh-session-stop-channel-timeout-timer session)
     (when earliest
       (setf (ssh-session-channel-timeout-timer session)
@@ -1604,7 +1643,11 @@ LAST-USED, so a timer that fires early simply recomputes and rearms."
                (ssh-session-channel-timeout-tick session)))))))
 
 (defun ssh-session-channel-timeout-tick (session)
-  "Close every open channel whose ChannelTimeout has expired."
+  "Close every open channel whose ChannelTimeout has expired.
+
+The per-channel limits are checked first; a global timeout then closes all
+channels still open once the newest activity on any of them is older than
+the global interval."
   (unless (ssh-session-closed session)
     (let ((now (ssh-session-now)))
       (dolist (channel (iter (for (id channel) in-hashtable
@@ -1614,7 +1657,25 @@ LAST-USED, so a timer that fires early simply recomputes and rearms."
                    (plusp (ssh-server-channel-inactive-timeout channel))
                    (>= now (+ (ssh-server-channel-last-used channel)
                               (ssh-server-channel-inactive-timeout channel))))
-          (ssh-server-channel-force-close channel))))
+          (ssh-server-channel-force-close channel)))
+      (let ((global (ssh-session-global-channel-timeout session))
+            (latest nil))
+        (when (and global (plusp global))
+          (loop for channel being the hash-values of
+                  (ssh-session-channels session)
+                when (and (eq (ssh-server-channel-state channel) :open)
+                          (plusp (ssh-server-channel-last-used channel)))
+                  do (setf latest
+                           (if latest
+                               (max latest (ssh-server-channel-last-used
+                                            channel))
+                               (ssh-server-channel-last-used channel))))
+          (when (and latest (>= now (+ latest global)))
+            (dolist (channel (iter (for (id channel) in-hashtable
+                                        (ssh-session-channels session))
+                                (collect channel)))
+              (when (eq (ssh-server-channel-state channel) :open)
+                (ssh-server-channel-force-close channel)))))))
     (ssh-session-refresh-channel-timeout-timer session)))
 
 (defun ssh-session-note-channel-change (session)

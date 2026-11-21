@@ -2030,11 +2030,13 @@ carries; without it only the plain algorithm is offered."
            (is (= 2 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
                      channel)))
            ;; Labeling re-resolves the limit but, as sshd's
-           ;; channel_set_xtype does, leaves the activity clock alone.
+           ;; channel_set_xtype does, leaves the activity clock alone.  In
+           ;; 10.6 "session" covers every session subtype, so the limit
+           ;; survives the label.
            (let ((started (cl-pnet-ssh::ssh-server-channel-last-used channel)))
              (cl-pnet-ssh::ssh-server-channel-set-x-type
               channel "session:command")
-             (is (= 0 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
+             (is (= 2 (cl-pnet-ssh::ssh-server-channel-inactive-timeout
                        channel)))
              (is (= started (cl-pnet-ssh::ssh-server-channel-last-used
                              channel)))))
@@ -2063,6 +2065,41 @@ carries; without it only the plain algorithm is offered."
            (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
            (is (eq :closed
                    (cl-pnet-ssh::ssh-server-channel-state channel))))
+      (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
+
+(test server-channel-global-timeout-closes-all-channels
+  "A global ChannelTimeout runs from the newest activity on any open channel
+and closes them all together."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("ChannelTimeout global=5 session:*=30")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (first (cl-pnet-ssh::%make-ssh-server-channel
+                 :session session :local-id 0 :remote-id 0 :state :open))
+         (second (cl-pnet-ssh::%make-ssh-server-channel
+                  :session session :local-id 1 :remote-id 1 :state :open))
+         (now (cl-pnet-ssh::ssh-session-now)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0 (cl-pnet-ssh::ssh-session-channels session)) first
+                 (gethash 1 (cl-pnet-ssh::ssh-session-channels session)) second)
+           (cl-pnet-ssh::ssh-server-channel-set-x-type
+            first "session:command")
+           (cl-pnet-ssh::ssh-server-channel-set-x-type
+            second "session:subsystem:sftp")
+           ;; The per-channel limit is 30, but the global one is 5.
+           (is (= 30 (cl-pnet-ssh::ssh-server-channel-inactive-timeout first)))
+           (setf (cl-pnet-ssh::ssh-server-channel-last-used first) (- now 20)
+                 (cl-pnet-ssh::ssh-server-channel-last-used second) (- now 2))
+           (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
+           (is (eq :open (cl-pnet-ssh::ssh-server-channel-state first)))
+           (is (eq :open (cl-pnet-ssh::ssh-server-channel-state second)))
+           ;; Once the newest activity is older than five seconds, both go.
+           (setf (cl-pnet-ssh::ssh-server-channel-last-used first) (- now 20)
+                 (cl-pnet-ssh::ssh-server-channel-last-used second) (- now 10))
+           (cl-pnet-ssh::ssh-session-channel-timeout-tick session)
+           (is (eq :closed (cl-pnet-ssh::ssh-server-channel-state first)))
+           (is (eq :closed (cl-pnet-ssh::ssh-server-channel-state second))))
       (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
 
 (test server-loopback-exec-multiple-host-keys

@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.25"
+(defparameter +bursyk-server-version+ "0.0.2.26"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -584,16 +584,23 @@ client can half-close its target, and the reply can still come back."
       (fail "not NAME=PATH: ~A" text))
     (cons (subseq text 0 equals) (subseq text (1+ equals)))))
 
-(defun configured-subsystems ()
-  "Subsystem (NAME . PROGRAM) pairs from -S, else from the sshd_config."
+(defun configured-subsystems (&optional session)
+  "Subsystem (NAME . PROGRAM) pairs from -S, else from the sshd_config.
+
+SESSION selects the Match-resolved Subsystem list for a connection; NIL
+means the startup config."
   (or (and (getf *options* :subsystem)
            (mapcar #'split-subsystem
                    (reverse (getf *options* :subsystem))))
-      (config-setting #'cl-pnet-ssh:ssh-server-config-subsystems)))
+      (if session
+          (session-config-setting
+           session #'cl-pnet-ssh:ssh-server-config-subsystems)
+          (config-setting #'cl-pnet-ssh:ssh-server-config-subsystems))))
 
-(defun subsystem-path (name)
+(defun subsystem-path (name &optional session)
   "The program for subsystem NAME, or NIL when nothing serves it."
-  (let ((configured (assoc name (configured-subsystems) :test #'string=)))
+  (let ((configured (assoc name (configured-subsystems session)
+                           :test #'string=)))
     (cond
       (configured (cdr configured))
       (t (let ((default (assoc name *default-subsystems* :test #'string=)))
@@ -1083,7 +1090,7 @@ asked for, when it asked for anything."
               (declare (ignore channel))
               ;; sshd still refuses an unknown subsystem before the forced
               ;; command is considered, so look the name up first.
-              (let ((path (subsystem-path name)))
+              (let ((path (subsystem-path name session)))
                 (and path
                      (if forced-command
                          (lambda () (run-forced path))
