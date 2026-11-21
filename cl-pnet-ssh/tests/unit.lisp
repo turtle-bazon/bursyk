@@ -2730,6 +2730,36 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test session-type-and-stdin-null-parse
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "SessionType none")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "StdinNull yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "none" (ssh-config-options-session-type options)))
+    (is (eq t (ssh-config-options-stdin-null options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-session-type options)))
+    (is (null (ssh-config-options-stdin-null options))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "SessionType nonsense"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test setenv-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

@@ -1044,7 +1044,7 @@ ordering without adding a request hook to the library."
               (send-pty-request channel)
               (start-winch channel)
               (cond
-                ((getf *options* :subsystem)
+                ((subsystem-request-p)
                  (send-subsystem-request channel command))
                 (command-given-p
                  (send-exec-request channel command))
@@ -1057,7 +1057,7 @@ ordering without adding a request hook to the library."
 
 (defun start-input (channel)
   "Feed stdin to CHANNEL, or report EOF at once under -n."
-  (if (getf *options* :stdin-null)
+  (if (stdin-null-p)
       (cl-pnet-ssh:ssh-channel-eof channel)
       (start-stdin channel)))
 
@@ -1113,7 +1113,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
                      (declare (ignore channel status))
                      (finish *status*))
          :on-error #'session-error))
-  (unless (getf *options* :subsystem)
+  (unless (subsystem-request-p)
     (dolist (name (cl-pnet-ssh:ssh-client-send-env client))
       (let ((value (uiop:getenv name)))
         (when value
@@ -1128,7 +1128,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   (if (request-tty-p client command-given-p)
       (start-pty-session *channel* command command-given-p)
       (cond
-        ((getf *options* :subsystem)
+        ((subsystem-request-p)
          (cl-pnet-ssh:ssh-channel-subsystem *channel* command)
          (start-input *channel*))
         (command-given-p
@@ -1496,6 +1496,33 @@ closed afterwards."
                                       :connection connection)))
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
+
+(defun config-session-type (client)
+  "CLIENT's ssh_config SessionType, or NIL when the file did not name one."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options (cl-pnet-ssh:ssh-config-options-session-type options))))
+
+(defun session-type-none-p (client)
+  "Whether SessionType none asks for forwards only, like -N."
+  (string= (or (config-session-type client) "default") "none"))
+
+(defun subsystem-request-p ()
+  "Whether this session asks for a subsystem, by -s or SessionType."
+  (or (getf *options* :subsystem)
+      (let ((client *client*))
+        (and client
+             (string= (or (config-session-type client) "default")
+                      "subsystem")))))
+
+(defun stdin-null-p ()
+  "Whether stdin is /dev/null, by -n or StdinNull."
+  (or (getf *options* :stdin-null)
+      (let ((client *client*))
+        (and client
+             (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+               (and options
+                    (cl-pnet-ssh:ssh-config-options-stdin-null
+                     options)))))))
 
 (defun exit-on-forward-failure-p (client)
   "Whether ExitOnForwardFailure asks this client to exit on a failed forward."
@@ -1993,6 +2020,13 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (format t "sessiontype ~A~%"
+            (or (cl-pnet-ssh:ssh-config-options-session-type options)
+                "default"))
+    (format t "stdinnull ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-stdin-null options)
+                "yes"
+                "no"))
     (print-list-option
      "identityfile"
      (or (reverse (cl-pnet-ssh:ssh-config-options-identity-files options))
@@ -2133,8 +2167,11 @@ of calling back in the middle of authentication."
         (multiple-value-bind (target port)
             (parse-host-port (getf *options* :stdio-forward))
           (start-stdio-forward client target port)))
-       ((getf *options* :no-command) nil)
-       (t (start-session client command command-given-p))))
+       ((or (getf *options* :no-command) (session-type-none-p client)) nil)
+       (t
+        (when (and (subsystem-request-p) (not command-given-p))
+          (fail "SessionType subsystem requires a subsystem name"))
+        (start-session client command command-given-p))))
    :on-error (lambda (client condition)
                (show-banner client)
                (format *error-output* "burs: ~A~%" condition)

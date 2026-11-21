@@ -100,6 +100,10 @@ relative Include is anchored here.")
   (remote-forwards nil)
   (dynamic-forwards nil)
   (request-tty nil)
+  ;; SessionType and StdinNull: whether to open a session at all, whether the
+  ;; command names a subsystem, and whether stdin is /dev/null.
+  (session-type nil)
+  (stdin-null nil)
   (tag nil)
   (extra nil))
 
@@ -1015,6 +1019,15 @@ understand them rather than silently match nothing."
         ((string= keyword "streamlocalbindunlink")
          (setf (ssh-config-options-streamlocal-bind-unlink options)
                (boolean)))
+        ((string= keyword "sessiontype")
+         (let ((value (string-downcase value)))
+           (unless (member value '("none" "subsystem" "default")
+                           :test #'string=)
+             (error (ssh-config-line-error line "invalid SessionType ~S"
+                                           value)))
+           (setf (ssh-config-options-session-type options) value)))
+        ((string= keyword "stdinnull")
+         (setf (ssh-config-options-stdin-null options) (boolean)))
         ((string= keyword "requesttty")
          (setf (ssh-config-options-request-tty options) (string-downcase value)))
         ((string= keyword "preferredauthentications")
@@ -1060,6 +1073,7 @@ understand them rather than silently match nothing."
                          "gatewayports" "exitonforwardfailure"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
+                         "sessiontype" "stdinnull"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"

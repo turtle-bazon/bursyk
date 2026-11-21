@@ -165,6 +165,8 @@
    #:ssh-config-options-remote-forwards
    #:ssh-config-options-dynamic-forwards
    #:ssh-config-options-request-tty
+   #:ssh-config-options-session-type
+   #:ssh-config-options-stdin-null
    #:ssh-config-options-forward-agent
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files
