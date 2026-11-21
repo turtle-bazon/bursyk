@@ -2249,6 +2249,13 @@ peer that connected to it; NIL refuses the channel."
             (if (cl-pnet-ssh:ssh-config-options-hash-known-hosts options)
                 "yes"
                 "no"))
+    (format t "updatehostkeys ~A~%"
+            (let ((value (cl-pnet-ssh:ssh-config-options-update-host-keys
+                          options)))
+              (cond ((eq value :yes) "yes")
+                    ((eq value :ask) "ask")
+                    ((eq value :no) "no")
+                    (t "yes"))))
     (let ((command (cl-pnet-ssh:ssh-config-options-known-hosts-command
                     options)))
       (when command

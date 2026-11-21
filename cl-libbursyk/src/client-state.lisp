@@ -63,6 +63,9 @@
   (hash-known-hosts nil)
   ;; KnownHostsCommand: a command whose output is read as known_hosts lines.
   (known-hosts-command nil)
+  ;; UpdateHostKeys: whether a proven host key may be added to known_hosts.
+  (update-host-keys :yes)
+  (host-keys-seen nil)
   ;; FingerprintHash: the digest used when showing a key fingerprint.
   (fingerprint-hash :sha256)
   ;; VisualHostKey: show the randomart picture once connected.

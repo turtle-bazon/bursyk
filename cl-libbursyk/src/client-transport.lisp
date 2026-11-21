@@ -741,12 +741,103 @@ order, which is how the callbacks stay paired with their requests."
             (when (getf entry :on-failure)
               (funcall (getf entry :on-failure))))))))
 
+(defun ssh-client-host-key-known-p (client key-blob)
+  "Whether KEY-BLOB itself is already recorded for CLIENT's host."
+  (some (lambda (file)
+          (eq :match (ssh-known-host-status
+                      file (ssh-client-host-spec client) key-blob)))
+        (ssh-client-known-hosts-files client)))
+
+(defun ssh-client-host-key-allowed-p (client key-blob)
+  "Whether KEY-BLOB's type is permitted by HostKeyAlgorithms."
+  (let* ((patterns (or (ssh-client-host-key-algorithms client)
+                       +ssh-host-key-algorithms+))
+         (type (nth-value 0 (ssh-public-key-parts
+                             (ssh-key-plain-blob key-blob)))))
+    (flet ((match (name)
+             (some (lambda (pattern) (ssh-match-pattern pattern name))
+                   patterns)))
+      (cond
+        ((string= type "ssh-rsa")
+         (or (match "rsa-sha2-512") (match "rsa-sha2-256")
+             (match "ssh-rsa")))
+        (t (match type))))))
+
+(defun ssh-signature-algorithm-name (signature)
+  "The algorithm name inside a signature blob, or NIL."
+  (handler-case (ssh-read-text (ssh-make-reader signature))
+    (error () nil)))
+
+(defun ssh-client-hostkey-proof-data (client key-blob)
+  "The octets a hostkeys-prove reply signs for KEY-BLOB."
+  (let ((writer (ssh-writer)))
+    (ssh-write-text writer "hostkeys-prove-00@openssh.com")
+    (ssh-write-string writer (ssh-client-session-id client))
+    (ssh-write-string writer key-blob)
+    (ssh-writer-output writer)))
+
+(defun ssh-client-add-proven-hostkey (client key-blob)
+  "Record a host key the server has proved it owns."
+  (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
+    (declare (ignore data))
+    (handler-case
+        (ssh-remember-known-host (ssh-client-known-hosts-file client)
+                                 (ssh-client-host-spec client)
+                                 type key-blob
+                                 :hash (ssh-client-hash-known-hosts client))
+      (error (condition)
+        (ssh-log "could not record a proved host key: ~A" condition)))))
+
+(defun ssh-client-prove-hostkeys (client keys)
+  "Ask the server to prove ownership of KEYS, then record the proofs."
+  (ssh-client-send-global-request
+   client "hostkeys-prove-00@openssh.com"
+   :fields (lambda (writer)
+             (dolist (key keys)
+               (ssh-write-string writer key)))
+   :on-success
+   (lambda (reply)
+     (dolist (key keys)
+       (when (plusp (ssh-reader-remaining reply))
+         (let ((signature (ssh-read-string reply)))
+           (when (and (not (string= (or (ssh-signature-algorithm-name signature)
+                                        "")
+                                    "ssh-rsa"))
+                      (ssh-public-key-signature-valid-p
+                       key signature
+                       (ssh-client-hostkey-proof-data client key)))
+             (ssh-client-add-proven-hostkey client key))))))
+   :on-failure
+   (lambda ()
+     (ssh-log "server refused to prove its host keys"))))
+
+(defun ssh-client-handle-hostkeys (client reader)
+  "Handle the server's hostkeys-00 list and update known_hosts."
+  (unless (ssh-client-host-keys-seen client)
+    (setf (ssh-client-host-keys-seen client) t)
+    (let ((keys '()))
+      (loop while (plusp (ssh-reader-remaining reader))
+            do (let ((blob (ssh-read-string reader)))
+                 (unless (or (ssh-certificate-blob-p blob)
+                             (member blob keys :test #'ssh-octets=)
+                             (not (ssh-client-host-key-allowed-p client blob)))
+                   (push blob keys))))
+      (when (eq (ssh-client-update-host-keys client) :yes)
+        (let ((new (remove-if (lambda (key)
+                                (ssh-client-host-key-known-p client key))
+                              keys)))
+          (when new
+            (ssh-client-prove-hostkeys client new)))))))
+
 (defun ssh-client-handle-global-request (client payload)
   (let* ((reader (ssh-make-reader payload))
          (name (progn (ssh-read-u8 reader) (ssh-read-text reader)))
          (want-reply (ssh-read-boolean reader)))
-    (declare (ignore name))
+    (when (string= name "hostkeys-00@openssh.com")
+      (ssh-client-handle-hostkeys client reader))
     (when want-reply
       (let ((writer (ssh-writer)))
-        (ssh-write-u8 writer +ssh-msg-request-failure+)
+        (ssh-write-u8 writer (if (string= name "hostkeys-00@openssh.com")
+                                 +ssh-msg-request-success+
+                                 +ssh-msg-request-failure+))
         (ssh-client-send-payload client (ssh-writer-output writer))))))

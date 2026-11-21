@@ -2782,6 +2782,32 @@ newline")))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
 
+(test update-host-keys-parses
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (ssh-config-options-update-host-keys options))))
+    (is (eq :yes (value "UpdateHostKeys yes")))
+    (is (eq :no (value "UpdateHostKeys no")))
+    (is (eq :ask (value "UpdateHostKeys ask")))
+    (is (null (value "Port 22"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "UpdateHostKeys sometimes"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test known-hosts-command-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

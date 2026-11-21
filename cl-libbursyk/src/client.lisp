@@ -193,6 +193,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  (revoked-host-keys '())
                                  hash-known-hosts
                                  known-hosts-command
+                                 (update-host-keys :yes)
                                  (fingerprint-hash :sha256)
                                  visual-host-key
                                  check-host-ip
@@ -225,6 +226,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
                     :known-hosts-command known-hosts-command
+                    :update-host-keys update-host-keys
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
                     :check-host-ip check-host-ip
@@ -296,6 +298,7 @@ is applied here, before any request names a key the configuration forbade."
                              (revoked-host-keys '())
                              hash-known-hosts
                              known-hosts-command
+                             (update-host-keys :yes)
                              (fingerprint-hash :sha256)
                              visual-host-key
                              check-host-ip
@@ -365,6 +368,7 @@ role-neutral."
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
                            :known-hosts-command known-hosts-command
+                           :update-host-keys update-host-keys
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key
                            :check-host-ip check-host-ip

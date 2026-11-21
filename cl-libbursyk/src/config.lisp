@@ -54,6 +54,9 @@ relative Include is anchored here.")
   (global-known-hosts nil)
   (hash-known-hosts nil)
   (known-hosts-command nil)
+  ;; UpdateHostKeys: :YES adds keys the server proves it owns, :NO does
+  ;; nothing, and :ASK is treated as no by this non-interactive client.
+  (update-host-keys nil)
   ;; FingerprintHash: :SHA256 (the default) or :MD5 for displayed
   ;; fingerprints.
   (fingerprint-hash nil)
@@ -842,6 +845,22 @@ understand them rather than silently match nothing."
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
                   (if (eq paths :none) nil paths))))))
+      ((string= keyword "updatehostkeys")
+       (ssh-config-set-once
+        seen options :update-host-keys
+        (lambda (options)
+          (let ((value (string-downcase (ssh-config-arg line))))
+            (setf (ssh-config-options-update-host-keys options)
+                  (cond ((member value '("yes" "true" "on")
+                                 :test #'string=)
+                         :yes)
+                        ((member value '("no" "false" "off")
+                                 :test #'string=)
+                         :no)
+                        ((string= value "ask") :ask)
+                        (t
+                         (error (ssh-config-line-error
+                                 line "invalid UpdateHostKeys ~S" value)))))))))
       ((string= keyword "knownhostscommand")
        (ssh-config-set-once
         seen options :known-hosts-command
@@ -1244,6 +1263,7 @@ understand them rather than silently match nothing."
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
                          "hashknownhosts" "knownhostscommand"
+                         "updatehostkeys"
                          "fingerprinthash"
                          "visualhostkey" "checkhostip"
                          "revokedhostkeys"
