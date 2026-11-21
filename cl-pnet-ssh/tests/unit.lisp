@@ -3454,3 +3454,21 @@ option the server cannot honour refuses the line rather than being lost."
             (cl-pnet-ssh::ssh-server-auth-method-lists mixed)))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists any)))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists nil)))))
+
+(test pubkey-ok-budget-delays-max-auth-tries
+  "The first max-pk-ok rejected probes are not charged to MaxAuthTries."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PubkeyAuthOptions max-pk-ok:2")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (is (not (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session)))
+    (is (not (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session)))
+    (is (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session))
+    (is (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session)))
+  ;; sshd's default budget is six probes.
+  (let* ((server (cl-pnet-ssh::%make-ssh-server))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (dotimes (index 6)
+      (declare (ignore index))
+      (is (not (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session))))
+    (is (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session))))

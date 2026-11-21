@@ -2921,3 +2921,42 @@ GSSAPIDelegateCredentials no
 AgentSocketPath /run/agent.sock
 WarnWeakCrypto no")))
     (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config))))))
+
+(test sshd-config-reads-pubkey-auth-options
+  "PubkeyAuthOptions keeps the first line's flags and probe budget."
+  (let ((config (config-from-text
+                 "PubkeyAuthOptions touch-required verify-required max-pk-ok:3")))
+    (is (equal '(:touch-required :verify-required)
+               (cl-pnet-ssh:ssh-server-config-pubkey-auth-options config)))
+    (is (= 3 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok config))))
+  (is (eq :none
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-pubkey-auth-options
+           "PubkeyAuthOptions none")))
+  (is (= 0
+         (config-value
+          #'cl-pnet-ssh:ssh-server-config-max-pubkey-ok
+          "PubkeyAuthOptions max-pk-ok:0")))
+  ;; A later line is validated but cannot replace the first.
+  (let ((config (config-from-text
+                 "PubkeyAuthOptions max-pk-ok:2
+PubkeyAuthOptions touch-required")))
+    (is (= 2 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok config)))
+    (is (eq :none
+            (cl-pnet-ssh:ssh-server-config-pubkey-auth-options config))))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PubkeyAuthOptions max-pk-ok:256"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PubkeyAuthOptions max-pk-ok:"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PubkeyAuthOptions bogus"))
+  (let* ((config (config-from-text
+                  "PubkeyAuthOptions max-pk-ok:2
+Match User alice
+  PubkeyAuthOptions max-pk-ok:5"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (= 5 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok alice)))
+    (is (= 2 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok bob)))))

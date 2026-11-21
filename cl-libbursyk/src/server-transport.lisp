@@ -574,6 +574,26 @@ which the transport enforces for pty and forwarding requests."
               (ssh-server-send-auth-failure session :count count)))
         (ssh-server-send-auth-failure session :count count))))
 
+(defun ssh-server-max-pubkey-ok (session)
+  "SESSION's PubkeyAuthOptions max-pk-ok budget, defaulting to sshd's 6."
+  (or (ssh-session-setting session #'ssh-server-config-max-pubkey-ok) 6))
+
+(defun ssh-server-publickey-offer-counts-p (session)
+  "Record a rejected unsigned publickey probe and say whether it counts.
+
+The first MAX-PK-OK probes do not count against MaxAuthTries, so a client
+can test keys without burning its authentication budget; later ones do."
+  (incf (ssh-session-pk-ok-failures session))
+  (> (ssh-session-pk-ok-failures session)
+     (ssh-server-max-pubkey-ok session)))
+
+(defun ssh-server-publickey-failure (session has-signature count)
+  "Refuse a publickey attempt, applying the probe budget only to offers."
+  (if has-signature
+      (ssh-server-send-auth-failure session :count count)
+      (ssh-server-send-auth-failure
+       session :count (ssh-server-publickey-offer-counts-p session))))
+
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader
                                     has-signature &key (count t))
   "Handle one publickey attempt, signed or merely offered."
@@ -581,10 +601,10 @@ which the transport enforces for pty and forwarding requests."
     ;; No AuthenticationMethods list can finish here; refuse before doing
     ;; the authorization work, as sshd's authmethod_lookup does.
     ((eq (ssh-session-auth-method-lists session) :impossible)
-     (ssh-server-send-auth-failure session :count count))
+     (ssh-server-publickey-failure session has-signature count))
     ;; sshd refuses a key that already completed a method, even its probe.
     ((ssh-server-auth-key-used-p session key-blob)
-     (ssh-server-send-auth-failure session :count count))
+     (ssh-server-publickey-failure session has-signature count))
     ((and (ssh-session-user-key-algorithm-p session key-blob algorithm)
           (ssh-session-user-key-length-p session key-blob)
           (ssh-server-authorized-key-p
@@ -598,7 +618,7 @@ which the transport enforces for pty and forwarding requests."
          ;; against MaxAuthTries because no authentication was tried.
          (ssh-server-send-pk-ok session algorithm key-blob)))
     (t
-     (ssh-server-send-auth-failure session :count count))))
+     (ssh-server-publickey-failure session has-signature count))))
 
 (defun ssh-server-user-permitted-p (session user)
   "Whether the application admits USER on SESSION.

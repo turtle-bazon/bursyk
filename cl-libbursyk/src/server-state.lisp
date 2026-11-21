@@ -142,6 +142,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   ;; "none" probe is exempt from the failure count, as in sshd.
   (auth-attempts 0)
   (auth-failures 0)
+  ;; PubkeyAuthOptions max-pk-ok: rejected unsigned publickey probes before
+  ;; they start counting against MaxAuthTries.
+  (pk-ok-failures 0)
   (allowed-users '())
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)

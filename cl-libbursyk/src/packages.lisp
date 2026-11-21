@@ -173,6 +173,8 @@
    #:ssh-server-config-host-key-files
    #:ssh-server-config-host-certificate-files
    #:ssh-server-config-authentication-methods
+   #:ssh-server-config-pubkey-auth-options
+   #:ssh-server-config-max-pubkey-ok
    #:ssh-server-config-authorized-keys-files
    #:ssh-server-config-trusted-user-ca-keys
    #:ssh-server-config-authorized-principals-file

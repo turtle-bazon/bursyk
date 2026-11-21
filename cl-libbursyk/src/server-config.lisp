@@ -201,6 +201,12 @@ socket address and has no routing domains.")
   (kex-algorithms nil)
   (host-key-algorithms nil)
   (pubkey-accepted-algorithms nil)
+  ;; PubkeyAuthOptions: NIL unset, :NONE for an explicit "none", or a list of
+  ;; :TOUCH-REQUIRED and :VERIFY-REQUIRED (which only affect FIDO keys, none
+  ;; of which this build accepts).  MAX-PUBKEY-OK is the separate probe
+  ;; budget, 0-255, with sshd's default of 6 when NIL.
+  (pubkey-auth-options nil)
+  (max-pubkey-ok nil)
   (required-rsa-size nil)
   (gateway-ports nil)
   (allow-tcp-forwarding nil)
@@ -674,6 +680,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     client-alive-interval client-alive-count-max
     force-command banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
+    pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     expose-auth-info
@@ -954,6 +961,46 @@ cannot apply per connection."
          line arguments +ssh-server-user-key-algorithms+
          (ssh-config-line-keyword line)
          :all +ssh-server-user-key-all-algorithms+)))
+      ((string= keyword "pubkeyauthoptions")
+       ;; sshd keeps the first line's flags and max-pk-ok budget but still
+       ;; validates every later line.
+       (when (null arguments)
+         (ssh-server-config-line-error
+          line "PubkeyAuthOptions needs an option"))
+       (let ((first (null (ssh-server-config-pubkey-auth-options config)))
+             (flags '())
+             (max nil)
+             (saw nil))
+         (dolist (argument arguments)
+           (cond
+             ((string-equal argument "none")
+              (setf saw t))
+             ((string-equal argument "touch-required")
+              (setf saw t)
+              (push :touch-required flags))
+             ((string-equal argument "verify-required")
+              (setf saw t)
+              (push :verify-required flags))
+             ((and (>= (length argument) 10)
+                   (string-equal "max-pk-ok:" argument :end2 10))
+              (let* ((text (subseq argument 10))
+                     (value (and (plusp (length text))
+                                 (every #'digit-char-p text)
+                                 (parse-integer text))))
+                (unless (and value (<= 0 value 255))
+                  (ssh-server-config-line-error
+                   line "bad PubkeyAuthOptions max-pk-ok value ~A" text))
+                (setf saw t max value)))
+             (t
+              (ssh-server-config-line-error
+               line "unsupported PubkeyAuthOptions option ~A" argument))))
+         (unless saw
+           (ssh-server-config-line-error
+            line "PubkeyAuthOptions needs an option"))
+         (when first
+           (setf (ssh-server-config-pubkey-auth-options config)
+                 (if flags (nreverse flags) :none)
+                 (ssh-server-config-max-pubkey-ok config) max))))
       ((string= keyword "requiredrsasize")
        (ssh-server-config-set-once
         config 'required-rsa-size

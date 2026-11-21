@@ -197,6 +197,7 @@
   ;; "none" probe and counts every refusal after it.
   (auth-attempts 0)
   (auth-failures 0)
+  (pk-ok-failures 0)
   (allowed-users '())
   ;; Connection timers, matching the pure backend's fields.
   login-grace-timer
