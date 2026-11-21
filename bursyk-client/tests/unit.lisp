@@ -201,6 +201,23 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test cancel-listen-spec-parses
+  (multiple-value-bind (address port path)
+      (burs::parse-cancel-listen "18082")
+    (is (null address))
+    (is (= 18082 port))
+    (is (null path)))
+  (multiple-value-bind (address port path)
+      (burs::parse-cancel-listen "127.0.0.1:18082")
+    (is (equal "127.0.0.1" address))
+    (is (= 18082 port))
+    (is (null path)))
+  (multiple-value-bind (address port path)
+      (burs::parse-cancel-listen "/tmp/sock")
+    (is (null address))
+    (is (null port))
+    (is (equal "/tmp/sock" path))))
+
 (test escape-filter-handles-sequences
   (let ((burs::*escape-char* #\~)
         (burs::*escape-pending* nil)

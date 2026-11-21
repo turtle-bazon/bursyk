@@ -1548,6 +1548,150 @@ closed afterwards."
             (dynamic-forward-bind-port forward)))
   (finish-output *error-output*))
 
+(defun parse-cancel-listen (spec)
+  "SPEC as (VALUES ADDRESS PORT PATH) for -KL/-KR/-KD."
+  (if (path-field-p spec)
+      (values nil nil spec)
+      (multiple-value-bind (first second) (split-host-port spec)
+        (if second
+            (values (and (plusp (length first)) first)
+                    (forwarding-port second spec) nil)
+            (values nil (forwarding-port first spec) nil)))))
+
+(defun cancel-local-forward (spec)
+  "Close the local forward matching SPEC."
+  (multiple-value-bind (address port path) (parse-cancel-listen spec)
+    (let ((forward
+            (find-if
+             (lambda (candidate)
+               (if path
+                   (and (forward-bind-path candidate)
+                        (string= path (forward-bind-path candidate)))
+                   (and (not (forward-bind-path candidate))
+                        (= port (forward-bind-port candidate))
+                        (or (null address)
+                            (null (forward-bind-address candidate))
+                            (string-equal address
+                                          (forward-bind-address candidate))))))
+             *forwards*)))
+      (when forward
+        (when (forward-listener forward)
+          (ignore-errors
+            (cl-pnet:close-listener (forward-listener forward)))
+          (setf (forward-listener forward) nil))
+        (when (forward-listener-watcher forward)
+          (cl-pnet:fd-unwatch (forward-listener-watcher forward))
+          (setf (forward-listener-watcher forward) nil))
+        (when (forward-listener-fd forward)
+          (ignore-errors
+            (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
+          (setf (forward-listener-fd forward) nil))
+        (setf *forwards* (delete forward *forwards*))
+        t))))
+
+(defun cancel-dynamic-forward (spec)
+  "Close the dynamic forward matching SPEC."
+  (multiple-value-bind (address port path) (parse-cancel-listen spec)
+    (declare (ignore path))
+    (let ((forward
+            (find-if (lambda (candidate)
+                       (and (= port (dynamic-forward-bind-port candidate))
+                            (or (null address)
+                                (null (dynamic-forward-bind-address candidate))
+                                (string-equal address
+                                              (dynamic-forward-bind-address
+                                               candidate)))))
+                     *dynamic-forwards*)))
+      (when forward
+        (when (dynamic-forward-listener forward)
+          (ignore-errors
+            (cl-pnet:close-listener (dynamic-forward-listener forward)))
+          (setf (dynamic-forward-listener forward) nil))
+        (setf *dynamic-forwards* (delete forward *dynamic-forwards*))
+        t))))
+
+(defun cancel-remote-forward (spec)
+  "Ask the server to stop the remote forward matching SPEC."
+  (multiple-value-bind (address port path) (parse-cancel-listen spec)
+    (let ((forward
+            (find-if
+             (lambda (candidate)
+               (if path
+                   (and (forward-bind-path candidate)
+                        (string= path (forward-bind-path candidate)))
+                   (and (not (forward-bind-path candidate))
+                        (= port (forward-bind-port candidate))
+                        (or (null address)
+                            (null (forward-bind-address candidate))
+                            (string-equal address
+                                          (forward-bind-address candidate))))))
+             *remote-forwards*)))
+      (when forward
+        (setf *remote-forwards* (delete forward *remote-forwards*))
+        (if path
+            (cl-pnet-ssh:ssh-client-send-global-request
+             *client* "cancel-streamlocal-forward@openssh.com"
+             :fields (lambda (writer)
+                       (cl-pnet-ssh::ssh-write-text writer path)))
+            (cl-pnet-ssh:ssh-client-send-global-request
+             *client* "cancel-tcpip-forward"
+             :fields (lambda (writer)
+                       (cl-pnet-ssh::ssh-write-text
+                        writer (or (forward-bind-address forward) ""))
+                       (cl-pnet-ssh::ssh-write-u32
+                        writer (forward-bind-port forward)))))
+        t))))
+
+(defun execute-escape-command (line)
+  "Run one ~C command line."
+  (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
+    (cond
+      ((zerop (length line)) nil)
+      ((member line '("h" "help" "?") :test #'string=)
+       (format *error-output*
+               "~%Commands:~%  -L[bind:]port:host:hostport  request local forward~%  -R[bind:]port:host:hostport  request remote forward~%  -D[bind:]port                 request dynamic forward~%  -KL[bind:]port or -KL path   cancel local forward~%  -KR[bind:]port or -KR path   cancel remote forward~%  -KD[bind:]port               cancel dynamic forward~%  h/help/?                     this message~%")
+       (finish-output *error-output*))
+      ((and (> (length line) 1) (char= (char line 0) #\-))
+       (let* ((letter (char line 1))
+              (rest (string-trim '(#\Space #\Tab) (subseq line 2)))
+              (cancel (and (char-equal letter #\K)
+                           (plusp (length rest))
+                           (member (char rest 0) '(#\L #\R #\D)))))
+         (cond
+           ((and cancel (char-equal (char rest 0) #\L))
+            (cancel-local-forward (subseq rest 1)))
+           ((and cancel (char-equal (char rest 0) #\R))
+            (cancel-remote-forward (subseq rest 1)))
+           ((and cancel (char-equal (char rest 0) #\D))
+            (cancel-dynamic-forward (subseq rest 1)))
+           ((char-equal letter #\L)
+            (start-local-forward *client* (parse-local-forward rest)))
+           ((char-equal letter #\R)
+            (start-remote-forward *client* (parse-remote-forward rest)))
+           ((char-equal letter #\D)
+            (start-dynamic-forward *client* (parse-dynamic-forward rest)))
+           (t
+            (format *error-output* "~%Unknown escape command ~A~%" line)
+            (finish-output *error-output*)))))
+      (t
+       (format *error-output* "~%Unknown escape command ~A~%" line)
+       (finish-output *error-output*)))))
+
+(defun escape-commandline ()
+  "Read and run one command from the interactive escape command line."
+  (restore-terminal)
+  (unwind-protect
+       (progn
+         (format *error-output* "~%burs> ")
+         (finish-output *error-output*)
+         (let ((line (read-line *standard-input* nil nil)))
+           (when line
+             (handler-case (execute-escape-command line)
+               (error (condition)
+                 (format *error-output* "~%burs: ~A~%" condition)
+                 (finish-output *error-output*))))))
+    (terminal-enter-raw)))
+
 (defun config-log-level (client)
   "CLIENT's LogLevel as a lowercase name, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2482,10 +2626,7 @@ of calling back in the middle of authentication."
                (finish *status*))
              *escape-commandline-function*
              (when (escape-commandline-enabled-p client)
-               (lambda ()
-                 (format *error-output*
-                         "~%The escape command line is not implemented.~%")
-                 (finish-output *error-output*)))))
+               #'escape-commandline)))
      (start-forwards client)
      (when (and (config-local-command client)
                 (permit-local-command-p client))
