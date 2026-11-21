@@ -2171,6 +2171,11 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (format t "fingerprinthash ~A~%"
+            (string-upcase
+             (symbol-name
+              (or (cl-pnet-ssh:ssh-config-options-fingerprint-hash options)
+                  :sha256))))
     (format t "loglevel ~A~%"
             (string-upcase
              (or (cl-pnet-ssh:ssh-config-options-log-level options)

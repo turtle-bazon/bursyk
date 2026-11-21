@@ -191,6 +191,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  ca-signature-algorithms
                                  (revoked-host-keys '())
                                  hash-known-hosts
+                                 (fingerprint-hash :sha256)
                                  (tcp-keep-alive t)
                                  set-env
                                  (connection-attempts 1)
@@ -217,6 +218,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :ca-signature-algorithms ca-signature-algorithms
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
+                    :fingerprint-hash fingerprint-hash
                     :tcp-keep-alive tcp-keep-alive
                     :set-env set-env
                     :connection-attempts connection-attempts
@@ -282,6 +284,7 @@ is applied here, before any request names a key the configuration forbade."
                              ca-signature-algorithms
                              (revoked-host-keys '())
                              hash-known-hosts
+                             (fingerprint-hash :sha256)
                              (tcp-keep-alive t)
                              set-env
                              (connection-attempts 1)
@@ -345,6 +348,7 @@ role-neutral."
                            :ca-signature-algorithms ca-signature-algorithms
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
+                           :fingerprint-hash fingerprint-hash
                            :tcp-keep-alive tcp-keep-alive
                            :set-env set-env
                            :connection-attempts connection-attempts
@@ -360,4 +364,5 @@ role-neutral."
 (defun ssh-client-host-key-fingerprint (client)
   "The fingerprint of the key the server presented, once the KEX has seen it."
   (let ((blob (ssh-client-host-key-blob client)))
-    (and blob (ssh-key-fingerprint blob))))
+    (and blob (ssh-key-fingerprint
+               blob (ssh-client-fingerprint-hash client)))))

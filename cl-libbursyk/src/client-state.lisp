@@ -61,6 +61,8 @@
   (revoked-host-keys '())
   ;; HashKnownHosts: write new known_hosts entries as salted hashes.
   (hash-known-hosts nil)
+  ;; FingerprintHash: the digest used when showing a key fingerprint.
+  (fingerprint-hash :sha256)
   ;; TCPKeepAlive: keep the transport's keepalive probes on, ssh's default.
   (tcp-keep-alive t)
   ;; SetEnv: NAME=VALUE assignments to send on every session.

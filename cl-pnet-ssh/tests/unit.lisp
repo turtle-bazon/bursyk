@@ -2730,6 +2730,40 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test fingerprints-obey-the-hash-choice
+  (let ((blob (ssh-random-octets 32)))
+    (is (eql 0 (search "SHA256:" (ssh-key-fingerprint blob))))
+    (let ((md5 (ssh-key-fingerprint blob :md5)))
+      (is (eql 0 (search "MD5:" md5)))
+      ;; MD5: plus sixteen two-hex groups and their separators.
+      (is (= 16 (count #\: md5))))))
+
+(test fingerprint-hash-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "FingerprintHash md5"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq :md5 (ssh-config-options-fingerprint-hash options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-fingerprint-hash options))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "FingerprintHash sha1"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test log-level-and-log-verbose-parse
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

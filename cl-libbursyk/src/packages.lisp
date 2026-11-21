@@ -151,6 +151,7 @@
    #:ssh-config-options-known-hosts
    #:ssh-config-options-global-known-hosts
    #:ssh-config-options-hash-known-hosts
+   #:ssh-config-options-fingerprint-hash
    #:ssh-config-options-revoked-host-keys
    #:ssh-config-options-strict-host-key-checking
    #:ssh-config-options-send-env

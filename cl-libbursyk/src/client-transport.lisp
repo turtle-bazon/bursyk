@@ -347,7 +347,7 @@ certificate, its plain key or its CA refuses it without that fallback."
            :detail (format nil
                            "the host key for ~A has an RSA modulus below RequiredRSASize"
                            (ssh-client-host-spec client))
-           :fingerprint (ssh-key-fingerprint host-key)))
+           :fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
   (let ((revoked
           (handler-case
               (ssh-key-revoked-p host-key
@@ -356,12 +356,12 @@ certificate, its plain key or its CA refuses it without that fallback."
               (error 'ssh-host-key-error
                      :detail (format nil "cannot check RevokedHostKeys: ~A"
                                      condition)
-                     :fingerprint (ssh-key-fingerprint host-key))))))
+                     :fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client)))))))
     (when revoked
       (error 'ssh-host-key-error
              :detail (format nil "the host key for ~A is revoked"
                              (ssh-client-host-spec client))
-             :fingerprint (ssh-key-fingerprint host-key))))
+             :fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client)))))
   (let ((certificate (and (ssh-certificate-blob-p host-key)
                           (ssh-certificate-parse host-key))))
     (cond
@@ -371,7 +371,7 @@ certificate, its plain key or its CA refuses it without that fallback."
        (error 'ssh-host-key-error
               :detail (format nil "the host key for ~A is revoked"
                               (ssh-client-host-spec client))
-              :fingerprint (ssh-key-fingerprint host-key)))
+              :fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
       ((and certificate
             (ssh-client-host-certificate-trusted-p client certificate))
        t)
@@ -381,7 +381,7 @@ certificate, its plain key or its CA refuses it without that fallback."
       (t
        (let* ((host (ssh-client-host-spec client))
               (status (ssh-client-known-host-status client host-key))
-              (fingerprint (ssh-key-fingerprint host-key)))
+              (fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
          (ecase status
            (:match t)
            (:mismatch

@@ -153,6 +153,8 @@ MAKE-SSH-CLIENT's own defaults."
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
         (ssh-config-options-hash-known-hosts options)
+        :fingerprint-hash
+        (or (ssh-config-options-fingerprint-hash options) :sha256)
         :tcp-keep-alive (ssh-config-options-tcp-keep-alive options)
         :set-env (ssh-config-options-set-env options)
         :connection-attempts
@@ -443,6 +445,7 @@ uses whichever of the two it saw first instead of chaining them."
            :ca-signature-algorithms (getf parameters :ca-signature-algorithms)
            :revoked-host-keys (getf parameters :revoked-host-keys)
            :hash-known-hosts (getf parameters :hash-known-hosts)
+           :fingerprint-hash (getf parameters :fingerprint-hash)
            :tcp-keep-alive (getf parameters :tcp-keep-alive)
            :set-env (getf parameters :set-env)
            :connection-attempts (getf parameters :connection-attempts)

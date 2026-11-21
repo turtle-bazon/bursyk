@@ -38,12 +38,19 @@
 (defun ssh-base64-octets (string)
   (cl-base64:base64-string-to-usb8-array string))
 
-(defun ssh-key-fingerprint (key-blob)
-  "OpenSSH's SHA256 fingerprint of KEY-BLOB: SHA256:base64, unpadded."
-  (let* ((digest (ssh-hash :sha256 key-blob))
-         (text (ssh-octets-base64 digest)))
-    (concatenate 'string "SHA256:"
-                 (string-right-trim '(#\=) text))))
+(defun ssh-key-fingerprint (key-blob &optional (hash :sha256))
+  "OpenSSH's fingerprint of KEY-BLOB.
+
+HASH is :SHA256 for the modern SHA256:base64 form, or :MD5 for the legacy
+MD5:aa:bb:... form."
+  (let ((digest (ssh-hash hash key-blob)))
+    (ecase hash
+      (:sha256
+       (concatenate 'string "SHA256:"
+                    (string-right-trim
+                     '(#\=) (ssh-octets-base64 digest))))
+      (:md5
+       (format nil "MD5:~{~2,'0x~^:~}" (coerce digest 'list))))))
 
 (defun ssh-public-key-parts (key-blob)
   "KEY-BLOB as (VALUES TYPE DATA), where DATA is the type-specific octets.

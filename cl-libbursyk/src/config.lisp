@@ -53,6 +53,9 @@ relative Include is anchored here.")
   (known-hosts nil)
   (global-known-hosts nil)
   (hash-known-hosts nil)
+  ;; FingerprintHash: :SHA256 (the default) or :MD5 for displayed
+  ;; fingerprints.
+  (fingerprint-hash nil)
   ;; RevokedHostKeys: files of host keys and certificates that may not be
   ;; used, in the order read; NONE clears the list.
   (revoked-host-keys '())
@@ -832,6 +835,17 @@ understand them rather than silently match nothing."
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
                   (if (eq paths :none) nil paths))))))
+      ((string= keyword "fingerprinthash")
+       (ssh-config-set-once
+        seen options :fingerprint-hash
+        (lambda (options)
+          (let ((value (string-downcase (ssh-config-arg line))))
+            (unless (member value '("sha256" "md5") :test #'string=)
+              (error (ssh-config-line-error line
+                                            "invalid FingerprintHash ~S"
+                                            value)))
+            (setf (ssh-config-options-fingerprint-hash options)
+                  (intern (string-upcase value) :keyword))))))
       ((string= keyword "hashknownhosts")
        (ssh-config-set-once
         seen options :hash-known-hosts
@@ -1161,7 +1175,8 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
-                         "hashknownhosts" "revokedhostkeys"
+                         "hashknownhosts" "fingerprinthash"
+                         "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"
                          "addressfamily" "batchmode")
