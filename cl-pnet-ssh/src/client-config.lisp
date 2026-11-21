@@ -120,7 +120,9 @@ overrides.  NIL leaves the decision to the config and then to
 MAKE-SSH-CLIENT's own defaults."
   (list :host host
         :connect-host (or (ssh-config-options-hostname options) host)
-        :host-key-host (or (ssh-config-options-hostname options) host)
+        :host-key-host (or (ssh-config-options-host-key-alias options)
+                           (ssh-config-options-hostname options)
+                           host)
         :port (or port (ssh-config-options-port options) 22)
         :user (or user (ssh-config-options-user options) (ssh-default-user))
         :private-key (ssh-config-client-identities options private-key)

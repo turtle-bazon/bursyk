@@ -2005,6 +2005,9 @@ peer that connected to it; NIL refuses the channel."
                        host)))
     (format t "host ~A~%" host)
     (format t "hostname ~A~%" hostname)
+    (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
+      (when alias
+        (format t "hostkeyalias ~A~%" alias)))
     (format t "user ~A~%"
             (or (cl-pnet-ssh:ssh-config-options-user options)
                 (getf *options* :user)

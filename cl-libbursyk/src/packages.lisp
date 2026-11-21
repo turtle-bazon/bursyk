@@ -143,6 +143,7 @@
    #:ssh-config-options-port
    #:ssh-config-options-identity-files
    #:ssh-config-options-identity-agent
+   #:ssh-config-options-host-key-alias
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts
    #:ssh-config-options-global-known-hosts

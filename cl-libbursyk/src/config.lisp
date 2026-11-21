@@ -47,6 +47,8 @@ relative Include is anchored here.")
   (identity-files nil)
   (certificate-files nil)
   (identity-agent nil)
+  ;; HostKeyAlias: the name known_hosts is checked and written under.
+  (host-key-alias nil)
   (identities-only nil)
   (known-hosts nil)
   (global-known-hosts nil)
@@ -748,6 +750,12 @@ understand them rather than silently match nothing."
         seen options :user
         (lambda (options)
           (setf (ssh-config-options-user options)
+                (ssh-config-expand-variables (ssh-config-arg line))))))
+      ((string= keyword "hostkeyalias")
+       (ssh-config-set-once
+        seen options :host-key-alias
+        (lambda (options)
+          (setf (ssh-config-options-host-key-alias options)
                 (ssh-config-expand-variables (ssh-config-arg line)))))))))
 
 (defun ssh-config-apply-identity (line options seen context)
@@ -1058,7 +1066,8 @@ understand them rather than silently match nothing."
   "Apply one non-block directive when the current block is selected."
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
-      ((member keyword '("hostname" "port" "user") :test #'string=)
+      ((member keyword '("hostname" "port" "user" "hostkeyalias")
+               :test #'string=)
        (ssh-config-apply-address line options seen context))
       ((member keyword '("identityfile" "certificatefile" "identityagent"
                          "identitiesonly")

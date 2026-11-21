@@ -2730,6 +2730,22 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test host-key-alias-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HostKeyAlias myalias"))))
+         (options nil))
+    (ssh-config-resolve config "example.org"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "myalias" (ssh-config-options-host-key-alias options)))
+    ;; The alias is what known_hosts and host certificates are checked under.
+    (is (equal "myalias"
+               (getf (cl-pnet-ssh::ssh-config-client-parameters
+                      "example.org" options)
+                     :host-key-host)))))
+
 (test connection-attempts-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
