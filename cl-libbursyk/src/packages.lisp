@@ -12,6 +12,8 @@
    #:ssh-client-send-env
    #:ssh-client-set-env
    #:ssh-client-host-key-fingerprint
+   #:ssh-client-host-key-randomart
+   #:ssh-client-host-key-known
    #:ssh-client-server-version
    #:ssh-client-banner
    #:ssh-client-connect-host
@@ -153,6 +155,7 @@
    #:ssh-config-options-global-known-hosts
    #:ssh-config-options-hash-known-hosts
    #:ssh-config-options-fingerprint-hash
+   #:ssh-config-options-visual-host-key
    #:ssh-config-options-revoked-host-keys
    #:ssh-config-options-strict-host-key-checking
    #:ssh-config-options-send-env
@@ -342,6 +345,7 @@
    #:ssh-known-host-status
    #:ssh-remember-known-host
    #:ssh-key-fingerprint
+   #:ssh-key-randomart
    #:ssh-load-known-hosts
    ;; keys (useful to applications that pass a parsed key)
    #:ssh-private-key

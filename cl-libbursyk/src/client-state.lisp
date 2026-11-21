@@ -63,6 +63,11 @@
   (hash-known-hosts nil)
   ;; FingerprintHash: the digest used when showing a key fingerprint.
   (fingerprint-hash :sha256)
+  ;; VisualHostKey: show the randomart picture once connected.
+  (visual-host-key nil)
+  ;; Whether the host key was already trusted before this connection; ssh
+  ;; shows randomart only for a key that was not just added.
+  (host-key-known nil)
   ;; IPQoS: DSCP values for interactive and bulk traffic; :NONE leaves the
   ;; operating system default.
   (ip-qos-interactive #xb8)

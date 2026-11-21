@@ -52,6 +52,82 @@ MD5:aa:bb:... form."
       (:md5
        (format nil "MD5:~{~2,'0x~^:~}" (coerce digest 'list))))))
 
+(defun ssh-key-randomart-title (key-blob)
+  "The [TYPE SIZE] title OpenSSH puts over a randomart field."
+  (multiple-value-bind (type data)
+      (ssh-public-key-parts (ssh-key-plain-blob key-blob))
+    (declare (ignore data))
+    (let ((name (cond
+                  ((string= type "ssh-ed25519") "ED25519")
+                  ((string= type "ssh-rsa") "RSA")
+                  ((member type '("ecdsa-sha2-nistp256"
+                                  "ecdsa-sha2-nistp384"
+                                  "ecdsa-sha2-nistp521")
+                           :test #'string=)
+                   "ECDSA")
+                  (t (string-upcase type))))
+          (size (cond
+                  ((string= type "ssh-ed25519") 256)
+                  ((string= type "ssh-rsa")
+                   (ssh-rsa-public-key-bits key-blob))
+                  ((string= type "ecdsa-sha2-nistp256") 256)
+                  ((string= type "ecdsa-sha2-nistp384") 384)
+                  ((string= type "ecdsa-sha2-nistp521") 521)
+                  (t 0))))
+      (when (and (ssh-certificate-blob-p key-blob)
+                 (not (search "-CERT" name)))
+        (setf name (concatenate 'string name "-CERT")))
+      (format nil "[~A~@[ ~D~]]" name size))))
+
+(defun ssh-key-randomart (key-blob &optional (hash :sha256))
+  "OpenSSH's randomart picture of KEY-BLOB's HASH digest."
+  (let* ((digest (ssh-hash hash key-blob))
+         (width 17)
+         (height 9)
+         (field (make-array (list width height) :initial-element 0))
+         (augmentation " .o+=*BOX@%&#/^SE")
+         (len (1- (length augmentation)))
+         (x (floor width 2))
+         (y (floor height 2)))
+    (loop for octet across digest
+          do (let ((input octet))
+               (dotimes (bit 4)
+                 (declare (ignore bit))
+                 (incf x (if (logbitp 0 input) 1 -1))
+                 (incf y (if (logbitp 1 input) 1 -1))
+                 (setf x (max 0 (min (1- width) x))
+                       y (max 0 (min (1- height) y)))
+                 (when (< (aref field x y) (- len 2))
+                   (incf (aref field x y)))
+                 (setf input (ash input -2)))))
+    (setf (aref field (floor width 2) (floor height 2)) (1- len)
+          (aref field x y) len)
+    (let ((title (ssh-key-randomart-title key-blob))
+          (hash-title (format nil "[~A]"
+                              (string-upcase (symbol-name hash)))))
+      (flet ((border (label)
+               (let* ((label (if (> (length label) width)
+                                 (subseq label 0 width)
+                                 label))
+                      (left (floor (- width (length label)) 2)))
+                 (concatenate 'string
+                              "+"
+                              (make-string left :initial-element #\-)
+                              label
+                              (make-string (- width (length label) left)
+                                           :initial-element #\-)
+                              "+"))))
+        (with-output-to-string (out)
+          (write-line (border title) out)
+          (dotimes (row height)
+            (write-char #\| out)
+            (dotimes (column width)
+              (write-char (char augmentation
+                                (min (aref field column row) len))
+                          out))
+            (write-line "|" out))
+          (write-string (border hash-title) out))))))
+
 (defun ssh-public-key-parts (key-blob)
   "KEY-BLOB as (VALUES TYPE DATA), where DATA is the type-specific octets.
 

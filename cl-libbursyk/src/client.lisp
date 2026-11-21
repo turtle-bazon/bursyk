@@ -192,6 +192,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  (revoked-host-keys '())
                                  hash-known-hosts
                                  (fingerprint-hash :sha256)
+                                 visual-host-key
                                  (ip-qos-interactive #xb8)
                                  (ip-qos-bulk :none)
                                  (tcp-keep-alive t)
@@ -221,6 +222,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
                     :fingerprint-hash fingerprint-hash
+                    :visual-host-key visual-host-key
                     :ip-qos-interactive ip-qos-interactive
                     :ip-qos-bulk ip-qos-bulk
                     :tcp-keep-alive tcp-keep-alive
@@ -289,6 +291,7 @@ is applied here, before any request names a key the configuration forbade."
                              (revoked-host-keys '())
                              hash-known-hosts
                              (fingerprint-hash :sha256)
+                             visual-host-key
                              (ip-qos-interactive #xb8)
                              (ip-qos-bulk :none)
                              (tcp-keep-alive t)
@@ -355,6 +358,7 @@ role-neutral."
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
                            :fingerprint-hash fingerprint-hash
+                           :visual-host-key visual-host-key
                            :ip-qos-interactive ip-qos-interactive
                            :ip-qos-bulk ip-qos-bulk
                            :tcp-keep-alive tcp-keep-alive
@@ -368,6 +372,12 @@ role-neutral."
   (ssh-client-send-disconnect client)
   (ssh-client-finish client :client-closed :close)
   client)
+
+(defun ssh-client-host-key-randomart (client)
+  "The randomart picture of CLIENT's host key, once KEX has seen it."
+  (let ((blob (ssh-client-host-key-blob client)))
+    (and blob (ssh-key-randomart
+               blob (ssh-client-fingerprint-hash client)))))
 
 (defun ssh-client-host-key-fingerprint (client)
   "The fingerprint of the key the server presented, once the KEX has seen it."

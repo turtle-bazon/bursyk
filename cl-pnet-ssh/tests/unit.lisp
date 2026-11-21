@@ -2770,6 +2770,34 @@ newline")))
                                     (setf failure condition)))
     (is (typep failure 'ssh-config-error))))
 
+(test randomart-draws-a-field
+  (let* ((blob (ssh-make-public-key-blob "ssh-ed25519"
+                                         (ssh-random-octets 32)))
+         (art (ssh-key-randomart blob))
+         (lines (uiop:split-string art :separator '(#\Newline))))
+    (is (= 11 (length lines)))
+    (is (every (lambda (line) (= 19 (length line))) lines))
+    (is (char= #\+ (char (first lines) 0)))
+    (is (char= #\+ (char (car (last lines)) 0)))
+    (is (search "[ED25519 256]" (first lines)))
+    (is (search "[SHA256]" (car (last lines))))))
+
+(test visual-host-key-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "VisualHostKey yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-visual-host-key options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-visual-host-key options)))))
+
 (test fingerprints-obey-the-hash-choice
   (let ((blob (ssh-random-octets 32)))
     (is (eql 0 (search "SHA256:" (ssh-key-fingerprint blob))))

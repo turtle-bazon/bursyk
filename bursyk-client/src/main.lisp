@@ -2182,6 +2182,10 @@ peer that connected to it; NIL refuses the channel."
                (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
               (ip-qos-name
                (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
+    (format t "visualhostkey ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-visual-host-key options)
+                "yes"
+                "no"))
     (format t "fingerprinthash ~A~%"
             (string-upcase
              (symbol-name
@@ -2324,6 +2328,21 @@ peer that connected to it; NIL refuses the channel."
             port
             (fail "invalid port ~A" value))))))
 
+(defun show-visual-host-key (client)
+  "Print the host key randomart when VisualHostKey asks for it."
+  (when (and client
+             (cl-pnet-ssh:ssh-client-host-key-known client)
+             (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+               (and options
+                    (cl-pnet-ssh:ssh-config-options-visual-host-key options))))
+    (let ((fingerprint
+            (cl-pnet-ssh:ssh-client-host-key-fingerprint client))
+          (randomart (cl-pnet-ssh:ssh-client-host-key-randomart client)))
+      (when (and fingerprint randomart)
+        (format *error-output* "Host key fingerprint is ~A~%~A~%"
+                fingerprint randomart)
+        (finish-output *error-output*)))))
+
 (defun show-banner (client)
   "Print the server's authentication banner, once, as OpenSSH does.
 
@@ -2370,6 +2389,7 @@ of calling back in the middle of authentication."
          (setf command (expand-remote-command client remote)
                command-given-p t)))
      (show-banner client)
+     (show-visual-host-key client)
      (cl-pnet-ssh:ssh-client-set-ip-qos
       client (request-tty-p client command-given-p))
      (start-forwards client)

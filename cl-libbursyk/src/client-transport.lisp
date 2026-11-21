@@ -390,6 +390,7 @@ certificate, its plain key or its CA refuses it without that fallback."
               :fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
       ((and certificate
             (ssh-client-host-certificate-trusted-p client certificate))
+       (setf (ssh-client-host-key-known client) t)
        t)
       (certificate
        (ssh-client-verify-host-key
@@ -399,12 +400,15 @@ certificate, its plain key or its CA refuses it without that fallback."
               (status (ssh-client-known-host-status client host-key))
               (fingerprint (ssh-key-fingerprint host-key (ssh-client-fingerprint-hash client))))
          (ecase status
-           (:match t)
+           (:match
+            (setf (ssh-client-host-key-known client) t)
+            t)
            (:mismatch
             (error 'ssh-host-key-error
                    :detail (format nil "the host key for ~A changed" host)
                    :fingerprint fingerprint))
            (:unknown
+            (setf (ssh-client-host-key-known client) nil)
             (ssh-client-accept-unknown-host-key
              client host-key fingerprint))))))))
 
