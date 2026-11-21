@@ -201,6 +201,14 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test clear-all-forwardings-reads-the-config
+  (let* ((client (cl-pnet-ssh::%make-ssh-client))
+         (options (cl-pnet-ssh::%make-ssh-config-options
+                   :clear-all-forwardings t)))
+    (is (null (burs::clear-all-forwardings-p client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client) options)
+    (is (burs::clear-all-forwardings-p client))))
+
 (test session-type-and-stdin-null-read-the-config
   (let* ((client (cl-pnet-ssh::%make-ssh-client))
          (options (cl-pnet-ssh::%make-ssh-config-options

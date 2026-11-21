@@ -157,6 +157,7 @@
    #:ssh-config-options-address-family
    #:ssh-config-options-gateway-ports
    #:ssh-config-options-exit-on-forward-failure
+   #:ssh-config-options-clear-all-forwardings
    #:ssh-config-options-tcp-keep-alive
    #:ssh-config-options-connection-attempts
    #:ssh-config-options-required-rsa-size

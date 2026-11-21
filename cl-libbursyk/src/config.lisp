@@ -99,6 +99,7 @@ relative Include is anchored here.")
   ;; this client creates; OpenSSH's defaults are 0177 and no.
   (streamlocal-bind-mask nil)
   (streamlocal-bind-unlink nil)
+  (clear-all-forwardings nil)
   (local-forwards nil)
   (remote-forwards nil)
   (dynamic-forwards nil)
@@ -1016,6 +1017,9 @@ understand them rather than silently match nothing."
         ((string= keyword "exitonforwardfailure")
          (setf (ssh-config-options-exit-on-forward-failure options)
                (boolean)))
+        ((string= keyword "clearallforwardings")
+         (setf (ssh-config-options-clear-all-forwardings options)
+               (boolean)))
         ((member keyword '("tcpkeepalive" "keepalive") :test #'string=)
          (setf (ssh-config-options-tcp-keep-alive options) (boolean)))
         ((string= keyword "refuseconnection")
@@ -1089,6 +1093,7 @@ understand them rather than silently match nothing."
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
                          "gatewayports" "exitonforwardfailure"
+                         "clearallforwardings"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
                          "sessiontype" "stdinnull"

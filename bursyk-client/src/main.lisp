@@ -1524,6 +1524,12 @@ closed afterwards."
                     (cl-pnet-ssh:ssh-config-options-stdin-null
                      options)))))))
 
+(defun clear-all-forwardings-p (client)
+  "Whether ClearAllForwardings discards every configured forward."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-clear-all-forwardings options))))
+
 (defun exit-on-forward-failure-p (client)
   "Whether ExitOnForwardFailure asks this client to exit on a failed forward."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -1918,6 +1924,8 @@ peer that connected to it; NIL refuses the channel."
     forward))
 
 (defun start-forwards (client)
+  (when (clear-all-forwardings-p client)
+    (return-from start-forwards nil))
   (dolist (forward (append (configured-local-forwards client)
                            (getf *options* :local-forward)))
     (start-local-forward client forward))
@@ -2039,6 +2047,11 @@ peer that connected to it; NIL refuses the channel."
      (or (cl-pnet-ssh:ssh-config-options-known-hosts options)
          (and (getf *options* :known-hosts)
               (list (getf *options* :known-hosts)))))
+    (format t "clearallforwardings ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-clear-all-forwardings
+                 options)
+                "yes"
+                "no"))
     (format t "connectionattempts ~D~%"
             (or (cl-pnet-ssh:ssh-config-options-connection-attempts options)
                 1))
