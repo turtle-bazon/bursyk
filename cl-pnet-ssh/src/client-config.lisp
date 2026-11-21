@@ -145,6 +145,9 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-client-algorithms
          options #'ssh-config-options-pubkey-accepted-algorithms
          +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms")
+        :required-rsa-size
+        (or (ssh-config-options-required-rsa-size options)
+            +ssh-rsa-minimum-modulus-size+)
         :host-key-policy (or host-key-policy
                              (and (null host-key-callback)
                                   (ssh-config-client-policy options)))
@@ -420,6 +423,7 @@ uses whichever of the two it saw first instead of chaining them."
            :macs (getf parameters :macs)
            :pubkey-accepted-algorithms
            (getf parameters :pubkey-accepted-algorithms)
+           :required-rsa-size (getf parameters :required-rsa-size)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)
            :server-alive-count-max (getf parameters :server-alive-count-max)

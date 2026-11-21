@@ -2706,6 +2706,28 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test required-rsa-size-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "RequiredRSASize 2048"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (= 2048 (ssh-config-options-required-rsa-size options)))
+    (is (= 2048 (getf (cl-pnet-ssh::ssh-config-client-parameters
+                       "alias" options)
+                      :required-rsa-size))))
+  ;; Unset means OpenSSH's default floor of 1024.
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (= 1024 (getf (cl-pnet-ssh::ssh-config-client-parameters
+                       "alias" options)
+                      :required-rsa-size)))))
+
 (test stream-local-bind-options-parse
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
@@ -3851,6 +3873,54 @@ too, and a refused policy never calls it."
     (is (= 0 (ssh-read-u32 reader)))
     ;; Nothing is sent before the transport is ready.
     (is (eq :connecting (cl-pnet-ssh:ssh-client-phase client)))))
+
+(test client-keys-obey-required-rsa-size
+  "RequiredRSASize rejects small RSA host keys and authentication keys."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((directory (ssh-test-directory "cl-pnet-ssh-client-rsasize")))
+        (unwind-protect
+             (let* ((short (merge-pathnames "rsa-1024" directory))
+                    (long (merge-pathnames "rsa-2048" directory))
+                    (ed25519 (merge-pathnames "ed25519" directory)))
+               (ensure-directories-exist short)
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "1024" "-N" ""
+                                 "-f" (namestring short)))
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring long)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ed25519)))
+               (let* ((short-key (ssh-load-private-key short))
+                      (long-key (ssh-load-private-key long))
+                      (ed-key (ssh-load-private-key ed25519))
+                      (signers
+                        (list (ssh-private-key-signer short-key)
+                              (ssh-private-key-signer long-key)
+                              (ssh-private-key-signer ed-key))))
+                 ;; A 2048-bit floor leaves the large RSA key and ed25519.
+                 (let ((kept (cl-pnet-ssh::ssh-filter-signers
+                              signers nil :minimum-rsa-size 2048)))
+                   (is (= 2 (length kept)))
+                   (is (member (second signers) kept :test #'eq))
+                   (is (member (third signers) kept :test #'eq)))
+                 ;; The default floor, 1024, keeps every key here.
+                 (is (= 3
+                        (length (cl-pnet-ssh::ssh-filter-signers
+                                 signers nil :minimum-rsa-size 1024))))
+                 ;; A small RSA host key is refused before any policy runs.
+                 (let ((client (cl-pnet-ssh::%make-ssh-client
+                                :host "example.org"
+                                :known-hosts '()
+                                :host-key-policy :insecure
+                                :required-rsa-size 2048)))
+                   (signals ssh-host-key-error
+                     (cl-pnet-ssh::ssh-client-verify-host-key
+                      client (ssh-public-key-blob-of short-key)))
+                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
+                              client (ssh-public-key-blob-of long-key))))
+                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
+                              client (ssh-public-key-blob-of ed-key)))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test client-accepts-a-forwarded-streamlocal-channel
   "A requested path is accepted and handed to the application's setup hook;

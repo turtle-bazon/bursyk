@@ -333,6 +333,13 @@ names its CA and the certificate itself checks out.  Otherwise OpenSSH
 drops the certificate and checks the plain key it certifies, so a host with
 only a plain known_hosts entry still connects.  A @revoked line for the
 certificate, its plain key or its CA refuses it without that fallback."
+  (unless (ssh-key-rsa-size-allowed-p
+           host-key (ssh-client-required-rsa-size client))
+    (error 'ssh-host-key-error
+           :detail (format nil
+                           "the host key for ~A has an RSA modulus below RequiredRSASize"
+                           (ssh-client-host-spec client))
+           :fingerprint (ssh-key-fingerprint host-key)))
   (let ((certificate (and (ssh-certificate-blob-p host-key)
                           (ssh-certificate-parse host-key))))
     (cond

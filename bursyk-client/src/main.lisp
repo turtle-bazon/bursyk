@@ -1986,6 +1986,14 @@ peer that connected to it; NIL refuses the channel."
                   (:insecure "no")
                   (:accept-new "accept-new")
                   (t "yes"))))
+    (format t "requiredrsasize ~D~%"
+            (or (cl-pnet-ssh:ssh-config-options-required-rsa-size options)
+                cl-pnet-ssh::+ssh-rsa-minimum-modulus-size+))
+    (format t "streamlocalbindunlink ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
+                 options)
+                "yes"
+                "no"))
     (print-list-option "sendenv"
                        (cl-pnet-ssh:ssh-config-options-send-env options))
     (print-list-option

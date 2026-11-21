@@ -54,6 +54,9 @@
   ;; PubkeyAcceptedAlgorithms: key types that may authenticate.  NIL offers
   ;; every signer; a list of patterns filters them before the first request.
   (pubkey-accepted-algorithms nil)
+  ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
+  ;; authentication key, as ssh's RequiredRSASize directive sets it.
+  (required-rsa-size +ssh-rsa-minimum-modulus-size+)
   ;; ProxyCommand: a helper program carrying the stream on its stdin/stdout.
   ;; NIL means dial the address directly.
   proxy-command

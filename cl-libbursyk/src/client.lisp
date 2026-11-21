@@ -169,7 +169,9 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                on-open on-error on-close on-forwarded-tcpip
                                on-forwarded-streamlocal
                                &key kex-algorithms host-key-algorithms
-                                 ciphers macs pubkey-accepted-algorithms)
+                                 ciphers macs pubkey-accepted-algorithms
+                                 (required-rsa-size
+                                  +ssh-rsa-minimum-modulus-size+))
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -188,22 +190,28 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :ciphers ciphers
                     :macs macs
                     :pubkey-accepted-algorithms pubkey-accepted-algorithms
+                    :required-rsa-size required-rsa-size
                     :on-open on-open
                     :on-error on-error
                     :on-close on-close
                     :on-forwarded-tcpip on-forwarded-tcpip
                     :on-forwarded-streamlocal on-forwarded-streamlocal))
 
-(defun ssh-filter-signers (signers patterns)
-  "SIGNERS whose type matches one of PATTERNS, or SIGNERS when PATTERNS is NIL."
-  (if (null patterns)
-      signers
-      (remove-if-not
-       (lambda (signer)
-         (let ((type (ssh-signer-type signer)))
-           (some (lambda (pattern) (ssh-match-pattern pattern type))
-                 patterns)))
-       signers)))
+(defun ssh-filter-signers (signers patterns &key minimum-rsa-size)
+  "SIGNERS whose type matches PATTERNS and whose RSA modulus is large enough.
+
+A NIL PATTERNS list leaves every type eligible.  MINIMUM-RSA-SIZE is
+RequiredRSASize: it only rejects RSA keys below the floor, as ssh does."
+  (remove-if
+   (lambda (signer)
+     (or (and patterns
+              (not (some (lambda (pattern)
+                           (ssh-match-pattern pattern
+                                              (ssh-signer-type signer)))
+                         patterns)))
+         (not (ssh-key-rsa-size-allowed-p (ssh-signer-blob signer)
+                                          minimum-rsa-size))))
+   signers))
 
 (defun ssh-resolve-and-connect (client private-key agent passphrase)
   "Find CLIENT's signers, then start its connection.
@@ -218,13 +226,14 @@ is applied here, before any request names a key the configuration forbade."
    (lambda (signers)
      (let ((signers (ssh-filter-signers
                      signers
-                     (ssh-client-pubkey-accepted-algorithms client))))
+                     (ssh-client-pubkey-accepted-algorithms client)
+                     :minimum-rsa-size (ssh-client-required-rsa-size client))))
        (if (null signers)
            (ssh-client-fail
             client
             (make-condition
              'ssh-authentication-error
-             :detail "no key matches PubkeyAcceptedAlgorithms"))
+             :detail "no key matches PubkeyAcceptedAlgorithms or RequiredRSASize"))
            (progn
              (setf (ssh-client-signers client) signers)
              (ssh-open-connection client)))))
@@ -240,6 +249,8 @@ is applied here, before any request names a key the configuration forbade."
                              proxy-command
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
+                             (required-rsa-size
+                              +ssh-rsa-minimum-modulus-size+)
                              on-open on-error on-close on-forwarded-tcpip
                              on-forwarded-streamlocal)
   "Connect to HOST as USER, authenticate, return at once.
@@ -294,7 +305,8 @@ role-neutral."
                            :ciphers ciphers
                            :macs macs
                            :pubkey-accepted-algorithms
-                           pubkey-accepted-algorithms)
+                           pubkey-accepted-algorithms
+                           :required-rsa-size required-rsa-size)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

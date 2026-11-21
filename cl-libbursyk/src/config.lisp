@@ -76,6 +76,9 @@ relative Include is anchored here.")
   (forward-x11 nil)
   (forward-x11-trusted nil)
   (gateway-ports nil)
+  ;; RequiredRSASize: the smallest RSA modulus this client will use for a
+  ;; host key or an authentication key; OpenSSH's default is 1024.
+  (required-rsa-size nil)
   ;; StreamLocalBindMask and StreamLocalBindUnlink for Unix-socket listeners
   ;; this client creates; OpenSSH's defaults are 0177 and no.
   (streamlocal-bind-mask nil)
@@ -932,6 +935,9 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
+        ((string= keyword "requiredrsasize")
+         (setf (ssh-config-options-required-rsa-size options)
+               (integer)))
         ((string= keyword "streamlocalbindmask")
          (let ((mask (handler-case (parse-integer value :radix 8)
                        (error () nil))))
@@ -983,8 +989,9 @@ understand them rather than silently match nothing."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "gatewayports" "streamlocalbindmask"
-                         "streamlocalbindunlink" "requesttty" "tag"
+                         "gatewayports" "requiredrsasize"
+                         "streamlocalbindmask" "streamlocalbindunlink"
+                         "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
                          "preferredauthentications" "pubkeyauthentication"
                          "passwordauthentication"

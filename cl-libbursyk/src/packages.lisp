@@ -151,6 +151,7 @@
    #:ssh-config-options-proxy-command
    #:ssh-config-options-address-family
    #:ssh-config-options-gateway-ports
+   #:ssh-config-options-required-rsa-size
    #:ssh-config-options-streamlocal-bind-mask
    #:ssh-config-options-streamlocal-bind-unlink
    #:ssh-config-options-local-forwards
