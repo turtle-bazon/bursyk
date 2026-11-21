@@ -22,16 +22,27 @@ and RSA follow because many existing accounts still have only one of those.")
   "The first default identity file that exists, or NIL."
   (first (ssh-default-private-keys)))
 
-(defun ssh-load-key-signer (private-key passphrase)
-  "PRIVATE-KEY, already loaded or a path, as a signer."
-  (if (typep private-key 'ssh-private-key)
-      (ssh-private-key-signer private-key)
-      (ssh-private-key-signer
-       (ssh-load-private-key private-key :passphrase passphrase))))
+(defun ssh-load-key-signer (private-key passphrase &key add-to-agent)
+  "PRIVATE-KEY, already loaded or a path, as a signer.
 
-(defun ssh-load-key-signers (private-keys passphrase)
+ADD-TO-AGENT, when given, is the agent path (or T for SSH_AUTH_SOCK); the
+loaded key is offered to it before being used, as AddKeysToAgent does."
+  (let ((key (if (typep private-key 'ssh-private-key)
+                 private-key
+                 (ssh-load-private-key private-key :passphrase passphrase))))
+    (when add-to-agent
+      (ssh-agent-add-identity
+       key :path add-to-agent
+       :on-error (lambda (condition)
+                   (ssh-log "could not add a key to the agent: ~A"
+                            condition))))
+    (ssh-private-key-signer key)))
+
+(defun ssh-load-key-signers (private-keys passphrase &key add-to-agent)
   "Signers for PRIVATE-KEYS, each already loaded or a path, in order."
-  (mapcar (lambda (key) (ssh-load-key-signer key passphrase))
+  (mapcar (lambda (key)
+            (ssh-load-key-signer key passphrase
+                                 :add-to-agent add-to-agent))
           (if (listp private-keys) private-keys (list private-keys))))
 
 (defun ssh-default-key-sources (private-key)
@@ -48,13 +59,17 @@ and RSA follow because many existing accounts still have only one of those.")
                            "no key given: pass PRIVATE-KEY or use :AGENT, "
                            "or create ~/.ssh/id_ed25519, id_ecdsa or id_rsa")))
 
-(defun ssh-report-key-signers (keys passphrase on-signers on-error)
+(defun ssh-report-key-signers (keys passphrase on-signers on-error
+                               &key add-to-agent)
   "Load KEY files and deliver their signers, or report why not."
   (handler-case
-      (funcall on-signers (ssh-load-key-signers keys passphrase))
+      (funcall on-signers
+               (ssh-load-key-signers keys passphrase
+                                     :add-to-agent add-to-agent))
     (error (condition) (funcall on-error condition))))
 
-(defun ssh-report-agent-keys (agent keys passphrase on-signers on-error)
+(defun ssh-report-agent-keys (agent keys passphrase on-signers on-error
+                              &key add-to-agent)
   "Deliver the agent's signers followed by KEY files, tolerating either."
   (ssh-agent-signers
    :path agent
@@ -62,13 +77,16 @@ and RSA follow because many existing accounts still have only one of those.")
                  (handler-case
                      (funcall on-signers
                               (append signers
-                                      (ssh-load-key-signers keys passphrase)))
+                                      (ssh-load-key-signers
+                                       keys passphrase
+                                       :add-to-agent add-to-agent)))
                    (error (condition) (funcall on-error condition))))
    ;; An agent that cannot answer is not fatal while a file remains.
    :on-error (lambda (condition)
                (declare (ignore condition))
                (ssh-report-key-signers
-                keys passphrase on-signers on-error))))
+                keys passphrase on-signers on-error
+                :add-to-agent add-to-agent))))
 
 (defun ssh-report-agent-signers (agent on-signers on-error)
   "Deliver the agent's signers, or say that it holds no usable key."
@@ -83,7 +101,8 @@ and RSA follow because many existing accounts still have only one of those.")
                    "the ssh-agent holds no supported keys"))))
    :on-error on-error))
 
-(defun ssh-resolve-signers (private-key agent passphrase on-signers on-error)
+(defun ssh-resolve-signers (private-key agent passphrase on-signers on-error
+                            &key add-keys-to-agent)
   "Find the signers authentication may try, in order, without blocking.
 
 The agent's ssh-ed25519 keys are offered first, then the key files, which
@@ -98,12 +117,15 @@ ssh-authentication-error only when nothing is left to try."
                     (and (null private-key)
                          (uiop:getenv "SSH_AUTH_SOCK")
                          t))))
-    (cond
-      ((and keys agent)
-       (ssh-report-agent-keys agent keys passphrase on-signers on-error))
-      (agent (ssh-report-agent-signers agent on-signers on-error))
-      (keys (ssh-report-key-signers keys passphrase on-signers on-error))
-      (t (funcall on-error (ssh-no-key-condition))))))
+    (let ((add-to-agent (and add-keys-to-agent agent)))
+      (cond
+        ((and keys agent)
+         (ssh-report-agent-keys agent keys passphrase on-signers on-error
+                                :add-to-agent add-to-agent))
+        (agent (ssh-report-agent-signers agent on-signers on-error))
+        (keys (ssh-report-key-signers keys passphrase on-signers on-error
+                                      :add-to-agent add-to-agent))
+        (t (funcall on-error (ssh-no-key-condition)))))))
 
 (defun ssh-connect-error (client status)
   "Report a failed connect, retrying while ConnectionAttempts remain."
@@ -193,6 +215,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  (revoked-host-keys '())
                                  hash-known-hosts
                                  known-hosts-command
+                                 (add-keys-to-agent :no)
                                  (update-host-keys :yes)
                                  (fingerprint-hash :sha256)
                                  visual-host-key
@@ -226,6 +249,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
                     :known-hosts-command known-hosts-command
+                    :add-keys-to-agent add-keys-to-agent
                     :update-host-keys update-host-keys
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
@@ -283,7 +307,9 @@ is applied here, before any request names a key the configuration forbade."
              (setf (ssh-client-signers client) signers)
              (ssh-open-connection client)))))
    (lambda (condition)
-     (ssh-client-fail client condition)))
+     (ssh-client-fail client condition))
+   :add-keys-to-agent
+   (eq (ssh-client-add-keys-to-agent client) :yes))
   client)
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
@@ -298,6 +324,7 @@ is applied here, before any request names a key the configuration forbade."
                              (revoked-host-keys '())
                              hash-known-hosts
                              known-hosts-command
+                             (add-keys-to-agent :no)
                              (update-host-keys :yes)
                              (fingerprint-hash :sha256)
                              visual-host-key
@@ -368,6 +395,7 @@ role-neutral."
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
                            :known-hosts-command known-hosts-command
+                           :add-keys-to-agent add-keys-to-agent
                            :update-host-keys update-host-keys
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key

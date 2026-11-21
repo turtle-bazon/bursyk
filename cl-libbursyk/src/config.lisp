@@ -47,6 +47,8 @@ relative Include is anchored here.")
   (identity-files nil)
   (certificate-files nil)
   (identity-agent nil)
+  ;; AddKeysToAgent: :YES adds keys loaded from files to the agent.
+  (add-keys-to-agent nil)
   ;; HostKeyAlias: the name known_hosts is checked and written under.
   (host-key-alias nil)
   (identities-only nil)
@@ -816,7 +818,22 @@ understand them rather than silently match nothing."
         seen options :identities-only
         (lambda (options)
           (setf (ssh-config-options-identities-only options)
-                (ssh-config-boolean line (ssh-config-arg line)))))))))
+                (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "addkeystoagent")
+       (ssh-config-set-once
+        seen options :add-keys-to-agent
+        (lambda (options)
+          (let ((value (string-downcase (ssh-config-arg line))))
+            (setf (ssh-config-options-add-keys-to-agent options)
+                  (cond ((member value '("yes" "true" "on") :test #'string=)
+                         :yes)
+                        ((member value '("no" "false" "off") :test #'string=)
+                         :no)
+                        ((string= value "ask") :ask)
+                        ((string= value "confirm") :confirm)
+                        (t
+                         (error (ssh-config-line-error
+                                 line "invalid AddKeysToAgent ~S" value))))))))))))
 
 (defun ssh-config-known-host-paths (line options context)
   "The paths on a known-hosts line; :NONE for the literal none."
@@ -1283,7 +1300,7 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-address line options seen context))
       ((member keyword '("identityfile" "certificatefile" "identityagent"
-                         "identitiesonly")
+                         "identitiesonly" "addkeystoagent")
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"

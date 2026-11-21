@@ -15,6 +15,7 @@
 (defconstant +ssh-agentc-request-identities+ 11)
 (defconstant +ssh-agent-identities-answer+ 12)
 (defconstant +ssh-agentc-sign-request+ 13)
+(defconstant +ssh-agentc-add-identity+ 17)
 (defconstant +ssh-agent-sign-response+ 14)
 
 (defstruct (ssh-agent-call (:constructor %make-ssh-agent-call))
@@ -294,6 +295,81 @@ ssh-authentication-error when the agent cannot be reached or refuses."
               :detail "the ssh-agent refused to sign"))
       (t (error 'ssh-protocol-error
                 :detail (format nil "unexpected ssh-agent reply ~D" type))))))
+
+(defun ssh-agent-identity-payload (key)
+  "KEY as the body of an SSH_AGENTC_ADD_IDENTITY message."
+  (let ((writer (ssh-writer))
+        (type (ssh-private-key-type key)))
+    (cond
+      ((string= type "ssh-ed25519")
+       (ssh-write-text writer type)
+       (ssh-write-string writer (ssh-private-key-public key))
+       (ssh-write-string writer (ssh-private-key-private key))
+       (ssh-write-text writer (ssh-private-key-comment key)))
+      ((string= type "ssh-rsa")
+       (ssh-write-text writer type)
+       (let ((public (ssh-make-reader (ssh-private-key-public key)))
+             (private (ssh-make-reader (ssh-private-key-private key))))
+         (let ((e (ssh-read-mpint public))
+               (n (ssh-read-mpint public)))
+           (ssh-write-mpint writer n)
+           (ssh-write-mpint writer e))
+         (dotimes (i 4)
+           (declare (ignore i))
+           (ssh-write-mpint writer (ssh-read-mpint private))))
+       (ssh-write-text writer (ssh-private-key-comment key)))
+      ((and (> (length type) (length "ecdsa-sha2-"))
+            (string= "ecdsa-sha2-" type
+                     :end2 (length "ecdsa-sha2-")))
+       (ssh-write-text writer type)
+       (ssh-write-text writer (subseq type (length "ecdsa-sha2-")))
+       (ssh-write-string writer (ssh-private-key-public key))
+       (ssh-write-mpint
+        writer
+        (ssh-read-mpint (ssh-make-reader (ssh-private-key-private key))))
+       (ssh-write-text writer (ssh-private-key-comment key)))
+      (t
+       (error 'ssh-protocol-error
+              :detail (format nil "cannot add ~A to an ssh-agent" type))))
+    (ssh-writer-output writer)))
+
+(defun ssh-agent-add-identity (key &key path on-added on-error)
+  "Ask the agent at PATH to hold KEY, without blocking.
+
+ON-ADDED runs on success; ON-ERROR receives an ssh-authentication-error or
+an ssh-protocol-error when the agent refuses or cannot be reached."
+  (handler-case
+      (let ((writer (ssh-writer)))
+        (ssh-write-u8 writer +ssh-agentc-add-identity+)
+        (ssh-write-octets writer (ssh-agent-identity-payload key))
+        (ssh-agent-request
+         (ssh-agent-path path)
+         (ssh-writer-output writer)
+         (lambda (response)
+           (handler-case
+               (let* ((reader (ssh-make-reader response))
+                      (type (ssh-read-u8 reader)))
+                 (cond
+                   ((= type +ssh-agent-success+)
+                    (when on-added (funcall on-added)))
+                   ((= type +ssh-agent-failure+)
+                    (when on-error
+                      (funcall on-error
+                               (ssh-agent-error
+                                "the ssh-agent refused the key"))))
+                   (t
+                    (when on-error
+                      (funcall on-error
+                               (make-condition
+                                'ssh-protocol-error
+                                :detail (format nil
+                                                "unexpected ssh-agent reply ~D"
+                                                type)))))))
+             (error (condition)
+               (when on-error (funcall on-error condition)))))
+         on-error))
+    (error (condition)
+      (when on-error (funcall on-error condition)))))
 
 (defun ssh-agent-sign (key-blob data &key path flags on-signature on-error)
   "Ask the agent at PATH to sign DATA with KEY-BLOB, without blocking.

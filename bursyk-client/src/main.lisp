@@ -2453,6 +2453,12 @@ peer that connected to it; NIL refuses the channel."
                  options)
                 "yes"
                 "no"))
+    (format t "addkeystoagent ~A~%"
+            (let ((value (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
+                          options)))
+              (case value
+                (:yes "yes") (:ask "ask") (:confirm "confirm")
+                (t "no"))))
     (format t "updatehostkeys ~A~%"
             (let ((value (cl-pnet-ssh:ssh-config-options-update-host-keys
                           options)))

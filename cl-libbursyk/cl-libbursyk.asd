@@ -2,7 +2,7 @@
   :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.62"
+  :version "0.0.1.63"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel

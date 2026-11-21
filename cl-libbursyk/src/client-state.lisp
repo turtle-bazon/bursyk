@@ -63,6 +63,8 @@
   (hash-known-hosts nil)
   ;; KnownHostsCommand: a command whose output is read as known_hosts lines.
   (known-hosts-command nil)
+  ;; AddKeysToAgent: :YES adds file-loaded keys to the agent.
+  (add-keys-to-agent :no)
   ;; UpdateHostKeys: whether a proven host key may be added to known_hosts.
   (update-host-keys :yes)
   (host-keys-seen nil)

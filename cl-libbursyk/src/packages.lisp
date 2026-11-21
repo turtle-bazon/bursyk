@@ -149,6 +149,7 @@
    #:ssh-config-options-port
    #:ssh-config-options-identity-files
    #:ssh-config-options-identity-agent
+   #:ssh-config-options-add-keys-to-agent
    #:ssh-config-options-host-key-alias
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts
@@ -406,6 +407,7 @@
    ;; ssh-agent
    #:ssh-agent-identities
    #:ssh-agent-sign
+   #:ssh-agent-add-identity
    #:ssh-agent-signers
    #:ssh-octets-base64
    #:ssh-base64-octets
