@@ -157,6 +157,14 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-known-hosts-command options)
         :add-keys-to-agent
         (or (ssh-config-options-add-keys-to-agent options) :no)
+        :hostbased-authentication
+        (ssh-config-options-hostbased-authentication options)
+        :hostbased-accepted-algorithms
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-hostbased-accepted-algorithms
+         +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms")
+        :hostbased-keys
+        (reverse (ssh-config-options-hostbased-keys options))
         :update-host-keys
         (or (ssh-config-options-update-host-keys options)
             (if (ssh-config-options-known-hosts options) :no :yes))
@@ -459,6 +467,11 @@ uses whichever of the two it saw first instead of chaining them."
            :hash-known-hosts (getf parameters :hash-known-hosts)
            :known-hosts-command (getf parameters :known-hosts-command)
            :add-keys-to-agent (getf parameters :add-keys-to-agent)
+           :hostbased-authentication
+           (getf parameters :hostbased-authentication)
+           :hostbased-accepted-algorithms
+           (getf parameters :hostbased-accepted-algorithms)
+           :hostbased-keys (getf parameters :hostbased-keys)
            :update-host-keys (getf parameters :update-host-keys)
            :fingerprint-hash (getf parameters :fingerprint-hash)
            :visual-host-key (getf parameters :visual-host-key)

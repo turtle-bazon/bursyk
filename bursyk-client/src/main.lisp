@@ -2453,6 +2453,20 @@ peer that connected to it; NIL refuses the channel."
                  options)
                 "yes"
                 "no"))
+    (format t "hostbasedauthentication ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-hostbased-authentication
+                 options)
+                "yes"
+                "no"))
+    (print-list-option
+     "hostbasedacceptedalgorithms"
+     (or (cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
+          options)
+         cl-pnet-ssh::+ssh-signature-algorithms+))
+    (format t "enablesshkeysign ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-enable-ssh-keysign options)
+                "yes"
+                "no"))
     (format t "addkeystoagent ~A~%"
             (let ((value (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
                           options)))

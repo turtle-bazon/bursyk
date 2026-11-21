@@ -1126,7 +1126,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
     (ssh-channel-exec channel "printf hello; printf oops >&2; exit 3")))
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
-                              &key (host-key-policy :accept-new))
+                              &key (host-key-policy :accept-new)
+                                hostbased-key)
   "Start a client against SERVER and return the command's exit status.
 
 HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
@@ -1148,6 +1149,8 @@ certificate was trusted rather than added on first use."
             :private-key client-key
             :known-hosts known-hosts
             :host-key-policy host-key-policy
+            :hostbased-authentication (and hostbased-key t)
+            :hostbased-keys (and hostbased-key (list hostbased-key))
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -2781,6 +2784,118 @@ newline")))
     (is (char= #\+ (char (car (last lines)) 0)))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
+
+(test hostbased-configuration-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HostbasedAuthentication yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostbasedAcceptedAlgorithms ssh-ed25519")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostbasedKey /tmp/host_key")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "EnableSSHKeysign yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-hostbased-authentication options)))
+    (is (equal '("ssh-ed25519")
+               (ssh-config-options-hostbased-accepted-algorithms options)))
+    (is (equal '("/tmp/host_key")
+               (mapcar #'namestring
+                       (ssh-config-options-hostbased-keys options))))
+    (is (eq t (ssh-config-options-enable-ssh-keysign options)))))
+
+(test client-builds-a-hostbased-request
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-request"))
+             (key-path (merge-pathnames "host_key" directory)))
+        (ensure-directories-exist key-path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring key-path)))
+               (let* ((key (ssh-load-private-key key-path))
+                      (session-id (make-array 32
+                                              :element-type '(unsigned-byte 8)
+                                              :initial-element 7))
+                      (client (cl-pnet-ssh::%make-ssh-client
+                               :user "tester"
+                               :hostbased-key key
+                               :session-id session-id))
+                      (unsigned (cl-pnet-ssh::ssh-client-hostbased-request-unsigned
+                                 client))
+                      (reader (ssh-make-reader unsigned)))
+                 (is (= cl-pnet-ssh::+ssh-msg-userauth-request+
+                        (ssh-read-u8 reader)))
+                 (is (equal "tester" (ssh-read-text reader)))
+                 (is (equal "ssh-connection" (ssh-read-text reader)))
+                 (is (equal "hostbased" (ssh-read-text reader)))
+                 (is (equal "ssh-ed25519" (ssh-read-text reader)))
+                 (is (equalp (ssh-public-key-blob-of key)
+                             (ssh-read-string reader)))
+                 (let ((host (ssh-read-text reader)))
+                   (is (plusp (length host)))
+                   (is (char= #\. (char host (1- (length host))))))
+                 (is (equal (ssh-default-user) (ssh-read-text reader)))
+                 ;; The signature covers the session id and the request.
+                 (let* ((data (let ((writer (ssh-writer)))
+                                (ssh-write-string writer session-id)
+                                (ssh-write-octets writer unsigned)
+                                (ssh-writer-output writer)))
+                        (signature (cl-pnet-ssh::ssh-private-key-signature-blob
+                                    key data)))
+                   (is (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                        (ssh-public-key-blob-of key) signature data)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test client-loopback-hostbased-authentication
+  "The client authenticates with a host key and the server's hostbased hook."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-loop"))
+             (server-key (merge-pathnames "server_key" directory))
+             (hostbased-key (merge-pathnames "client_host_key" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring hostbased-key)))
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      :sshd-config
+                      (ssh-server-config-load
+                       nil :options '("HostbasedAuthentication yes"))
+                      :hostbased-key-allowed
+                      (lambda (session user client-user client-host key)
+                        (declare (ignore session user client-user client-host
+                                         key))
+                        t)
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((status (ssh-test-loopback-run
+                              server nil known-hosts stdout stderr
+                              :host-key-policy :insecure
+                              :hostbased-key hostbased-key)))
+                 (is (equal "hello" (get-output-stream-string stdout)))
+                 (is (equal "oops" (get-output-stream-string stderr)))
+                 (is (eql 3 status))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test add-keys-to-agent-parses
   (flet ((value (line)

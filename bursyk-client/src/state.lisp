@@ -4,7 +4,7 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.62")
+(defparameter +burs-version+ "0.0.2.63")
 
 ;;; Interactive escape handling.  The character is active only in a pty
 ;;; session, and only at the start of a line, as in ssh.

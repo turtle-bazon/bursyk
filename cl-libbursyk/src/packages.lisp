@@ -150,6 +150,10 @@
    #:ssh-config-options-identity-files
    #:ssh-config-options-identity-agent
    #:ssh-config-options-add-keys-to-agent
+   #:ssh-config-options-hostbased-authentication
+   #:ssh-config-options-hostbased-accepted-algorithms
+   #:ssh-config-options-hostbased-keys
+   #:ssh-config-options-enable-ssh-keysign
    #:ssh-config-options-host-key-alias
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts

@@ -636,7 +636,7 @@ certificate, its plain key or its CA refuses it without that fallback."
     (ssh-write-string writer signature)
     (ssh-client-send-payload client (ssh-writer-output writer))))
 
-(defun ssh-client-send-auth-request (client)
+(defun ssh-client-send-publickey-request (client)
   "Offer the current key, signing the session id and the request.
 
 The signer may answer at once (a local key) or later (an agent), so the
@@ -649,6 +649,7 @@ request goes out from the callback rather than from this function's tail."
                                                  (ssh-client-session-id client))
                                (ssh-write-octets writer unsigned)
                                (ssh-writer-output writer))))
+        (setf (ssh-client-last-auth-method client) "publickey")
         (funcall (ssh-signer-sign signer)
                  signature-data
                  (lambda (signature)
@@ -658,6 +659,58 @@ request goes out from the callback rather than from this function's tail."
                    (ssh-client-fail client condition))))
     (error (condition)
       (ssh-client-fail client condition))))
+
+(defun ssh-client-local-host-name ()
+  "The name this client reports in a hostbased request, with a trailing dot."
+  (let ((name (or (uiop:getenv "HOSTNAME") (machine-instance) "localhost")))
+    (if (and (plusp (length name))
+             (char= (char name (1- (length name))) #\.))
+        name
+        (concatenate 'string name "."))))
+
+(defun ssh-client-hostbased-request-unsigned (client)
+  "The hostbased request without its signature."
+  (let ((writer (ssh-writer))
+        (key (ssh-client-hostbased-key client)))
+    (unless key
+      (error 'ssh-authentication-error
+             :detail "no host key for hostbased authentication"))
+    (ssh-write-u8 writer +ssh-msg-userauth-request+)
+    (ssh-write-text writer (ssh-client-user client))
+    (ssh-write-text writer "ssh-connection")
+    (ssh-write-text writer "hostbased")
+    (ssh-write-text writer (ssh-private-key-algorithm key))
+    (ssh-write-string writer (ssh-public-key-blob-of key))
+    (ssh-write-text writer (ssh-client-local-host-name))
+    (ssh-write-text writer (ssh-default-user))
+    (ssh-writer-output writer)))
+
+(defun ssh-client-send-hostbased-request (client)
+  "Offer the host key, signing the session id and the hostbased request."
+  (handler-case
+      (let* ((key (ssh-client-hostbased-key client))
+             (unsigned (ssh-client-hostbased-request-unsigned client))
+             (data (let ((writer (ssh-writer)))
+                     (ssh-write-string writer (ssh-client-session-id client))
+                     (ssh-write-octets writer unsigned)
+                     (ssh-writer-output writer)))
+             (signature (ssh-private-key-signature-blob key data)))
+        (setf (ssh-client-hostbased-tried client) t
+              (ssh-client-last-auth-method client) "hostbased")
+        (let ((writer (ssh-writer)))
+          (ssh-write-octets writer unsigned)
+          (ssh-write-string writer signature)
+          (ssh-client-send-payload client (ssh-writer-output writer))))
+    (error (condition)
+      (ssh-client-fail client condition))))
+
+(defun ssh-client-send-auth-request (client)
+  "Try hostbased first when enabled, then publickey."
+  (if (and (ssh-client-hostbased-authentication client)
+           (not (ssh-client-hostbased-tried client))
+           (ssh-client-hostbased-key client))
+      (ssh-client-send-hostbased-request client)
+      (ssh-client-send-publickey-request client)))
 
 (defun ssh-client-handle-banner (client payload)
   "Store a USER AUTH BANNER, which the program shows as it likes.
@@ -697,16 +750,22 @@ has no use for it either."
          ;; RFC 4252's partial-success flag: one method of an
          ;; AuthenticationMethods list is done and another must follow.
          (partial (ssh-read-boolean reader)))
-    (if (ssh-client-next-signer-p client)
-        (progn
-          (ssh-log "~:[publickey rejected~;partial success~]; trying the next key"
-                   partial)
-          (ssh-client-send-auth-request client))
-        (ssh-client-fail
-         client
-         (make-condition 'ssh-authentication-error
-                         :detail (format nil "server accepts ~{~A~^, ~}"
-                                         methods))))))
+    (cond
+      ((string= (or (ssh-client-last-auth-method client) "") "hostbased")
+       (setf (ssh-client-last-auth-method client) nil)
+       (ssh-log "hostbased rejected~:[~;; partial success~]; trying publickey"
+                partial)
+       (ssh-client-send-auth-request client))
+      ((ssh-client-next-signer-p client)
+       (ssh-log "~:[publickey rejected~;partial success~]; trying the next key"
+                partial)
+       (ssh-client-send-auth-request client))
+      (t
+       (ssh-client-fail
+        client
+        (make-condition 'ssh-authentication-error
+                        :detail (format nil "server accepts ~{~A~^, ~}"
+                                        methods)))))))
 
 (defun ssh-client-send-global-request (client name &key fields on-success
                                                      on-failure)

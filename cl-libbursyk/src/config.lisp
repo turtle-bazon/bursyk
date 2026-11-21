@@ -47,6 +47,12 @@ relative Include is anchored here.")
   (identity-files nil)
   (certificate-files nil)
   (identity-agent nil)
+  ;; HostbasedAuthentication and its host keys.  EnableSSHKeysign is parsed
+  ;; for compatibility; this client signs with a readable host key directly.
+  (hostbased-authentication nil)
+  (hostbased-accepted-algorithms nil)
+  (hostbased-keys '())
+  (enable-ssh-keysign nil)
   ;; AddKeysToAgent: :YES adds keys loaded from files to the agent.
   (add-keys-to-agent nil)
   ;; HostKeyAlias: the name known_hosts is checked and written under.
@@ -819,6 +825,28 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-identities-only options)
                 (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "hostbasedauthentication")
+       (ssh-config-set-once
+        seen options :hostbased-authentication
+        (lambda (options)
+          (setf (ssh-config-options-hostbased-authentication options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
+      ((member keyword '("hostbasedacceptedalgorithms" "hostbasedkeytypes")
+               :test #'string=)
+       (ssh-config-set-once
+        seen options :hostbased-accepted-algorithms
+        (lambda (options)
+          (setf (ssh-config-options-hostbased-accepted-algorithms options)
+                (ssh-config-split-list (ssh-config-arg line))))))
+      ((string= keyword "hostbasedkey")
+       (push (ssh-config-path-value line options context)
+             (ssh-config-options-hostbased-keys options)))
+      ((string= keyword "enablesshkeysign")
+       (ssh-config-set-once
+        seen options :enable-ssh-keysign
+        (lambda (options)
+          (setf (ssh-config-options-enable-ssh-keysign options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "addkeystoagent")
        (ssh-config-set-once
         seen options :add-keys-to-agent
@@ -1300,7 +1328,10 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-address line options seen context))
       ((member keyword '("identityfile" "certificatefile" "identityagent"
-                         "identitiesonly" "addkeystoagent")
+                         "identitiesonly" "addkeystoagent"
+                         "hostbasedauthentication" "hostbasedacceptedalgorithms"
+                         "hostbasedkeytypes" "hostbasedkey"
+                         "enablesshkeysign")
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"

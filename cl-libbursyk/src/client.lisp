@@ -216,6 +216,9 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  hash-known-hosts
                                  known-hosts-command
                                  (add-keys-to-agent :no)
+                                 hostbased-authentication
+                                 hostbased-accepted-algorithms
+                                 (hostbased-keys '())
                                  (update-host-keys :yes)
                                  (fingerprint-hash :sha256)
                                  visual-host-key
@@ -250,6 +253,10 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :hash-known-hosts hash-known-hosts
                     :known-hosts-command known-hosts-command
                     :add-keys-to-agent add-keys-to-agent
+                    :hostbased-authentication hostbased-authentication
+                    :hostbased-accepted-algorithms
+                    hostbased-accepted-algorithms
+                    :hostbased-keys hostbased-keys
                     :update-host-keys update-host-keys
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
@@ -282,6 +289,39 @@ RequiredRSASize: it only rejects RSA keys below the floor, as ssh does."
                                           minimum-rsa-size))))
    signers))
 
+(defparameter +ssh-hostbased-default-key-paths+
+  '("/etc/ssh/ssh_host_ed25519_key"
+    "/etc/ssh/ssh_host_ecdsa_key"
+    "/etc/ssh/ssh_host_rsa_key")
+  "Where ssh looks for a hostbased client host key.")
+
+(defun ssh-private-key-algorithm (key)
+  "The hostbased algorithm name for private KEY."
+  (let ((type (ssh-private-key-type key)))
+    (if (string= type "ssh-rsa")
+        "rsa-sha2-256"
+        type)))
+
+(defun ssh-hostbased-key-allowed-p (client key)
+  "Whether KEY's type matches HostbasedAcceptedAlgorithms."
+  (let ((algorithm (ssh-private-key-algorithm key))
+        (patterns (ssh-client-hostbased-accepted-algorithms client)))
+    (or (null patterns)
+        (some (lambda (pattern) (ssh-match-pattern pattern algorithm))
+              patterns))))
+
+(defun ssh-load-hostbased-key (client)
+  "The first readable host key that HostbasedAcceptedAlgorithms permits."
+  (let ((paths (append (ssh-client-hostbased-keys client)
+                       (mapcar #'pathname +ssh-hostbased-default-key-paths+))))
+    (dolist (path paths)
+      (when (probe-file path)
+        (let ((key (handler-case
+                       (ssh-load-private-key path)
+                     (error () nil))))
+          (when (and key (ssh-hostbased-key-allowed-p client key))
+            (return key)))))))
+
 (defun ssh-resolve-and-connect (client private-key agent passphrase)
   "Find CLIENT's signers, then start its connection.
 
@@ -290,6 +330,9 @@ and the SSH connection starts as soon as the signers are known.  A failure
 in either step ends CLIENT through its error callback.  PubkeyAcceptedAlgorithms
 is applied here, before any request names a key the configuration forbade."
   (ssh-client-start-connect-timer client)
+  (when (ssh-client-hostbased-authentication client)
+    (setf (ssh-client-hostbased-key client)
+          (ssh-load-hostbased-key client)))
   (ssh-resolve-signers
    private-key agent passphrase
    (lambda (signers)
@@ -297,7 +340,8 @@ is applied here, before any request names a key the configuration forbade."
                      signers
                      (ssh-client-pubkey-accepted-algorithms client)
                      :minimum-rsa-size (ssh-client-required-rsa-size client))))
-       (if (null signers)
+       (if (and (null signers)
+                (null (ssh-client-hostbased-key client)))
            (ssh-client-fail
             client
             (make-condition
@@ -307,7 +351,9 @@ is applied here, before any request names a key the configuration forbade."
              (setf (ssh-client-signers client) signers)
              (ssh-open-connection client)))))
    (lambda (condition)
-     (ssh-client-fail client condition))
+     (if (ssh-client-hostbased-key client)
+         (ssh-open-connection client)
+         (ssh-client-fail client condition)))
    :add-keys-to-agent
    (eq (ssh-client-add-keys-to-agent client) :yes))
   client)
@@ -325,6 +371,9 @@ is applied here, before any request names a key the configuration forbade."
                              hash-known-hosts
                              known-hosts-command
                              (add-keys-to-agent :no)
+                             hostbased-authentication
+                             hostbased-accepted-algorithms
+                             (hostbased-keys '())
                              (update-host-keys :yes)
                              (fingerprint-hash :sha256)
                              visual-host-key
@@ -396,6 +445,10 @@ role-neutral."
                            :hash-known-hosts hash-known-hosts
                            :known-hosts-command known-hosts-command
                            :add-keys-to-agent add-keys-to-agent
+                           :hostbased-authentication hostbased-authentication
+                           :hostbased-accepted-algorithms
+                           hostbased-accepted-algorithms
+                           :hostbased-keys hostbased-keys
                            :update-host-keys update-host-keys
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key

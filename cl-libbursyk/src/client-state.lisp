@@ -65,6 +65,13 @@
   (known-hosts-command nil)
   ;; AddKeysToAgent: :YES adds file-loaded keys to the agent.
   (add-keys-to-agent :no)
+  ;; HostbasedAuthentication: a readable host key and the method state.
+  (hostbased-authentication nil)
+  (hostbased-accepted-algorithms nil)
+  (hostbased-keys '())
+  (hostbased-key nil)
+  (hostbased-tried nil)
+  (last-auth-method nil)
   ;; UpdateHostKeys: whether a proven host key may be added to known_hosts.
   (update-host-keys :yes)
   (host-keys-seen nil)
