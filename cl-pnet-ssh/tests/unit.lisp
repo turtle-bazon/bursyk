@@ -1161,6 +1161,12 @@ certificate was trusted rather than added on first use."
             :on-close (lambda (client reason)
                         (declare (ignore client reason))
                         (cl-pnet:event-loop-stop)))
+           ;; A stop requested after an earlier loop had already ended can
+           ;; leave a wakeup queued; consume it so it cannot break this run
+           ;; before the client has connected.
+           (when (fboundp '(setf cl-pnet::ev-stop-requested-p))
+             (setf (cl-pnet::ev-stop-requested-p) nil)
+             (cl-pnet:event-loop-run-once))
            (cl-pnet:event-loop-run)
            (when (second state)
              (error "loopback: ~A" (second state)))
@@ -3472,3 +3478,52 @@ option the server cannot honour refuses the line rather than being lost."
       (declare (ignore index))
       (is (not (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session))))
     (is (cl-pnet-ssh::ssh-server-publickey-offer-counts-p session))))
+
+(test server-loopback-refuse-connection
+  "RefuseConnection in a Match block terminates the connection before auth."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-refuse"))
+             (host-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (config-path (merge-pathnames "sshd_config" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist host-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (with-open-file (out config-path :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                 (write-string "Match User tester
+  RefuseConnection yes" out))
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key host-key
+                      :authorized-keys authorized
+                      :sshd-config (ssh-server-config-load config-path)
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((failed
+                       (handler-case
+                           (progn (ssh-test-loopback-run
+                                   server client-key known-hosts
+                                   stdout stderr)
+                                  nil)
+                         (error () t))))
+                 (is (not (null failed)))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))

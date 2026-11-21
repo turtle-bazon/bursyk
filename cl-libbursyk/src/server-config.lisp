@@ -144,10 +144,9 @@ socket address and has no routing domains.")
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
     "streamlocalbindmask" "streamlocalbindunlink"
-    ;; 10.6: these change connection refusal or rate limiting, so accepting
-    ;; them without their behaviour would be unsafe.
-    "persourcepenalties" "persourcepenaltyexemptlist"
-    "refuseconnection"))
+    ;; 10.6: these change rate limiting, so accepting them without their
+    ;; behaviour would be unsafe.
+    "persourcepenalties" "persourcepenaltyexemptlist"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -216,6 +215,9 @@ socket address and has no routing domains.")
   ;; be able to override a global yes.  This records that the directive was
   ;; read at all; sshd's tri-state (-1/0/1) does the same job.
   (disable-forwarding-set-p nil)
+  ;; RefuseConnection: :YES terminates the connection after the account is
+  ;; known, :NO (or NIL) does not.  Match can turn a global yes off.
+  (refuse-connection nil)
   (subsystems '())
   (log-level nil)
   ;; Access control.  Each list holds sshd patterns and accumulates across
@@ -683,7 +685,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
-    expose-auth-info
+    expose-auth-info refuse-connection
     unused-connection-timeout channel-timeouts
     trusted-user-ca-keys authorized-principals-file
     authorized-principals-command authorized-principals-command-user
@@ -1054,6 +1056,15 @@ cannot apply per connection."
        ;; than the absence of one, so a Match block can turn a global yes off.
        (ssh-server-config-set-once
         config 'expose-auth-info
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes
+            :no)))
+      ((string= keyword "refuseconnection")
+       ;; 10.6's flag: first value wins, and a Match block can turn a global
+       ;; yes off, so "no" is stored as a value of its own.
+       (ssh-server-config-set-once
+        config 'refuse-connection
         (if (ssh-server-config-flag
              line (ssh-server-config-one-argument line))
             :yes

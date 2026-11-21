@@ -661,6 +661,17 @@ allowed methods; everything after it counts."
       ;; first known, before it sends the Banner that they may choose.
       (ssh-session-resolve-config session user)
       (ssh-server-send-banner session))
+    ;; RefuseConnection is checked once the account is known, before any
+    ;; method runs, as sshd's monitor does after getpwnamallow.
+    (when (eq (ssh-session-setting
+               session #'ssh-server-config-refuse-connection)
+              :yes)
+      (ssh-session-send-payload-and-close
+       session
+       (ssh-disconnect-payload "administratively prohibited"
+                               +ssh-disconnect-protocol-error+)
+       :refused)
+      (return-from ssh-server-handle-userauth-request nil))
     (incf (ssh-session-auth-attempts session))
     (let ((count (ssh-server-auth-failure-counts-p
                   (ssh-session-auth-attempts session) method)))

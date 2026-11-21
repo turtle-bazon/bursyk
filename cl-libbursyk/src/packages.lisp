@@ -223,6 +223,7 @@
    #:ssh-server-config-force-command
    #:ssh-server-config-permit-user-environment
    #:ssh-server-config-expose-auth-info
+   #:ssh-server-config-refuse-connection
    #:ssh-server-config-set-env
    #:ssh-server-config-version-addendum
    #:ssh-server-config-warnings

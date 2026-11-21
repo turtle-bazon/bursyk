@@ -2911,8 +2911,6 @@ only describe OpenSSH's own helpers are accepted and warned about."
     (config-from-text "PerSourcePenalties yes"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "PerSourcePenaltyExemptList 127.0.0.1/32"))
-  (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "RefuseConnection yes"))
   (let ((config (config-from-text
                  "SshdSessionPath /usr/libexec/sshd-session
 SshdAuthPath /usr/libexec/sshd-auth
@@ -2960,3 +2958,31 @@ Match User alice
                config :user "bob")))
     (is (= 5 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok alice)))
     (is (= 2 (cl-pnet-ssh:ssh-server-config-max-pubkey-ok bob)))))
+
+(test sshd-config-reads-refuse-connection
+  "RefuseConnection is a Match-aware flag whose first value wins."
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-refuse-connection
+           "RefuseConnection yes")))
+  (is (eq :no
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-refuse-connection
+           "RefuseConnection no")))
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-refuse-connection
+           "RefuseConnection yes
+RefuseConnection no")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RefuseConnection maybe"))
+  (let* ((config (config-from-text
+                  "RefuseConnection yes
+Match User alice
+  RefuseConnection no"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-refuse-connection alice)))
+    (is (eq :yes (cl-pnet-ssh:ssh-server-config-refuse-connection bob)))))
