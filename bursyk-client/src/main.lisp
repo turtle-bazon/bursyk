@@ -2182,6 +2182,10 @@ peer that connected to it; NIL refuses the channel."
                (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
               (ip-qos-name
                (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
+    (format t "checkhostip ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-check-host-ip options)
+                "yes"
+                "no"))
     (format t "visualhostkey ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-visual-host-key options)
                 "yes"

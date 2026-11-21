@@ -144,6 +144,7 @@ ssh-authentication-error only when nothing is left to try."
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
   (let ((port (or (ssh-client-connect-port client) (ssh-client-port client))))
+    (setf (ssh-client-remote-address client) address)
     (ssh-log "connecting to ~A:~D" address port)
     (let ((connection
             (cl-pnet:tcp-connect
@@ -193,6 +194,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  hash-known-hosts
                                  (fingerprint-hash :sha256)
                                  visual-host-key
+                                 check-host-ip
                                  (ip-qos-interactive #xb8)
                                  (ip-qos-bulk :none)
                                  (tcp-keep-alive t)
@@ -223,6 +225,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :hash-known-hosts hash-known-hosts
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
+                    :check-host-ip check-host-ip
                     :ip-qos-interactive ip-qos-interactive
                     :ip-qos-bulk ip-qos-bulk
                     :tcp-keep-alive tcp-keep-alive
@@ -292,6 +295,7 @@ is applied here, before any request names a key the configuration forbade."
                              hash-known-hosts
                              (fingerprint-hash :sha256)
                              visual-host-key
+                             check-host-ip
                              (ip-qos-interactive #xb8)
                              (ip-qos-bulk :none)
                              (tcp-keep-alive t)
@@ -359,6 +363,7 @@ role-neutral."
                            :hash-known-hosts hash-known-hosts
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key
+                           :check-host-ip check-host-ip
                            :ip-qos-interactive ip-qos-interactive
                            :ip-qos-bulk ip-qos-bulk
                            :tcp-keep-alive tcp-keep-alive

@@ -156,6 +156,7 @@
    #:ssh-config-options-hash-known-hosts
    #:ssh-config-options-fingerprint-hash
    #:ssh-config-options-visual-host-key
+   #:ssh-config-options-check-host-ip
    #:ssh-config-options-revoked-host-keys
    #:ssh-config-options-strict-host-key-checking
    #:ssh-config-options-send-env

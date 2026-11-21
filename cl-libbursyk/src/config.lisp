@@ -57,6 +57,7 @@ relative Include is anchored here.")
   ;; fingerprints.
   (fingerprint-hash nil)
   (visual-host-key nil)
+  (check-host-ip nil)
   ;; RevokedHostKeys: files of host keys and certificates that may not be
   ;; used, in the order read; NONE clears the list.
   (revoked-host-keys '())
@@ -851,6 +852,12 @@ understand them rather than silently match nothing."
                                             value)))
             (setf (ssh-config-options-fingerprint-hash options)
                   (intern (string-upcase value) :keyword))))))
+      ((string= keyword "checkhostip")
+       (ssh-config-set-once
+        seen options :check-host-ip
+        (lambda (options)
+          (setf (ssh-config-options-check-host-ip options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "visualhostkey")
        (ssh-config-set-once
         seen options :visual-host-key
@@ -1229,7 +1236,7 @@ understand them rather than silently match nothing."
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
                          "hashknownhosts" "fingerprinthash"
-                         "visualhostkey"
+                         "visualhostkey" "checkhostip"
                          "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"

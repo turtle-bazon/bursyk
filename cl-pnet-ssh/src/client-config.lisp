@@ -156,6 +156,7 @@ MAKE-SSH-CLIENT's own defaults."
         :fingerprint-hash
         (or (ssh-config-options-fingerprint-hash options) :sha256)
         :visual-host-key (ssh-config-options-visual-host-key options)
+        :check-host-ip (ssh-config-options-check-host-ip options)
         :ip-qos-interactive
         (ssh-config-options-ip-qos-interactive options)
         :ip-qos-bulk (ssh-config-options-ip-qos-bulk options)
@@ -451,6 +452,7 @@ uses whichever of the two it saw first instead of chaining them."
            :hash-known-hosts (getf parameters :hash-known-hosts)
            :fingerprint-hash (getf parameters :fingerprint-hash)
            :visual-host-key (getf parameters :visual-host-key)
+           :check-host-ip (getf parameters :check-host-ip)
            :ip-qos-interactive (getf parameters :ip-qos-interactive)
            :ip-qos-bulk (getf parameters :ip-qos-bulk)
            :tcp-keep-alive (getf parameters :tcp-keep-alive)

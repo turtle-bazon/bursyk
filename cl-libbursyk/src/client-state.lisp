@@ -65,6 +65,10 @@
   (fingerprint-hash :sha256)
   ;; VisualHostKey: show the randomart picture once connected.
   (visual-host-key nil)
+  ;; CheckHostIP: also look up and record the peer's numeric address.
+  (check-host-ip nil)
+  (remote-address nil)
+  (host-key-ip-checked nil)
   ;; Whether the host key was already trusted before this connection; ssh
   ;; shows randomart only for a key that was not just added.
   (host-key-known nil)

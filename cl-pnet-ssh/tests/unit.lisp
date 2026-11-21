@@ -2782,6 +2782,58 @@ newline")))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
 
+(test check-host-ip-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CheckHostIP yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-check-host-ip options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-check-host-ip options)))))
+
+(test client-check-host-ip-records-and-refuses
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-checkip"))
+         (path (merge-pathnames "known_hosts" directory))
+         (blob (ssh-make-public-key-blob "ssh-ed25519"
+                                         (ssh-random-octets 32)))
+         (other (ssh-make-public-key-blob "ssh-ed25519"
+                                          (ssh-random-octets 32))))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (flet ((client ()
+                  (cl-pnet-ssh::%make-ssh-client
+                   :host "example.org"
+                   :known-hosts (list path)
+                   :check-host-ip t
+                   :remote-address "192.0.2.1")))
+           ;; An unknown address is recorded beside the host.
+           (cl-pnet-ssh::ssh-client-check-host-address (client) blob)
+           (is (eq :match (ssh-known-host-status path "192.0.2.1" blob)))
+           ;; A conflicting address entry is refused.
+           (with-open-file (out path :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (format out "192.0.2.1 ssh-ed25519 ~A~%"
+                     (ssh-octets-base64 other)))
+           (signals ssh-host-key-error
+             (cl-pnet-ssh::ssh-client-check-host-address (client) blob))
+           ;; Loopback and a host that is already its address are skipped.
+           (let ((loopback (cl-pnet-ssh::%make-ssh-client
+                            :host "localhost"
+                            :known-hosts (list path)
+                            :check-host-ip t
+                            :remote-address "192.0.2.1")))
+             (is (null (cl-pnet-ssh::ssh-client-check-host-address
+                        loopback blob)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test visual-host-key-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

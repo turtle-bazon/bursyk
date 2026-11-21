@@ -304,12 +304,8 @@ KNOWN-HOSTS is one path, a list of paths, or NIL for ~/.ssh/known_hosts."
 
 A key found in any file wins over a mismatch in another: the same host may
 be listed in both the user's file and the system-wide one."
-  (let ((host (ssh-client-host-spec client))
-        (status :unknown))
-    (dolist (file (ssh-client-known-hosts-files client) status)
-      (case (ssh-known-host-status file host host-key)
-        (:match (return :match))
-        (:mismatch (setf status :mismatch))))))
+  (ssh-client-known-host-status-for client (ssh-client-host-spec client)
+                                    host-key))
 
 (defun ssh-client-host-certificate-trusted-p (client certificate)
   "Whether CERTIFICATE is a valid host certificate for CLIENT.
@@ -349,7 +345,7 @@ or its CA."
             (ssh-known-host-key-revoked-p file host blobs))
           (ssh-client-known-hosts-files client))))
 
-(defun ssh-client-verify-host-key (client host-key)
+(defun ssh-client-verify-host-key-main (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal.
 
 A host certificate is accepted when a @cert-authority line for the host
@@ -411,6 +407,56 @@ certificate, its plain key or its CA refuses it without that fallback."
             (setf (ssh-client-host-key-known client) nil)
             (ssh-client-accept-unknown-host-key
              client host-key fingerprint))))))))
+
+(defun ssh-client-known-host-status-for (client host host-key)
+  "How HOST-KEY stands for HOST across CLIENT's known-hosts files."
+  (let ((status :unknown))
+    (dolist (file (ssh-client-known-hosts-files client) status)
+      (case (ssh-known-host-status file host host-key)
+        (:match (return :match))
+        (:mismatch (setf status :mismatch))))))
+
+(defun ssh-client-check-host-address (client host-key)
+  "Apply CheckHostIP to HOST-KEY, adding or refusing its address entry."
+  (when (and (ssh-client-check-host-ip client)
+             (not (ssh-client-host-key-ip-checked client))
+             (ssh-client-remote-address client)
+             (null (ssh-client-proxy-command client))
+             (not (ssh-certificate-blob-p host-key)))
+    (setf (ssh-client-host-key-ip-checked client) t)
+    (let* ((address (ssh-client-remote-address client))
+           (host (ssh-client-host client))
+           (port (or (ssh-client-connect-port client) 22))
+           (ip-host (if (= port 22)
+                        address
+                        (format nil "[~A]:~D" address port))))
+      (unless (or (string= host address)
+                  (member (string-downcase host)
+                          '("localhost" "127.0.0.1" "::1")
+                          :test #'string=))
+        (case (ssh-client-known-host-status-for client ip-host host-key)
+          (:mismatch
+           (error 'ssh-host-key-error
+                  :detail (format nil
+                                  "the host key for ~A differs from the key for its address ~A"
+                                  (ssh-client-host-spec client) ip-host)
+                  :fingerprint (ssh-key-fingerprint
+                                host-key
+                                (ssh-client-fingerprint-hash client))))
+          (:unknown
+           (multiple-value-bind (type data) (ssh-public-key-parts host-key)
+             (declare (ignore data))
+             (ignore-errors
+               (ssh-remember-known-host
+                (ssh-client-known-hosts-file client)
+                ip-host type host-key
+                :hash (ssh-client-hash-known-hosts client)))))
+          (t nil))))))
+
+(defun ssh-client-verify-host-key (client host-key)
+  "Check HOST-KEY's policy and, when configured, its address entry."
+  (prog1 (ssh-client-verify-host-key-main client host-key)
+    (ssh-client-check-host-address client host-key)))
 
 (defun ssh-client-accept-unknown-host-key (client host-key fingerprint)
   "Decide what to do with a host key never seen before."
