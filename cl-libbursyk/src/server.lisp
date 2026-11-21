@@ -149,6 +149,7 @@ presented."
                           on-session
                           on-channel
                           on-direct-tcpip
+                          on-direct-streamlocal
                           on-tcpip-forward
                           on-cancel-tcpip-forward
                           on-error
@@ -282,6 +283,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :on-session on-session
                   :on-channel on-channel
                   :on-direct-tcpip on-direct-tcpip
+                  :on-direct-streamlocal on-direct-streamlocal
                   :on-tcpip-forward on-tcpip-forward
                   :on-cancel-tcpip-forward on-cancel-tcpip-forward
                   :on-error on-error

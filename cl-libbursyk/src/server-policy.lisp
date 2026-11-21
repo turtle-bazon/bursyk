@@ -1313,6 +1313,24 @@ applies."
     (and (ssh-authorization-options-permit-port-forwarding-p options)
          (ssh-authorization-options-permit-open-p options host port))))
 
+(defun ssh-session-permits-direct-streamlocal-p (session path)
+  "Whether SESSION may open a local forward to the Unix socket PATH.
+
+The key must permit port forwarding and the connection must not disable it;
+AllowStreamLocalForwarding must be yes/all or local.  This server defaults
+the directive to no, so a client cannot reach a server-side Unix socket
+unless an administrator opts in."
+  (declare (ignore path))
+  (let ((options (ssh-session-authorization session))
+        (policy (or (ssh-session-setting
+                     session
+                     #'ssh-server-config-allow-streamlocal-forwarding)
+                    :no)))
+    (and (ssh-authorization-options-permit-port-forwarding-p options)
+         (not (ssh-session-setting
+               session #'ssh-server-config-disable-forwarding))
+         (member policy '(:yes :local) :test #'eq))))
+
 (defun ssh-server-permit-listen-allows-p (rules host port)
   "Whether sshd_config PermitListen RULES allow a listener on HOST:PORT.
 

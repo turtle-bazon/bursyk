@@ -3625,3 +3625,86 @@ RefuseConnection penalty."
           (cl-pnet-ssh::ssh-session-close-reason session) :refused)
     (cl-pnet-ssh::ssh-server-session-penalty session)
     (is (not (null (penalty-refused-p server "192.0.2.1"))) "refused")))
+
+(test direct-streamlocal-forwarding-policy
+  "AllowStreamLocalForwarding admits local forwards only for yes/all/local,
+and DisableForwarding or no-port-forwarding vetoes them."
+  (dolist (case '(("yes" . t) ("all" . t) ("local" . t)
+                  ("remote" . nil) ("no" . nil)))
+    (let* ((config (ssh-server-config-load
+                    nil :options
+                    (list (format nil "AllowStreamLocalForwarding ~A"
+                                  (car case)))))
+           (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+           (session (cl-pnet-ssh::%make-ssh-session :server server)))
+      (is (eq (cdr case)
+              (not (null (cl-pnet-ssh:ssh-session-permits-direct-streamlocal-p
+                          session "/tmp/sock")))))))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes"
+                                 "DisableForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (is (null (cl-pnet-ssh:ssh-session-permits-direct-streamlocal-p
+               session "/tmp/sock"))))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :authorization
+                   (nth-value
+                    0 (ssh-authorized-key-options-parse
+                       "no-port-forwarding")))))
+    (is (null (cl-pnet-ssh:ssh-session-permits-direct-streamlocal-p
+               session "/tmp/sock")))))
+
+(test server-accepts-a-direct-streamlocal-open
+  "A permitted direct-streamlocal open records the socket path."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server
+                  :sshd-config config
+                  :on-direct-streamlocal
+                  (lambda (session path)
+                    (declare (ignore session))
+                    (string= path "/tmp/sock"))))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-channel-open+)
+    (cl-pnet-ssh:ssh-write-text writer "direct-streamlocal@openssh.com")
+    (cl-pnet-ssh:ssh-write-u32 writer 7)
+    (cl-pnet-ssh:ssh-write-u32 writer 2097152)
+    (cl-pnet-ssh:ssh-write-u32 writer 32768)
+    (cl-pnet-ssh:ssh-write-text writer "/tmp/sock")
+    (cl-pnet-ssh:ssh-write-text writer "")
+    (cl-pnet-ssh:ssh-write-u32 writer 0)
+    (cl-pnet-ssh::ssh-server-handle-channel-message
+     session (cl-pnet-ssh:ssh-writer-output writer))
+    (let ((channel (gethash 0 (cl-pnet-ssh::ssh-session-channels session))))
+      (is (not (null channel)))
+      (is (equal "direct-streamlocal@openssh.com"
+                 (cl-pnet-ssh:ssh-server-channel-type channel)))
+      (is (equal "/tmp/sock"
+                 (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))))
+  ;; The application hook can refuse a path.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server
+                  :sshd-config config
+                  :on-direct-streamlocal (lambda (session path)
+                                           (declare (ignore session path))
+                                           nil)))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-channel-open+)
+    (cl-pnet-ssh:ssh-write-text writer "direct-streamlocal@openssh.com")
+    (cl-pnet-ssh:ssh-write-u32 writer 7)
+    (cl-pnet-ssh:ssh-write-u32 writer 2097152)
+    (cl-pnet-ssh:ssh-write-u32 writer 32768)
+    (cl-pnet-ssh:ssh-write-text writer "/tmp/sock")
+    (cl-pnet-ssh:ssh-write-text writer "")
+    (cl-pnet-ssh:ssh-write-u32 writer 0)
+    (cl-pnet-ssh::ssh-server-handle-channel-message
+     session (cl-pnet-ssh:ssh-writer-output writer))
+    (is (null (gethash 0 (cl-pnet-ssh::ssh-session-channels session))))))

@@ -3157,3 +3157,38 @@ Match User alice
       (let ((text (get-output-stream-string out)))
         (is (search "hello alice" text))
         (is (not (search "hello bob" text)))))))
+
+(test sshd-config-reads-allow-stream-local-forwarding
+  "AllowStreamLocalForwarding takes sshd's four values and is Match-aware."
+  (is (eq :yes
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+           "AllowStreamLocalForwarding yes")))
+  (is (eq :no
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+           "AllowStreamLocalForwarding no")))
+  (is (eq :local
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+           "AllowStreamLocalForwarding local")))
+  (is (eq :remote
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+           "AllowStreamLocalForwarding remote")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AllowStreamLocalForwarding sometimes"))
+  (let* ((config (config-from-text
+                  "AllowStreamLocalForwarding no
+Match User alice
+  AllowStreamLocalForwarding yes"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (eq :yes
+            (cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+             alice)))
+    (is (eq :no
+            (cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
+             bob)))))

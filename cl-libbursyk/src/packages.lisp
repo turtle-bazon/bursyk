@@ -101,6 +101,7 @@
    #:ssh-server-channel-pty-rows
    #:ssh-server-channel-pty-modes
    #:ssh-server-channel-subsystem
+   #:ssh-server-channel-streamlocal-path
    #:ssh-server-channel-write
    #:ssh-server-channel-write-stderr
    #:ssh-server-open-forwarded-tcpip
@@ -196,6 +197,7 @@
    #:ssh-server-config-required-rsa-size
    #:ssh-server-config-gateway-ports
    #:ssh-server-config-allow-tcp-forwarding
+   #:ssh-server-config-allow-streamlocal-forwarding
    #:ssh-server-config-disable-forwarding
    #:ssh-server-config-subsystems
    #:ssh-server-config-log-level
@@ -286,6 +288,7 @@
    #:ssh-session-remote-ip
    #:ssh-session-permits-pty-p
    #:ssh-session-permits-direct-tcpip-p
+   #:ssh-session-permits-direct-streamlocal-p
    #:ssh-session-permits-tcpip-forward-p
    #:ssh-parse-absolute-time
    #:ssh-match-pattern-list

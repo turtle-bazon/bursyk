@@ -1104,6 +1104,7 @@ this program's error, because a configured list is meant exactly as written."
                           on-session
                           on-channel
                           on-direct-tcpip
+                          on-direct-streamlocal
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -1192,6 +1193,7 @@ list, applied by the same inactivity accounting as the pure backend."
                   :on-session on-session
                   :on-channel on-channel
                   :on-direct-tcpip on-direct-tcpip
+                  :on-direct-streamlocal on-direct-streamlocal
                   :on-error on-error
                   :on-close on-close))
          (bind (ssh-bind-new)))

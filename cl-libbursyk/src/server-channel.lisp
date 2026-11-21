@@ -178,6 +178,9 @@ with SSH_OPEN_ADMINISTRATIVELY_PROHIBITED instead of allocating a channel."
       ((string= type "direct-tcpip")
        (ssh-server-handle-direct-tcpip-open session reader sender window
                                             max-packet))
+      ((string= type "direct-streamlocal@openssh.com")
+       (ssh-server-handle-direct-streamlocal-open session reader sender window
+                                                  max-packet))
       (t
        (ssh-server-channel-open-failure session sender 3
                                         (format nil "unsupported channel type ~A"
@@ -206,6 +209,36 @@ reports - instead of opening a channel that can never carry a byte."
         (ssh-server-channel-open-failure
          session sender 1
          (format nil "direct-tcpip to ~A:~D is not permitted" host port)))))
+
+(defun ssh-server-handle-direct-streamlocal-open (session reader sender window
+                                                  max-packet)
+  "Accept a client's local forward to a Unix-domain socket.
+
+The open carries the socket path and two reserved fields.  The application's
+ON-DIRECT-STREAMLOCAL hook decides whether the path is acceptable, and the
+channel's data callbacks are left to the application, which owns the
+Unix-socket connection."
+  (let* ((path (ssh-read-text reader))
+         (reserved (ssh-read-text reader))
+         (reserved-number (ssh-read-u32 reader))
+         (handler (ssh-server-on-direct-streamlocal
+                   (ssh-session-server session)))
+         (allowed (and (ssh-session-permits-direct-streamlocal-p session path)
+                       handler
+                       (funcall handler session path))))
+    (declare (ignore reserved reserved-number))
+    (if allowed
+        (let ((channel (ssh-server-register-channel
+                        session "direct-streamlocal@openssh.com"
+                        sender window max-packet)))
+          (setf (ssh-server-channel-streamlocal-path channel) path)
+          (when (ssh-server-on-channel (ssh-session-server session))
+            (funcall (ssh-server-on-channel (ssh-session-server session))
+                     channel))
+          channel)
+        (ssh-server-channel-open-failure
+         session sender 1
+         (format nil "direct-streamlocal to ~A is not permitted" path)))))
 
 ;;; ---- Requests ----
 

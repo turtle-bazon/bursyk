@@ -74,6 +74,9 @@
   (on-session nil)
   (on-channel nil)
   (on-direct-tcpip nil)
+  ;; A function of (SESSION PATH) answering whether a client's
+  ;; direct-streamlocal@openssh.com channel may connect to PATH.
+  (on-direct-streamlocal nil)
   ;; Remote forwarding: the application owns the listener, because it knows
   ;; which addresses and ports its user is willing to expose.  The first
   ;; returns the bound port (or NIL to refuse); the second returns true once
@@ -197,6 +200,8 @@ present after RequiredRSASize, for callers that only want to describe it."
   (env nil)
   (command nil)
   (subsystem nil)
+  ;; The Unix-domain path a direct-streamlocal channel targets.
+  (streamlocal-path nil)
   ;; PTY-REQ stores the peer's terminal here, so the application that starts
   ;; the shell or command can size it before the first output.
   (pty-p nil)

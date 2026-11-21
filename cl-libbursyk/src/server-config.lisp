@@ -140,8 +140,7 @@ socket address and has no routing domains.")
     ("ignorerhosts" . "yes")
     ("permittty" . "yes")
     ("permituserrc" . "yes")
-    ("compression" . "no")
-    ("allowstreamlocalforwarding" . "no")))
+    ("compression" . "no")))
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
@@ -208,6 +207,9 @@ socket address and has no routing domains.")
   (required-rsa-size nil)
   (gateway-ports nil)
   (allow-tcp-forwarding nil)
+  ;; AllowStreamLocalForwarding: :YES, :NO, :LOCAL or :REMOTE.  NIL leaves
+  ;; this server's own default, which refuses stream-local forwarding.
+  (allow-streamlocal-forwarding nil)
   (disable-forwarding nil)
   ;; DisableForwarding is the one Match keyword whose "no" is a value of its
   ;; own rather than the absence of one, so a match block that says no must
@@ -690,7 +692,8 @@ error, never an accidental no-match: sshd fatals in the same situation."
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems log-level
-    gateway-ports allow-tcp-forwarding disable-forwarding set-env
+    gateway-ports allow-tcp-forwarding allow-streamlocal-forwarding
+    disable-forwarding set-env
     expose-auth-info refuse-connection
     unused-connection-timeout channel-timeouts
     trusted-user-ca-keys authorized-principals-file
@@ -1143,6 +1146,13 @@ cannot apply per connection."
         (ssh-server-config-multistate
          line (ssh-server-config-one-argument line)
          +ssh-server-config-tcp-forwarding-values+ "AllowTcpForwarding")))
+      ((string= keyword "allowstreamlocalforwarding")
+       (ssh-server-config-set-once
+        config 'allow-streamlocal-forwarding
+        (ssh-server-config-multistate
+         line (ssh-server-config-one-argument line)
+         +ssh-server-config-tcp-forwarding-values+
+         "AllowStreamLocalForwarding")))
       ((string= keyword "disableforwarding")
        (unless (ssh-server-config-disable-forwarding-set-p config)
          (setf (ssh-server-config-disable-forwarding config)

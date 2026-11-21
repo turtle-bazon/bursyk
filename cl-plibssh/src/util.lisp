@@ -154,6 +154,7 @@
   (on-session nil)
   (on-channel nil)
   (on-direct-tcpip nil)
+  (on-direct-streamlocal nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))
@@ -239,6 +240,7 @@
   target
   (command nil)
   (subsystem nil)
+  (streamlocal-path nil)
   ;; The pty the peer asked for, kept for the shell or command that follows.
   (pty-p nil)
   (pty-term nil)

@@ -66,7 +66,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.32"
+(defparameter +bursyk-server-version+ "0.0.2.33"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1045,6 +1045,210 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
   (cl-pnet-ssh:ssh-server-channel-exit channel 126)
   (cl-pnet-ssh:ssh-server-channel-close channel))
 
+;;; ---- stream-local forwarding ----
+;;;
+;;; A direct-streamlocal channel names a Unix-domain socket on this host.
+;;; The library approves the path; this program owns the socket, so it can
+;;; bridge it without teaching the library about file descriptors.
+
+#-win32
+(progn
+(defstruct (streamlocal-bridge (:constructor %make-streamlocal-bridge))
+  channel
+  fd
+  read-watcher
+  write-watcher
+  (pending (make-array 0 :element-type '(unsigned-byte 8)
+                         :adjustable t :fill-pointer 0))
+  (offset 0)
+  (input-closed nil)
+  (output-closed nil)
+  (shutdown-done nil)
+  (closed nil))
+
+(defun streamlocal-bridge-close (bridge)
+  "Close BRIDGE's socket and watchers once."
+  (unless (streamlocal-bridge-closed bridge)
+    (setf (streamlocal-bridge-closed bridge) t)
+    (when (streamlocal-bridge-read-watcher bridge)
+      (cl-pnet:fd-unwatch (streamlocal-bridge-read-watcher bridge))
+      (setf (streamlocal-bridge-read-watcher bridge) nil))
+    (when (streamlocal-bridge-write-watcher bridge)
+      (cl-pnet:fd-unwatch (streamlocal-bridge-write-watcher bridge))
+      (setf (streamlocal-bridge-write-watcher bridge) nil))
+    (let ((fd (streamlocal-bridge-fd bridge)))
+      (when (and fd (not (minusp fd)))
+        (ignore-errors (c-close fd))
+        (setf (streamlocal-bridge-fd bridge) nil)))))
+
+(defun streamlocal-bridge-fail (bridge condition)
+  "Report CONDITION and close BRIDGE and its channel."
+  (log-at-session
+   (cl-pnet-ssh:ssh-server-channel-session (streamlocal-bridge-channel bridge))
+   :error "direct-streamlocal: ~A" condition)
+  (streamlocal-bridge-close bridge)
+  (ignore-errors
+    (cl-pnet-ssh:ssh-server-channel-close
+     (streamlocal-bridge-channel bridge))))
+
+(defun streamlocal-bridge-shutdown-input (bridge)
+  "Shut the socket's write side once the client's queued data has drained."
+  (when (and (streamlocal-bridge-input-closed bridge)
+             (not (streamlocal-bridge-shutdown-done bridge))
+             (zerop (fill-pointer (streamlocal-bridge-pending bridge))))
+    (setf (streamlocal-bridge-shutdown-done bridge) t)
+    (let ((fd (streamlocal-bridge-fd bridge)))
+      (when (and fd (not (minusp fd)))
+        (ignore-errors (cl-pnet-sockets:c-shutdown fd 1))))))
+
+(defun streamlocal-bridge-flush (bridge)
+  "Send BRIDGE's queued client data to the Unix socket."
+  (unless (or (streamlocal-bridge-closed bridge)
+              (streamlocal-bridge-input-closed bridge))
+    (let* ((fd (streamlocal-bridge-fd bridge))
+           (pending (streamlocal-bridge-pending bridge))
+           (offset (streamlocal-bridge-offset bridge))
+           (failed nil))
+      (loop while (< offset (fill-pointer pending))
+            do (multiple-value-bind (count error)
+                   (cl-pnet-sockets:write-octets
+                    fd pending :start offset)
+                 (cond
+                   ((plusp count) (incf offset count))
+                   ((member error '(4 11)) (return))
+                   (t
+                    (setf failed error)
+                    (return)))))
+      (setf (streamlocal-bridge-offset bridge) offset)
+      (cond
+        (failed
+         (streamlocal-bridge-fail
+          bridge
+          (make-condition 'cl-pnet-ssh:ssh-connection-error
+                          :detail (format nil "Unix socket write failed (~A)"
+                                          failed))))
+        ((>= offset (fill-pointer pending))
+         (setf (fill-pointer pending) 0
+               (streamlocal-bridge-offset bridge) 0)
+         (when (streamlocal-bridge-write-watcher bridge)
+           (cl-pnet:fd-unwatch (streamlocal-bridge-write-watcher bridge))
+           (setf (streamlocal-bridge-write-watcher bridge) nil))
+         (streamlocal-bridge-shutdown-input bridge))
+        (t
+         (unless (streamlocal-bridge-write-watcher bridge)
+           (setf (streamlocal-bridge-write-watcher bridge)
+                 (cl-pnet:fd-watch
+                  fd :on-writable
+                  (lambda (watcher)
+                    (declare (ignore watcher))
+                    (setf (streamlocal-bridge-write-watcher bridge) nil)
+                    (streamlocal-bridge-flush bridge))))))))))
+
+(defun streamlocal-bridge-on-data (bridge data)
+  "Queue client DATA for the Unix socket."
+  (unless (or (streamlocal-bridge-closed bridge)
+              (streamlocal-bridge-input-closed bridge))
+    (let ((pending (streamlocal-bridge-pending bridge)))
+      (loop for octet across data
+            do (vector-push-extend octet pending)))
+    (streamlocal-bridge-flush bridge)))
+
+(defun streamlocal-bridge-on-eof (bridge)
+  "The client sent EOF: drain what it queued, then shut the socket's writer."
+  (unless (streamlocal-bridge-closed bridge)
+    (setf (streamlocal-bridge-input-closed bridge) t)
+    (streamlocal-bridge-shutdown-input bridge)
+    (when (streamlocal-bridge-output-closed bridge)
+      (ignore-errors
+        (cl-pnet-ssh:ssh-server-channel-close
+         (streamlocal-bridge-channel bridge))))))
+
+(defun streamlocal-bridge-on-readable (bridge)
+  "Read the Unix socket and send what it yields to the client."
+  (unless (streamlocal-bridge-closed bridge)
+    (multiple-value-bind (data count error)
+        (cl-pnet-sockets:read-octets (streamlocal-bridge-fd bridge) 4096)
+      (cond
+        ((plusp count)
+         (ignore-errors
+           (cl-pnet-ssh:ssh-server-channel-write
+            (streamlocal-bridge-channel bridge) data)))
+        ((or (zerop count) (member error '(5 104 111)))
+         ;; EOF, EIO on a closed peer, ECONNRESET or ECONNREFUSED.
+         (setf (streamlocal-bridge-output-closed bridge) t)
+         (when (streamlocal-bridge-read-watcher bridge)
+           (cl-pnet:fd-unwatch (streamlocal-bridge-read-watcher bridge))
+           (setf (streamlocal-bridge-read-watcher bridge) nil))
+         (ignore-errors
+           (cl-pnet-ssh:ssh-server-channel-eof
+            (streamlocal-bridge-channel bridge)))
+         (when (streamlocal-bridge-input-closed bridge)
+           (ignore-errors
+             (cl-pnet-ssh:ssh-server-channel-close
+              (streamlocal-bridge-channel bridge)))))
+        (t
+         (streamlocal-bridge-fail
+          bridge
+          (make-condition 'cl-pnet-ssh:ssh-connection-error
+                          :detail (format nil "Unix socket read failed (~A)"
+                                          error))))))))
+
+(defun streamlocal-bridge-connected (bridge)
+  "BRIDGE's socket is connected: watch it and send anything already queued."
+  (setf (streamlocal-bridge-read-watcher bridge)
+        (cl-pnet:fd-watch
+         (streamlocal-bridge-fd bridge)
+         :on-readable
+         (lambda (watcher)
+           (declare (ignore watcher))
+           (streamlocal-bridge-on-readable bridge))))
+  (streamlocal-bridge-flush bridge))
+
+(defun start-streamlocal-bridge (channel)
+  "Bridge CHANNEL to the Unix socket its open named."
+  (let ((path (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))
+    (multiple-value-bind (fd state)
+        (cl-pnet-sockets:connect-unix path)
+      (if (null fd)
+          (progn
+            (log-at-session
+             (cl-pnet-ssh:ssh-server-channel-session channel)
+             :error "direct-streamlocal ~A: ~A"
+             path (cl-pnet-sockets:c-strerror state))
+            (ignore-errors (cl-pnet-ssh:ssh-server-channel-close channel)))
+          (let ((bridge (%make-streamlocal-bridge :channel channel :fd fd)))
+            (setf (cl-pnet-ssh:ssh-server-channel-on-data channel)
+                  (lambda (channel data kind)
+                    (declare (ignore channel kind))
+                    (streamlocal-bridge-on-data bridge data))
+                  (cl-pnet-ssh:ssh-server-channel-on-eof channel)
+                  (lambda (channel)
+                    (declare (ignore channel))
+                    (streamlocal-bridge-on-eof bridge))
+                  (cl-pnet-ssh:ssh-server-channel-on-close channel)
+                  (lambda (channel)
+                    (declare (ignore channel))
+                    (streamlocal-bridge-close bridge)))
+            (if (eq state :connected)
+                (streamlocal-bridge-connected bridge)
+                (setf (streamlocal-bridge-write-watcher bridge)
+                      (cl-pnet:fd-watch
+                       fd :on-writable
+                       (lambda (watcher)
+                         (declare (ignore watcher))
+                         (setf (streamlocal-bridge-write-watcher bridge) nil)
+                         (multiple-value-bind (errno answered)
+                             (cl-pnet-sockets:socket-error fd)
+                           (if (and answered (zerop errno))
+                               (streamlocal-bridge-connected bridge)
+                               (streamlocal-bridge-fail
+                                bridge
+                                (make-condition
+                                 'cl-pnet-ssh:ssh-connection-error
+                                 :detail
+                                 (format nil "Unix socket connect failed (~A)"
+                                         errno)))))))))))))))
+
 (defun install-channel-handlers (channel)
   "Attach the session policy and remember the bridge for window changes.
 
@@ -1053,6 +1257,11 @@ sshd's ForceCommand and the authorized_keys command= option do; ForceCommand
 wins when both are present.  It runs through the same bridge as any other
 command, with SSH_ORIGINAL_COMMAND in its environment holding what the client
 asked for, when it asked for anything."
+  #-win32
+  (when (string= (cl-pnet-ssh:ssh-server-channel-type channel)
+                 "direct-streamlocal@openssh.com")
+    (start-streamlocal-bridge channel)
+    (return-from install-channel-handlers nil))
   (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
          (authorization (cl-pnet-ssh:ssh-session-authorization session))
          (forced-command
@@ -1973,6 +2182,18 @@ guess, so only an explicit PidFile is written."
                 session :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
                 host port allowed)
                allowed))
+           :on-direct-streamlocal
+           #-win32
+           (lambda (session path)
+             ;; The library has already applied AllowStreamLocalForwarding,
+             ;; the key's permit-port-forwarding option and DisableForwarding.
+             (log-at-session session :verbose
+                             "direct-streamlocal to ~A: allowed" path)
+             t)
+           #+win32
+           (lambda (session path)
+             (declare (ignore session path))
+             nil)
            ;; The libssh backend has no forwarded-tcpip channels yet, so it
            ;; must not be handed these hooks: its MAKE-SSH-SERVER does not
            ;; take them, and libssh refuses a client's tcpip-forward request
