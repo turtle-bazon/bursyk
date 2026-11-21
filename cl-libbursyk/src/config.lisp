@@ -83,6 +83,7 @@ relative Include is anchored here.")
   (forward-x11 nil)
   (forward-x11-trusted nil)
   (gateway-ports nil)
+  (exit-on-forward-failure nil)
   ;; RequiredRSASize: the smallest RSA modulus this client will use for a
   ;; host key or an authentication key; OpenSSH's default is 1024.
   (required-rsa-size nil)
@@ -968,6 +969,9 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
+        ((string= keyword "exitonforwardfailure")
+         (setf (ssh-config-options-exit-on-forward-failure options)
+               (boolean)))
         ((string= keyword "refuseconnection")
          ;; ssh treats this as fatal while the active block is read, so a
          ;; managed configuration can stop a connection before it starts.
@@ -1027,7 +1031,8 @@ understand them rather than silently match nothing."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "gatewayports" "refuseconnection" "requiredrsasize"
+                         "gatewayports" "exitonforwardfailure"
+                         "refuseconnection" "requiredrsasize"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"

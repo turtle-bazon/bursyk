@@ -1490,6 +1490,12 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun exit-on-forward-failure-p (client)
+  "Whether ExitOnForwardFailure asks this client to exit on a failed forward."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-exit-on-forward-failure options))))
+
 (defun start-local-streamlocal-forward (client forward)
   "Listen on FORWARD's local Unix socket and bridge accepted peers.
 
@@ -1512,7 +1518,9 @@ does when it binds a local forwarding socket."
       (unless (getf *options* :quiet)
         (format *error-output*
                 "burs: cannot listen on ~A for -L~%" path))
-      (finish 255))
+      (if (exit-on-forward-failure-p client)
+          (finish 255)
+          (return-from start-local-streamlocal-forward nil)))
     (setf (forward-listener-fd forward) listener
           (forward-listener-watcher forward)
           (cl-pnet:fd-watch
@@ -1573,7 +1581,9 @@ does when it binds a local forwarding socket."
       (format *error-output*
               "burs: cannot listen on ~A:~D for -L~%"
               address (forward-bind-port forward))
-      (finish 255))
+      (if (exit-on-forward-failure-p client)
+          (finish 255)
+          (return-from start-local-forward nil)))
     (setf (forward-listener forward) listener)
     (push forward *forwards*)
     (let ((port (cl-pnet:listener-port listener)))
@@ -1732,7 +1742,9 @@ buffered with the tunnel and flushed once the channel is open."
       (format *error-output*
               "burs: cannot listen on ~A:~D for -D~%"
               address (dynamic-forward-bind-port forward))
-      (finish 255))
+      (if (exit-on-forward-failure-p client)
+          (finish 255)
+          (return-from start-dynamic-forward nil)))
     (setf (dynamic-forward-listener forward) listener)
     (push forward *dynamic-forwards*)
     (let ((port (cl-pnet:listener-port listener)))
@@ -1830,10 +1842,12 @@ peer that connected to it; NIL refuses the channel."
    :on-failure
    (lambda ()
      (setf *remote-forwards* (delete forward *remote-forwards*))
-     (unless (getf *options* :quiet)
-       (format *error-output*
-               "burs: remote streamlocal forward ~A was refused~%"
-               (forward-bind-path forward)))))
+     (if (exit-on-forward-failure-p client)
+         (finish 255)
+         (unless (getf *options* :quiet)
+           (format *error-output*
+                   "burs: remote streamlocal forward ~A was refused~%"
+                   (forward-bind-path forward))))))
   forward)
 
 (defun start-remote-forward (client forward)
@@ -1861,10 +1875,12 @@ peer that connected to it; NIL refuses the channel."
      :on-failure
      (lambda ()
        (setf *remote-forwards* (delete forward *remote-forwards*))
-       (unless (getf *options* :quiet)
-         (format *error-output*
-                 "burs: remote forward ~A:~D was refused~%"
-                 address port))))
+       (if (exit-on-forward-failure-p client)
+           (finish 255)
+           (unless (getf *options* :quiet)
+             (format *error-output*
+                     "burs: remote forward ~A:~D was refused~%"
+                     address port)))))
     forward))
 
 (defun start-forwards (client)
@@ -1979,6 +1995,11 @@ peer that connected to it; NIL refuses the channel."
      (or (cl-pnet-ssh:ssh-config-options-known-hosts options)
          (and (getf *options* :known-hosts)
               (list (getf *options* :known-hosts)))))
+    (format t "exitonforwardfailure ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-exit-on-forward-failure
+                 options)
+                "yes"
+                "no"))
     (format t "hashknownhosts ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-hash-known-hosts options)
                 "yes"

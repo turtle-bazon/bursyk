@@ -201,6 +201,14 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test exit-on-forward-failure-reads-the-config
+  (let ((client (cl-pnet-ssh::%make-ssh-client)))
+    (is (null (burs::exit-on-forward-failure-p client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options
+           :exit-on-forward-failure t))
+    (is (burs::exit-on-forward-failure-p client))))
+
 (test stream-local-forwarding-specifications-parse
   ;; -L local_socket:remote_socket
   (let ((forward

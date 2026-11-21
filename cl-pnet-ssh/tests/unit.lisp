@@ -2730,6 +2730,22 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test exit-on-forward-failure-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "ExitOnForwardFailure yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-exit-on-forward-failure options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-exit-on-forward-failure options)))))
+
 (test hash-known-hosts-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

@@ -153,6 +153,7 @@
    #:ssh-config-options-proxy-command
    #:ssh-config-options-address-family
    #:ssh-config-options-gateway-ports
+   #:ssh-config-options-exit-on-forward-failure
    #:ssh-config-options-required-rsa-size
    #:ssh-config-options-ca-signature-algorithms
    #:ssh-config-options-streamlocal-bind-mask
