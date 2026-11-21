@@ -2706,6 +2706,37 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test refuse-connection-stops-resolution
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "RefuseConnection \"maintenance window\""))))
+         (failure nil)
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value))
+                        :on-error (lambda (condition) (setf failure condition)))
+    (is (typep failure 'ssh-config-error))
+    (is (search "maintenance window" (princ-to-string failure)))
+    (is (null options)))
+  ;; A RefuseConnection in a Host block that does not match is inert.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "Host other")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "RefuseConnection not for you")
+                  (cl-pnet-ssh::ssh-config-option-line "Host alias")
+                  (cl-pnet-ssh::ssh-config-option-line "Port 2222"))))
+         (failure nil)
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value))
+                        :on-error (lambda (condition) (setf failure condition)))
+    (is (null failure))
+    (is (= 2222 (ssh-config-options-port options)))))
+
 (test revoked-host-keys-parse
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

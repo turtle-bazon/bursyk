@@ -961,6 +961,10 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
+        ((string= keyword "refuseconnection")
+         ;; ssh treats this as fatal while the active block is read, so a
+         ;; managed configuration can stop a connection before it starts.
+         (error (ssh-config-line-error line "RefuseConnection: ~A" value)))
         ((string= keyword "requiredrsasize")
          (setf (ssh-config-options-required-rsa-size options)
                (integer)))
@@ -1015,7 +1019,7 @@ understand them rather than silently match nothing."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "gatewayports" "requiredrsasize"
+                         "gatewayports" "refuseconnection" "requiredrsasize"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
