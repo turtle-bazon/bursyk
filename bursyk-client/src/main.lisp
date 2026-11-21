@@ -561,13 +561,12 @@ itself never blocks: this matcher is what a caller supplies."
      (setf (getf *options* :request-tty) (string-downcase value)))
     ((string-equal name "BindAddress")
      (setf (getf *options* :bind-address) value))
-    ((string-equal name "RemoteForward")
-     (push value (getf *options* :remote-forward)))
-    ((string-equal name "DynamicForward")
-     (push value (getf *options* :dynamic-forward)))
-    ;; Everything else reaches the ssh_config resolver through the same -o
-    ;; list, or is accepted and ignored as SSH itself tolerates keywords a
-    ;; newer client wrote.
+    ;; Forwarding keywords stay with the ssh_config resolver: it already
+    ;; sees every -o line, so recording them here too would start each
+    ;; forward twice.
+    ;; Everything else reaches the same resolver through the -o list, or is
+    ;; accepted and ignored as SSH itself tolerates keywords a newer client
+    ;; wrote.
     (t nil)))
 
 (defun command-line-option-list ()

@@ -365,6 +365,10 @@ CLI's decision and at the plist it filled."
     (burs::command-line-option "ProxyCommand" "nc %h %p")
     ;; Every other keyword is accepted and ignored.
     (burs::command-line-option "Compression" "yes")
+    ;; Forwarding lines stay with the ssh_config resolver; recording them
+    ;; here as well would start every -o forward twice.
+    (burs::command-line-option "RemoteForward" "/tmp/a /tmp/b")
+    (is (null (getf burs::*options* :remote-forward)))
     (is (equal "2200" (getf burs::*options* :port)))
     (is (equal "bob" (getf burs::*options* :user)))
     (is (equal '("/tmp/key") (getf burs::*options* :identity)))
