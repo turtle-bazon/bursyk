@@ -871,6 +871,45 @@ Match User bob
     (is (eq :yes (cl-pnet-ssh:ssh-server-config-expose-auth-info alice)))
     (is (eq :no (cl-pnet-ssh:ssh-server-config-expose-auth-info bob)))))
 
+(test sshd-config-reads-authentication-methods
+  "AuthenticationMethods keeps the first line, validates later ones, and
+can be overridden by Match."
+  (is (equal '("publickey,publickey")
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authentication-methods
+              "AuthenticationMethods publickey,publickey")))
+  (is (eq :any
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-authentication-methods
+           "AuthenticationMethods any")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AuthenticationMethods publickey,not-a-method"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AuthenticationMethods any publickey"))
+  ;; A later line is validated but ignored, and 10.6 permits a later "any"
+  ;; because the first line already won.
+  (is (equal '("publickey")
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authentication-methods
+              "AuthenticationMethods publickey
+AuthenticationMethods any")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text
+     "AuthenticationMethods publickey
+AuthenticationMethods publickey,not-a-method"))
+  (let* ((config (config-from-text
+                  "AuthenticationMethods publickey
+Match User bob
+  AuthenticationMethods publickey,publickey"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal '("publickey")
+               (cl-pnet-ssh:ssh-server-config-authentication-methods alice)))
+    (is (equal '("publickey,publickey")
+               (cl-pnet-ssh:ssh-server-config-authentication-methods bob)))))
+
 (test permit-user-environment-controls-names
   (let ((allowlist (cl-pnet-ssh::%make-ssh-server
                     :permit-user-environment '("LANG" "LC_*")))
@@ -2829,3 +2868,19 @@ list; its arguments expand the certificate's tokens."
           (ignore-errors (delete-file args))
           (ignore-errors
            (uiop:delete-directory-tree directory :validate t))))))
+
+(test expose-auth-info-writes-one-line-per-method
+  "A login that completed several methods records each key's line."
+  (let* ((config (config-from-text "ExposeAuthInfo yes"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "alice"
+                   :auth-info-lines
+                   '("publickey ssh-ed25519 AAAA"
+                     "publickey ssh-ed25519 BBBB"))))
+    (unwind-protect
+         (let ((path (bursyk-server::write-auth-info-file session)))
+           (is (equal '("publickey ssh-ed25519 AAAA"
+                        "publickey ssh-ed25519 BBBB")
+                      (uiop:read-file-lines path))))
+      (bursyk-server::delete-auth-info-file session))))

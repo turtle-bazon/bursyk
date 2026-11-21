@@ -176,6 +176,13 @@
   ;; The key blob that authenticated the user, exactly as offered: a
   ;; certificate when one was used.  ExposeAuthInfo writes it out.
   (authorized-key nil)
+  ;; The pure backend's multi-method bookkeeping; libssh completes a
+  ;; connection with one method, but the slots keep the records alike.
+  (auth-method-lists nil)
+  (auth-used-keys '())
+  (auth-merged-options nil)
+  (auth-merged-key-env '())
+  (auth-info-lines '())
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())

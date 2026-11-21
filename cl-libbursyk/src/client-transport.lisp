@@ -485,10 +485,14 @@ has no use for it either."
 
 (defun ssh-client-handle-auth-failure (client payload)
   (let* ((reader (ssh-make-reader payload))
-         (methods (progn (ssh-read-u8 reader) (ssh-read-name-list reader))))
+         (methods (progn (ssh-read-u8 reader) (ssh-read-name-list reader)))
+         ;; RFC 4252's partial-success flag: one method of an
+         ;; AuthenticationMethods list is done and another must follow.
+         (partial (ssh-read-boolean reader)))
     (if (ssh-client-next-signer-p client)
         (progn
-          (ssh-log "publickey rejected; trying the next key")
+          (ssh-log "~:[publickey rejected~;partial success~]; trying the next key"
+                   partial)
           (ssh-client-send-auth-request client))
         (ssh-client-fail
          client

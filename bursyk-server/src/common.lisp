@@ -36,38 +36,45 @@
 (defun write-auth-info-file (session)
   "Write SESSION's ExposeAuthInfo file when the directive asks for it.
 
-The file holds one line, \"publickey TYPE BASE64\", the same text sshd's
-auth2_update_session_info builds.  The key is the blob that authenticated
-the user, so a certificate is written as its certificate type and blob.
-A file that cannot be created is logged and leaves SSH_USER_AUTH unset, as
-sshd's prepare_auth_info_file does."
+The file holds one line per successful method, \"publickey TYPE BASE64\",
+the same text sshd's auth2_update_session_info builds.  The keys are the
+blobs that authenticated the user, so a certificate is written as its
+certificate type and blob.  A file that cannot be created is logged and
+leaves SSH_USER_AUTH unset, as sshd's prepare_auth_info_file does."
   (when (and (eq (session-config-setting
                   session #'cl-pnet-ssh:ssh-server-config-expose-auth-info)
                  :yes)
              (null (auth-info-file session)))
-    (let ((key (cl-pnet-ssh:ssh-session-authorized-key session)))
-      (when key
-        (handler-case
+    (let ((lines (cl-pnet-ssh:ssh-session-auth-info-lines session)))
+      ;; A session made outside the transport has no recorded lines; keep
+      ;; the single-key answer for it.
+      (unless lines
+        (let ((key (cl-pnet-ssh:ssh-session-authorized-key session)))
+          (when key
             (multiple-value-bind (type data)
                 (cl-pnet-ssh:ssh-public-key-parts key)
               (declare (ignore data))
-              (let* ((text (format nil "publickey ~A ~A~%"
-                                   type
-                                   (cl-pnet-ssh:ssh-octets-base64 key)))
-                     (path
-                       (uiop:with-temporary-file
-                           (:stream out :pathname path :keep t
-                            :prefix "sshauth." :direction :output
-                            :external-format :utf-8)
-                         ;; sshd's mkstemp creates the file 0600; UIOP's
-                         ;; portable version cannot, so tighten it while it
-                         ;; is still empty and before the key is written.
-                         #-win32 (c-chmod (uiop:native-namestring path) #o600)
-                         (write-string text out)
-                         path)))
-                (let ((name (uiop:native-namestring path)))
-                  (setf (gethash session *auth-info-files*) name)
-                  name)))
+              (setf lines
+                    (list (format nil "publickey ~A ~A"
+                                  type
+                                  (cl-pnet-ssh:ssh-octets-base64 key))))))))
+      (when lines
+        (handler-case
+            (let* ((text (format nil "~{~A~%~}" lines))
+                   (path
+                     (uiop:with-temporary-file
+                         (:stream out :pathname path :keep t
+                          :prefix "sshauth." :direction :output
+                          :external-format :utf-8)
+                       ;; sshd's mkstemp creates the file 0600; UIOP's
+                       ;; portable version cannot, so tighten it while it
+                       ;; is still empty and before the keys are written.
+                       #-win32 (c-chmod (uiop:native-namestring path) #o600)
+                       (write-string text out)
+                       path)))
+              (let ((name (uiop:native-namestring path)))
+                (setf (gethash session *auth-info-files*) name)
+                name))
           (error (condition)
             (log-at :error
                     "ExposeAuthInfo: cannot write the authentication file: ~A"

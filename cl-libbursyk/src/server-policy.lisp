@@ -1144,6 +1144,50 @@ certificate is checked both through itself and through its CA key."
   (let ((config (ssh-session-effective-config session)))
     (and config (funcall accessor config))))
 
+(defparameter +ssh-server-enabled-auth-methods+ '("publickey")
+  "Authentication methods this server can complete.
+
+AuthenticationMethods is valid with any OpenSSH method name, but a list that
+needs password, keyboard-interactive, hostbased or GSSAPI can never finish
+here, so sshd's rule of skipping a list that names a disabled method leaves
+only publickey sequences.")
+
+(defun ssh-server-auth-method-lists (config)
+  "CONFIG's AuthenticationMethods lists that this server can complete.
+
+NIL means no multi-method requirement, :IMPOSSIBLE means the directive was
+set but no usable list remains, and otherwise the result is a list of
+method lists, each in the order it must be completed."
+  (let ((methods (and config
+                      (ssh-server-config-authentication-methods config))))
+    (cond
+      ((or (null methods) (eq methods :any))
+       nil)
+      (t
+       (let ((lists
+               (remove-if-not
+                (lambda (text)
+                  (let ((parts (uiop:split-string text :separator ",")))
+                    (and parts
+                         (every (lambda (method)
+                                  (member method
+                                          +ssh-server-enabled-auth-methods+
+                                          :test #'string=))
+                                parts))))
+                methods)))
+         (if lists
+             (mapcar (lambda (text)
+                       (uiop:split-string text :separator ","))
+                     lists)
+             :impossible))))))
+
+(defun ssh-server-auth-info-line (key-blob)
+  "The ExposeAuthInfo line for KEY-BLOB, as sshd's sshkey_format_text."
+  (multiple-value-bind (type data)
+      (ssh-public-key-parts key-blob)
+    (declare (ignore data))
+    (format nil "publickey ~A ~A" type (ssh-octets-base64 key-blob))))
+
 (defun ssh-session-resolve-config (session user)
   "Resolve SESSION's Match blocks for USER and remember the result.
 
@@ -1165,7 +1209,17 @@ the session's config NIL so the server-level settings stay in force."
                  :address (ssh-session-remote-ip session)
                  :hostname (ssh-session-remote-ip session)
                  :local-port (ssh-server-port server)))
-          (setf (ssh-session-config-user session) user))))
+          (setf (ssh-session-config-user session) user)
+          ;; A new user starts with a fresh method history, as sshd's
+          ;; per-connection Authctxt does not carry one user's partial
+          ;; authentication into another's.
+          (setf (ssh-session-auth-method-lists session)
+                (ssh-server-auth-method-lists
+                 (ssh-session-effective-config session))
+                (ssh-session-auth-used-keys session) '()
+                (ssh-session-auth-merged-options session) nil
+                (ssh-session-auth-merged-key-env session) '()
+                (ssh-session-auth-info-lines session) '()))))
     (ssh-session-config session)))
 
 (defun ssh-read-banner-file (path)

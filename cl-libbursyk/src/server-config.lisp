@@ -137,7 +137,6 @@ socket address and has no routing domains.")
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
   '("chrootdirectory"
-    "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
     "streamlocalbindmask" "streamlocalbindunlink"))
@@ -154,6 +153,10 @@ socket address and has no routing domains.")
   ;; HostCertificate files, in the order read.  Each must certify one of
   ;; HostKey's public keys; sshd pairs them at startup and drops the rest.
   (host-certificate-files '())
+  ;; AuthenticationMethods: NIL when absent, :ANY for the "any" pseudo-method,
+  ;; or a list of comma-separated method-list strings.  Only lists this
+  ;; server can complete (publickey) are usable at connection time.
+  (authentication-methods nil)
   ;; NIL means the default; sshd's "none" entries are skipped, so a list of
   ;; only "none" disables public-key authentication.
   (authorized-keys-files nil)
@@ -307,6 +310,28 @@ carrying = or a space cannot be passed to execve safely."
     (t (ssh-server-config-line-error line "~A must be yes or no, not ~A"
                                      (ssh-config-line-keyword line)
                                      argument))))
+
+(defparameter +ssh-authentication-method-names+
+  '("none" "publickey" "password" "keyboard-interactive" "hostbased"
+    "gssapi-with-mic")
+  "The method names OpenSSH's authmethods table accepts.
+
+Only publickey can actually complete on this server; the others are still
+valid in the file, and a list that needs one is skipped at connection time
+as sshd skips a list naming a disabled method.")
+
+(defun ssh-server-config-check-authentication-methods (line argument)
+  "Refuse ARGUMENT unless it is a comma-separated list of known methods."
+  (when (zerop (length argument))
+    (ssh-server-config-line-error
+     line "AuthenticationMethods has an empty method list"))
+  (dolist (method (uiop:split-string argument :separator ","))
+    (let* ((colon (position #\: method))
+           (name (if colon (subseq method 0 colon) method)))
+      (unless (member name +ssh-authentication-method-names+
+                      :test #'string=)
+        (ssh-server-config-line-error
+         line "unknown authentication method ~A" name)))))
 
 (defun ssh-server-config-multistate (line argument table keyword)
   "ARGUMENT's value in TABLE, or an error naming the keyword."
@@ -641,6 +666,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     client-alive-interval client-alive-count-max
     force-command banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
+    authentication-methods
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     expose-auth-info
     unused-connection-timeout channel-timeouts
@@ -766,6 +792,34 @@ cannot apply per connection."
        (push (ssh-config-expand-home
               (ssh-server-config-one-argument line))
              (ssh-server-config-host-certificate-files config)))
+      ((string= keyword "authenticationmethods")
+       ;; sshd keeps the first line's lists but validates every line; "any"
+       ;; must stand alone, and later lines cannot add to the first.
+       (when (null arguments)
+         (ssh-server-config-line-error
+          line "AuthenticationMethods needs a method list"))
+       (let ((first (null (ssh-server-config-authentication-methods config)))
+             (any-seen nil)
+             (count 0))
+         (dolist (argument arguments)
+           (cond
+             ((string-equal argument "any")
+              ;; 10.6's rule: "any" must be alone on its own line.  A later
+              ;; line is validated and then ignored because the first wins.
+              (when (plusp count)
+                (ssh-server-config-line-error
+                 line "AuthenticationMethods \"any\" must appear alone"))
+              (setf any-seen t))
+             (any-seen
+              (ssh-server-config-line-error
+               line "AuthenticationMethods \"any\" must appear alone"))
+             (t
+              (ssh-server-config-check-authentication-methods
+               line argument)))
+           (incf count))
+         (when first
+           (setf (ssh-server-config-authentication-methods config)
+                 (if any-seen :any arguments)))))
       ((string= keyword "authorizedkeysfile")
        (unless (ssh-server-config-authorized-keys-files config)
          (cond

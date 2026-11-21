@@ -45,6 +45,7 @@
    #:ssh-session-server
    #:ssh-session-user
    #:ssh-session-authorized-key
+   #:ssh-session-auth-info-lines
    #:ssh-session-key-env
    #:ssh-session-authorization
    #:ssh-session-client-version
@@ -171,6 +172,7 @@
    #:ssh-server-config-address-family
    #:ssh-server-config-host-key-files
    #:ssh-server-config-host-certificate-files
+   #:ssh-server-config-authentication-methods
    #:ssh-server-config-authorized-keys-files
    #:ssh-server-config-trusted-user-ca-keys
    #:ssh-server-config-authorized-principals-file

@@ -384,12 +384,39 @@ it the Match blocks -- is finally known to the server."
         (ssh-write-text writer "")
         (ssh-session-send-payload session (ssh-writer-output writer))))))
 
-(defun ssh-server-send-auth-failure (session &key (count t))
-  "Refuse the current attempt and say publickey is the only method.
+(defun ssh-server-allowed-auth-methods (session)
+  "The methods SESSION may try next, as sshd's authmethods_get reports.
 
-COUNT is false for sshd's two exempt cases: the first \"none\" probe and an
-unsigned publickey offer that was answered with PK_OK.  Reaching
-MaxAuthTries sends DISCONNECT instead of another failure."
+An impossible AuthenticationMethods setting leaves no method, which makes
+every attempt fail rather than quietly falling back to publickey."
+  (let ((lists (ssh-session-auth-method-lists session)))
+    (cond
+      ((eq lists :impossible) '())
+      ((null lists) +ssh-server-enabled-auth-methods+)
+      (t (remove-duplicates (mapcar #'first lists) :test #'string=)))))
+
+(defun ssh-server-auth-key-used-p (session key-blob)
+  "Whether KEY-BLOB already completed a method on SESSION."
+  (some (lambda (used)
+          (ssh-octets= used key-blob))
+        (ssh-session-auth-used-keys session)))
+
+(defun ssh-server-record-auth-success (session key-blob)
+  "Record KEY-BLOB as a completed method and add its ExposeAuthInfo line."
+  (setf (ssh-session-auth-used-keys session)
+        (cons key-blob (ssh-session-auth-used-keys session))
+        (ssh-session-auth-info-lines session)
+        (append (ssh-session-auth-info-lines session)
+                (list (ssh-server-auth-info-line key-blob)))))
+
+(defun ssh-server-send-auth-failure (session &key (count t) partial)
+  "Refuse the current attempt and name the methods that may continue.
+
+COUNT is false for sshd's exempt cases: the first \"none\" probe, an
+unsigned publickey offer answered with PK_OK, and a method that completed
+one list of AuthenticationMethods but not all of them.  PARTIAL sets the
+RFC 4252 partial-success flag for that last case.  Reaching MaxAuthTries
+sends DISCONNECT instead of another failure."
   (when count
     (incf (ssh-session-auth-failures session))
     (when (>= (ssh-session-auth-failures session)
@@ -404,8 +431,8 @@ MaxAuthTries sends DISCONNECT instead of another failure."
       (return-from ssh-server-send-auth-failure nil)))
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-userauth-failure+)
-    (ssh-write-name-list writer '("publickey"))
-    (ssh-write-boolean writer nil)
+    (ssh-write-name-list writer (ssh-server-allowed-auth-methods session))
+    (ssh-write-boolean writer (and partial t))
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
 (defun ssh-server-send-pk-ok (session algorithm key-blob)
@@ -463,6 +490,51 @@ rsa-sha2-512 request cannot be satisfied by a SHA-1 ssh-rsa signature."
                    (ssh-server-signed-data session user algorithm key-blob))))
          (error () nil))))
 
+(defun ssh-server-auth-method-succeeded
+    (session user key-blob key-env authorization)
+  "Record one successful publickey and either finish or ask for the next.
+
+Without AuthenticationMethods this is the whole login.  With it, the method
+is removed from the front of every remaining list; a list that becomes empty
+finishes the login, and otherwise the client is told the method was a
+partial success.  Options from all successful keys are merged, and a key
+already used for a method is never accepted again."
+  (let ((lists (ssh-session-auth-method-lists session)))
+    (cond
+      ((eq lists :impossible)
+       (ssh-server-send-auth-failure session))
+      ((null lists)
+       (ssh-server-record-auth-success session key-blob)
+       (ssh-server-complete-auth session user key-blob key-env authorization))
+      ((not (some (lambda (list)
+                    (and list (string= (first list) "publickey")))
+                  lists))
+       ;; No remaining list starts with this method; do not advance.
+       (ssh-server-send-auth-failure session))
+      (t
+       (let* ((empty (ssh-certificate-authorization-options-empty))
+              (merged (ssh-authorization-options-merge
+                       (or (ssh-session-auth-merged-options session) empty)
+                       (or authorization empty))))
+         (unless merged
+           ;; Inconsistent options, such as two different force-commands.
+           (ssh-server-send-auth-failure session)
+           (return-from ssh-server-auth-method-succeeded nil))
+         (let ((remaining (mapcar #'rest lists)))
+           (ssh-server-record-auth-success session key-blob)
+           (setf (ssh-session-auth-merged-options session) merged
+                 (ssh-session-auth-merged-key-env session)
+                 (append (ssh-session-auth-merged-key-env session) key-env))
+           (if (some #'null remaining)
+               (ssh-server-complete-auth
+                session user key-blob
+                (ssh-session-auth-merged-key-env session)
+                merged)
+               (progn
+                 (setf (ssh-session-auth-method-lists session) remaining)
+                 (ssh-server-send-auth-failure
+                  session :count nil :partial t)))))))))
+
 (defun ssh-server-complete-auth (session user key-blob
                                  &optional key-env authorization)
   "Accept SESSION's authenticated user, then let the application run.
@@ -497,27 +569,36 @@ which the transport enforces for pty and forwarding requests."
              :address (ssh-session-remote-ip session)
              :session session)
           (if authorized
-              (ssh-server-complete-auth session user key-blob
-                                        key-env authorization)
+              (ssh-server-auth-method-succeeded session user key-blob
+                                                key-env authorization)
               (ssh-server-send-auth-failure session :count count)))
         (ssh-server-send-auth-failure session :count count))))
 
 (defun ssh-server-handle-publickey (session user algorithm key-blob reader
                                     has-signature &key (count t))
   "Handle one publickey attempt, signed or merely offered."
-  (if (and (ssh-session-user-key-algorithm-p session key-blob algorithm)
-           (ssh-session-user-key-length-p session key-blob)
-           (ssh-server-authorized-key-p
-            (ssh-session-server session) user key-blob
-            :address (ssh-session-remote-ip session)
-            :session session))
-      (if has-signature
-          (ssh-server-handle-signed-key session user algorithm key-blob reader
-                                        :count count)
-          ;; An accepted offer is sshd's "partial" attempt: it may not count
-          ;; against MaxAuthTries because no authentication was tried.
-          (ssh-server-send-pk-ok session algorithm key-blob))
-      (ssh-server-send-auth-failure session :count count)))
+  (cond
+    ;; No AuthenticationMethods list can finish here; refuse before doing
+    ;; the authorization work, as sshd's authmethod_lookup does.
+    ((eq (ssh-session-auth-method-lists session) :impossible)
+     (ssh-server-send-auth-failure session :count count))
+    ;; sshd refuses a key that already completed a method, even its probe.
+    ((ssh-server-auth-key-used-p session key-blob)
+     (ssh-server-send-auth-failure session :count count))
+    ((and (ssh-session-user-key-algorithm-p session key-blob algorithm)
+          (ssh-session-user-key-length-p session key-blob)
+          (ssh-server-authorized-key-p
+           (ssh-session-server session) user key-blob
+           :address (ssh-session-remote-ip session)
+           :session session))
+     (if has-signature
+         (ssh-server-handle-signed-key session user algorithm key-blob reader
+                                       :count count)
+         ;; An accepted offer is sshd's "partial" attempt: it may not count
+         ;; against MaxAuthTries because no authentication was tried.
+         (ssh-server-send-pk-ok session algorithm key-blob)))
+    (t
+     (ssh-server-send-auth-failure session :count count))))
 
 (defun ssh-server-user-permitted-p (session user)
   "Whether the application admits USER on SESSION.

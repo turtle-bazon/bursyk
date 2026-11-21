@@ -118,6 +118,16 @@ present after RequiredRSASize, for callers that only want to describe it."
   (authenticated nil)
   (user nil)
   (authorized-key nil)
+  ;; AuthenticationMethods progress.  AUTH-METHOD-LISTS is NIL when no
+  ;; multi-method requirement applies, a list of remaining method lists, or
+  ;; :IMPOSSIBLE when no configured list can be completed here.  The rest
+  ;; record what has already succeeded for this connection.
+  (auth-method-lists nil)
+  (auth-used-keys '())
+  (auth-merged-options nil)
+  (auth-merged-key-env '())
+  ;; ExposeAuthInfo lines, one per successful method, in completion order.
+  (auth-info-lines '())
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())

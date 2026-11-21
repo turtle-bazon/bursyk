@@ -375,7 +375,7 @@ flag at a rekey would make the two sides count packets differently."
                      (is (string= "ssh-ed25519" algorithm))
                      (is (ssh-ed25519-verify bytes (octets-ascii "data")
                                              (second parts)))))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test openssh-private-key-passphrase-round-trip
   (if (not (ssh-keygen-available-p))
@@ -403,7 +403,7 @@ flag at a rekey would make the two sides count packets differently."
                    (ssh-load-private-key path :passphrase "wrong"))
                  (signals ssh-authentication-error
                    (ssh-load-private-key path))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 ;;; ---- OpenSSH certificates ----
 
@@ -555,7 +555,7 @@ its CA, and is admitted only for a principal and address its options allow."
                      (is (= 2 (ssh-certificate-cert-type host-certificate)))
                      (is (null (ssh-certificate-check host-certificate
                                                       "example.org")))))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test certificate-option-merge-follows-sshd
   "Permission flags are ANDed, restrictive values are combined, and two
@@ -629,7 +629,7 @@ refuses to pair a certificate with a different key."
                                     nil)
                            (error () t))))
                    (is (not (null mismatch))))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 
 (defun ssh-test-known-host-blob ()
@@ -650,7 +650,7 @@ refuses to pair a certificate with a different key."
            (is (eq :mismatch
                    (ssh-known-host-status file "example.org"
                                           (ssh-test-known-host-blob)))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test known-hosts-hashed-entry
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khh"))
@@ -669,7 +669,7 @@ refuses to pair a certificate with a different key."
                      (ssh-octets-base64 blob)))
            (is (eq :match (ssh-known-host-status file "hashed.example:2222" blob)))
            (is (eq :unknown (ssh-known-host-status file "hashed.example:2223" blob))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 ;; Both backends accept a list of known-hosts files, as ssh_config's
 ;; UserKnownHostsFile and GlobalKnownHostsFile produce, and a key found in
@@ -733,7 +733,7 @@ alias, and trust-on-first-use must write github.com, not gh."
                (is (eq :mismatch (client-known-host-status-for client fresh))
                    "the alias entry was consulted instead of the HostName's")
                (is (eq :match (client-known-host-status-for alias-only fresh))))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test client-rejected-host-key-signals
   "A policy callback that declines an unknown key must refuse the connection.
@@ -758,7 +758,7 @@ caller asked for."
              (client-accept-unknown-host-key-for client blob fingerprint))
            (is (eq :unknown (client-known-host-status-for client blob))
                "a rejected key was recorded anyway"))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test client-accepted-host-key-is-recorded
   "A policy callback that accepts an unknown key records it and does not
@@ -778,7 +778,7 @@ signal, so the override still works."
            (client-accept-unknown-host-key-for client blob
                                                (ssh-key-fingerprint blob))
            (is (eq :match (client-known-host-status-for client blob))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test client-known-hosts-checks-every-file
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khm"))
@@ -806,7 +806,7 @@ signal, so the override still works."
              (client-remember-host-key-for client fresh)
              (is (eq :match (ssh-known-host-status first-file
                                                    "example.org" fresh)))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 ;;; ---- Channel requests ----
 ;;; Capturing SSH-CHANNEL-SEND only makes sense for the pure transport.
@@ -1035,7 +1035,7 @@ signal, so the override still works."
                                           :on-error on-error)))))
            (is (equalp blob (caar entries)))
            (is (string= "from-agent" (cdar entries))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test agent-sign-over-a-unix-socket
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-s"))
@@ -1066,7 +1066,7 @@ signal, so the override still works."
                                     :on-signature on-result
                                     :on-error on-error)))))
            (is (equalp signature received)))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 ;;; ---- Server role: a loopback around both halves of this library ----
 
@@ -1207,7 +1207,7 @@ Returns (VALUES STDOUT STDERR STATUS)."
                      (get-output-stream-string stderr)
                      status)))
       (when server (ssh-server-close server))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 #-ssh-backend-ffi
 (defun ssh-test-loopback-pty-shell-result (&key authorized-options)
@@ -1343,7 +1343,7 @@ share the test, so each must dispatch the same channel requests."
                    status))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test server-loopback-exec
   (if (not (ssh-keygen-available-p))
@@ -1466,7 +1466,98 @@ share the test, so each must dispatch the same channel requests."
                  (is (equal "oops" (get-output-stream-string stderr)))
                  (is (eql 3 status))))
           (when server (ssh-server-close server))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test server-loopback-authentication-methods
+  "publickey,publickey requires two different keys, and ExposeAuthInfo
+records both successful methods."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-authmethods"))
+             (host-key (merge-pathnames "host_key" directory))
+             (client-key-1 (merge-pathnames "client_key_1" directory))
+             (client-key-2 (merge-pathnames "client_key_2" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (config (ssh-server-config-load
+                      nil :options '("AuthenticationMethods publickey,publickey")))
+             (captured nil)
+             (server nil))
+        (ensure-directories-exist host-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key-1)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key-2)))
+               (with-open-file (out authorized :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                 (dolist (public (list (merge-pathnames "client_key_1.pub"
+                                                        directory)
+                                       (merge-pathnames "client_key_2.pub"
+                                                        directory)))
+                   (with-open-file (in public)
+                     (format out "~A~%"
+                             (string-trim '(#\Space #\Return #\Newline)
+                                          (read-line in))))))
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key host-key
+                      :authorized-keys authorized
+                      :sshd-config config
+                      :on-session
+                      (lambda (session)
+                        (setf captured
+                              (copy-list
+                               (ssh-session-auth-info-lines session))))
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((stdout (make-string-output-stream))
+                     (stderr (make-string-output-stream)))
+                 (let ((status (ssh-test-loopback-run
+                                server
+                                (list client-key-1 client-key-2)
+                                known-hosts stdout stderr)))
+                   (is (equal "hello" (get-output-stream-string stdout)))
+                   (is (equal "oops" (get-output-stream-string stderr)))
+                   (is (eql 3 status)))
+                 (is (= 2 (length captured)))
+                 (is (every (lambda (line)
+                              (and (stringp line)
+                                   (search "publickey ssh-ed25519 " line)))
+                            captured)))
+               ;; One key cannot complete both methods.
+               (let ((stdout (make-string-output-stream))
+                     (stderr (make-string-output-stream))
+                     (failed
+                       (handler-case
+                           (progn (ssh-test-loopback-run
+                                   server client-key-1 known-hosts
+                                   stdout stderr)
+                                  nil)
+                         (error () t))))
+                 (is (not (null failed))))
+               ;; The same key twice is refused as already used.
+               (let ((stdout (make-string-output-stream))
+                     (stderr (make-string-output-stream))
+                     (failed
+                       (handler-case
+                           (progn (ssh-test-loopback-run
+                                   server
+                                   (list client-key-1 client-key-1)
+                                   known-hosts stdout stderr)
+                                  nil)
+                         (error () t))))
+                 (is (not (null failed)))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test host-certificate-known-hosts-policy
   "A @cert-authority line trusts the certificate; a @revoked line for the
@@ -1517,7 +1608,7 @@ certificate, its plain key or its CA refuses it."
                      (remember "@revoked" revoked)
                      (signals cl-pnet-ssh:ssh-host-key-error
                        (cl-pnet-ssh::ssh-client-verify-host-key client blob))))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test server-host-key-advertisement
   ;; KEXINIT must list exactly the algorithms the loaded keys can sign with,
@@ -1557,7 +1648,7 @@ certificate, its plain key or its CA refuses it."
                  (is (eq (third keys)
                          (cl-pnet-ssh::ssh-server-host-key-for
                           keys "rsa-sha2-512")))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test server-host-certificate-advertisement
   "A paired certificate outranks its plain key, and is what KEX_ECDH_REPLY
@@ -1612,7 +1703,7 @@ carries; without it only the plain algorithm is offered."
                  (is (equal (list blob other-blob)
                             (cl-pnet-ssh::ssh-server-pair-host-certificates
                              (list key other) (list blob other-blob))))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 ;;; ---- algorithm choices from sshd_config ----
 ;;
@@ -1684,7 +1775,7 @@ carries; without it only the plain algorithm is offered."
                  (is (equal "rsa-sha2-512" (getf negotiated :host-key)))
                  (is (equal "hmac-sha2-512"
                             (getf negotiated :mac-c2s)))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 #-ssh-backend-ffi
 (test server-host-keys-obey-required-rsa-size
@@ -1759,7 +1850,7 @@ carries; without it only the plain algorithm is offered."
                  (is (equal (list short-key)
                             (cl-pnet-ssh::ssh-server-check-host-keys
                              (list short-key) nil)))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 #-ssh-backend-ffi
 (test server-user-key-policy-follows-config
@@ -1812,7 +1903,7 @@ carries; without it only the plain algorithm is offered."
                         session rsa-blob "ssh-rsa"))
                    (is (cl-pnet-ssh::ssh-session-user-key-length-p
                         session rsa-blob)))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 #-ssh-backend-ffi
 (test server-permit-listen-restricts-remote-forwards
@@ -2018,7 +2109,7 @@ carries; without it only the plain algorithm is offered."
                  (is (equal "oops" (get-output-stream-string stderr)))
                  (is (eql 3 status))))
           (when server (ssh-server-close server))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (defun ssh-test-loopback-outcome (policy &key server-version version-addendum
                                          banner authorized-options)
@@ -2104,7 +2195,7 @@ environment= list the server recorded for the authenticated key."
            (values opened error greeting banner-text key-env))
       (when timeout (cl-pnet:timer-stop timeout))
       (when server (ssh-server-close server))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test server-loopback-declined-host-key-does-not-connect
   "Answering \"no\" to an unknown host key must end the handshake.
@@ -2613,7 +2704,7 @@ newline")))
               :on-options (lambda (value) (setf options value)))
              (is (equal "cli.example" (ssh-config-options-hostname options)))
              (is (= 2222 (ssh-config-options-port options)))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test facade-client-parameters-carry-timeouts
   (let ((parameters
@@ -2700,7 +2791,7 @@ newline")))
                  (signals ssh-protocol-error
                    (cl-pnet-ssh::ssh-verify-host-signature
                     blob signature (octets-ascii "different data")))))
-          (ignore-errors (delete-directory-tree directory :validate t))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test openssh-ecdsa-private-key-signs
   ;; An ECDSA key file holds the scalar and the point; signing must produce
@@ -2734,7 +2825,7 @@ newline")))
                      (signals ssh-protocol-error
                        (cl-pnet-ssh::ssh-verify-host-signature
                         blob signature (octets-ascii "different data")))))
-              (ignore-errors (delete-directory-tree directory :validate t))))))))
+              (ignore-errors (uiop:delete-directory-tree directory :validate t))))))))
 
 (defun ssh-test-public-key-file-blob (private-key-path)
   "The wire blob encoded in the .pub file beside PRIVATE-KEY-PATH."
@@ -2770,7 +2861,7 @@ newline")))
                      (is (equalp (ssh-test-public-key-file-blob path)
                                  (ssh-public-key-blob-of key))
                          "~A uses the wire blob ssh-keygen wrote" name)))
-              (ignore-errors (delete-directory-tree directory :validate t))))))))
+              (ignore-errors (uiop:delete-directory-tree directory :validate t))))))))
 
 (defun ssh-test-ecdsa-signature (raw)
   "RAW r||s as the SSH signature value: string r then string s.
@@ -2898,7 +2989,7 @@ also covers that the verifier trims it before padding to the curve width."
                  (cl-pnet-ssh:ssh-authorized-key-blob-match authorized blob)
                (is (not (null matched)))
                (is (equal '("FROM=first") environment)))))
-      (ignore-errors (delete-directory-tree directory :validate t)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test authorized-keys-options-follow-sshd
   "Key options decide pty, forwarding, command and environment, and an
@@ -3189,7 +3280,7 @@ option the server cannot honour refuses the line rather than being lost."
                        ;; One RSA key signs under any RFC 8332 name.
                        (is (cl-pnet-ssh::ssh-server-user-key-algorithm-p
                             blob "rsa-sha2-512")))))
-              (ignore-errors (delete-directory-tree directory :validate t))))))))
+              (ignore-errors (uiop:delete-directory-tree directory :validate t))))))))
 
 (test kex-markers-are-never-selected
   ;; ext-info-* and kex-strict-* are negotiation signals.  A peer that lists
@@ -3309,3 +3400,20 @@ option the server cannot honour refuses the line rather than being lost."
   (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1:2:3:4:5:6:7")))
   (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1::2::3")))
   (is (= 8 (length (cl-pnet-ssh::ssh-config-ipv6-words "::")))))
+
+(test authentication-methods-are-filtered-to-what-this-server-can-complete
+  ;; Password and the other methods are valid names, but this server cannot
+  ;; complete them, so a list that needs one is skipped as sshd skips a list
+  ;; naming a disabled method.
+  (let ((two (ssh-server-config-load
+              nil :options '("AuthenticationMethods publickey,publickey")))
+        (mixed (ssh-server-config-load
+                nil :options '("AuthenticationMethods publickey,password")))
+        (any (ssh-server-config-load
+              nil :options '("AuthenticationMethods any"))))
+    (is (equal '(("publickey" "publickey"))
+               (cl-pnet-ssh::ssh-server-auth-method-lists two)))
+    (is (eq :impossible
+            (cl-pnet-ssh::ssh-server-auth-method-lists mixed)))
+    (is (null (cl-pnet-ssh::ssh-server-auth-method-lists any)))
+    (is (null (cl-pnet-ssh::ssh-server-auth-method-lists nil)))))

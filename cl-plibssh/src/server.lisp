@@ -262,6 +262,8 @@ KEY-ENV holds the environment= assignments from the authorized_keys line
 that admitted the key, and AUTHORIZATION the rest of that line's options."
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
+        (ssh-session-auth-info-lines session)
+        (list (ssh-server-auth-info-line key-blob))
         (ssh-session-key-env session) key-env
         (ssh-session-authorization session) authorization
         (ssh-session-authenticated session) t
