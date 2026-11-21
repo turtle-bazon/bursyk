@@ -1497,6 +1497,35 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun config-local-command (client)
+  "CLIENT's LocalCommand as written, or NIL."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-local-command options))))
+
+(defun permit-local-command-p (client)
+  "Whether PermitLocalCommand allows LocalCommand to run."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-permit-local-command options))))
+
+(defun run-local-command (client)
+  "Run CLIENT's LocalCommand through the shell, reporting only its status."
+  (let* ((command (expand-remote-command client
+                                         (config-local-command client)))
+         (shell (or (uiop:getenv "SHELL") "/bin/sh")))
+    (handler-case
+        (let ((status (nth-value 2
+                                 (uiop:run-program
+                                  (list shell "-c" command)
+                                  :output *standard-output*
+                                  :error-output *error-output*
+                                  :ignore-error-status t))))
+          (unless (eql status 0)
+            (log-line "local command exited with status ~A" status)))
+      (error (condition)
+        (log-line "local command failed: ~A" condition)))))
+
 (defun config-remote-command (client)
   "CLIENT's RemoteCommand as written, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2114,6 +2143,14 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
+      (when local
+        (format t "localcommand ~A~%" local)))
+    (format t "permitlocalcommand ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-permit-local-command
+                 options)
+                "yes"
+                "no"))
     (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
       (when remote
         (format t "remotecommand ~A~%" remote)))
@@ -2283,6 +2320,9 @@ of calling back in the middle of authentication."
                command-given-p t)))
      (show-banner client)
      (start-forwards client)
+     (when (and (config-local-command client)
+                (permit-local-command-p client))
+       (run-local-command client))
      (cond
        ((getf *options* :stdio-forward)
         (multiple-value-bind (target port)

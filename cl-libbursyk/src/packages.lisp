@@ -172,6 +172,8 @@
    #:ssh-config-options-remote-forwards
    #:ssh-config-options-dynamic-forwards
    #:ssh-config-options-request-tty
+   #:ssh-config-options-local-command
+   #:ssh-config-options-permit-local-command
    #:ssh-config-options-remote-command
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null

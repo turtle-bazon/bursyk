@@ -2730,6 +2730,27 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test local-command-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "PermitLocalCommand yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "LocalCommand printf '%h %p'"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-permit-local-command options)))
+    (is (equal "printf '%h %p'"
+               (ssh-config-options-local-command options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-permit-local-command options)))
+    (is (null (ssh-config-options-local-command options)))))
+
 (test remote-command-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

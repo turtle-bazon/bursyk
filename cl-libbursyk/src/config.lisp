@@ -108,6 +108,10 @@ relative Include is anchored here.")
   (remote-forwards nil)
   (dynamic-forwards nil)
   (request-tty nil)
+  ;; LocalCommand and PermitLocalCommand: a shell command run locally after
+  ;; the connection is up, but only when explicitly permitted.
+  (local-command nil)
+  (permit-local-command nil)
   ;; RemoteCommand: the command ssh runs on the peer when the command line
   ;; names none.  Stored as written; the caller expands its % tokens.
   (remote-command nil)
@@ -1088,6 +1092,13 @@ understand them rather than silently match nothing."
         ((string= keyword "streamlocalbindunlink")
          (setf (ssh-config-options-streamlocal-bind-unlink options)
                (boolean)))
+        ((string= keyword "permitlocalcommand")
+         (setf (ssh-config-options-permit-local-command options) (boolean)))
+        ((string= keyword "localcommand")
+         (unless (ssh-config-options-local-command options)
+           (setf (ssh-config-options-local-command options)
+                 (let ((raw (ssh-config-line-raw line)))
+                   (if (and raw (plusp (length raw))) raw value)))))
         ((string= keyword "remotecommand")
          ;; The first active line wins; NIL is how "not set" is spelled.
          (unless (ssh-config-options-remote-command options)
@@ -1151,7 +1162,9 @@ understand them rather than silently match nothing."
                          "permitremoteopen" "clearallforwardings"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
-                         "remotecommand" "sessiontype" "stdinnull"
+                         "remotecommand" "localcommand"
+                         "permitlocalcommand"
+                         "sessiontype" "stdinnull"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"

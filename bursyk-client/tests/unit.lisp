@@ -201,6 +201,17 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test local-command-reads-the-config
+  (let* ((client (cl-pnet-ssh::%make-ssh-client))
+         (options (cl-pnet-ssh::%make-ssh-config-options
+                   :local-command "printf local"
+                   :permit-local-command t)))
+    (is (null (burs::config-local-command client)))
+    (is (null (burs::permit-local-command-p client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client) options)
+    (is (equal "printf local" (burs::config-local-command client)))
+    (is (burs::permit-local-command-p client))))
+
 (test remote-command-tokens-expand
   (let ((client (cl-pnet-ssh::%make-ssh-client
                  :host "alias"
