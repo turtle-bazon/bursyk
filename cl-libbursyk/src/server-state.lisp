@@ -83,6 +83,9 @@
   ;; the listener is closed.
   (on-tcpip-forward nil)
   (on-cancel-tcpip-forward nil)
+  ;; Stream-local remote forwarding, as (SESSION PATH) functions.
+  (on-streamlocal-forward nil)
+  (on-cancel-streamlocal-forward nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))

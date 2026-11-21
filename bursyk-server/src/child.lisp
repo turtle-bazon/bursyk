@@ -31,6 +31,7 @@
 (cffi:defcfun ("ptsname" c-ptsname) :string (fd :int))
 (cffi:defcfun ("open" c-open) :int
   (path :string) (flags :int) (mode :int))
+(cffi:defcfun ("umask" c-umask) :unsigned-int (mask :unsigned-int))
 (cffi:defcfun ("chroot" c-chroot) :int (path :string))
 (cffi:defcfun ("chdir" c-chdir) :int (path :string))
 (cffi:defcfun ("write" c-write) :int (fd :int) (buffer :string) (count :int))

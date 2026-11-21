@@ -115,10 +115,9 @@ socket address and has no routing domains.")
     ;; this server refuses outright (PAM, GSSAPI, agent forwarding).
     "sshdauthpath" "sshdsessionpath" "pamservicename"
     "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"
-    ;; These configure protocols this server refuses (hostbased auth and
-    ;; stream-local forwarding), so their values cannot change anything.
-    "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
-    "streamlocalbindmask" "streamlocalbindunlink"))
+    ;; These configure hostbased authentication, which this server refuses,
+    ;; so their values cannot change anything.
+    "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
@@ -210,6 +209,10 @@ socket address and has no routing domains.")
   ;; AllowStreamLocalForwarding: :YES, :NO, :LOCAL or :REMOTE.  NIL leaves
   ;; this server's own default, which refuses stream-local forwarding.
   (allow-streamlocal-forwarding nil)
+  ;; StreamLocalBindMask and StreamLocalBindUnlink for remote Unix-socket
+  ;; listeners; sshd's defaults are 0177 and no.
+  (streamlocal-bind-mask nil)
+  (streamlocal-bind-unlink nil)
   (disable-forwarding nil)
   ;; DisableForwarding is the one Match keyword whose "no" is a value of its
   ;; own rather than the absence of one, so a match block that says no must
@@ -693,6 +696,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems log-level
     gateway-ports allow-tcp-forwarding allow-streamlocal-forwarding
+    streamlocal-bind-mask streamlocal-bind-unlink
     disable-forwarding set-env
     expose-auth-info refuse-connection
     unused-connection-timeout channel-timeouts
@@ -1153,6 +1157,21 @@ cannot apply per connection."
          line (ssh-server-config-one-argument line)
          +ssh-server-config-tcp-forwarding-values+
          "AllowStreamLocalForwarding")))
+      ((string= keyword "streamlocalbindmask")
+       (let* ((text (ssh-server-config-one-argument line))
+              (value (handler-case
+                         (parse-integer text :radix 8)
+                       (error () nil))))
+         (unless (and value (<= 0 value #o777))
+           (ssh-server-config-line-error
+            line "Invalid StreamLocalBindMask ~A" text))
+         (ssh-server-config-set-once
+          config 'streamlocal-bind-mask value)))
+      ((string= keyword "streamlocalbindunlink")
+       (ssh-server-config-set-once
+        config 'streamlocal-bind-unlink
+        (ssh-server-config-flag
+         line (ssh-server-config-one-argument line))))
       ((string= keyword "disableforwarding")
        (unless (ssh-server-config-disable-forwarding-set-p config)
          (setf (ssh-server-config-disable-forwarding config)

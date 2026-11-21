@@ -3192,3 +3192,37 @@ Match User alice
     (is (eq :no
             (cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding
              bob)))))
+
+(test sshd-config-reads-stream-local-bind-options
+  "StreamLocalBindMask and StreamLocalBindUnlink are Match-aware."
+  (is (= #o177
+         (config-value
+          #'cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask
+          "StreamLocalBindMask 0177")))
+  (is (= #o700
+         (config-value
+          #'cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask
+          "StreamLocalBindMask 700")))
+  (is (eq t
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-streamlocal-bind-unlink
+           "StreamLocalBindUnlink yes")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "StreamLocalBindMask 888"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "StreamLocalBindMask nope"))
+  (let* ((config (config-from-text
+                  "StreamLocalBindMask 0177
+Match User alice
+  StreamLocalBindMask 0700
+  StreamLocalBindUnlink yes"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (= #o700
+           (cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask alice)))
+    (is (eq t
+            (cl-pnet-ssh:ssh-server-config-streamlocal-bind-unlink alice)))
+    (is (= #o177
+           (cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask bob)))))

@@ -3708,3 +3708,108 @@ and DisableForwarding or no-port-forwarding vetoes them."
     (cl-pnet-ssh::ssh-server-handle-channel-message
      session (cl-pnet-ssh:ssh-writer-output writer))
     (is (null (gethash 0 (cl-pnet-ssh::ssh-session-channels session))))))
+
+(test streamlocal-remote-forwarding-policy
+  "Remote stream-local forwarding needs yes/all or remote, and forwarding
+must not be disabled by the key or the connection."
+  (dolist (case '(("yes" . t) ("all" . t) ("remote" . t)
+                  ("local" . nil) ("no" . nil)))
+    (let* ((config (ssh-server-config-load
+                    nil :options
+                    (list (format nil "AllowStreamLocalForwarding ~A"
+                                  (car case)))))
+           (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+           (session (cl-pnet-ssh::%make-ssh-session :server server)))
+      (is (eq (cdr case)
+              (not (null (cl-pnet-ssh:ssh-session-permits-streamlocal-forward-p
+                          session "/tmp/sock")))))))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes"
+                                 "DisableForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server)))
+    (is (null (cl-pnet-ssh:ssh-session-permits-streamlocal-forward-p
+               session "/tmp/sock"))))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :authorization
+                   (nth-value
+                    0 (ssh-authorized-key-options-parse
+                       "no-port-forwarding")))))
+    (is (null (cl-pnet-ssh:ssh-session-permits-streamlocal-forward-p
+               session "/tmp/sock")))))
+
+(test server-handles-streamlocal-forward-requests
+  "A streamlocal-forward request reaches the application hook; a cancel does
+too, and a refused policy never calls it."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (seen '())
+         (server (cl-pnet-ssh::%make-ssh-server
+                  :sshd-config config
+                  :on-streamlocal-forward
+                  (lambda (session path)
+                    (declare (ignore session))
+                    (push (cons :forward path) seen)
+                    t)
+                  :on-cancel-streamlocal-forward
+                  (lambda (session path)
+                    (declare (ignore session))
+                    (push (cons :cancel path) seen)
+                    t)))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-global-request+)
+    (cl-pnet-ssh:ssh-write-text writer "streamlocal-forward@openssh.com")
+    (cl-pnet-ssh:ssh-write-boolean writer nil)
+    (cl-pnet-ssh:ssh-write-text writer "/tmp/sock")
+    (cl-pnet-ssh::ssh-server-handle-global-request
+     session (cl-pnet-ssh:ssh-writer-output writer))
+    (setf writer (cl-pnet-ssh:ssh-writer))
+    (cl-pnet-ssh:ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-global-request+)
+    (cl-pnet-ssh:ssh-write-text writer "cancel-streamlocal-forward@openssh.com")
+    (cl-pnet-ssh:ssh-write-boolean writer nil)
+    (cl-pnet-ssh:ssh-write-text writer "/tmp/sock")
+    (cl-pnet-ssh::ssh-server-handle-global-request
+     session (cl-pnet-ssh:ssh-writer-output writer))
+    (is (equal '((:forward . "/tmp/sock") (:cancel . "/tmp/sock"))
+               (nreverse seen))))
+  ;; The library's policy gate keeps a hook from running when the directive
+  ;; does not allow remote stream-local forwarding.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding no")))
+         (called nil)
+         (server (cl-pnet-ssh::%make-ssh-server
+                  :sshd-config config
+                  :on-streamlocal-forward
+                  (lambda (session path)
+                    (declare (ignore session path))
+                    (setf called t)
+                    t)))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-global-request+)
+    (cl-pnet-ssh:ssh-write-text writer "streamlocal-forward@openssh.com")
+    (cl-pnet-ssh:ssh-write-boolean writer nil)
+    (cl-pnet-ssh:ssh-write-text writer "/tmp/sock")
+    (cl-pnet-ssh::ssh-server-handle-global-request
+     session (cl-pnet-ssh:ssh-writer-output writer))
+    (is (null called))))
+
+(test server-opens-a-forwarded-streamlocal-channel
+  "The forwarded-streamlocal channel carries the listen path and reserved field."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("AllowStreamLocalForwarding yes")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session :server server))
+         (channel
+           (cl-pnet-ssh:ssh-server-open-forwarded-streamlocal
+            session "/tmp/sock")))
+    (is (eq :opening (cl-pnet-ssh:ssh-server-channel-state channel)))
+    (is (equal "forwarded-streamlocal@openssh.com"
+               (cl-pnet-ssh:ssh-server-channel-type channel)))
+    (is (equal "/tmp/sock"
+               (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))))

@@ -732,6 +732,25 @@ it got, which differs from the request only when the client asked for port
     (when want-reply
       (ssh-server-send-global-reply session (not (null ok))))))
 
+(defun ssh-server-handle-streamlocal-forward (session reader want-reply)
+  "Offer a streamlocal-forward@openssh.com request to the application."
+  (let* ((path (ssh-read-text reader))
+         (handler (ssh-server-on-streamlocal-forward
+                   (ssh-session-server session)))
+         (ok (and handler
+                  (ssh-session-permits-streamlocal-forward-p session path)
+                  (funcall handler session path))))
+    (when want-reply
+      (ssh-server-send-global-reply session (not (null ok))))))
+
+(defun ssh-server-handle-cancel-streamlocal-forward (session reader want-reply)
+  (let* ((path (ssh-read-text reader))
+         (handler (ssh-server-on-cancel-streamlocal-forward
+                   (ssh-session-server session)))
+         (ok (and handler (funcall handler session path))))
+    (when want-reply
+      (ssh-server-send-global-reply session (not (null ok))))))
+
 (defun ssh-server-handle-global-request (session payload)
   (let* ((reader (ssh-make-reader payload))
          (name (progn (ssh-read-u8 reader) (ssh-read-text reader)))
@@ -741,6 +760,11 @@ it got, which differs from the request only when the client asked for port
        (ssh-server-handle-tcpip-forward session reader want-reply))
       ((string= name "cancel-tcpip-forward")
        (ssh-server-handle-cancel-tcpip-forward session reader want-reply))
+      ((string= name "streamlocal-forward@openssh.com")
+       (ssh-server-handle-streamlocal-forward session reader want-reply))
+      ((string= name "cancel-streamlocal-forward@openssh.com")
+       (ssh-server-handle-cancel-streamlocal-forward
+        session reader want-reply))
       (t
        (when want-reply
          (ssh-server-send-global-reply session nil))))))

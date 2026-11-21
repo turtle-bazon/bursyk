@@ -152,6 +152,8 @@ presented."
                           on-direct-streamlocal
                           on-tcpip-forward
                           on-cancel-tcpip-forward
+                          on-streamlocal-forward
+                          on-cancel-streamlocal-forward
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -286,6 +288,8 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :on-direct-streamlocal on-direct-streamlocal
                   :on-tcpip-forward on-tcpip-forward
                   :on-cancel-tcpip-forward on-cancel-tcpip-forward
+                  :on-streamlocal-forward on-streamlocal-forward
+                  :on-cancel-streamlocal-forward on-cancel-streamlocal-forward
                   :on-error on-error
                   :on-close on-close
                   :connections (make-hash-table :test #'eq)))

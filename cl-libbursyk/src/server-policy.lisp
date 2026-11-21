@@ -1331,6 +1331,19 @@ unless an administrator opts in."
                session #'ssh-server-config-disable-forwarding))
          (member policy '(:yes :local) :test #'eq))))
 
+(defun ssh-session-permits-streamlocal-forward-p (session path)
+  "Whether SESSION may ask the server to listen on the Unix socket PATH."
+  (declare (ignore path))
+  (let ((options (ssh-session-authorization session))
+        (policy (or (ssh-session-setting
+                     session
+                     #'ssh-server-config-allow-streamlocal-forwarding)
+                    :no)))
+    (and (ssh-authorization-options-permit-port-forwarding-p options)
+         (not (ssh-session-setting
+               session #'ssh-server-config-disable-forwarding))
+         (member policy '(:yes :remote) :test #'eq))))
+
 (defun ssh-server-permit-listen-allows-p (rules host port)
   "Whether sshd_config PermitListen RULES allow a listener on HOST:PORT.
 

@@ -54,6 +54,8 @@ when it is no more talkative than that; QUIET prints nothing at all."
   "The signal watchers this process installed, so each can be stopped.")
 (defvar *remote-forwards* nil
   "Remote forwarding listeners requested with tcpip-forward, newest first.")
+(defvar *streamlocal-forwards* nil
+  "Unix-socket listeners requested with streamlocal-forward, newest first.")
 (defvar *remote-tunnels* (make-hash-table :test #'eq)
   "Accepted remote-forwarding connections, keyed by their CL-PNET connection.")
 
@@ -66,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.33"
+(defparameter +bursyk-server-version+ "0.0.2.34"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -410,6 +412,12 @@ one of --no-tcp-forwarding and AllowTcpForwarding no refuses everything."
 ;;; program, not the library, because the policy of which addresses may be
 ;;; exposed is an sshd decision.
 
+(defstruct (streamlocal-forward (:constructor %make-streamlocal-forward))
+  session
+  path
+  fd
+  watcher)
+
 (defstruct (remote-forward (:constructor %make-remote-forward))
   session
   requested-address
@@ -457,7 +465,134 @@ client should not make by itself."
       (if (or (null session) (eq (remote-forward-session forward) session))
           (remote-forward-close forward)
           (push forward kept)))
-    (setf *remote-forwards* (nreverse kept))))
+    (setf *remote-forwards* (nreverse kept)))
+  (close-streamlocal-forwards session))
+
+#-win32
+(progn
+(defun streamlocal-forwarding-mode (session)
+  "SESSION's AllowStreamLocalForwarding value, defaulting to no."
+  (or (session-config-setting
+       session #'cl-pnet-ssh:ssh-server-config-allow-streamlocal-forwarding)
+      :no))
+
+(defun streamlocal-forward-close (forward)
+  "Stop a streamlocal listener and remove its socket file."
+  (when (streamlocal-forward-watcher forward)
+    (cl-pnet:fd-unwatch (streamlocal-forward-watcher forward))
+    (setf (streamlocal-forward-watcher forward) nil))
+  (when (streamlocal-forward-fd forward)
+    (ignore-errors (c-close (streamlocal-forward-fd forward)))
+    (setf (streamlocal-forward-fd forward) nil))
+  (ignore-errors (delete-file (streamlocal-forward-path forward))))
+
+(defun close-streamlocal-forwards (&optional session)
+  "Close streamlocal listeners, for SESSION or for every session."
+  (let ((kept '()))
+    (dolist (forward *streamlocal-forwards*)
+      (if (or (null session) (eq (streamlocal-forward-session forward) session))
+          (streamlocal-forward-close forward)
+          (push forward kept)))
+    (setf *streamlocal-forwards* (nreverse kept))))
+
+(defun start-streamlocal-remote-forward (session path)
+  "Listen on PATH for a client's streamlocal-forward request."
+  (unless (and (not (getf *options* :no-remote-forwarding))
+               (member (streamlocal-forwarding-mode session)
+                       '(:yes :remote)))
+    (log-at-session session :error
+                    "streamlocal forwarding refused by policy")
+    (return-from start-streamlocal-remote-forward nil))
+  (let* ((unlink (session-config-setting
+                  session
+                  #'cl-pnet-ssh:ssh-server-config-streamlocal-bind-unlink))
+         (mask (or (session-config-setting
+                    session
+                    #'cl-pnet-ssh:ssh-server-config-streamlocal-bind-mask)
+                   #o177))
+         (old-mask (c-umask mask))
+         (fd (handler-case
+                 (progn
+                   (when unlink (ignore-errors (delete-file path)))
+                   (cl-pnet-sockets:listen-unix path))
+               (error () nil))))
+    (c-umask old-mask)
+    (unless fd
+      (log-at-session session :error
+                      "streamlocal forward could not listen on ~A" path)
+      (return-from start-streamlocal-remote-forward nil))
+    (let* ((forward (%make-streamlocal-forward
+                     :session session :path path :fd fd))
+           (watcher
+             (cl-pnet:fd-watch
+              fd :on-readable
+              (lambda (watcher)
+                (declare (ignore watcher))
+                (streamlocal-forward-accept forward)))))
+      (setf (streamlocal-forward-watcher forward) watcher)
+      (push forward *streamlocal-forwards*)
+      t)))
+
+(defun streamlocal-forward-accept (forward)
+  "Open a forwarded-streamlocal channel for each accepted connection."
+  (let ((fd (streamlocal-forward-fd forward)))
+    (loop for client = (cl-pnet-sockets:accept-socket fd)
+          while client
+          do (cl-pnet-sockets:set-nonblocking client)
+             (let ((bridge nil))
+               (handler-case
+                   (let ((channel
+                           (cl-pnet-ssh:ssh-server-open-forwarded-streamlocal
+                            (streamlocal-forward-session forward)
+                            (streamlocal-forward-path forward)
+                            :on-data
+                            (lambda (channel data kind)
+                              (declare (ignore channel kind))
+                              (when bridge
+                                (streamlocal-bridge-on-data bridge data)))
+                            :on-eof
+                            (lambda (channel)
+                              (declare (ignore channel))
+                              (when bridge
+                                (streamlocal-bridge-on-eof bridge)))
+                            :on-close
+                            (lambda (channel)
+                              (declare (ignore channel))
+                              (when bridge
+                                (streamlocal-bridge-close bridge)))
+                            :on-error
+                            (lambda (channel condition)
+                              (declare (ignore channel condition))
+                              (when bridge
+                                (streamlocal-bridge-close bridge))))))
+                     (setf bridge
+                           (%make-streamlocal-bridge
+                            :channel channel :fd client))
+                     (streamlocal-bridge-connected bridge))
+                 (error (condition)
+                   (declare (ignore condition))
+                   (ignore-errors (c-close client))))))))
+
+(defun cancel-streamlocal-remote-forward (session path)
+  "Stop a streamlocal listener the client cancelled."
+  (let ((forward
+          (find-if (lambda (candidate)
+                     (and (eq (streamlocal-forward-session candidate) session)
+                          (string= (streamlocal-forward-path candidate) path)))
+                   *streamlocal-forwards*)))
+    (if forward
+        (progn
+          (streamlocal-forward-close forward)
+          (setf *streamlocal-forwards*
+                (delete forward *streamlocal-forwards*))
+          t)
+        nil)))
+)
+
+#+win32
+(defun close-streamlocal-forwards (&optional session)
+  (declare (ignore session))
+  nil)
 
 (defun remote-tunnel-data (connection data)
   "Move bytes between an accepted remote-forwarding connection and its channel.
@@ -2208,6 +2343,16 @@ guess, so only an explicit PidFile is written."
            #-ssh-backend-ffi
            (lambda (session bind-address bind-port)
              (cancel-remote-forward session bind-address bind-port))
+           #-(or win32 ssh-backend-ffi)
+           :on-streamlocal-forward
+           #-(or win32 ssh-backend-ffi)
+           (lambda (session path)
+             (start-streamlocal-remote-forward session path))
+           #-(or win32 ssh-backend-ffi)
+           :on-cancel-streamlocal-forward
+           #-(or win32 ssh-backend-ffi)
+           (lambda (session path)
+             (cancel-streamlocal-remote-forward session path))
            :on-close (lambda (session reason)
                        (log-at-session
                         session :info "closed session for ~A: ~A"

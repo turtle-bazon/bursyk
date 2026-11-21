@@ -155,6 +155,8 @@
   (on-channel nil)
   (on-direct-tcpip nil)
   (on-direct-streamlocal nil)
+  (on-streamlocal-forward nil)
+  (on-cancel-streamlocal-forward nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))

@@ -83,6 +83,40 @@ out once the client confirms."
       (ssh-session-send-payload session (ssh-writer-output writer)))
     channel))
 
+(defun ssh-server-open-forwarded-streamlocal
+    (session path &key on-data on-eof on-close on-error)
+  "Ask SESSION's client to open a forwarded-streamlocal channel for PATH.
+
+The channel starts in :OPENING; data queued with SSH-SERVER-CHANNEL-WRITE
+goes out once the client confirms."
+  (let* ((id (ssh-session-next-channel-id session))
+         (window (ssh-session-window session))
+         (max-packet (ssh-session-max-packet session))
+         (channel (%make-ssh-server-channel
+                   :session session
+                   :local-id id
+                   :type "forwarded-streamlocal@openssh.com"
+                   :state :opening
+                   :local-window window
+                   :local-max-packet max-packet
+                   :streamlocal-path path
+                   :on-data on-data :on-eof on-eof
+                   :on-close on-close :on-error on-error)))
+    (incf (ssh-session-next-channel-id session))
+    (setf (gethash id (ssh-session-channels session)) channel)
+    (ssh-session-note-channel-change session)
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-channel-open+)
+      (ssh-write-text writer "forwarded-streamlocal@openssh.com")
+      (ssh-write-u32 writer id)
+      (ssh-write-u32 writer window)
+      (ssh-write-u32 writer max-packet)
+      (ssh-write-text writer path)
+      ;; Reserved for future owner/mode information.
+      (ssh-write-text writer "")
+      (ssh-session-send-payload session (ssh-writer-output writer)))
+    channel))
+
 (defun ssh-server-channel-handle-open-confirmation (channel reader)
   "The client accepted a forwarded-tcpip CHANNEL we opened."
   (setf (ssh-server-channel-remote-id channel) (ssh-read-u32 reader)
