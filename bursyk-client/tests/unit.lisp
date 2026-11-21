@@ -201,6 +201,16 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test remote-command-tokens-expand
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "alias"
+                 :connect-host "real.example"
+                 :port 2200
+                 :connect-port 2200
+                 :user "bob")))
+    (is (equal "real.example 2200 bob alias %"
+               (burs::expand-remote-command client "%h %p %r %n %%")))))
+
 (test permit-remote-open-matches
   (flet ((allowed (permit host port)
            (let ((client (cl-pnet-ssh::%make-ssh-client)))

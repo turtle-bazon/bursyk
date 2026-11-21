@@ -1497,6 +1497,43 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun config-remote-command (client)
+  "CLIENT's RemoteCommand as written, or NIL."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-remote-command options))))
+
+(defun expand-remote-command (client value)
+  "VALUE with the ssh % tokens RemoteCommand understands."
+  (let ((host (cl-pnet-ssh:ssh-client-connect-host client))
+        (name (cl-pnet-ssh:ssh-client-host client))
+        (port (or (cl-pnet-ssh:ssh-client-connect-port client) 22))
+        (user (cl-pnet-ssh:ssh-client-user client))
+        (uid (or (uiop:getenv "UID") ""))
+        (local (or (uiop:getenv "HOSTNAME") "")))
+    (with-output-to-string (out)
+      (loop with length = (length value)
+            for index from 0 below length
+            for character = (char value index)
+            do (if (and (char= character #\%)
+                        (< (1+ index) length))
+                   (let ((token (char value (1+ index))))
+                     (case token
+                       (#\% (write-char #\% out) (incf index))
+                       (#\h (princ host out) (incf index))
+                       (#\n (princ name out) (incf index))
+                       (#\p (princ port out) (incf index))
+                       (#\r (princ user out) (incf index))
+                       (#\u (princ (cl-pnet-ssh:ssh-default-user) out)
+                            (incf index))
+                       (#\d (princ (namestring (user-homedir-pathname)) out)
+                            (incf index))
+                       (#\i (princ uid out) (incf index))
+                       (#\l (princ local out) (incf index))
+                       (#\L (princ local out) (incf index))
+                       (t (write-char character out))))
+                   (write-char character out))))))
+
 (defun config-session-type (client)
   "CLIENT's ssh_config SessionType, or NIL when the file did not name one."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2077,6 +2114,9 @@ peer that connected to it; NIL refuses the channel."
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
                 "auto"))
+    (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
+      (when remote
+        (format t "remotecommand ~A~%" remote)))
     (format t "sessiontype ~A~%"
             (or (cl-pnet-ssh:ssh-config-options-session-type options)
                 "default"))
@@ -2235,6 +2275,12 @@ of calling back in the middle of authentication."
    :on-forwarded-streamlocal #'forwarded-streamlocal-target
    :on-open
    (lambda (client)
+     (let ((remote (config-remote-command client)))
+       (when remote
+         (when command-given-p
+           (fail "Cannot execute command-line and remote command."))
+         (setf command (expand-remote-command client remote)
+               command-given-p t)))
      (show-banner client)
      (start-forwards client)
      (cond

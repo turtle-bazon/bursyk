@@ -108,6 +108,9 @@ relative Include is anchored here.")
   (remote-forwards nil)
   (dynamic-forwards nil)
   (request-tty nil)
+  ;; RemoteCommand: the command ssh runs on the peer when the command line
+  ;; names none.  Stored as written; the caller expands its % tokens.
+  (remote-command nil)
   ;; SessionType and StdinNull: whether to open a session at all, whether the
   ;; command names a subsystem, and whether stdin is /dev/null.
   (session-type nil)
@@ -1085,6 +1088,12 @@ understand them rather than silently match nothing."
         ((string= keyword "streamlocalbindunlink")
          (setf (ssh-config-options-streamlocal-bind-unlink options)
                (boolean)))
+        ((string= keyword "remotecommand")
+         ;; The first active line wins; NIL is how "not set" is spelled.
+         (unless (ssh-config-options-remote-command options)
+           (setf (ssh-config-options-remote-command options)
+                 (let ((raw (ssh-config-line-raw line)))
+                   (if (and raw (plusp (length raw))) raw value)))))
         ((string= keyword "sessiontype")
          (let ((value (string-downcase value)))
            (unless (member value '("none" "subsystem" "default")
@@ -1142,7 +1151,7 @@ understand them rather than silently match nothing."
                          "permitremoteopen" "clearallforwardings"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
-                         "sessiontype" "stdinnull"
+                         "remotecommand" "sessiontype" "stdinnull"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"

@@ -15,6 +15,9 @@
    #:ssh-client-server-version
    #:ssh-client-banner
    #:ssh-client-connect-host
+   #:ssh-client-connect-port
+   #:ssh-client-host
+   #:ssh-client-user
    #:*ssh-log-function*
    #:*ssh-log-enabled*
    #:ssh-log
@@ -169,6 +172,7 @@
    #:ssh-config-options-remote-forwards
    #:ssh-config-options-dynamic-forwards
    #:ssh-config-options-request-tty
+   #:ssh-config-options-remote-command
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null
    #:ssh-config-options-forward-agent
