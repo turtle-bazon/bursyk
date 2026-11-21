@@ -14,6 +14,10 @@
   (port 22)
   listener
   (host-keys nil)
+  ;; HostCertificate blobs paired with those keys.  A certificate is
+  ;; presented instead of its plain key when the client selects a
+  ;; certificate algorithm.
+  (host-certificates nil)
   authorized-keys
   authorize
   ;; Called once per (SESSION USER) before any authentication method runs;

@@ -21,7 +21,13 @@
             "kex-strict-c-v00@openssh.com")))
 
 (defparameter +ssh-host-key-algorithms+
-  '("ssh-ed25519"
+  '("ssh-ed25519-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    "rsa-sha2-512-cert-v01@openssh.com"
+    "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
@@ -31,10 +37,19 @@
     "rsa-sha2-512"
     "rsa-sha2-256"
     "ssh-rsa")
-  "Host key algorithms offered to a server, in preference order.")
+  "Host key algorithms offered to a server, in preference order.
+
+Certificate names come first, as in OpenSSH, but a server only selects one
+when it actually has the matching certificate.")
 
 (defparameter +ssh-server-host-key-preference+
-  '("ssh-ed25519"
+  '("ssh-ed25519-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    "rsa-sha2-512-cert-v01@openssh.com"
+    "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
@@ -44,7 +59,16 @@
   "Host key algorithms a server can present, in preference order.
 
 A server advertises only those its loaded keys can actually sign with, so a
-client never selects an algorithm that would fail at KEX_ECDH_REPLY.")
+client never selects an algorithm that would fail at KEX_ECDH_REPLY.  A
+certificate algorithm is offered only when a HostCertificate supplies the
+certificate for the key, and then it outranks the plain key, as in sshd.")
+
+(defparameter +ssh-server-host-key-all-algorithms+
+  (append +ssh-server-host-key-preference+
+          ;; Not offered by default, but an administrator may still name the
+          ;; SHA-1 certificate form, as OpenSSH's own list allows.
+          '("ssh-rsa-cert-v01@openssh.com"))
+  "Every host key algorithm a HostKeyAlgorithms directive may name.")
 
 (defparameter +ssh-server-user-key-algorithms+
   '("ssh-ed25519"

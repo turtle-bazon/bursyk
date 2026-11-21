@@ -100,44 +100,120 @@ with SSH-CONCAT around it would hand the peer the text itself as a length."
 
 ;;; ---- Host key selection ----
 
-(defun ssh-server-host-key-algorithm-p (key algorithm)
-  "Whether private KEY can sign with host key ALGORITHM."
-  (let ((type (ssh-private-key-type key)))
-    (and type
-         (cond
-           ((string= algorithm "ssh-ed25519")
-            (string= type "ssh-ed25519"))
-           ((ssh-rsa-digest-keyword algorithm)
-            ;; A single ssh-rsa key serves all three signature algorithms.
-            (string= type "ssh-rsa"))
-           (t
-            (string= type algorithm))))))
+(defun ssh-host-certificate-algorithm-p (algorithm)
+  "Whether ALGORITHM names a certificate host key this build can present.
 
-(defun ssh-server-host-key-algorithms (keys &optional allowed)
+The certificate's own key type is ssh-rsa-cert-v01@openssh.com even when the
+signature algorithm is rsa-sha2-512 or rsa-sha2-256, so those two names are
+certificate algorithms without being certificate key types."
+  (or (ssh-certificate-type-name-p algorithm)
+      (member algorithm '("rsa-sha2-512-cert-v01@openssh.com"
+                          "rsa-sha2-256-cert-v01@openssh.com")
+              :test #'string=)))
+
+(defun ssh-host-certificate-signature-algorithm (algorithm)
+  "The plain signature algorithm a host certificate ALGORITHM signs with."
+  (cond
+    ((string= algorithm "rsa-sha2-512-cert-v01@openssh.com")
+     "rsa-sha2-512")
+    ((string= algorithm "rsa-sha2-256-cert-v01@openssh.com")
+     "rsa-sha2-256")
+    ((ssh-certificate-type-name-p algorithm)
+     (ssh-certificate-plain-type algorithm))
+    (t nil)))
+
+(defun ssh-certificate-host-key-algorithm-p (certificate algorithm)
+  "Whether CERTIFICATE can present host key ALGORITHM."
+  (let ((type (ssh-certificate-key-type certificate)))
+    (cond
+      ((member algorithm '("rsa-sha2-512-cert-v01@openssh.com"
+                           "rsa-sha2-256-cert-v01@openssh.com")
+               :test #'string=)
+       (string= type "ssh-rsa-cert-v01@openssh.com"))
+      (t
+       (string= algorithm type)))))
+
+(defun ssh-server-host-certificate-for-key (certificates key)
+  "The first certificate blob in CERTIFICATES certified for KEY, or NIL."
+  (let ((plain (ssh-public-key-blob-of key)))
+    (find-if (lambda (blob)
+               (let ((certificate (ssh-certificate-parse blob)))
+                 (and certificate
+                      (ssh-octets= (ssh-certificate-plain-blob certificate)
+                                   plain))))
+             certificates)))
+
+(defun ssh-server-host-key-algorithm-p (key algorithm &optional certificate)
+  "Whether private KEY, with CERTIFICATE, can present host key ALGORITHM.
+
+CERTIFICATE is the certificate blob paired with KEY, or NIL.  A certificate
+algorithm needs it; a plain algorithm never uses it."
+  (if (ssh-host-certificate-algorithm-p algorithm)
+      (let ((certificate (and certificate
+                              (ssh-certificate-parse certificate))))
+        (and certificate
+             (ssh-certificate-host-key-algorithm-p certificate algorithm)
+             (ssh-octets= (ssh-certificate-plain-blob certificate)
+                          (ssh-public-key-blob-of key))))
+      (let ((type (ssh-private-key-type key)))
+        (and type
+             (cond
+               ((string= algorithm "ssh-ed25519")
+                (string= type "ssh-ed25519"))
+               ((ssh-rsa-digest-keyword algorithm)
+                ;; A single ssh-rsa key serves all three signature algorithms.
+                (string= type "ssh-rsa"))
+               (t
+                (string= type algorithm)))))))
+
+(defun ssh-server-host-key-algorithms (keys &optional allowed certificates)
   "The host key algorithms KEYS can present, in preference order.
 
 ALLOWED, when given, is the configured HostKeyAlgorithms list and replaces
 the default preference order; the result still holds only algorithms a
-loaded key can sign with."
+loaded key can sign with.  CERTIFICATES holds the host certificate blobs;
+without one for a key, its certificate algorithms are not offered."
   (remove-if-not
    (lambda (algorithm)
      (some (lambda (key)
-             (ssh-server-host-key-algorithm-p key algorithm))
+             (ssh-server-host-key-algorithm-p
+              key algorithm
+              (and (ssh-host-certificate-algorithm-p algorithm)
+                   (ssh-server-host-certificate-for-key certificates key))))
            keys))
    (or allowed +ssh-server-host-key-preference+)))
 
-(defun ssh-server-host-key-for (keys algorithm)
-  "The first of KEYS able to sign with host key ALGORITHM, or NIL."
+(defun ssh-server-host-key-for (keys algorithm &optional certificates)
+  "The first of KEYS able to present host key ALGORITHM, or NIL."
   (find-if (lambda (key)
-             (ssh-server-host-key-algorithm-p key algorithm))
+             (ssh-server-host-key-algorithm-p
+              key algorithm
+              (and (ssh-host-certificate-algorithm-p algorithm)
+                   (ssh-server-host-certificate-for-key certificates key))))
            keys))
+
+(defun ssh-server-host-key-presentation (keys certificates algorithm)
+  "VALUES PRIVATE-KEY HOST-KEY-BLOB for ALGORITHM, or NIL.
+
+The blob is the certificate when ALGORITHM names one, and the plain public
+key otherwise.  Both are what the exchange hash and KEX_ECDH_REPLY carry."
+  (dolist (key keys)
+    (let ((certificate
+            (and (ssh-host-certificate-algorithm-p algorithm)
+                 (ssh-server-host-certificate-for-key certificates key))))
+      (when (ssh-server-host-key-algorithm-p key algorithm certificate)
+        (return-from ssh-server-host-key-presentation
+          (values key (or certificate (ssh-public-key-blob-of key))))))))
 
 (defun ssh-server-host-key-signature (key algorithm message)
   "A signature blob of MESSAGE under host KEY for negotiated ALGORITHM.
 
 RSA is the one type whose wire signature name differs from the key type:
-rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa."
-  (let ((digest (ssh-rsa-digest-keyword algorithm)))
+rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa.
+A certificate algorithm signs with the plain algorithm under the same name."
+  (let* ((algorithm (or (ssh-host-certificate-signature-algorithm algorithm)
+                        algorithm))
+         (digest (ssh-rsa-digest-keyword algorithm)))
     (cond
       (digest (ssh-rsa-signature-blob key message digest))
       ((string= algorithm "ssh-ed25519")
@@ -373,8 +449,11 @@ A malformed or mismatched blob is simply not a valid signature."
 
 The key blob names the key type; the signature blob names the algorithm.
 An RSA host key keeps the ssh-rsa type while the algorithm says
-rsa-sha2-256 or rsa-sha2-512, exactly as RFC 8332 defines."
+rsa-sha2-256 or rsa-sha2-512, exactly as RFC 8332 defines.  A host
+certificate is signed by the plain key it certifies, so verification uses
+that plain key while the exchange hash still covers the certificate."
   (unless (ssh-public-key-signature-valid-p
-           host-key-blob signature-blob exchange-hash)
+           (ssh-key-plain-blob host-key-blob)
+           signature-blob exchange-hash)
     (error 'ssh-protocol-error
            :detail "host key signature does not verify")))

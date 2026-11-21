@@ -1125,8 +1125,12 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                        (cl-pnet:event-loop-stop)))))
     (ssh-channel-exec channel "printf hello; printf oops >&2; exit 3")))
 
-(defun ssh-test-loopback-run (server client-key known-hosts stdout stderr)
-  "Start a client against SERVER and return the command's exit status."
+(defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
+                              &key (host-key-policy :accept-new))
+  "Start a client against SERVER and return the command's exit status.
+
+HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
+certificate was trusted rather than added on first use."
   (let ((state (list :none nil))
         (timeout nil))
     (unwind-protect
@@ -1143,7 +1147,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
             :user "tester"
             :private-key client-key
             :known-hosts known-hosts
-            :host-key-policy :accept-new
+            :host-key-policy host-key-policy
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -1403,6 +1407,118 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
 
+(test server-loopback-host-certificate
+  ;; The server presents the certificate, the client checks its CA against
+  ;; @cert-authority in known_hosts, and the KEX signature is verified with
+  ;; the plain key inside the certificate.
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert-loop"))
+             (ca (merge-pathnames "ca" directory))
+             (host-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "host-id"
+                      "-h" "-n" "127.0.0.1" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "host_key.pub" directory))))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key host-key
+                      :host-certificate
+                      (merge-pathnames "host_key-cert.pub" directory)
+                      :authorized-keys authorized
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               ;; The host's known_hosts name includes the ephemeral port.
+               (with-open-file (out known-hosts :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                 (with-open-file (in (merge-pathnames "ca.pub" directory))
+                   (format out "@cert-authority [127.0.0.1]:~D ~A~%"
+                           (ssh-server-port server)
+                           (string-trim '(#\Space #\Return #\Newline)
+                                        (read-line in)))))
+               ;; Strict policy: only the certificate's CA can admit the host.
+               (let ((status (ssh-test-loopback-run
+                              server client-key known-hosts stdout stderr
+                              :host-key-policy :strict)))
+                 (is (equal "hello" (get-output-stream-string stdout)))
+                 (is (equal "oops" (get-output-stream-string stderr)))
+                 (is (eql 3 status))))
+          (when server (ssh-server-close server))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test host-certificate-known-hosts-policy
+  "A @cert-authority line trusts the certificate; a @revoked line for the
+certificate, its plain key or its CA refuses it."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert-known"))
+             (ca (merge-pathnames "ca" directory))
+             (host-key (merge-pathnames "host" directory))
+             (cert (merge-pathnames "host-cert.pub" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "host-id"
+                      "-h" "-n" "127.0.0.1" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "host.pub" directory))))
+               (let* ((blob (cl-pnet-ssh::ssh-public-key-file-blob cert))
+                      (ca-line
+                        (cl-pnet-ssh::ssh-public-key-file-blob
+                         (merge-pathnames "ca.pub" directory)))
+                      (host-line
+                        (cl-pnet-ssh::ssh-public-key-file-blob
+                         (merge-pathnames "host.pub" directory)))
+                      (client
+                        (cl-pnet-ssh::%make-ssh-client
+                         :host "127.0.0.1" :port 22
+                         :known-hosts known-hosts
+                         :host-key-policy :strict)))
+                 (labels ((remember (marker key-line)
+                            (with-open-file (out known-hosts
+                                                 :direction :output
+                                                 :if-exists :supersede
+                                                 :if-does-not-exist :create)
+                              (format out "~A 127.0.0.1 ~A ~A~%"
+                                      marker
+                                      (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts
+                                                    key-line))
+                                      (cl-pnet-ssh:ssh-octets-base64 key-line)))))
+                   (remember "@cert-authority" ca-line)
+                   (is (cl-pnet-ssh::ssh-client-verify-host-key client blob))
+                   (dolist (revoked (list ca-line host-line blob))
+                     (remember "@revoked" revoked)
+                     (signals cl-pnet-ssh:ssh-host-key-error
+                       (cl-pnet-ssh::ssh-client-verify-host-key client blob))))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
 (test server-host-key-advertisement
   ;; KEXINIT must list exactly the algorithms the loaded keys can sign with,
   ;; in preference order, and no algorithm whose key is missing.
@@ -1441,6 +1557,61 @@ share the test, so each must dispatch the same channel requests."
                  (is (eq (third keys)
                          (cl-pnet-ssh::ssh-server-host-key-for
                           keys "rsa-sha2-512")))))
+          (ignore-errors (delete-directory-tree directory :validate t))))))
+
+(test server-host-certificate-advertisement
+  "A paired certificate outranks its plain key, and is what KEX_ECDH_REPLY
+carries; without it only the plain algorithm is offered."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert"))
+             (ca (merge-pathnames "ca" directory))
+             (host-key (merge-pathnames "host" directory))
+             (other-key (merge-pathnames "other" directory))
+             (cert (merge-pathnames "host-cert.pub" directory))
+             (other-cert (merge-pathnames "other-cert.pub" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring other-key)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "host-id"
+                      "-h" "-n" "127.0.0.1" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "host.pub" directory))))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "other-id"
+                      "-h" "-n" "other" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "other.pub" directory))))
+               (let* ((key (ssh-load-private-key host-key))
+                      (other (ssh-load-private-key other-key))
+                      (blob (cl-pnet-ssh::ssh-public-key-file-blob cert))
+                      (other-blob
+                        (cl-pnet-ssh::ssh-public-key-file-blob other-cert)))
+                 (is (equal '("ssh-ed25519-cert-v01@openssh.com"
+                              "ssh-ed25519")
+                            (cl-pnet-ssh::ssh-server-host-key-algorithms
+                             (list key) nil (list blob))))
+                 (multiple-value-bind (presented presented-blob)
+                     (cl-pnet-ssh::ssh-server-host-key-presentation
+                      (list key) (list blob)
+                      "ssh-ed25519-cert-v01@openssh.com")
+                   (is (eq key presented))
+                   (is (cl-pnet-ssh::ssh-octets= blob presented-blob)))
+                 ;; Without the certificate the plain key stands alone.
+                 (is (equal '("ssh-ed25519")
+                            (cl-pnet-ssh::ssh-server-host-key-algorithms
+                             (list key))))
+                 ;; A certificate for another key is dropped at startup.
+                 (is (null (cl-pnet-ssh::ssh-server-pair-host-certificates
+                            (list key) (list other-blob))))
+                 (is (equal (list blob other-blob)
+                            (cl-pnet-ssh::ssh-server-pair-host-certificates
+                             (list key other) (list blob other-blob))))))
           (ignore-errors (delete-directory-tree directory :validate t))))))
 
 ;;; ---- algorithm choices from sshd_config ----

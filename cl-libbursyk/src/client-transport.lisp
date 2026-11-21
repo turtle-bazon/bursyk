@@ -288,19 +288,80 @@ be listed in both the user's file and the system-wide one."
         (:match (return :match))
         (:mismatch (setf status :mismatch))))))
 
-(defun ssh-client-verify-host-key (client host-key)
-  "Apply the client's host key policy to HOST-KEY, or signal."
+(defun ssh-client-host-certificate-trusted-p (client certificate)
+  "Whether CERTIFICATE is a valid host certificate for CLIENT.
+
+The CA must appear in a @cert-authority line for the host, the certificate
+must be a host certificate inside its validity window, carry no critical
+options, and name the host or have no principals.  The host name used for
+the principal is the real host, not the [host]:port spelling known_hosts
+uses."
   (let* ((host (ssh-client-host-spec client))
-         (status (ssh-client-known-host-status client host-key))
-         (fingerprint (ssh-key-fingerprint host-key)))
-    (ecase status
-      (:match t)
-      (:mismatch
+         (name (or (ssh-client-host-key-host client)
+                   (ssh-client-host client)))
+         (now (ssh-unix-time (get-universal-time))))
+    (and (some (lambda (file)
+                 (ssh-known-host-certificate-authority-p
+                  file host certificate))
+               (ssh-client-known-hosts-files client))
+         (= (ssh-certificate-cert-type certificate) 2)
+         (null (ssh-certificate-critical certificate))
+         (<= (ssh-certificate-valid-after certificate) now)
+         (< now (ssh-certificate-valid-before certificate))
+         (ssh-certificate-signature-valid-p certificate)
+         (ssh-certificate-signature-algorithm-allowed-p certificate nil)
+         (or (null (ssh-certificate-principals certificate))
+             (member name (ssh-certificate-principals certificate)
+                     :test #'string=)))))
+
+(defun ssh-client-host-certificate-revoked-p (client host-key certificate)
+  "Whether a @revoked line for CLIENT's host names the certificate, its key
+or its CA."
+  (let ((host (ssh-client-host-spec client))
+        (blobs (list host-key
+                     (ssh-certificate-plain-blob certificate)
+                     (ssh-certificate-signature-key certificate))))
+    (some (lambda (file)
+            (ssh-known-host-key-revoked-p file host blobs))
+          (ssh-client-known-hosts-files client))))
+
+(defun ssh-client-verify-host-key (client host-key)
+  "Apply the client's host key policy to HOST-KEY, or signal.
+
+A host certificate is accepted when a @cert-authority line for the host
+names its CA and the certificate itself checks out.  Otherwise OpenSSH
+drops the certificate and checks the plain key it certifies, so a host with
+only a plain known_hosts entry still connects.  A @revoked line for the
+certificate, its plain key or its CA refuses it without that fallback."
+  (let ((certificate (and (ssh-certificate-blob-p host-key)
+                          (ssh-certificate-parse host-key))))
+    (cond
+      ((and certificate
+            (ssh-client-host-certificate-revoked-p
+             client host-key certificate))
        (error 'ssh-host-key-error
-              :detail (format nil "the host key for ~A changed" host)
-              :fingerprint fingerprint))
-      (:unknown
-       (ssh-client-accept-unknown-host-key client host-key fingerprint)))))
+              :detail (format nil "the host key for ~A is revoked"
+                              (ssh-client-host-spec client))
+              :fingerprint (ssh-key-fingerprint host-key)))
+      ((and certificate
+            (ssh-client-host-certificate-trusted-p client certificate))
+       t)
+      (certificate
+       (ssh-client-verify-host-key
+        client (ssh-certificate-plain-blob certificate)))
+      (t
+       (let* ((host (ssh-client-host-spec client))
+              (status (ssh-client-known-host-status client host-key))
+              (fingerprint (ssh-key-fingerprint host-key)))
+         (ecase status
+           (:match t)
+           (:mismatch
+            (error 'ssh-host-key-error
+                   :detail (format nil "the host key for ~A changed" host)
+                   :fingerprint fingerprint))
+           (:unknown
+            (ssh-client-accept-unknown-host-key
+             client host-key fingerprint))))))))
 
 (defun ssh-client-accept-unknown-host-key (client host-key fingerprint)
   "Decide what to do with a host key never seen before."

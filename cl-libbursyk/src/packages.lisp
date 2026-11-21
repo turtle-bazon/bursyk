@@ -170,6 +170,7 @@
    #:ssh-server-config-listen-addresses
    #:ssh-server-config-address-family
    #:ssh-server-config-host-key-files
+   #:ssh-server-config-host-certificate-files
    #:ssh-server-config-authorized-keys-files
    #:ssh-server-config-trusted-user-ca-keys
    #:ssh-server-config-authorized-principals-file

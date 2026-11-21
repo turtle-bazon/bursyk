@@ -137,7 +137,6 @@ socket address and has no routing domains.")
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
   '("chrootdirectory"
-    "hostcertificate"
     "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
@@ -152,6 +151,9 @@ socket address and has no routing domains.")
   (listen-addresses-from-command-line nil)
   (address-family nil)
   (host-key-files '())
+  ;; HostCertificate files, in the order read.  Each must certify one of
+  ;; HostKey's public keys; sshd pairs them at startup and drops the rest.
+  (host-certificate-files '())
   ;; NIL means the default; sshd's "none" entries are skipped, so a list of
   ;; only "none" disables public-key authentication.
   (authorized-keys-files nil)
@@ -760,6 +762,10 @@ cannot apply per connection."
        (push (ssh-config-expand-home
               (ssh-server-config-one-argument line))
              (ssh-server-config-host-key-files config)))
+      ((string= keyword "hostcertificate")
+       (push (ssh-config-expand-home
+              (ssh-server-config-one-argument line))
+             (ssh-server-config-host-certificate-files config)))
       ((string= keyword "authorizedkeysfile")
        (unless (ssh-server-config-authorized-keys-files config)
          (cond
@@ -874,7 +880,8 @@ cannot apply per connection."
         config 'host-key-algorithms
         (ssh-server-config-resolve-algorithms
          line arguments +ssh-server-host-key-preference+
-         "HostKeyAlgorithms")))
+         "HostKeyAlgorithms"
+         :all +ssh-server-host-key-all-algorithms+)))
       ((or (string= keyword "pubkeyacceptedalgorithms")
            (string= keyword "pubkeyacceptedkeytypes"))
        ;; PubkeyAcceptedKeyTypes is the obsolete name for the same field;
@@ -1349,6 +1356,7 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-ports)
     (reverse-slot ssh-server-config-listen-addresses)
     (reverse-slot ssh-server-config-host-key-files)
+    (reverse-slot ssh-server-config-host-certificate-files)
     (reverse-slot ssh-server-config-accept-env)
     (reverse-slot ssh-server-config-permit-open)
     (reverse-slot ssh-server-config-permit-listen)

@@ -1076,6 +1076,7 @@ this program's error, because a configured list is meant exactly as written."
 (defun make-ssh-server (address port
                         &key
                           host-key
+                          host-certificate
                           authorized-keys
                           authorize
                           authorize-user
@@ -1124,6 +1125,9 @@ MAX-STARTUPS, PER-SOURCE-MAX-STARTUPS, PER-SOURCE-NET-BLOCK-SIZE,
 UNUSED-CONNECTION-TIMEOUT and TCP-KEEP-ALIVE are the pure backend's, with
 the same meanings and defaults.  CHANNEL-TIMEOUTS is sshd's ChannelTimeout
 list, applied by the same inactivity accounting as the pure backend."
+  (when host-certificate
+    (error 'ssh-connection-error
+           :detail "the libssh backend cannot present host certificates"))
   (let* ((required-rsa-size
            (and sshd-config
                 (ssh-server-config-required-rsa-size sshd-config)))

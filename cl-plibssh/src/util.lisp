@@ -110,6 +110,9 @@
   watcher
   bind
   (host-keys nil)
+  ;; The pure backend presents these; libssh has no bind option for them,
+  ;; so MAKE-SSH-SERVER refuses a non-empty list here.
+  (host-certificates nil)
   authorized-keys
   authorize
   authorize-user

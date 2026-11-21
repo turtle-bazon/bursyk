@@ -31,7 +31,8 @@ only curve25519 does not turn off either extension."
   "The host key algorithms SESSION can present, in configured order."
   (ssh-server-host-key-algorithms
    (ssh-session-host-keys session)
-   (ssh-session-setting session #'ssh-server-config-host-key-algorithms)))
+   (ssh-session-setting session #'ssh-server-config-host-key-algorithms)
+   (ssh-server-host-certificates (ssh-session-server session))))
 
 (defun ssh-server-make-kexinit-payload (session)
   "A fresh server SSH_MSG_KEXINIT advertising SESSION's configured offers."
@@ -220,10 +221,8 @@ came up."
   (let* ((reader (ssh-make-reader payload))
          (client-public (progn (ssh-read-u8 reader) (ssh-read-string reader)))
          (algorithm (getf (ssh-session-negotiated session) :host-key))
-         (host-key (and algorithm
-                        (ssh-server-host-key-for
-                         (ssh-session-host-keys session)
-                         algorithm)))
+         (host-key nil)
+         (host-key-blob nil)
          (private nil)
          (server-public nil)
          (shared nil)
@@ -231,6 +230,12 @@ came up."
          (signature nil))
     (unless (ssh-session-negotiated session)
       (error 'ssh-protocol-error :detail "ECDH_INIT before KEXINIT"))
+    (when algorithm
+      (multiple-value-setq (host-key host-key-blob)
+        (ssh-server-host-key-presentation
+         (ssh-session-host-keys session)
+         (ssh-server-host-certificates (ssh-session-server session))
+         algorithm)))
     (unless host-key
       (error 'ssh-protocol-error
              :detail (format nil "no key for host key algorithm ~A" algorithm)))
@@ -241,15 +246,14 @@ came up."
                 (ssh-session-server-version session)
                 (ssh-session-client-kexinit session)
                 (ssh-session-server-kexinit session)
-                (ssh-public-key-blob-of host-key)
+                host-key-blob
                 client-public server-public shared)
           signature (ssh-server-host-key-signature host-key algorithm hash))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
           (ssh-session-ephemeral-private session) private
           (ssh-session-ephemeral-public session) server-public
-          (ssh-session-host-key-blob session)
-          (ssh-public-key-blob-of host-key)
+          (ssh-session-host-key-blob session) host-key-blob
           (ssh-session-derived-keys session)
           (ssh-session-keys (ssh-session-negotiated session) shared hash
                             (ssh-session-session-id session) :server t))

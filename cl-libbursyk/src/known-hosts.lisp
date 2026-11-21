@@ -132,6 +132,28 @@ not a reason to abort the file.  Only the decode failure is caught."
       (entries :mismatch)
       (t :unknown))))
 
+(defun ssh-known-host-certificate-authority-p (path host certificate)
+  "Whether a @cert-authority entry for HOST in PATH names CERTIFICATE's CA."
+  (let ((ca (ssh-certificate-signature-key certificate)))
+    (and ca
+         (some (lambda (entry)
+                 (and (equal (ssh-known-host-entry-marker entry)
+                             "@cert-authority")
+                      (ssh-known-host-entry-matches-p entry host)
+                      (ssh-octets= ca (ssh-known-host-entry-key-blob entry))))
+               (ssh-load-known-hosts path)))))
+
+(defun ssh-known-host-key-revoked-p (path host key-blobs)
+  "Whether a @revoked entry for HOST in PATH names one of KEY-BLOBS."
+  (some (lambda (entry)
+          (and (equal (ssh-known-host-entry-marker entry) "@revoked")
+               (ssh-known-host-entry-matches-p entry host)
+               (some (lambda (blob)
+                       (ssh-octets= blob
+                                    (ssh-known-host-entry-key-blob entry)))
+                     key-blobs)))
+        (ssh-load-known-hosts path)))
+
 (defun ssh-remember-known-host (path host key-type key-blob)
   "Append HOST's KEY-BLOB to the known_hosts file at PATH."
   (ensure-directories-exist path)

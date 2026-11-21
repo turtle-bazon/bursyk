@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.23"
+(defparameter +bursyk-server-version+ "0.0.2.24"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -77,6 +77,7 @@ version rather than a generic library string.")
   (format *error-output*
           "usage: bursyk-server [-a ADDRESS] [-p PORT] [-f SSHD_CONFIG]~%~
            ~15@T[-g LOGIN_GRACE_TIME] [-H HOST_KEY]... [-A AUTHORIZED_KEYS]~%~
+           ~15@T[--host-certificate CERT_FILE]...~%~
            ~15@T[-e NAME]... [-c PREFIX]... [-S NAME=PATH]...~%~
            ~15@T[-o KEYWORD=VALUE]... [-v]... [-q]~%~
            ~15@T[--no-tcp-forwarding]~%~
@@ -101,6 +102,8 @@ version rather than a generic library string.")
   (cond ((member name '("-a" "--address") :test #'string=) :address)
         ((member name '("-p" "--port") :test #'string=) :port)
         ((member name '("-H" "--host-key") :test #'string=) :host-key)
+        ((member name '("--host-certificate") :test #'string=)
+         :host-certificate)
         ((member name '("-A" "--authorized-keys") :test #'string=)
          :authorized-keys)
         ((member name '("-e" "--accept-env") :test #'string=) :accept-env)
@@ -143,7 +146,7 @@ version rather than a generic library string.")
 
 (defun record-option (key value)
   (case key
-    ((:accept-env :allow :subsystem :host-key :option)
+    ((:accept-env :allow :subsystem :host-key :host-certificate :option)
      (push value (getf *options* key)))
     (:verbose
      (incf (getf *options* :verbose 0)))
@@ -1236,6 +1239,12 @@ unprivileged run simple."
             found)
           (list (home-file ".ssh/id_ed25519")))))
 
+(defun host-certificate-files ()
+  "The --host-certificate files, then the config's HostCertificate files."
+  (append (reverse (getf *options* :host-certificate))
+          (config-setting
+           #'cl-pnet-ssh:ssh-server-config-host-certificate-files)))
+
 (defun root-uid-p (user)
   "Whether USER is uid 0, the only account PermitRootLogin governs."
   (let ((uid (nth-value 1 (user-home-and-uid user))))
@@ -1754,6 +1763,12 @@ guess, so only an explicit PidFile is written."
     (dolist (host-key host-keys)
       (unless (probe-file host-key)
         (fail "host key not found: ~A" host-key)))
+    ;; sshd logs a HostCertificate it cannot load and serves the plain key,
+    ;; so a bad certificate never stops the listener.
+    (dolist (host-certificate (host-certificate-files))
+      (unless (probe-file host-certificate)
+        (log-at :info "warning: host certificate ~A not found"
+                host-certificate)))
     (let ((global (getf *options* :authorized-keys)))
       (when (and global (not (probe-file global)))
         (log-at :info "warning: ~A not found" global)))
@@ -1762,6 +1777,7 @@ guess, so only an explicit PidFile is written."
            (server-address)
            (server-port)
            :host-key host-keys
+           :host-certificate (host-certificate-files)
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
            :sshd-config *server-config*

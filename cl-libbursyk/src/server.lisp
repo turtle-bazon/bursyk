@@ -65,9 +65,58 @@ advertised and then fail the first KEX."
                 key))
             values)))
 
+(defun ssh-server-host-certificate-list (host-certificate)
+  "HOST-CERTIFICATE as a list of certificate blobs.
+
+HOST-CERTIFICATE is a certificate blob, a file holding one, or a list of
+those.  sshd logs a file it cannot load and carries on with the rest, so a
+missing or malformed entry never stops the listener; it is simply not
+offered."
+  (let ((values (if (listp host-certificate)
+                    host-certificate
+                    (list host-certificate))))
+    (remove nil
+            (mapcar (lambda (value)
+                      (let ((blob
+                              (if (or (stringp value) (pathnamep value))
+                                  (ssh-public-key-file-blob value)
+                                  value)))
+                        (cond
+                          ((null blob)
+                           (ssh-log "could not load host certificate ~A"
+                                    value)
+                           nil)
+                          ((not (ssh-certificate-blob-p blob))
+                           (ssh-log "not a host certificate: ~A" value)
+                           nil)
+                          (t blob))))
+                    values))))
+
+(defun ssh-server-pair-host-certificates (keys certificates)
+  "CERTIFICATES whose plain key is one of KEYS, dropping the rest.
+
+sshd pairs each HostCertificate with the HostKey it certifies and logs a
+certificate that matches none, because such a certificate could never be
+presented."
+  (remove-if-not
+   (lambda (blob)
+     (let* ((certificate (ssh-certificate-parse blob))
+            (plain (and certificate
+                        (ssh-certificate-plain-blob certificate)))
+            (key (and plain
+                      (find-if (lambda (key)
+                                 (ssh-octets= plain
+                                              (ssh-public-key-blob-of key)))
+                               keys))))
+       (unless key
+         (ssh-log "host certificate has no matching HostKey"))
+       key))
+   certificates))
+
 (defun make-ssh-server (address port
                         &key
                           host-key
+                          host-certificate
                           authorized-keys
                           authorize
                           authorize-user
@@ -101,7 +150,10 @@ advertised and then fail the first KEX."
 
 HOST-KEY is an ssh-private-key, a path to an OpenSSH key, or a list of
 those; ssh-ed25519, ECDSA and RSA keys are supported, and the server
-advertises every algorithm its keys can sign with.  AUTHORIZED-KEYS is an
+advertises every algorithm its keys can sign with.  HOST-CERTIFICATE is a
+host certificate blob, a file holding one, or a list of those; each must
+certify one of HOST-KEY's public keys, and a certificate algorithm then
+outranks the plain key in KEXINIT.  AUTHORIZED-KEYS is an
 authorized_keys file, a list of public key blobs, or NIL.  AUTHORIZE, when
 given, is a function of (USER KEY-BLOB ADDRESS) and replaces AUTHORIZED-KEYS;
 it should return the same (VALUES MATCHED ENVIRONMENTS OPTIONS) that
@@ -180,11 +232,15 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                 (ssh-server-host-key-list host-key)
                 (and sshd-config
                      (ssh-server-config-required-rsa-size sshd-config))))
+         (certificates
+           (ssh-server-pair-host-certificates
+            keys (ssh-server-host-certificate-list host-certificate)))
          (server (%make-ssh-server
                   :address address
                   :port port
                   :version software
                   :host-keys keys
+                  :host-certificates certificates
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user

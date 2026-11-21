@@ -1484,6 +1484,26 @@ HostKey /tmp/host_b")))
     (is (equal '("/tmp/only")
                (mapcar #'namestring (bursyk-server::host-key-files))))))
 
+(test host-certificates-come-from-the-command-line-and-config
+  (let ((config (config-from-text
+                 "HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub
+HostCertificate /etc/ssh/ssh_host_rsa_key-cert.pub")))
+    (is (equal '("/etc/ssh/ssh_host_ed25519_key-cert.pub"
+                 "/etc/ssh/ssh_host_rsa_key-cert.pub")
+               (cl-pnet-ssh:ssh-server-config-host-certificate-files
+                config))))
+  (let ((bursyk-server::*options*
+          (list :host-certificate '("/tmp/cli-cert.pub")))
+        (bursyk-server::*server-config*
+          (config-from-text "HostCertificate /tmp/config-cert.pub")))
+    (is (equal '("/tmp/cli-cert.pub" "/tmp/config-cert.pub")
+               (mapcar #'namestring
+                       (bursyk-server::host-certificate-files)))))
+  ;; HostCertificate is global only, like HostKey.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+  HostCertificate /tmp/cert.pub")))
+
 (test config-forwarding-policy-drives-the-decisions
   (let ((bursyk-server::*options* nil)
         (bursyk-server::*server-config*
