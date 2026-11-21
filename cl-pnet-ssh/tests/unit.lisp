@@ -2706,6 +2706,46 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test hashed-known-hosts-round-trip
+  "HashKnownHosts writes a salted hash that still matches the same host."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-hash-known"))
+         (path (merge-pathnames "known_hosts" directory))
+         (blob (ssh-random-octets 32)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (ssh-remember-known-host path "example.org" "ssh-ed25519" blob
+                                    :hash t)
+           (let ((line (with-open-file (in path)
+                         (read-line in))))
+             (is (not (search "example.org" line)))
+             (is (eql 0 (search "|1|" line))))
+           (is (eq :match
+                   (ssh-known-host-status path "example.org" blob)))
+           (is (eq :unknown
+                   (ssh-known-host-status path "other.example" blob)))
+           ;; Without HASH the name stays readable, as before.
+           (ssh-remember-known-host path "plain.example" "ssh-ed25519" blob)
+           (is (eq :match
+                   (ssh-known-host-status path "plain.example" blob))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test hash-known-hosts-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HashKnownHosts yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-hash-known-hosts options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-hash-known-hosts options)))))
+
 (test refuse-connection-stops-resolution
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

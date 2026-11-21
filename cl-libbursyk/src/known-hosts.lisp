@@ -154,13 +154,25 @@ not a reason to abort the file.  Only the decode failure is caught."
                      key-blobs)))
         (ssh-load-known-hosts path)))
 
-(defun ssh-remember-known-host (path host key-type key-blob)
-  "Append HOST's KEY-BLOB to the known_hosts file at PATH."
+(defun ssh-hashed-known-host (host)
+  "HOST as OpenSSH's hashed known_hosts field: |1|salt|HMAC-SHA1."
+  (let ((salt (ssh-random-octets 20)))
+    (format nil "|1|~A|~A"
+            (ssh-octets-base64 salt)
+            (ssh-octets-base64
+             (ssh-hmac salt (ssh-string-octets host) :sha1)))))
+
+(defun ssh-remember-known-host (path host key-type key-blob &key hash)
+  "Append HOST's KEY-BLOB to the known_hosts file at PATH.
+
+HASH writes the host as a salted hash, as HashKnownHosts does, instead of
+the plain name."
   (ensure-directories-exist path)
   (with-open-file (stream path :direction :output
                                :if-exists :append
                                :if-does-not-exist :create
                                :external-format :utf-8)
     (format stream "~A ~A ~A~%"
-            host key-type (ssh-octets-base64 key-blob)))
+            (if hash (ssh-hashed-known-host host) host)
+            key-type (ssh-octets-base64 key-blob)))
   path)

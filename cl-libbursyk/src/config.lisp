@@ -50,6 +50,7 @@ relative Include is anchored here.")
   (identities-only nil)
   (known-hosts nil)
   (global-known-hosts nil)
+  (hash-known-hosts nil)
   ;; RevokedHostKeys: files of host keys and certificates that may not be
   ;; used, in the order read; NONE clears the list.
   (revoked-host-keys '())
@@ -795,6 +796,12 @@ understand them rather than silently match nothing."
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
                   (if (eq paths :none) nil paths))))))
+      ((string= keyword "hashknownhosts")
+       (ssh-config-set-once
+        seen options :hash-known-hosts
+        (lambda (options)
+          (setf (ssh-config-options-hash-known-hosts options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "revokedhostkeys")
        ;; Unlike most keywords this accumulates, and NONE clears what came
        ;; before it, as ssh's oRevokedHostKeys does.
@@ -1007,7 +1014,8 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
-                         "revokedhostkeys" "stricthostkeychecking"
+                         "hashknownhosts" "revokedhostkeys"
+                         "stricthostkeychecking"
                          "connecttimeout" "addressfamily" "batchmode")
                :test #'string=)
        (ssh-config-apply-policy line options seen context))

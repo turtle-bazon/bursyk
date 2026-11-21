@@ -59,6 +59,8 @@
   (ca-signature-algorithms nil)
   ;; RevokedHostKeys: files whose host keys and certificates may not be used.
   (revoked-host-keys '())
+  ;; HashKnownHosts: write new known_hosts entries as salted hashes.
+  (hash-known-hosts nil)
   ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
   ;; authentication key, as ssh's RequiredRSASize directive sets it.
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

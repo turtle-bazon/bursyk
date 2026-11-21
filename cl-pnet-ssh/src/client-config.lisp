@@ -149,6 +149,8 @@ MAKE-SSH-CLIENT's own defaults."
          +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms")
         :revoked-host-keys
         (reverse (ssh-config-options-revoked-host-keys options))
+        :hash-known-hosts
+        (ssh-config-options-hash-known-hosts options)
         :ca-signature-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-ca-signature-algorithms
@@ -434,6 +436,7 @@ uses whichever of the two it saw first instead of chaining them."
            (getf parameters :pubkey-accepted-algorithms)
            :ca-signature-algorithms (getf parameters :ca-signature-algorithms)
            :revoked-host-keys (getf parameters :revoked-host-keys)
+           :hash-known-hosts (getf parameters :hash-known-hosts)
            :required-rsa-size (getf parameters :required-rsa-size)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)

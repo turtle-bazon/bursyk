@@ -274,7 +274,8 @@ KNOWN-HOSTS is one path, a list of paths, or NIL for ~/.ssh/known_hosts."
     (declare (ignore data))
     (ssh-remember-known-host (ssh-client-known-hosts-file client)
                              (ssh-client-host-spec client)
-                             type host-key)))
+                             type host-key
+                             :hash (ssh-client-hash-known-hosts client))))
 
 (defun ssh-client-known-host-status (client host-key)
   "How HOST-KEY stands for CLIENT's host across every known-hosts file.

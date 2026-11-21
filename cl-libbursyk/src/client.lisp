@@ -172,6 +172,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  ciphers macs pubkey-accepted-algorithms
                                  ca-signature-algorithms
                                  (revoked-host-keys '())
+                                 hash-known-hosts
                                  (required-rsa-size
                                   +ssh-rsa-minimum-modulus-size+))
   "The CLIENT structure, before any connection exists."
@@ -194,6 +195,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :pubkey-accepted-algorithms pubkey-accepted-algorithms
                     :ca-signature-algorithms ca-signature-algorithms
                     :revoked-host-keys revoked-host-keys
+                    :hash-known-hosts hash-known-hosts
                     :required-rsa-size required-rsa-size
                     :on-open on-open
                     :on-error on-error
@@ -255,6 +257,7 @@ is applied here, before any request names a key the configuration forbade."
                              ciphers macs pubkey-accepted-algorithms
                              ca-signature-algorithms
                              (revoked-host-keys '())
+                             hash-known-hosts
                              (required-rsa-size
                               +ssh-rsa-minimum-modulus-size+)
                              on-open on-error on-close on-forwarded-tcpip
@@ -314,6 +317,7 @@ role-neutral."
                            pubkey-accepted-algorithms
                            :ca-signature-algorithms ca-signature-algorithms
                            :revoked-host-keys revoked-host-keys
+                           :hash-known-hosts hash-known-hosts
                            :required-rsa-size required-rsa-size)
    private-key agent passphrase))
 
