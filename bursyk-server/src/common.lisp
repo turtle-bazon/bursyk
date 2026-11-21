@@ -15,6 +15,72 @@
   (let ((columns (cl-pnet-ssh:ssh-server-channel-pty-columns channel)))
     (if (and columns (plusp columns)) columns 80)))
 
+;;; ---- ExposeAuthInfo ----
+;;;
+;;; sshd writes one temporary file per authenticated connection and points
+;;; SSH_USER_AUTH at it.  The file holds the method and the key that admitted
+;;; the user, and is removed when the connection ends.  The path is kept here
+;;; because both process backends build the child environment through
+;;; SESSION-ENVIRONMENT.
+
+(defvar *auth-info-files* (make-hash-table :test #'eq)
+  "ExposeAuthInfo files, keyed by the session that owns them.")
+
+#-win32
+(cffi:defcfun ("chmod" c-chmod) :int (path :string) (mode :unsigned-int))
+
+(defun auth-info-file (session)
+  "The ExposeAuthInfo file SESSION owns, or NIL."
+  (gethash session *auth-info-files*))
+
+(defun write-auth-info-file (session)
+  "Write SESSION's ExposeAuthInfo file when the directive asks for it.
+
+The file holds one line, \"publickey TYPE BASE64\", the same text sshd's
+auth2_update_session_info builds.  The key is the blob that authenticated
+the user, so a certificate is written as its certificate type and blob.
+A file that cannot be created is logged and leaves SSH_USER_AUTH unset, as
+sshd's prepare_auth_info_file does."
+  (when (and (eq (session-config-setting
+                  session #'cl-pnet-ssh:ssh-server-config-expose-auth-info)
+                 :yes)
+             (null (auth-info-file session)))
+    (let ((key (cl-pnet-ssh:ssh-session-authorized-key session)))
+      (when key
+        (handler-case
+            (multiple-value-bind (type data)
+                (cl-pnet-ssh:ssh-public-key-parts key)
+              (declare (ignore data))
+              (let* ((text (format nil "publickey ~A ~A~%"
+                                   type
+                                   (cl-pnet-ssh:ssh-octets-base64 key)))
+                     (path
+                       (uiop:with-temporary-file
+                           (:stream out :pathname path :keep t
+                            :prefix "sshauth." :direction :output
+                            :external-format :utf-8)
+                         ;; sshd's mkstemp creates the file 0600; UIOP's
+                         ;; portable version cannot, so tighten it while it
+                         ;; is still empty and before the key is written.
+                         #-win32 (c-chmod (uiop:native-namestring path) #o600)
+                         (write-string text out)
+                         path)))
+                (let ((name (uiop:native-namestring path)))
+                  (setf (gethash session *auth-info-files*) name)
+                  name)))
+          (error (condition)
+            (log-at :error
+                    "ExposeAuthInfo: cannot write the authentication file: ~A"
+                    condition)
+            nil))))))
+
+(defun delete-auth-info-file (session)
+  "Remove SESSION's ExposeAuthInfo file, if one was written."
+  (let ((path (auth-info-file session)))
+    (when path
+      (remhash session *auth-info-files*)
+      (ignore-errors (delete-file path)))))
+
 (defun environment-put (environment name value)
   "NAME=VALUE in ENVIRONMENT, replacing earlier assignments of NAME.
 
@@ -114,6 +180,12 @@ replaces the global one here as it does in sshd."
             (environment-assignment-parts assignment)
           (when name
             (setf environment (environment-put environment name value))))))
+    ;; sshd adds SSH_USER_AUTH after SetEnv, so an administrator's SetEnv
+    ;; cannot point the session at a different file.
+    (let ((auth-info (auth-info-file session)))
+      (when auth-info
+        (setf environment
+              (environment-put environment "SSH_USER_AUTH" auth-info))))
     environment))
 
 (defun user-shell ()

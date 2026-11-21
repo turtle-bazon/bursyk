@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.21"
+(defparameter +bursyk-server-version+ "0.0.2.22"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1826,7 +1826,10 @@ guess, so only an explicit PidFile is written."
                          (log-at :info "accepted ~A from ~A"
                                  (cl-pnet-ssh:ssh-session-user session)
                                  (cl-pnet-ssh:ssh-session-remote-address
-                                  session)))
+                                  session))
+                         ;; sshd writes this once authentication succeeds,
+                         ;; before any channel can run.
+                         (write-auth-info-file session))
            :on-direct-tcpip
            (lambda (session host port origin origin-port)
              (declare (ignore origin origin-port))
@@ -1852,9 +1855,11 @@ guess, so only an explicit PidFile is written."
                        (log-at :info "closed session for ~A: ~A"
                                (cl-pnet-ssh:ssh-session-user session)
                                (close-reason-text reason))
+                       (delete-auth-info-file session)
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session
+                         (delete-auth-info-file session)
                          (close-remote-forwards session))
                        (log-at :error "~A" condition))))
     (log-at :info "listening on ~A:~D"

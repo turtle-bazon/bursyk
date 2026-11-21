@@ -141,8 +141,7 @@ socket address and has no routing domains.")
     "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
-    "streamlocalbindmask" "streamlocalbindunlink"
-    "exposeauthinfo"))
+    "streamlocalbindmask" "streamlocalbindunlink"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -237,6 +236,9 @@ socket address and has no routing domains.")
   ;; PermitUserEnvironment: NIL (unset, means no), :YES, :NO, or a list of
   ;; patterns naming the variables a user may set.
   (permit-user-environment nil)
+  ;; ExposeAuthInfo: :YES writes sshd's SSH_USER_AUTH file for the
+  ;; connection, :NO (or NIL, unset) writes none.
+  (expose-auth-info nil)
   ;; SetEnv assignments, "NAME=VALUE", in the order they were read.
   (set-env '())
   (pid-file nil)
@@ -638,6 +640,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     force-command banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
+    expose-auth-info
     unused-connection-timeout channel-timeouts
     trusted-user-ca-keys authorized-principals-file
     authorized-principals-command authorized-principals-command-user
@@ -924,6 +927,15 @@ cannot apply per connection."
                  (ssh-server-config-line-error
                   line "empty PermitUserEnvironment pattern"))
                patterns))))))
+      ((string= keyword "exposeauthinfo")
+       ;; sshd's parse_flag: first value wins, and "no" is a value rather
+       ;; than the absence of one, so a Match block can turn a global yes off.
+       (ssh-server-config-set-once
+        config 'expose-auth-info
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes
+            :no)))
       ;; ---- forwarding policy ----
       ((string= keyword "permitopen")
        (when (null (ssh-server-config-permit-open config))

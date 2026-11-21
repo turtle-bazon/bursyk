@@ -44,6 +44,7 @@
    #:ssh-session-p
    #:ssh-session-server
    #:ssh-session-user
+   #:ssh-session-authorized-key
    #:ssh-session-key-env
    #:ssh-session-authorization
    #:ssh-session-client-version
@@ -216,6 +217,7 @@
    #:ssh-server-config-banner
    #:ssh-server-config-force-command
    #:ssh-server-config-permit-user-environment
+   #:ssh-server-config-expose-auth-info
    #:ssh-server-config-set-env
    #:ssh-server-config-version-addendum
    #:ssh-server-config-warnings

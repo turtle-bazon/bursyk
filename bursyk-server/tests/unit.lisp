@@ -844,6 +844,33 @@ SetEnv C=4")))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "SetEnv")))
 
+(test sshd-config-reads-expose-auth-info
+  "ExposeAuthInfo is a flag whose first value wins, and Match can turn it off."
+  (is (null (config-value
+             #'cl-pnet-ssh:ssh-server-config-expose-auth-info "")))
+  (is (eq :yes (config-value
+                #'cl-pnet-ssh:ssh-server-config-expose-auth-info
+                "ExposeAuthInfo yes")))
+  (is (eq :no (config-value
+               #'cl-pnet-ssh:ssh-server-config-expose-auth-info
+               "ExposeAuthInfo no")))
+  (is (eq :yes (config-value
+                #'cl-pnet-ssh:ssh-server-config-expose-auth-info
+                "ExposeAuthInfo yes
+ExposeAuthInfo no")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "ExposeAuthInfo maybe"))
+  (let* ((config (config-from-text
+                  "ExposeAuthInfo yes
+Match User bob
+  ExposeAuthInfo no"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (eq :yes (cl-pnet-ssh:ssh-server-config-expose-auth-info alice)))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-expose-auth-info bob)))))
+
 (test permit-user-environment-controls-names
   (let ((allowlist (cl-pnet-ssh::%make-ssh-server
                     :permit-user-environment '("LANG" "LC_*")))
@@ -2605,3 +2632,80 @@ no file or TrustedUserCAKeys does."
                                    "other" cert-blob "127.0.0.1"))))
                    (ignore-errors (delete-file output)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+;;; ---- ExposeAuthInfo ----
+
+#-win32
+(test expose-auth-info-writes-the-authenticated-key
+  "SSH_USER_AUTH names a 0600 file holding sshd's publickey line, and the
+file is removed with the session."
+  (let* ((key (revoked-test-key 25))
+         (config (config-from-text "ExposeAuthInfo yes"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "alice" :authorized-key key)))
+    (unwind-protect
+         (let ((path (bursyk-server::write-auth-info-file session)))
+           (is (stringp path))
+           (is (probe-file path))
+           (is (equal (list (format nil "publickey ssh-ed25519 ~A"
+                                    (cl-pnet-ssh:ssh-octets-base64 key)))
+                      (uiop:read-file-lines path)))
+           ;; sshd's mkstemp makes the file readable only by its owner.
+           (is (equal "600"
+                      (uiop:run-program
+                       (list "stat" "-c" "%a" path)
+                       :output '(:string :stripped t))))
+           (is (equal path (bursyk-server::auth-info-file session))))
+      (bursyk-server::delete-auth-info-file session)
+      (is (null (bursyk-server::auth-info-file session))))))
+
+(test expose-auth-info-writes-a-certificate-as-its-own-type
+  "A certificate is written as its certificate type and certificate blob,
+as sshd's sshkey_format_text does for the key that authenticated."
+  (let* ((key (cl-pnet-ssh:ssh-make-public-key-blob
+               "ssh-ed25519-cert-v01@openssh.com"
+               (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-element 7)))
+         (config (config-from-text "ExposeAuthInfo yes"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "alice" :authorized-key key)))
+    (unwind-protect
+         (let ((path (bursyk-server::write-auth-info-file session)))
+           (is (equal (list (format nil "publickey ssh-ed25519-cert-v01@openssh.com ~A"
+                                    (cl-pnet-ssh:ssh-octets-base64 key)))
+                      (uiop:read-file-lines path))))
+      (bursyk-server::delete-auth-info-file session))))
+
+(test expose-auth-info-reaches-the-child-environment
+  "SSH_USER_AUTH is in the session environment and beats an admin SetEnv."
+  (let* ((key (revoked-test-key 26))
+         (config (config-from-text
+                  "ExposeAuthInfo yes
+SetEnv SSH_USER_AUTH=/wrong"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :user "bursyk-test-user-with-no-passwd-entry"
+                   :authorized-key key))
+         (channel (cl-pnet-ssh::%make-ssh-server-channel :session session)))
+    (unwind-protect
+         (let* ((path (bursyk-server::write-auth-info-file session))
+                (environment (bursyk-server::session-environment channel)))
+           (is (equal path
+                      (cdr (assoc "SSH_USER_AUTH" environment
+                                  :test #'string=))))
+           ;; One entry per name, as sshd's child_set_env leaves it.
+           (is (= 1 (count "SSH_USER_AUTH" environment
+                           :key #'car :test #'string=))))
+      (bursyk-server::delete-auth-info-file session))))
+
+(test expose-auth-info-is-off-by-default
+  "Without the directive no file is written and no path is remembered."
+  (let* ((key (revoked-test-key 27))
+         (server (cl-pnet-ssh::%make-ssh-server))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "alice" :authorized-key key)))
+    (is (null (bursyk-server::write-auth-info-file session)))
+    (is (null (bursyk-server::auth-info-file session)))))

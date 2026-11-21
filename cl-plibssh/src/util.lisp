@@ -170,6 +170,9 @@
   (client-version nil)
   (user nil)
   (authenticated nil)
+  ;; The key blob that authenticated the user, exactly as offered: a
+  ;; certificate when one was used.  ExposeAuthInfo writes it out.
+  (authorized-key nil)
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())

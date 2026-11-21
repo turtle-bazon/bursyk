@@ -260,8 +260,8 @@ the reason is recorded and the pump finishes it after the callback returns."
 
 KEY-ENV holds the environment= assignments from the authorized_keys line
 that admitted the key, and AUTHORIZATION the rest of that line's options."
-  (declare (ignore key-blob))
   (setf (ssh-session-user session) user
+        (ssh-session-authorized-key session) key-blob
         (ssh-session-key-env session) key-env
         (ssh-session-authorization session) authorization
         (ssh-session-authenticated session) t
