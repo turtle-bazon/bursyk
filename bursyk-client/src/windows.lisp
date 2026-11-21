@@ -292,3 +292,11 @@ bytes the user typed."
   (setf *stdin-thread*
         (bt:make-thread (lambda () (stdin-thread channel))
                         :name "burs stdin")))
+
+
+
+;;; The parent waits for this marker on stdout before it exits.
+(defun background-ready ()
+  (write-line "BURS-AUTH-OK" *standard-output*)
+  (finish-output *standard-output*)
+  (setf *background-child* nil))

@@ -13,6 +13,23 @@
   #+sbcl (plusp (sb-unix:unix-isatty 0))
   #-sbcl nil)
 
+(cffi:defcfun ("open" c-open) :int (path :string) (flags :int) (mode :int))
+(cffi:defcfun ("dup2" c-dup2) :int (old :int) (new :int))
+(cffi:defcfun ("close" c-close) :int (fd :int))
+
+(defun background-ready ()
+  "Tell the waiting parent that authentication succeeded, then detach stdio."
+  (write-line "BURS-AUTH-OK" *standard-output*)
+  (finish-output *standard-output*)
+  (let ((null (c-open "/dev/null" 2 0)))
+    (when (>= null 0)
+      (c-dup2 null 0)
+      (c-dup2 null 1)
+      (c-dup2 null 2)
+      (when (> null 2)
+        (c-close null))))
+  (setf *background-child* nil))
+
 (defun restore-terminal ()
   "Put the terminal back the way TERMINAL-ENTER-RAW found it."
   (when *terminal-saved*

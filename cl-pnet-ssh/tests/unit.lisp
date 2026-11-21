@@ -2785,6 +2785,22 @@ newline")))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
 
+(test fork-after-authentication-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "ForkAfterAuthentication yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (ssh-config-options-fork-after-authentication options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-fork-after-authentication options)))))
+
 (test hostbased-configuration-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

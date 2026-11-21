@@ -196,6 +196,7 @@
    #:ssh-config-options-enable-escape-commandline
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null
+   #:ssh-config-options-fork-after-authentication
    #:ssh-config-options-forward-agent
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files

@@ -20,7 +20,8 @@
         :no-command nil :stdin-null nil :subsystem nil :stdio-forward nil
         :local-forward nil :remote-forward nil :dynamic-forward nil
         :query nil :help nil :version nil :print-config nil
-        :background nil :control-master nil :control-path nil
+        :background nil :background-child nil
+        :control-master nil :control-path nil
         :control-command nil :pkcs11 nil :bind-interface nil
         :bind-address nil :gssapi-auth nil :tunnel nil :x11-forward nil
         :escape-char nil))

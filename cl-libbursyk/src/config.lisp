@@ -144,6 +144,7 @@ relative Include is anchored here.")
   ;; command names a subsystem, and whether stdin is /dev/null.
   (session-type nil)
   (stdin-null nil)
+  (fork-after-authentication nil)
   (tag nil)
   ;; LogLevel and LogVerbose: how much this client logs, and per-area
   ;; overrides.  LogVerbose is accepted for ssh_config compatibility; this
@@ -1302,6 +1303,9 @@ understand them rather than silently match nothing."
            (setf (ssh-config-options-session-type options) value)))
         ((string= keyword "stdinnull")
          (setf (ssh-config-options-stdin-null options) (boolean)))
+        ((string= keyword "forkafterauthentication")
+         (setf (ssh-config-options-fork-after-authentication options)
+               (boolean)))
         ((string= keyword "requesttty")
          (setf (ssh-config-options-request-tty options) (string-downcase value)))
         ((string= keyword "preferredauthentications")
@@ -1362,6 +1366,7 @@ understand them rather than silently match nothing."
                          "enableescapecommandline"
                          "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
+                         "forkafterauthentication"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"

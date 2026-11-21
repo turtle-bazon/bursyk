@@ -80,6 +80,8 @@ for every invocation keeps two parses from sharing state."
               :long "compression")
    (burs-flag :background "Background before command execution" :short #\f
               :long "background")
+   (burs-flag :background-child "Internal: signal the waiting parent"
+              :long "background-child")
    (burs-flag :print-config "Print the effective configuration and exit"
               :short #\G :long "print-config")
    (burs-flag :gateway-ports "Allow remote hosts to use forwarded ports"
@@ -316,6 +318,7 @@ the order the old push-based parser kept them in."
             (getf *options* :version) (flag :version)
             (getf *options* :print-config) (flag :print-config)
             (getf *options* :background) (flag :background)
+            (getf *options* :background-child) (flag :background-child)
             (getf *options* :control-master) (flag :control-master)
             (getf *options* :control-path) (value :control-path)
             (getf *options* :control-command) (value :control-command)
@@ -402,8 +405,6 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-B" "binding the source interface is not implemented"))
   (when (getf *options* :bind-address)
     (unsupported "-b" "binding the source address is not implemented"))
-  (when (getf *options* :background)
-    (unsupported "-f" "backgrounding is not implemented"))
   (when (getf *options* :control-master)
     (unsupported "-M" "connection sharing is not implemented"))
   (when (getf *options* :control-path)
@@ -1748,6 +1749,11 @@ closed afterwards."
       (error (condition)
         (log-line "local command failed: ~A" condition)))))
 
+(defun config-fork-after-authentication-p (client)
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-fork-after-authentication options))))
+
 (defun config-remote-command (client)
   "CLIENT's RemoteCommand as written, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2406,6 +2412,11 @@ peer that connected to it; NIL refuses the channel."
     (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
       (when remote
         (format t "remotecommand ~A~%" remote)))
+    (format t "forkafterauthentication ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-fork-after-authentication
+                 options)
+                "yes"
+                "no"))
     (format t "sessiontype ~A~%"
             (or (cl-pnet-ssh:ssh-config-options-session-type options)
                 "default"))
@@ -2615,6 +2626,10 @@ of calling back in the middle of authentication."
    :on-client (lambda (client)
                 (setf *client* client)
                 (apply-config-log-level client)
+                (when (and (config-fork-after-authentication-p client)
+                           (not (getf *options* :background))
+                           (not *background-child*))
+                  (launch-background-child))
                 (check-config-supported client))
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
@@ -2651,6 +2666,17 @@ of calling back in the middle of authentication."
      (when (and (config-local-command client)
                 (permit-local-command-p client))
        (run-local-command client))
+     (let ((background (or (getf *options* :background)
+                           (config-fork-after-authentication-p client)
+                           *background-child*)))
+       (when (and background
+                  (not command-given-p)
+                  (not (getf *options* :no-command))
+                  (not (session-type-none-p client))
+                  (null (config-remote-command client)))
+         (fail "Cannot fork into background without a command to execute."))
+       (when background
+         (background-ready)))
      (cond
        ((getf *options* :stdio-forward)
         (multiple-value-bind (target port)
@@ -2669,6 +2695,30 @@ of calling back in the middle of authentication."
                (declare (ignore client reason))
                (finish *status*))))
 
+(defun background-child-arguments ()
+  "The current arguments with the marker flag before the destination."
+  (cons "--background-child" (uiop:command-line-arguments)))
+
+(defun launch-background-child ()
+  "Re-exec this client in the background and wait for authentication.
+
+A fresh process avoids forking the Lisp runtime.  The child writes
+BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
+  (let ((process
+          (uiop:launch-program
+           (cons (or (uiop:argv0) "/proc/self/exe")
+                 (background-child-arguments))
+           :input nil
+           :output :stream
+           :error-output nil)))
+    (let* ((stream (uiop:process-info-output process))
+           (line (read-line stream nil nil)))
+      (if (equal line "BURS-AUTH-OK")
+          (uiop:quit 0)
+          (progn
+            (ignore-errors (uiop:wait-process process))
+            (uiop:quit 255))))))
+
 (defun main ()
   "Entry point for the BURS program."
   (handler-case
@@ -2679,6 +2729,11 @@ of calling back in the middle of authentication."
             (print-version)
             (uiop:quit 0))
           (apply-command-line-options)
+          (setf *background-child*
+                (and (getf *options* :background-child) t))
+          (when (and (getf *options* :background)
+                     (not *background-child*))
+            (launch-background-child))
           (check-supported-options)
           (start-logging)
           (when (getf *options* :query)
