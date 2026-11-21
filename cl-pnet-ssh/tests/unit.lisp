@@ -3527,3 +3527,101 @@ option the server cannot honour refuses the line rather than being lost."
                  (is (not (null failed)))))
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(defun penalty-allowed-p (server address)
+  (multiple-value-bind (allowed)
+      (cl-pnet-ssh::ssh-server-penalty-check server address)
+    (and allowed t)))
+
+(defun penalty-refused-p (server address)
+  (not (penalty-allowed-p server address)))
+
+(test per-source-penalties-refuse-penalised-networks
+  "Penalties activate above min, accumulate up to max, expire, and honour
+the exempt list and PerSourceNetBlockSize."
+  ;; Off unless configured.
+  (let ((server (cl-pnet-ssh::%make-ssh-server)))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (is (not (null (penalty-allowed-p server "127.0.0.1")))))
+  ;; A single penalty above min refuses the network.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties authfail:10 min:5 max:30")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (multiple-value-bind (allowed reason)
+        (cl-pnet-ssh::ssh-server-penalty-check server "127.0.0.1")
+      (is (not (null allowed)))
+      (is (null reason)))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (multiple-value-bind (allowed reason)
+        (cl-pnet-ssh::ssh-server-penalty-check server "127.0.0.1")
+      (is (not allowed))
+      (is (stringp reason))))
+  ;; Below min the entry is deferred; a second penalty activates it.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties authfail:3 min:5 max:30")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (is (not (null (penalty-allowed-p server "127.0.0.1"))))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (is (not (null (penalty-refused-p server "127.0.0.1")))))
+  ;; The exempt list wins.
+  (let* ((config (ssh-server-config-load
+                  nil :options
+                  '("PerSourcePenalties authfail:10 min:5"
+                    "PerSourcePenaltyExemptList 127.0.0.1/32")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (is (not (null (penalty-allowed-p server "127.0.0.1")))))
+  ;; PerSourceNetBlockSize groups the penalty.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties authfail:10 min:5")))
+         (server (cl-pnet-ssh::%make-ssh-server
+                  :sshd-config config
+                  :per-source-net-block-size-ipv4 24
+                  :per-source-net-block-size-ipv6 128)))
+    (cl-pnet-ssh::ssh-server-penalise server "192.0.2.1" :authfail)
+    (is (not (null (penalty-refused-p server "192.0.2.200")))))
+  ;; An expired entry is gone.
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties authfail:1 min:0 max:30")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (cl-pnet-ssh::ssh-server-penalise server "127.0.0.1" :authfail)
+    (is (not (null (penalty-refused-p server "127.0.0.1"))))
+    (maphash (lambda (key value)
+               (declare (ignore key))
+               (setf (first value) 0))
+             (cl-pnet-ssh::ssh-server-per-source-penalties server))
+    (is (not (null (penalty-allowed-p server "127.0.0.1"))))))
+
+(test per-source-penalties-are-applied-on-session-close
+  "A failed or unauthenticated close charges the source; a refusal uses the
+RefuseConnection penalty."
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties authfail:10 min:5")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :remote-address '(:address "192.0.2.1" :port 1234))))
+    (setf (cl-pnet-ssh::ssh-session-auth-failures session) 1
+          (cl-pnet-ssh::ssh-session-close-reason session) :peer-closed)
+    (cl-pnet-ssh::ssh-server-session-penalty session)
+    (is (not (null (penalty-refused-p server "192.0.2.1"))) "authfail"))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties noauth:10 min:5")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :remote-address '(:address "192.0.2.1" :port 1234))))
+    (setf (cl-pnet-ssh::ssh-session-close-reason session) :peer-closed)
+    (cl-pnet-ssh::ssh-server-session-penalty session)
+    (is (not (null (penalty-refused-p server "192.0.2.1"))) "noauth"))
+  (let* ((config (ssh-server-config-load
+                  nil :options '("PerSourcePenalties refuseconnection:10 min:5")))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server
+                   :remote-address '(:address "192.0.2.1" :port 1234))))
+    (setf (cl-pnet-ssh::ssh-session-refused-p session) t
+          (cl-pnet-ssh::ssh-session-close-reason session) :refused)
+    (cl-pnet-ssh::ssh-server-session-penalty session)
+    (is (not (null (penalty-refused-p server "192.0.2.1"))) "refused")))

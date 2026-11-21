@@ -214,6 +214,8 @@
    #:ssh-server-config-per-source-max-startups
    #:ssh-server-config-per-source-net-block-size-ipv4
    #:ssh-server-config-per-source-net-block-size-ipv6
+   #:ssh-server-config-per-source-penalties
+   #:ssh-server-config-per-source-penalty-exempt
    #:ssh-server-config-unused-connection-timeout
    #:ssh-server-config-channel-timeouts
    #:ssh-server-config-tcp-keep-alive

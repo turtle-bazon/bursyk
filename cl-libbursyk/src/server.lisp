@@ -13,6 +13,13 @@
 (defun ssh-server-accept-session (server connection)
   "Create SESSION for a freshly accepted CONNECTION and start its greeting."
   (let ((peer (cl-pnet:connection-peer-address connection)))
+    (multiple-value-bind (allowed reason)
+        (ssh-server-penalty-check server (getf peer :address))
+      (unless allowed
+        (ssh-log "refuse connection from ~A: ~A"
+                 (getf peer :address) reason)
+        (cl-pnet:close-connection connection)
+        (return-from ssh-server-accept-session nil)))
     (unless (ssh-server-connection-allowed-p server peer)
       (ssh-log "drop connection from ~A past MaxStartups or PerSourceMaxStartups"
                (getf peer :address))

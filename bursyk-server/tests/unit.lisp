@@ -2905,12 +2905,8 @@ list; its arguments expand the certificate's tokens."
       (bursyk-server::delete-auth-info-file session))))
 
 (test sshd-config-recognises-the-10.6-additions
-  "10.6 directives this server cannot honour fail clearly, while those that
-only describe OpenSSH's own helpers are accepted and warned about."
-  (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "PerSourcePenalties yes"))
-  (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "PerSourcePenaltyExemptList 127.0.0.1/32"))
+  "10.6 directives that only describe OpenSSH's own helpers are accepted
+with a warning rather than becoming unknown keywords."
   (let ((config (config-from-text
                  "SshdSessionPath /usr/libexec/sshd-session
 SshdAuthPath /usr/libexec/sshd-auth
@@ -2986,3 +2982,52 @@ Match User alice
                config :user "bob")))
     (is (eq :no (cl-pnet-ssh:ssh-server-config-refuse-connection alice)))
     (is (eq :yes (cl-pnet-ssh:ssh-server-config-refuse-connection bob)))))
+
+(test sshd-config-reads-per-source-penalties
+  "PerSourcePenalties keeps the first value of each field and validates all."
+  (let ((penalties
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-per-source-penalties
+           "PerSourcePenalties authfail:10s min:20s max:5m max-sources4:100 overflow:deny-all")))
+    (is (eq t (getf penalties :enabled)))
+    (is (= 10 (getf penalties :authfail)))
+    (is (= 20 (getf penalties :min)))
+    (is (= 300 (getf penalties :max)))
+    (is (= 100 (getf penalties :max-sources4)))
+    (is (eq :deny-all (getf penalties :overflow4))))
+  (is (eq t (getf (config-value
+                   #'cl-pnet-ssh:ssh-server-config-per-source-penalties
+                   "PerSourcePenalties yes")
+                  :enabled)))
+  (is (eq nil (getf (config-value
+                     #'cl-pnet-ssh:ssh-server-config-per-source-penalties
+                     "PerSourcePenalties no")
+                    :enabled)))
+  ;; The first line's fields win, but a later line is still validated.
+  (let ((penalties
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-per-source-penalties
+           "PerSourcePenalties authfail:10
+PerSourcePenalties authfail:20 min:3")))
+    (is (= 10 (getf penalties :authfail)))
+    (is (= 3 (getf penalties :min))))
+  (dolist (bad '("PerSourcePenalties no authfail:5"
+                 "PerSourcePenalties bogus:5"
+                 "PerSourcePenalties max-sources4:x"
+                 "PerSourcePenalties"
+                 "PerSourcePenalties min:-1"))
+    (signals cl-pnet-ssh:ssh-server-config-error
+      (config-from-text bad)))
+  (is (equal "127.0.0.1/32,10.0.0.0/8"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-per-source-penalty-exempt
+              "PerSourcePenaltyExemptList 127.0.0.1/32,10.0.0.0/8")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "PerSourcePenaltyExemptList 192.0.2.0/33"))
+  ;; Both directives are global only.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+  PerSourcePenalties yes"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+  PerSourcePenaltyExemptList 127.0.0.1")))

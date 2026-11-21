@@ -1445,6 +1445,236 @@ no peer, the same allowance sshd makes when it cannot convert the sockaddr."
                  sessions)))
     (t 0)))
 
+;;; ---- PerSourcePenalties ----
+;;;
+;;; sshd 10.6 keeps one penalty entry per masked source network.  An entry
+;;; becomes active once more than the "min" threshold has accrued and refuses
+;;; new connections until it expires; repeated penalties accumulate up to
+;;; "max".  This server leaves penalties off unless PerSourcePenalties is
+;;; configured, rather than enabling sshd's default set.
+
+(defun ssh-server-penalty-settings (server)
+  "SERVER's PerSourcePenalties settings as a plist.
+
+The values are sshd's defaults except that :ENABLED is true only when the
+directive turned it on; an absent directive leaves penalties off."
+  (let* ((config (ssh-server-sshd-config server))
+         (stored (and config
+                      (ssh-server-config-per-source-penalties config)))
+         (overflow (if (member :overflow4 stored)
+                       (getf stored :overflow4)
+                       :permissive)))
+    (list :enabled (and (member :enabled stored)
+                        (getf stored :enabled))
+          :crash (or (getf stored :crash) 90)
+          :authfail (or (getf stored :authfail) 5)
+          :invaliduser (or (getf stored :invaliduser) 5)
+          :noauth (or (getf stored :noauth) 1)
+          :grace (or (getf stored :grace) 10)
+          :refuseconnection (or (getf stored :refuseconnection) 10)
+          :max (or (getf stored :max) 600)
+          :min (or (getf stored :min) 15)
+          :max-sources4 (or (getf stored :max-sources4) 65536)
+          :max-sources6 (or (getf stored :max-sources6) 65536)
+          :overflow4 overflow
+          :overflow6 (if (member :overflow6 stored)
+                         (getf stored :overflow6)
+                         overflow))))
+
+(defun ssh-server-penalty-exempt-p (server address)
+  "Whether ADDRESS is named by SERVER's PerSourcePenaltyExemptList."
+  (let ((config (ssh-server-sshd-config server)))
+    (let ((patterns (and config
+                         (ssh-server-config-per-source-penalty-exempt
+                          config))))
+      (and patterns
+           (some (lambda (pattern)
+                   (and (plusp (length pattern))
+                        (not (char= (char pattern 0) #\!))
+                        (or (ssh-config-ipv4-cidr-match-p pattern address)
+                            (ssh-config-ipv6-cidr-match-p pattern address)
+                            (ssh-match-pattern pattern address))))
+                 (uiop:split-string patterns :separator ","))))))
+
+(defun ssh-server-penalty-network (server address)
+  "VALUES KEY FAMILY for ADDRESS masked by PerSourceNetBlockSize."
+  (cond
+    ((ssh-config-ipv4-octets address)
+     (let* ((bits (ssh-server-per-source-net-block-size-ipv4 server))
+            (mask (if (zerop bits)
+                      0
+                      (logand #xFFFFFFFF (ash #xFFFFFFFF (- 32 bits)))))
+            (value (logand (ssh-config-ipv4-integer
+                            (ssh-config-ipv4-octets address))
+                           mask)))
+       (values (format nil "4:~8,'0X/~D" value bits) 4)))
+    ((ssh-config-ipv6-words address)
+     (let* ((bits (ssh-server-per-source-net-block-size-ipv6 server))
+            (full (floor bits 16))
+            (rest (mod bits 16))
+            (masked
+              (loop for word in (ssh-config-ipv6-words address)
+                    for index from 0
+                    collect (cond
+                              ((< index full) word)
+                              ((= index full)
+                               (if (zerop rest)
+                                   0
+                                   (logand word
+                                           (logand #xFFFF
+                                                   (ash #xFFFF (- 16 rest))))))
+                              (t 0)))))
+       (values (format nil "6:~{~4,'0X~}/~D" masked bits) 6)))
+    (t (values nil nil))))
+
+(defun ssh-server-penalty-expire (server)
+  "Drop every expired entry from SERVER's penalty table."
+  (let ((table (ssh-server-per-source-penalties server))
+        (now (ssh-session-now))
+        (expired '()))
+    (maphash (lambda (key value)
+               (when (< (first value) now)
+                 (push key expired)))
+             table)
+    (dolist (key expired) (remhash key table))))
+
+(defun ssh-server-penalty-count (server family)
+  "How many entries SERVER holds for address FAMILY, 4 or 6."
+  (let ((prefix (if (= family 4) "4:" "6:"))
+        (count 0))
+    (maphash (lambda (key value)
+               (declare (ignore value))
+               (when (and (>= (length key) 2)
+                          (string= prefix key :end2 2))
+                 (incf count)))
+             (ssh-server-per-source-penalties server))
+    count))
+
+(defun ssh-server-penalty-evict-soonest (server family)
+  "Remove the soonest-expiring entry for FAMILY, as permissive overflow does."
+  (let ((prefix (if (= family 4) "4:" "6:"))
+        (soonest nil)
+        (soonest-key nil))
+    (maphash (lambda (key value)
+               (when (and (>= (length key) 2)
+                          (string= prefix key :end2 2)
+                          (or (null soonest) (< (first value) soonest)))
+                 (setf soonest (first value) soonest-key key)))
+             (ssh-server-per-source-penalties server))
+    (when soonest-key
+      (remhash soonest-key (ssh-server-per-source-penalties server)))))
+
+(defun ssh-server-penalty-check (server address)
+  "VALUES ALLOWED REASON for a new connection from ADDRESS."
+  (let ((settings (ssh-server-penalty-settings server)))
+    (if (or (not (getf settings :enabled))
+            (null address)
+            (ssh-server-penalty-exempt-p server address))
+        (values t nil)
+        (progn
+          (ssh-server-penalty-expire server)
+          (multiple-value-bind (key family)
+              (ssh-server-penalty-network server address)
+            (if (null key)
+                (values t nil)
+                (let ((entry
+                        (gethash key
+                                 (ssh-server-per-source-penalties server))))
+                  (cond
+                    ((and entry (second entry)
+                          (>= (first entry) (ssh-session-now)))
+                     (values nil (third entry)))
+                    (t
+                     (let* ((limit (if (= family 4)
+                                       (getf settings :max-sources4)
+                                       (getf settings :max-sources6)))
+                            (mode (if (= family 4)
+                                      (getf settings :overflow4)
+                                      (getf settings :overflow6))))
+                       (if (and (>= (ssh-server-penalty-count server family)
+                                    limit)
+                                (eq mode :deny-all))
+                           (values nil "too many penalised addresses")
+                           (values t nil))))))))))))
+
+(defun ssh-server-penalise (server address type)
+  "Add TYPE's penalty to SERVER's entry for ADDRESS."
+  (let ((settings (ssh-server-penalty-settings server)))
+    (when (and (getf settings :enabled)
+               address
+               (not (ssh-server-penalty-exempt-p server address)))
+      (let ((seconds (case type
+                       (:crash (getf settings :crash))
+                       (:authfail (getf settings :authfail))
+                       (:invaliduser (getf settings :invaliduser))
+                       (:noauth (getf settings :noauth))
+                       (:grace (getf settings :grace))
+                       (:refuseconnection (getf settings :refuseconnection))
+                       (t 0)))
+            (reason (case type
+                      (:crash "penalty: caused crash")
+                      (:authfail "penalty: failed authentication")
+                      (:invaliduser "penalty: attempted authentication by invalid user")
+                      (:noauth "penalty: connections without attempting authentication")
+                      (:grace "penalty: exceeded LoginGraceTime")
+                      (:refuseconnection "penalty: connection prohibited by RefuseConnection")
+                      (t "penalty"))))
+        (when (and seconds (plusp seconds))
+          (ssh-server-penalty-expire server)
+          (multiple-value-bind (key family)
+              (ssh-server-penalty-network server address)
+            (when key
+              (let* ((table (ssh-server-per-source-penalties server))
+                     (now (ssh-session-now))
+                     (max (getf settings :max))
+                     (min (getf settings :min))
+                     (entry (gethash key table)))
+                (if entry
+                    (let ((expiry (min (+ now max)
+                                       (+ (first entry) seconds))))
+                      (setf (first entry) expiry)
+                      (when (and (> (- expiry now) min)
+                                 (not (second entry)))
+                        (setf (second entry) t
+                              (third entry) reason)))
+                    (let* ((limit (if (= family 4)
+                                      (getf settings :max-sources4)
+                                      (getf settings :max-sources6)))
+                           (mode (if (= family 4)
+                                     (getf settings :overflow4)
+                                     (getf settings :overflow6)))
+                           (count (ssh-server-penalty-count server family)))
+                      (when (and (>= count limit) (eq mode :permissive))
+                        (ssh-server-penalty-evict-soonest server family))
+                      (when (or (< count limit) (eq mode :permissive))
+                        (setf (gethash key table)
+                              (list (+ now seconds)
+                                    (> seconds min)
+                                    reason)))))))))))))
+
+(defun ssh-server-session-penalty (session)
+  "Apply SESSION's close-time PerSourcePenalties reason, if any."
+  (unless (ssh-session-penalty-applied-p session)
+    (setf (ssh-session-penalty-applied-p session) t)
+    (let ((server (ssh-session-server session))
+          (address (ssh-session-remote-ip session)))
+      (when (and server address
+                 (not (eq (ssh-session-close-reason session)
+                          :server-closed)))
+        (cond
+          ((ssh-session-refused-p session)
+           (ssh-server-penalise server address :refuseconnection))
+          ((ssh-session-grace-exceeded-p session)
+           (ssh-server-penalise server address :grace))
+          ((ssh-session-invalid-user-p session)
+           (ssh-server-penalise server address :invaliduser))
+          ((and (not (ssh-session-authenticated session))
+                (plusp (ssh-session-auth-failures session)))
+           (ssh-server-penalise server address :authfail))
+          ((and (not (ssh-session-authenticated session))
+                (zerop (ssh-session-auth-attempts session)))
+           (ssh-server-penalise server address :noauth)))))))
+
 (defun ssh-server-connection-allowed-p (server peer-address
                                         &key (random (random 100)))
   "Whether SERVER may keep a newly accepted connection.

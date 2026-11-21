@@ -71,7 +71,8 @@ prohibit-password and means the same thing.")
     "ignoreuserknownhosts" "xauthlocation" "strictmodes"
     "permituserenvironment" "uselogin" "compression" "tcpkeepalive"
     "keepalive" "ciphers" "macs" "protocol" "maxstartups"
-    "persourcemaxstartups" "persourcenetblocksize" "usedns"
+    "persourcemaxstartups" "persourcenetblocksize"
+    "persourcepenalties" "persourcepenaltyexemptlist" "usedns"
     "verifyreversemapping" "reversemappingcheck" "useprivilegeseparation"
     "hostcertificate" "kexalgorithms" "versionaddendum" "fingerprinthash"
     "securitykeyprovider")
@@ -143,10 +144,7 @@ socket address and has no routing domains.")
   '("chrootdirectory"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
-    "streamlocalbindmask" "streamlocalbindunlink"
-    ;; 10.6: these change rate limiting, so accepting them without their
-    ;; behaviour would be unsafe.
-    "persourcepenalties" "persourcepenaltyexemptlist"))
+    "streamlocalbindmask" "streamlocalbindunlink"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -246,6 +244,11 @@ socket address and has no routing domains.")
   ;; 32 and 128, which treat every address by itself.
   (per-source-net-block-size-ipv4 nil)
   (per-source-net-block-size-ipv6 nil)
+  ;; PerSourcePenalties: a plist of the fields that were set, including
+  ;; :ENABLED.  NIL means the directive was absent, which leaves penalties
+  ;; off in this server; sshd 10.6 enables them by default.
+  (per-source-penalties nil)
+  (per-source-penalty-exempt nil)
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout nil)
   ;; ChannelTimeout as (TYPE-PATTERN . SECONDS) pairs in the order the
@@ -1252,6 +1255,88 @@ cannot apply per connection."
                 line "Invalid PerSourceNetBlockSize spec"))
              (setf (ssh-server-config-per-source-net-block-size-ipv6 config)
                    ipv6)))))
+      ((string= keyword "persourcepenaltyexemptlist")
+       (let ((value (ssh-server-config-one-argument line)))
+         (unless (ssh-server-config-address-pattern-valid-p value)
+           (ssh-server-config-line-error
+            line "Invalid PerSourcePenaltyExemptList"))
+         (ssh-server-config-set-once
+          config 'per-source-penalty-exempt value)))
+      ((string= keyword "persourcepenalties")
+       (when (null arguments)
+         (ssh-server-config-line-error
+          line "PerSourcePenalties needs an argument"))
+       (let ((stored (ssh-server-config-per-source-penalties config))
+             (duration-keys
+               '(("crash:" . :crash)
+                 ("authfail:" . :authfail)
+                 ("invaliduser:" . :invaliduser)
+                 ("noauth:" . :noauth)
+                 ("grace-exceeded:" . :grace)
+                 ("refuseconnection:" . :refuseconnection)
+                 ("max:" . :max)
+                 ("min:" . :min)
+                 ("max-sources4:" . :max-sources4)
+                 ("max-sources6:" . :max-sources6))))
+         (dolist (argument arguments)
+           (cond
+             ((member argument '("no" "yes") :test #'string-equal)
+              (when (rest arguments)
+                (ssh-server-config-line-error
+                 line "PerSourcePenalties ~A must appear alone" argument))
+              (unless (member :enabled stored)
+                (setf stored (append stored
+                                    (list :enabled
+                                          (string-equal argument "yes"))))))
+             ((string-equal argument "overflow:deny-all")
+              (unless (member :overflow4 stored)
+                (setf stored (append stored (list :overflow4 :deny-all)))
+                (unless (member :enabled stored)
+                  (setf stored (append stored (list :enabled t))))))
+             ((string-equal argument "overflow:permissive")
+              (unless (member :overflow4 stored)
+                (setf stored (append stored (list :overflow4 :permissive)))
+                (unless (member :enabled stored)
+                  (setf stored (append stored (list :enabled t))))))
+             ((string-equal argument "overflow6:deny-all")
+              (unless (member :overflow6 stored)
+                (setf stored (append stored (list :overflow6 :deny-all)))
+                (unless (member :enabled stored)
+                  (setf stored (append stored (list :enabled t))))))
+             ((string-equal argument "overflow6:permissive")
+              (unless (member :overflow6 stored)
+                (setf stored (append stored (list :overflow6 :permissive)))
+                (unless (member :enabled stored)
+                  (setf stored (append stored (list :enabled t))))))
+             (t
+              (let ((pair
+                      (find-if
+                       (lambda (entry)
+                         (let ((prefix (car entry)))
+                           (and (>= (length argument) (length prefix))
+                                (string-equal prefix argument
+                                              :end2 (length prefix)))))
+                       duration-keys)))
+                (unless pair
+                  (ssh-server-config-line-error
+                   line "unsupported PerSourcePenalties keyword ~A"
+                   argument))
+                (let* ((key (cdr pair))
+                       (text (subseq argument (length (car pair))))
+                       (value
+                         (if (member key '(:max-sources4 :max-sources6))
+                             (and (plusp (length text))
+                                  (every #'digit-char-p text)
+                                  (parse-integer text))
+                             (ssh-parse-time text))))
+                  (unless (and value (>= value 0))
+                    (ssh-server-config-line-error
+                     line "invalid PerSourcePenalties value ~A" text))
+                  (unless (member key stored)
+                    (setf stored (append stored (list key value))))
+                  (unless (member :enabled stored)
+                    (setf stored (append stored (list :enabled t)))))))))
+         (setf (ssh-server-config-per-source-penalties config) stored)))
       ((string= keyword "unusedconnectiontimeout")
        (let ((argument (ssh-server-config-one-argument line)))
          (if (string-equal argument "none")

@@ -60,6 +60,8 @@
   ;; PerSourceNetBlockSize; 32:128 treats every address by itself.
   (per-source-net-block-size-ipv4 32)
   (per-source-net-block-size-ipv6 128)
+  ;; PerSourcePenalties: (EXPIRY ACTIVE REASON) per masked source network.
+  (per-source-penalties (make-hash-table :test #'equal))
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout 0)
   ;; ChannelTimeout: (TYPE-PATTERN . SECONDS) pairs, in the order the winning
@@ -145,6 +147,11 @@ present after RequiredRSASize, for callers that only want to describe it."
   ;; PubkeyAuthOptions max-pk-ok: rejected unsigned publickey probes before
   ;; they start counting against MaxAuthTries.
   (pk-ok-failures 0)
+  ;; PerSourcePenalties reasons observed for this connection.
+  (invalid-user-p nil)
+  (grace-exceeded-p nil)
+  (refused-p nil)
+  (penalty-applied-p nil)
   (allowed-users '())
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
@@ -311,6 +318,7 @@ server was built without a value."
                (setf (ssh-session-login-grace-timer session) nil)
                (unless (or (ssh-session-closed-p session)
                            (ssh-session-authenticated session))
+                 (setf (ssh-session-grace-exceeded-p session) t)
                  ;; sshd leaves no disconnect behind: the alarm exits and the
                  ;; socket simply closes.
                  (ssh-session-finish session
@@ -388,6 +396,7 @@ server was built without a value."
     (setf (ssh-session-closed session) t
           (ssh-session-phase session) :closed
           (ssh-session-close-reason session) reason)
+    (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
     (ssh-session-terminate-channels session reason kind)
     (ssh-session-close-connection session)

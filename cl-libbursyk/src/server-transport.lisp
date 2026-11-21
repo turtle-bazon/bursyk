@@ -636,6 +636,8 @@ application's answer and everything after it use the per-connection values."
           (if cached
               (cdr cached)
               (let ((allowed (and (funcall hook session user) t)))
+                (unless allowed
+                  (setf (ssh-session-invalid-user-p session) t))
                 (push (cons user allowed)
                       (ssh-session-allowed-users session))
                 allowed))))))
@@ -666,6 +668,7 @@ allowed methods; everything after it counts."
     (when (eq (ssh-session-setting
                session #'ssh-server-config-refuse-connection)
               :yes)
+      (setf (ssh-session-refused-p session) t)
       (ssh-session-send-payload-and-close
        session
        (ssh-disconnect-payload "administratively prohibited"

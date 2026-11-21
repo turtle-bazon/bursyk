@@ -143,6 +143,7 @@
   ;; PerSourceNetBlockSize; 32:128 treats every address by itself.
   (per-source-net-block-size-ipv4 32)
   (per-source-net-block-size-ipv6 128)
+  (per-source-penalties (make-hash-table :test #'equal))
   ;; UnusedConnectionTimeout in seconds; 0 is sshd's "none".
   (unused-connection-timeout 0)
   ;; ChannelTimeout: (TYPE-PATTERN . SECONDS) pairs, or :NONE to disable.
@@ -198,6 +199,10 @@
   (auth-attempts 0)
   (auth-failures 0)
   (pk-ok-failures 0)
+  (invalid-user-p nil)
+  (grace-exceeded-p nil)
+  (refused-p nil)
+  (penalty-applied-p nil)
   (allowed-users '())
   ;; Connection timers, matching the pure backend's fields.
   login-grace-timer
