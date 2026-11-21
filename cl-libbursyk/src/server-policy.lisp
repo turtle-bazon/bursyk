@@ -1069,6 +1069,27 @@ permissive defaults."
   "Whether KEY-BLOB is listed in SOURCE, a file, a list, or one line."
   (nth-value 0 (ssh-authorized-key-blob-match source key-blob)))
 
+(defun ssh-server-revoked-key-p (server session key-blob)
+  "Whether KEY-BLOB is revoked by the RevokedKeys in force for SESSION.
+
+A configured file that cannot be read or parsed counts as revoked: sshd
+refuses public-key authentication in that case rather than ignoring the
+list.  When SESSION is NIL the server's startup config is consulted."
+  (let ((files
+          (cond
+            (session
+             (ssh-session-setting session #'ssh-server-config-revoked-keys))
+            (t
+             (let ((config (ssh-server-sshd-config server)))
+               (and config (ssh-server-config-revoked-keys config)))))))
+    (if (or (null files) (eq files :none))
+        nil
+        (handler-case
+            (ssh-key-revoked-p key-blob files)
+          (error (condition)
+            (ssh-log "RevokedKeys check failed: ~A" condition)
+            t)))))
+
 (defun ssh-server-authorized-key-p (server user key-blob
                                    &key address session)
   "Whether KEY-BLOB may log in as USER on SERVER.
@@ -1078,15 +1099,20 @@ authorized_keys line's environment= options and enforce the rest of its
 policy.  A custom AUTHORIZE function is called with
 (USER KEY-BLOB ADDRESS SESSION) and may return the same values; ADDRESS is
 SESSION's peer address, which from= needs, and SESSION is there because
-AuthorizedKeysFile and PermitRootLogin may come from a Match block."
-  (let ((authorize (ssh-server-authorize server)))
-    (cond
-      ((functionp authorize)
-       (funcall authorize user key-blob address session))
-      ((ssh-server-authorized-keys server)
-       (ssh-authorized-key-blob-match (ssh-server-authorized-keys server)
-                                      key-blob :address address))
-      (t (values nil nil nil)))))
+AuthorizedKeysFile and PermitRootLogin may come from a Match block.
+
+A key named by RevokedKeys is refused before AUTHORIZE runs, and a
+certificate is checked both through itself and through its CA key."
+  (if (ssh-server-revoked-key-p server session key-blob)
+      (values nil nil nil)
+      (let ((authorize (ssh-server-authorize server)))
+        (cond
+          ((functionp authorize)
+           (funcall authorize user key-blob address session))
+          ((ssh-server-authorized-keys server)
+           (ssh-authorized-key-blob-match (ssh-server-authorized-keys server)
+                                          key-blob :address address))
+          (t (values nil nil nil))))))
 
 ;;; ---- Per-session policy ----
 ;;;

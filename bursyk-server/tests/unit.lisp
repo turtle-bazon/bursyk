@@ -513,6 +513,51 @@ Match User alice
                (cl-pnet-ssh:ssh-server-config-pubkey-accepted-algorithms
                 bob)))))
 
+(test sshd-config-reads-revokedkeys
+  "RevokedKeys is a list of files, may be disabled with none, and may be
+overridden per connection."
+  (is (equal '("/etc/ssh/revoked_keys" "/etc/ssh/extra")
+             (config-value #'cl-pnet-ssh:ssh-server-config-revoked-keys
+                           "RevokedKeys /etc/ssh/revoked_keys /etc/ssh/extra")))
+  (is (eq :none
+          (config-value #'cl-pnet-ssh:ssh-server-config-revoked-keys
+                        "RevokedKeys none")))
+  ;; sshd refuses "none" beside another file, and a directive with no file.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RevokedKeys none /etc/ssh/revoked_keys"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RevokedKeys /etc/ssh/revoked_keys none"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RevokedKeys"))
+  ;; The first line wins, as sshd's parse_filenames keeps the first list;
+  ;; later lines are still parsed, so a malformed one is still an error.
+  (is (equal '("/first")
+             (config-value #'cl-pnet-ssh:ssh-server-config-revoked-keys
+                           "RevokedKeys /first
+ RevokedKeys /second")))
+  (is (eq :none
+          (config-value #'cl-pnet-ssh:ssh-server-config-revoked-keys
+                        "RevokedKeys none
+ RevokedKeys /second")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "RevokedKeys /first
+ RevokedKeys /second none"))
+  ;; A Match block may replace the list, and none there disables it.
+  (let* ((config (config-from-text
+                  "RevokedKeys /global
+ Match User alice
+   RevokedKeys /alice
+ Match User bob
+   RevokedKeys none"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal '("/alice")
+               (cl-pnet-ssh:ssh-server-config-revoked-keys alice)))
+    (is (eq :none
+            (cl-pnet-ssh:ssh-server-config-revoked-keys bob)))))
+
 (test sshd-config-reads-banner
   "Banner is a path read per connection, or none for no banner at all."
   (is (equal "/etc/issue.net"
@@ -1911,3 +1956,396 @@ the certificate's force-command and source-address are enforced."
               (progn (bursyk-server::split-command-arguments "\"unclosed") nil)
             (error () t))))
     (is (not (null unmatched)))))
+
+;;; ---- RevokedKeys ----
+
+(defun revoked-test-key (seed)
+  "An ssh-ed25519 public key blob for a deterministic test key."
+  (cl-pnet-ssh:ssh-make-public-key-blob
+   "ssh-ed25519"
+   (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)))
+
+(defun revoked-test-file (contents &key binary)
+  (let ((path (merge-pathnames
+               (format nil "bursyk-revoked-~D-~D"
+                       (get-universal-time) (random 1000000))
+               (uiop:temporary-directory))))
+    (with-open-file (stream path :direction :output :if-exists :supersede
+                                 :element-type (if binary
+                                                   '(unsigned-byte 8)
+                                                   'character))
+      (if binary
+          (write-sequence contents stream)
+          (write-string contents stream)))
+    path))
+
+(defun revoked-test-string (octets)
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-string writer octets)
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun revoked-test-krl-header (writer)
+  (cl-pnet-ssh:ssh-write-octets writer cl-pnet-ssh::+ssh-krl-magic+)
+  (cl-pnet-ssh:ssh-write-u32 writer 1)
+  (cl-pnet-ssh:ssh-write-u64 writer 0)
+  (cl-pnet-ssh:ssh-write-u64 writer 0)
+  (cl-pnet-ssh:ssh-write-u64 writer 0)
+  (cl-pnet-ssh:ssh-write-string writer #())       ; reserved
+  (cl-pnet-ssh:ssh-write-string writer #())       ; comment
+  writer)
+
+(defun revoked-test-krl (sections)
+  "A KRL from SECTIONS, a list of (TYPE . DATA-OCTETS) pairs."
+  (let ((writer (revoked-test-krl-header (cl-pnet-ssh:ssh-writer))))
+    (dolist (section sections)
+      (cl-pnet-ssh:ssh-write-u8 writer (car section))
+      (cl-pnet-ssh:ssh-write-string writer (cdr section)))
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun revoked-test-extension (name critical)
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-text writer name)
+    (cl-pnet-ssh:ssh-write-boolean writer critical)
+    (cl-pnet-ssh:ssh-write-string writer #())
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun revoked-test-cert-section (ca-key subsection-type subsection-writer)
+  "A certificates KRL section for CA-KEY with one subsection."
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-string writer ca-key)
+    (cl-pnet-ssh:ssh-write-string writer #())
+    (cl-pnet-ssh:ssh-write-u8 writer subsection-type)
+    (cl-pnet-ssh:ssh-write-string
+     writer (funcall subsection-writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun revoked-test-serial-subsection (writer)
+  (cl-pnet-ssh:ssh-write-u64 writer 42)
+  (cl-pnet-ssh:ssh-writer-output writer))
+
+(defun revoked-test-key-id-subsection (writer)
+  (cl-pnet-ssh:ssh-write-text writer "revoked-test-id")
+  (cl-pnet-ssh:ssh-writer-output writer))
+
+(test revoked-keys-text-file-revokes-a-listed-key
+  "A text RevokedKeys file refuses the key it names and no other key."
+  (let* ((key (revoked-test-key 1))
+         (other (revoked-test-key 2))
+         (path (revoked-test-file
+                (format nil "# revoked~%ssh-ed25519 ~A listed~%"
+                        (cl-pnet-ssh:ssh-octets-base64 key)))))
+    (unwind-protect
+         (progn
+           (is (cl-pnet-ssh:ssh-key-revoked-in-file-p key path))
+           (is (not (cl-pnet-ssh:ssh-key-revoked-in-file-p other path)))
+           (is (cl-pnet-ssh:ssh-key-revoked-p key (list path)))
+           (is (not (cl-pnet-ssh:ssh-key-revoked-p other (list path)))))
+      (ignore-errors (delete-file path)))))
+
+(test revoked-keys-unreadable-or-malformed-fails-closed
+  "A broken list signals so the server refuses, as sshd does."
+  (let ((key (revoked-test-key 3))
+        (path (revoked-test-file "this is not a public key")))
+    (unwind-protect
+         (signals cl-pnet-ssh:ssh-revoked-keys-error
+           (cl-pnet-ssh:ssh-key-revoked-in-file-p key path))
+      (ignore-errors (delete-file path))))
+  (signals cl-pnet-ssh:ssh-revoked-keys-error
+    (cl-pnet-ssh:ssh-key-revoked-in-file-p
+     (revoked-test-key 4) "/nonexistent/bursyk-revoked-keys"))
+  ;; A truncated KRL is a parse error, not a quiet "not revoked".
+  (let* ((key (revoked-test-key 11))
+         (krl (revoked-test-krl
+               (list (cons 2 (revoked-test-string key)))))
+         (path (revoked-test-file (subseq krl 0 20) :binary t)))
+    (unwind-protect
+         (signals cl-pnet-ssh:ssh-revoked-keys-error
+           (cl-pnet-ssh:ssh-key-revoked-in-file-p key path))
+      (ignore-errors (delete-file path))))
+  ;; A certificate section naming a malformed CA key cannot revoke what it
+  ;; was meant to, so the whole KRL is refused.
+  (let ((path (revoked-test-file
+               (revoked-test-krl
+                (list (cons 1
+                            (revoked-test-cert-section
+                             #(1 2 3) #x20
+                             #'revoked-test-serial-subsection))))
+               :binary t)))
+    (unwind-protect
+         (signals cl-pnet-ssh:ssh-revoked-keys-error
+           (cl-pnet-ssh:ssh-key-revoked-in-file-p (revoked-test-key 12) path))
+      (ignore-errors (delete-file path))))
+  ;; A truncated key line is a parse error, not a silent no-match.
+  (let* ((key (revoked-test-key 13))
+         (short (subseq key 0 (1- (length key))))
+         (path (revoked-test-file
+                (format nil "ssh-ed25519 ~A~%"
+                        (cl-pnet-ssh:ssh-octets-base64 short)))))
+    (unwind-protect
+         (signals cl-pnet-ssh:ssh-revoked-keys-error
+           (cl-pnet-ssh:ssh-key-revoked-in-file-p key path))
+      (ignore-errors (delete-file path)))))
+
+(test revoked-keys-krl-explicit-key-and-fingerprint
+  "A KRL revokes an explicit key and a key by its SHA256 fingerprint."
+  (let* ((key (revoked-test-key 5))
+         (other (revoked-test-key 6))
+         (explicit (revoked-test-krl
+                    (list (cons 2 (revoked-test-string key)))))
+         (fingerprint
+           (revoked-test-krl
+            (list (cons 5 (revoked-test-string
+                           (cl-pnet-ssh:ssh-hash :sha256 key))))))
+         (explicit-path (revoked-test-file explicit :binary t))
+         (fingerprint-path (revoked-test-file fingerprint :binary t)))
+    (unwind-protect
+         (progn
+           (is (cl-pnet-ssh:ssh-key-revoked-in-file-p key explicit-path))
+           (is (not (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                     other explicit-path)))
+           (is (cl-pnet-ssh:ssh-key-revoked-in-file-p key fingerprint-path))
+           (is (not (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                     other fingerprint-path))))
+      (ignore-errors (delete-file explicit-path))
+      (ignore-errors (delete-file fingerprint-path)))))
+
+(test revoked-keys-krl-extension-and-signature-sections
+  "A non-critical extension is skipped and a critical one refuses the KRL;
+OpenSSH refuses a KRL whose signature section it cannot verify."
+  (let* ((key (revoked-test-key 7))
+         (ignored
+           (revoked-test-krl
+            (list (cons 255 (revoked-test-extension "vendor@example" nil))
+                  (cons 2 (revoked-test-string key)))))
+         (ignored-path (revoked-test-file ignored :binary t))
+         (critical
+           (revoked-test-krl
+            (list (cons 255 (revoked-test-extension "vendor@example" t))
+                  (cons 2 (revoked-test-string key)))))
+         (critical-path (revoked-test-file critical :binary t)))
+    (unwind-protect
+         (progn
+           (is (cl-pnet-ssh:ssh-key-revoked-in-file-p key ignored-path))
+           (signals cl-pnet-ssh:ssh-revoked-keys-error
+             (cl-pnet-ssh:ssh-key-revoked-in-file-p key critical-path)))
+      (ignore-errors (delete-file ignored-path))
+      (ignore-errors (delete-file critical-path))))
+  ;; A signature section carries two strings, not one section-data string,
+  ;; and OpenSSH 9.4 and later refuse the whole KRL because of it.
+  (let* ((key (revoked-test-key 8))
+         (writer (revoked-test-krl-header (cl-pnet-ssh:ssh-writer))))
+    (cl-pnet-ssh:ssh-write-u8 writer 4)
+    (cl-pnet-ssh:ssh-write-string writer #())
+    (cl-pnet-ssh:ssh-write-string writer #())
+    (cl-pnet-ssh:ssh-write-u8 writer 2)
+    (cl-pnet-ssh:ssh-write-string writer (revoked-test-string key))
+    (let ((path (revoked-test-file
+                 (cl-pnet-ssh:ssh-writer-output writer) :binary t)))
+      (unwind-protect
+           (signals cl-pnet-ssh:ssh-revoked-keys-error
+             (cl-pnet-ssh:ssh-key-revoked-in-file-p key path))
+        (ignore-errors (delete-file path))))))
+
+(test server-refuses-a-revoked-key
+  "The authorization hook refuses a key listed in RevokedKeys and fails
+closed when the configured file cannot be read."
+  (let* ((key (revoked-test-key 9))
+         (line (format nil "ssh-ed25519 ~A"
+                       (cl-pnet-ssh:ssh-octets-base64 key)))
+         (path (revoked-test-file (format nil "~A~%" line)))
+         (allowed (cl-pnet-ssh::%make-ssh-server
+                   :authorized-keys (list line)))
+         (revoked (cl-pnet-ssh::%make-ssh-server
+                   :authorized-keys (list line)
+                   :sshd-config
+                   (config-from-text
+                    (format nil "RevokedKeys ~A" (namestring path)))))
+         (missing (cl-pnet-ssh::%make-ssh-server
+                   :authorized-keys (list line)
+                   :sshd-config
+                   (config-from-text
+                    "RevokedKeys /nonexistent/bursyk-revoked-keys"))))
+    (unwind-protect
+         (progn
+           (is (cl-pnet-ssh::ssh-server-authorized-key-p
+                allowed "turtle" key))
+           (is (null (cl-pnet-ssh::ssh-server-authorized-key-p
+                      revoked "turtle" key)))
+           (is (null (cl-pnet-ssh::ssh-server-authorized-key-p
+                      missing "turtle" key))))
+      (ignore-errors (delete-file path)))))
+
+#-win32
+(test revoked-keys-refuses-a-revoked-certificate
+  "A text list naming the CA revokes its certificates; a KRL can revoke the
+certificate's plain key, its serial, or its key ID."
+  (if (not (certificate-test-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (certificate-test-directory "bursyk-revoked-cert"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory))
+             (ca-pub (merge-pathnames "ca.pub" directory))
+             (user-pub (merge-pathnames "user.pub" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring ca))
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring user))
+               (certificate-test-keygen
+                "-q" "-s" (namestring ca) "-I" "revoked-test-id"
+                "-n" "turtle" "-V" "-1m:+52w" "-z" "42"
+                (namestring user-pub))
+               (let* ((ca-blob (certificate-test-key-blob ca-pub))
+                      (user-blob (certificate-test-key-blob user-pub))
+                      (cert-blob
+                        (certificate-test-key-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (ca-text (revoked-test-file
+                                (with-open-file (stream ca-pub)
+                                  (read-line stream))))
+                      (plain-text (revoked-test-file
+                                   (with-open-file (stream user-pub)
+                                     (read-line stream))))
+                      (cert-text
+                        (revoked-test-file
+                         (with-open-file
+                             (stream
+                              (merge-pathnames "user-cert.pub" directory))
+                           (read-line stream))))
+                      (explicit-path
+                        (revoked-test-file
+                         (revoked-test-krl
+                          (list (cons 2 (revoked-test-string user-blob))))
+                         :binary t))
+                      (serial-path
+                        (revoked-test-file
+                         (revoked-test-krl
+                          (list (cons 1
+                                      (revoked-test-cert-section
+                                       ca-blob #x20
+                                       #'revoked-test-serial-subsection))))
+                         :binary t))
+                      (key-id-path
+                        (revoked-test-file
+                         (revoked-test-krl
+                          (list (cons 1
+                                      (revoked-test-cert-section
+                                       ca-blob #x23
+                                       #'revoked-test-key-id-subsection))))
+                         :binary t)))
+                 ;; A text list revokes a certificate through its CA.
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p cert-blob ca-text))
+                 ;; The plain key is compared by key material, so naming the
+                 ;; certified key revokes the certificate too.
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                      cert-blob plain-text))
+                 ;; A certificate line in the text list stands for the plain
+                 ;; key it certifies, as sshkey_equal_public compares them.
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                      user-blob cert-text))
+                 ;; A KRL's explicit-key section does match the plain key.
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                      cert-blob explicit-path))
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                      cert-blob serial-path))
+                 (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                      cert-blob key-id-path))
+                 ;; The serial is per CA and the certificate's serial is 42.
+                 (let ((other-serial
+                         (revoked-test-file
+                          (revoked-test-krl
+                           (list (cons 1
+                                       (revoked-test-cert-section
+                                        ca-blob #x20
+                                        (lambda (writer)
+                                          (cl-pnet-ssh:ssh-write-u64 writer 43)
+                                          (cl-pnet-ssh:ssh-writer-output
+                                           writer))))))
+                          :binary t)))
+                   (unwind-protect
+                        (is (not (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                                  cert-blob other-serial)))
+                     (ignore-errors (delete-file other-serial))))
+                 ;; A serial range and a serial bitmap also match serial 42.
+                 (flet ((serial-file (type writer)
+                          (revoked-test-file
+                           (revoked-test-krl
+                            (list (cons 1
+                                        (revoked-test-cert-section
+                                         ca-blob type writer))))
+                           :binary t)))
+                   (let ((range-path
+                           (serial-file
+                            #x21
+                            (lambda (writer)
+                              (cl-pnet-ssh:ssh-write-u64 writer 10)
+                              (cl-pnet-ssh:ssh-write-u64 writer 50)
+                              (cl-pnet-ssh:ssh-writer-output writer))))
+                         (bitmap-path
+                           (serial-file
+                            #x22
+                            (lambda (writer)
+                              (cl-pnet-ssh:ssh-write-u64 writer 40)
+                              (cl-pnet-ssh:ssh-write-mpint writer 4)
+                              (cl-pnet-ssh:ssh-writer-output writer))))
+                         (bad-range-path
+                           (serial-file
+                            #x21
+                            (lambda (writer)
+                              (cl-pnet-ssh:ssh-write-u64 writer 1)
+                              (cl-pnet-ssh:ssh-write-u64 writer 2)
+                              (cl-pnet-ssh:ssh-write-u64 writer 3)
+                              (cl-pnet-ssh:ssh-write-u64 writer 4)
+                              (cl-pnet-ssh:ssh-writer-output writer)))))
+                     (unwind-protect
+                          (progn
+                            (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                                 cert-blob range-path))
+                            (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                                 cert-blob bitmap-path))
+                            ;; A range subsection holds exactly one pair.
+                            (signals cl-pnet-ssh:ssh-revoked-keys-error
+                              (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                               cert-blob bad-range-path)))
+                       (dolist (path (list range-path bitmap-path
+                                           bad-range-path))
+                         (ignore-errors (delete-file path))))))
+                 (dolist (path (list ca-text plain-text cert-text
+                                     explicit-path serial-path key-id-path))
+                   (ignore-errors (delete-file path))))
+               (ignore-errors
+                 (delete-file (merge-pathnames "user-cert.pub" directory))))
+          (ignore-errors
+            (uiop:delete-directory-tree directory :validate t))))))
+
+#-win32
+(test revoked-keys-reads-a-krl-written-by-ssh-keygen
+  "The KRL ssh-keygen writes is parsed like the one OpenSSH reads."
+  (if (not (certificate-test-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (certificate-test-directory "bursyk-real-krl"))
+             (key (merge-pathnames "key" directory))
+             (other (merge-pathnames "other" directory))
+             (krl (merge-pathnames "revoked.krl" directory)))
+        (ensure-directories-exist key)
+        (unwind-protect
+             (progn
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring key))
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring other))
+               (certificate-test-keygen "-q" "-k" "-f" (namestring krl)
+                                        (namestring
+                                         (merge-pathnames "key.pub" directory)))
+               (is (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                    (certificate-test-key-blob
+                     (merge-pathnames "key.pub" directory))
+                    krl))
+               (is (not (cl-pnet-ssh:ssh-key-revoked-in-file-p
+                         (certificate-test-key-blob
+                          (merge-pathnames "other.pub" directory))
+                         krl))))
+          (ignore-errors
+            (uiop:delete-directory-tree directory :validate t))))))

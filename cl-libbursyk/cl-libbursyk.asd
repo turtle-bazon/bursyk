@@ -2,7 +2,7 @@
   :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.20"
+  :version "0.0.1.21"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
@@ -34,6 +34,8 @@
                              (:file "packet")
                              (:file "keys")
                              (:file "known-hosts")
+                             ;; RevokedKeys: a text key list or a binary KRL.
+                             (:file "revoked-keys")
                              (:file "server-policy")
                              (:file "kex")
                              ;; The agent protocol is role-neutral: both roles

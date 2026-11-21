@@ -138,7 +138,7 @@ socket address and has no routing domains.")
 (defparameter +ssh-server-config-unsupported-keywords+
   '("chrootdirectory"
     "authorizedkeyscommand" "authorizedkeyscommanduser"
-    "revokedkeys" "hostcertificate"
+    "hostcertificate"
     "authenticationmethods"
     "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
@@ -167,6 +167,11 @@ socket address and has no routing domains.")
   (authorized-principals-command nil)
   (authorized-principals-command-user nil)
   (ca-signature-algorithms nil)
+  ;; RevokedKeys is a list of files holding public keys that may not log
+  ;; in, or :none.  sshd keeps the first line's list and validates later
+  ;; ones; the files are read for each authentication attempt, so a KRL can
+  ;; be replaced while the server runs.
+  (revoked-keys nil)
   (accept-env '())
   (permit-open '())
   (permit-listen '())
@@ -631,7 +636,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     unused-connection-timeout channel-timeouts
     trusted-user-ca-keys authorized-principals-file
     authorized-principals-command authorized-principals-command-user
-    ca-signature-algorithms
+    ca-signature-algorithms revoked-keys
     allow-users deny-users allow-groups deny-groups)
   "The fields a matching Match block may override.
 
@@ -757,6 +762,23 @@ cannot apply per connection."
             ;; authenticating, so "none" may sit beside real files.
             (setf (ssh-server-config-authorized-keys-files config)
                   (mapcar #'ssh-config-expand-home arguments))))))
+      ((string= keyword "revokedkeys")
+       ;; sshd's parse_filenames: one line may list several files, "none" must
+       ;; appear alone, and only the first list is kept -- but every line is
+       ;; still parsed, so a malformed later one is an error.
+       (when (null arguments)
+         (ssh-server-config-line-error
+          line "RevokedKeys needs a filename"))
+       (when (and (find "none" arguments :test #'string-equal)
+                  (or (rest arguments)
+                      (not (string-equal (first arguments) "none"))))
+         (ssh-server-config-line-error
+          line "RevokedKeys \"none\" must appear alone"))
+       (unless (ssh-server-config-revoked-keys config)
+         (setf (ssh-server-config-revoked-keys config)
+               (if (string-equal (first arguments) "none")
+                   :none
+                   (mapcar #'ssh-config-expand-home arguments)))))
       ((string= keyword "trustedusercakeys")
        (let ((value (ssh-config-expand-home
                      (ssh-server-config-one-argument line))))

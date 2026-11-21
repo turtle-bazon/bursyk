@@ -60,3 +60,10 @@
                      (ssh-server-config-error-line condition)
                      (ssh-server-config-error-keyword condition)
                      (ssh-error-detail condition)))))
+
+(define-condition ssh-revoked-keys-error (ssh-error)
+  ((path :initarg :path :initform nil :reader ssh-revoked-keys-error-path))
+  (:report (lambda (condition stream)
+             (format stream "revoked keys error~@[ in ~A~]~@[: ~A~]"
+                     (ssh-revoked-keys-error-path condition)
+                     (ssh-error-detail condition)))))

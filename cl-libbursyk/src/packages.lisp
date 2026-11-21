@@ -175,6 +175,7 @@
    #:ssh-server-config-authorized-principals-command
    #:ssh-server-config-authorized-principals-command-user
    #:ssh-server-config-ca-signature-algorithms
+   #:ssh-server-config-revoked-keys
    #:ssh-server-config-accept-env
    #:ssh-server-config-permit-open
    #:ssh-server-config-permit-listen
@@ -291,6 +292,8 @@
    #:ssh-make-public-key-blob
    #:ssh-public-key-blob-of
    #:ssh-key-plain-blob
+   #:ssh-key-revoked-p
+   #:ssh-key-revoked-in-file-p
    ;; OpenSSH certificates
    #:ssh-certificate
    #:ssh-certificate-p
@@ -345,6 +348,8 @@
    #:ssh-host-key-error-fingerprint
    #:ssh-channel-error
    #:ssh-channel-error-channel
+   #:ssh-revoked-keys-error
+   #:ssh-revoked-keys-error-path
    ;; protocol core: shared by the client and a future server
    #:ssh-octets
    #:ssh-copy-octets
