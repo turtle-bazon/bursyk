@@ -2782,6 +2782,53 @@ newline")))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
 
+(test known-hosts-command-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "KnownHostsCommand printf '%H %K'"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "printf '%H %K'"
+               (ssh-config-options-known-hosts-command options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives nil))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (ssh-config-options-known-hosts-command options)))))
+
+(test client-known-hosts-command-supplies-keys
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-khc"))
+         (script (merge-pathnames "keys.sh" directory))
+         (blob (ssh-make-public-key-blob "ssh-ed25519"
+                                         (ssh-random-octets 32)))
+         (other (ssh-make-public-key-blob "ssh-ed25519"
+                                          (ssh-random-octets 32))))
+    (ensure-directories-exist script)
+    (unwind-protect
+         (progn
+           (with-open-file (out script :direction :output
+                                       :if-exists :supersede
+                                       :if-does-not-exist :create)
+             (format out "#!/bin/sh~%printf '%s ssh-ed25519 ~A~%' \"$1\"~%"
+                     (ssh-octets-base64 blob)))
+           (ignore-errors (uiop:run-program (list "chmod" "700"
+                                                  (namestring script))))
+           (let ((client (cl-pnet-ssh::%make-ssh-client
+                          :host "example.org"
+                          :known-hosts '()
+                          :known-hosts-command
+                          (format nil "~A %H" (namestring script)))))
+             (is (eq :match
+                     (cl-pnet-ssh::ssh-client-known-host-status-for
+                      client "example.org" blob)))
+             (is (eq :mismatch
+                     (cl-pnet-ssh::ssh-client-known-host-status-for
+                      client "example.org" other)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test check-host-ip-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

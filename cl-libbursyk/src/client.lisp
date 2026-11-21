@@ -192,6 +192,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                  ca-signature-algorithms
                                  (revoked-host-keys '())
                                  hash-known-hosts
+                                 known-hosts-command
                                  (fingerprint-hash :sha256)
                                  visual-host-key
                                  check-host-ip
@@ -223,6 +224,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :ca-signature-algorithms ca-signature-algorithms
                     :revoked-host-keys revoked-host-keys
                     :hash-known-hosts hash-known-hosts
+                    :known-hosts-command known-hosts-command
                     :fingerprint-hash fingerprint-hash
                     :visual-host-key visual-host-key
                     :check-host-ip check-host-ip
@@ -293,6 +295,7 @@ is applied here, before any request names a key the configuration forbade."
                              ca-signature-algorithms
                              (revoked-host-keys '())
                              hash-known-hosts
+                             known-hosts-command
                              (fingerprint-hash :sha256)
                              visual-host-key
                              check-host-ip
@@ -361,6 +364,7 @@ role-neutral."
                            :ca-signature-algorithms ca-signature-algorithms
                            :revoked-host-keys revoked-host-keys
                            :hash-known-hosts hash-known-hosts
+                           :known-hosts-command known-hosts-command
                            :fingerprint-hash fingerprint-hash
                            :visual-host-key visual-host-key
                            :check-host-ip check-host-ip

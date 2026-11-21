@@ -2,7 +2,7 @@
   :description "SSH server command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.57"
+  :version "0.0.2.58"
   :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cffi
                #:bordeaux-threads #:uiop)
   :serial t

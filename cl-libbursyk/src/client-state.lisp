@@ -61,6 +61,8 @@
   (revoked-host-keys '())
   ;; HashKnownHosts: write new known_hosts entries as salted hashes.
   (hash-known-hosts nil)
+  ;; KnownHostsCommand: a command whose output is read as known_hosts lines.
+  (known-hosts-command nil)
   ;; FingerprintHash: the digest used when showing a key fingerprint.
   (fingerprint-hash :sha256)
   ;; VisualHostKey: show the randomart picture once connected.

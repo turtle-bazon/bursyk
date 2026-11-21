@@ -2249,6 +2249,10 @@ peer that connected to it; NIL refuses the channel."
             (if (cl-pnet-ssh:ssh-config-options-hash-known-hosts options)
                 "yes"
                 "no"))
+    (let ((command (cl-pnet-ssh:ssh-config-options-known-hosts-command
+                    options)))
+      (when command
+        (format t "knownhostscommand ~A~%" command)))
     (let ((revoked (reverse
                     (cl-pnet-ssh:ssh-config-options-revoked-host-keys
                      options))))

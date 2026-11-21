@@ -153,6 +153,8 @@ MAKE-SSH-CLIENT's own defaults."
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
         (ssh-config-options-hash-known-hosts options)
+        :known-hosts-command
+        (ssh-config-options-known-hosts-command options)
         :fingerprint-hash
         (or (ssh-config-options-fingerprint-hash options) :sha256)
         :visual-host-key (ssh-config-options-visual-host-key options)
@@ -450,6 +452,7 @@ uses whichever of the two it saw first instead of chaining them."
            :ca-signature-algorithms (getf parameters :ca-signature-algorithms)
            :revoked-host-keys (getf parameters :revoked-host-keys)
            :hash-known-hosts (getf parameters :hash-known-hosts)
+           :known-hosts-command (getf parameters :known-hosts-command)
            :fingerprint-hash (getf parameters :fingerprint-hash)
            :visual-host-key (getf parameters :visual-host-key)
            :check-host-ip (getf parameters :check-host-ip)

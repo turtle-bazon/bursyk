@@ -53,6 +53,7 @@ relative Include is anchored here.")
   (known-hosts nil)
   (global-known-hosts nil)
   (hash-known-hosts nil)
+  (known-hosts-command nil)
   ;; FingerprintHash: :SHA256 (the default) or :MD5 for displayed
   ;; fingerprints.
   (fingerprint-hash nil)
@@ -841,6 +842,13 @@ understand them rather than silently match nothing."
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
                   (if (eq paths :none) nil paths))))))
+      ((string= keyword "knownhostscommand")
+       (ssh-config-set-once
+        seen options :known-hosts-command
+        (lambda (options)
+          (setf (ssh-config-options-known-hosts-command options)
+                (let ((raw (ssh-config-line-raw line)))
+                  (if (and raw (plusp (length raw))) raw value))))))
       ((string= keyword "fingerprinthash")
        (ssh-config-set-once
         seen options :fingerprint-hash
@@ -1235,7 +1243,8 @@ understand them rather than silently match nothing."
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
-                         "hashknownhosts" "fingerprinthash"
+                         "hashknownhosts" "knownhostscommand"
+                         "fingerprinthash"
                          "visualhostkey" "checkhostip"
                          "revokedhostkeys"
                          "stricthostkeychecking"

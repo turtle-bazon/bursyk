@@ -319,10 +319,12 @@ uses."
          (name (or (ssh-client-host-key-host client)
                    (ssh-client-host client)))
          (now (ssh-unix-time (get-universal-time))))
-    (and (some (lambda (file)
-                 (ssh-known-host-certificate-authority-p
-                  file host certificate))
-               (ssh-client-known-hosts-files client))
+    (and (or (some (lambda (file)
+                     (ssh-known-host-certificate-authority-p
+                      file host certificate))
+                   (ssh-client-known-hosts-files client))
+             (ssh-client-known-hosts-command-certificate-authority-p
+              client host certificate))
          (= (ssh-certificate-cert-type certificate) 2)
          (null (ssh-certificate-critical certificate))
          (<= (ssh-certificate-valid-after certificate) now)
@@ -341,9 +343,11 @@ or its CA."
         (blobs (list host-key
                      (ssh-certificate-plain-blob certificate)
                      (ssh-certificate-signature-key certificate))))
-    (some (lambda (file)
-            (ssh-known-host-key-revoked-p file host blobs))
-          (ssh-client-known-hosts-files client))))
+    (or (some (lambda (file)
+                (ssh-known-host-key-revoked-p file host blobs))
+              (ssh-client-known-hosts-files client))
+        (ssh-client-known-hosts-command-revoked-p
+         client host blobs host-key))))
 
 (defun ssh-client-verify-host-key-main (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal.
@@ -408,13 +412,122 @@ certificate, its plain key or its CA refuses it without that fallback."
             (ssh-client-accept-unknown-host-key
              client host-key fingerprint))))))))
 
+(defun ssh-client-expand-known-hosts-command (client host host-key command)
+  "Expand the ssh % tokens in a KnownHostsCommand string."
+  (multiple-value-bind (type data) (ssh-public-key-parts host-key)
+    (declare (ignore data))
+    (let ((address (or (ssh-client-remote-address client) ""))
+          (name (ssh-client-host client))
+          (port (or (ssh-client-connect-port client) 22))
+          (user (ssh-client-user client))
+          (uid (or (uiop:getenv "UID") ""))
+          (local (or (uiop:getenv "HOSTNAME") ""))
+          (fingerprint (ssh-key-fingerprint
+                        host-key (ssh-client-fingerprint-hash client)))
+          (encoded (ssh-octets-base64 host-key)))
+      (with-output-to-string (out)
+        (loop with length = (length command)
+              for index from 0 below length
+              for character = (char command index)
+              do (if (and (char= character #\%)
+                          (< (1+ index) length))
+                     (let ((token (char command (1+ index))))
+                       (case token
+                         (#\% (write-char #\% out) (incf index))
+                         (#\H (princ host out) (incf index))
+                         (#\I (princ address out) (incf index))
+                         (#\n (princ name out) (incf index))
+                         (#\p (princ port out) (incf index))
+                         (#\r (princ user out) (incf index))
+                         (#\u (princ (cl-pnet-ssh:ssh-default-user) out)
+                              (incf index))
+                         (#\d (princ (namestring (user-homedir-pathname)) out)
+                              (incf index))
+                         (#\i (princ uid out) (incf index))
+                         (#\l (princ local out) (incf index))
+                         (#\L (princ local out) (incf index))
+                         (#\f (princ fingerprint out) (incf index))
+                         (#\t (princ type out) (incf index))
+                         (#\K (princ encoded out) (incf index))
+                         (t (write-char character out))))
+                     (write-char character out)))))))
+
+(defun ssh-client-known-hosts-command-entries (client host host-key)
+  "The known_hosts entries KnownHostsCommand prints for HOST, or NIL."
+  (let ((command (ssh-client-known-hosts-command client)))
+    (when (and command (plusp (length command)))
+      (let* ((expanded
+               (ssh-client-expand-known-hosts-command
+                client host host-key command))
+             (shell (or (uiop:getenv "SHELL") "/bin/sh"))
+             (output
+               (handler-case
+                   (uiop:run-program (list shell "-c" expanded)
+                                     :output :string
+                                     :error-output :string
+                                     :ignore-error-status nil)
+                 (error (condition)
+                   (error 'ssh-host-key-error
+                          :detail (format nil "KnownHostsCommand failed: ~A"
+                                          condition)
+                          :fingerprint
+                          (ssh-key-fingerprint
+                           host-key
+                           (ssh-client-fingerprint-hash client)))))))
+        (loop for line in (uiop:split-string output :separator '(#\Newline))
+              for entry = (ssh-known-host-line-entry line)
+              when entry collect entry)))))
+
+(defun ssh-client-known-hosts-command-status (client host host-key)
+  "How the command's entries stand for HOST-KEY at HOST."
+  (let ((blob (ssh-copy-octets host-key))
+        (seen nil))
+    (dolist (entry (ssh-client-known-hosts-command-entries
+                    client host host-key))
+      (when (and (ssh-known-host-entry-matches-p entry host)
+                 (not (equal (ssh-known-host-entry-marker entry)
+                             "@cert-authority")))
+        (setf seen t)
+        (unless (equal (ssh-known-host-entry-marker entry) "@revoked")
+          (when (ssh-octets= blob (ssh-known-host-entry-key-blob entry))
+            (return-from ssh-client-known-hosts-command-status :match)))))
+    (if seen :mismatch :unknown)))
+
+(defun ssh-client-known-hosts-command-certificate-authority-p
+    (client host certificate)
+  "Whether the command's output names CERTIFICATE's CA for HOST."
+  (let ((ca (ssh-certificate-signature-key certificate)))
+    (and ca
+         (some (lambda (entry)
+                 (and (equal (ssh-known-host-entry-marker entry)
+                             "@cert-authority")
+                      (ssh-known-host-entry-matches-p entry host)
+                      (ssh-octets= ca (ssh-known-host-entry-key-blob entry))))
+               (ssh-client-known-hosts-command-entries
+                client host certificate)))))
+
+(defun ssh-client-known-hosts-command-revoked-p (client host key-blobs key)
+  "Whether the command's output revokes one of KEY-BLOBS for HOST."
+  (some (lambda (entry)
+          (and (equal (ssh-known-host-entry-marker entry) "@revoked")
+               (ssh-known-host-entry-matches-p entry host)
+               (some (lambda (blob)
+                       (ssh-octets= blob
+                                    (ssh-known-host-entry-key-blob entry)))
+                     key-blobs)))
+        (ssh-client-known-hosts-command-entries client host key)))
+
 (defun ssh-client-known-host-status-for (client host host-key)
   "How HOST-KEY stands for HOST across CLIENT's known-hosts files."
   (let ((status :unknown))
-    (dolist (file (ssh-client-known-hosts-files client) status)
+    (dolist (file (ssh-client-known-hosts-files client))
       (case (ssh-known-host-status file host host-key)
-        (:match (return :match))
-        (:mismatch (setf status :mismatch))))))
+        (:match (return-from ssh-client-known-host-status-for :match))
+        (:mismatch (setf status :mismatch))))
+    (case (ssh-client-known-hosts-command-status client host host-key)
+      (:match :match)
+      (:mismatch :mismatch)
+      (t status))))
 
 (defun ssh-client-check-host-address (client host-key)
   "Apply CheckHostIP to HOST-KEY, adding or refusing its address entry."
