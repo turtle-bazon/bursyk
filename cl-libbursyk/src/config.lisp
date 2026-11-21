@@ -121,6 +121,10 @@ relative Include is anchored here.")
   (remote-forwards nil)
   (dynamic-forwards nil)
   (request-tty nil)
+  ;; EscapeChar and EnableEscapeCommandline: the interactive escape
+  ;; character, and whether its command line may be opened.
+  (escape-char nil)
+  (enable-escape-commandline nil)
   ;; LocalCommand and PermitLocalCommand: a shell command run locally after
   ;; the connection is up, but only when explicitly permitted.
   (local-command nil)
@@ -1126,6 +1130,18 @@ understand them rather than silently match nothing."
                             line "invalid PermitRemoteOpen port ~S" port)))
                   value))))))
 
+(defun ssh-config-escape-char-value (value)
+  "VALUE as an escape character, or :NONE."
+  (cond
+    ((string-equal value "none") :none)
+    ((and (= 2 (length value)) (char= (char value 0) #\^))
+     (let ((character (char-upcase (char value 1))))
+       (if (char= character #\?)
+           127
+           (logand (char-code character) #x1f))))
+    ((= 1 (length value)) (char value 0))
+    (t nil)))
+
 (defun ssh-config-apply-session-value (line options keyword)
   (let ((value (ssh-config-arg line)))
     (flet ((boolean () (ssh-config-boolean line value))
@@ -1223,6 +1239,15 @@ understand them rather than silently match nothing."
          (unless (ssh-config-options-log-verbose options)
            (setf (ssh-config-options-log-verbose options)
                  (ssh-config-line-args line))))
+        ((string= keyword "escapechar")
+         (let ((value (ssh-config-escape-char-value value)))
+           (unless value
+             (error (ssh-config-line-error line "invalid EscapeChar ~S"
+                                           (ssh-config-arg line))))
+           (setf (ssh-config-options-escape-char options) value)))
+        ((string= keyword "enableescapecommandline")
+         (setf (ssh-config-options-enable-escape-commandline options)
+               (boolean)))
         ((string= keyword "sessiontype")
          (let ((value (string-downcase value)))
            (unless (member value '("none" "subsystem" "default")
@@ -1285,7 +1310,8 @@ understand them rather than silently match nothing."
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
                          "remotecommand" "localcommand"
-                         "permitlocalcommand"
+                         "permitlocalcommand" "escapechar"
+                         "enableescapecommandline"
                          "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
                          "streamlocalbindmask" "streamlocalbindunlink"

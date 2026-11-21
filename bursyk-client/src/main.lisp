@@ -392,6 +392,10 @@ a name this build lacks is an error instead of a silently widened offer."
 
 (defun check-supported-options ()
   "Fail before connecting on a flag whose feature is not in this build."
+  (when (getf *options* :escape-char)
+    (unless (cl-pnet-ssh::ssh-config-escape-char-value
+             (getf *options* :escape-char))
+      (fail "invalid escape character ~A" (getf *options* :escape-char))))
   (when (getf *options* :pkcs11)
     (unsupported "-I" "PKCS#11 keys are not implemented"))
   (when (getf *options* :bind-interface)
@@ -1498,6 +1502,52 @@ closed afterwards."
     (setf (gethash connection *tunnels*) tunnel)
     (open-forward-channel client tunnel)))
 
+(defun escape-char-setting (client)
+  "The escape character for CLIENT, NIL when disabled."
+  (let ((explicit (getf *options* :escape-char))
+        (options (cl-pnet-ssh:ssh-client-config-options client)))
+    (cond
+      (explicit
+       (let ((value (cl-pnet-ssh::ssh-config-escape-char-value explicit)))
+         (if (eq value :none) nil (or value #\~))))
+      (options
+       (let ((value (cl-pnet-ssh:ssh-config-options-escape-char options)))
+         (if (eq value :none) nil (or value #\~))))
+      (t #\~))))
+
+(defun escape-commandline-enabled-p (client)
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-enable-escape-commandline
+          options))))
+
+(defun print-escape-help ()
+  (format *error-output*
+          "~%Supported escape sequences:~%  ~C.  - terminate connection~%  ~C#  - list forwarded connections~%  ~C?  - this message~%  ~C~C  - send the escape character by typing it twice~%"
+          *escape-char* *escape-char* *escape-char*
+          *escape-char* *escape-char*)
+  (finish-output *error-output*))
+
+(defun print-escape-forwards ()
+  (format *error-output* "~%Forwarded connections:~%")
+  (dolist (forward *forwards*)
+    (format *error-output* "  local ~A to ~A~%"
+            (or (forward-bind-path forward)
+                (format nil "~A:~D" (or (forward-bind-address forward) "*")
+                        (forward-bind-port forward)))
+            (forward-target-name forward)))
+  (dolist (forward *remote-forwards*)
+    (format *error-output* "  remote ~A to ~A~%"
+            (or (forward-bind-path forward)
+                (format nil "~A:~D" (or (forward-bind-address forward) "*")
+                        (forward-bind-port forward)))
+            (forward-target-name forward)))
+  (dolist (forward *dynamic-forwards*)
+    (format *error-output* "  dynamic ~A:~D~%"
+            (dynamic-bind-address forward)
+            (dynamic-forward-bind-port forward)))
+  (finish-output *error-output*))
+
 (defun config-log-level (client)
   "CLIENT's LogLevel as a lowercase name, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -2249,6 +2299,16 @@ peer that connected to it; NIL refuses the channel."
             (if (cl-pnet-ssh:ssh-config-options-hash-known-hosts options)
                 "yes"
                 "no"))
+    (format t "escapechar ~A~%"
+            (let ((value (cl-pnet-ssh:ssh-config-options-escape-char options)))
+              (cond ((eq value :none) "none")
+                    ((null value) "~")
+                    (t (format nil "~C" value)))))
+    (format t "enableescapecommandline ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-enable-escape-commandline
+                 options)
+                "yes"
+                "no"))
     (format t "updatehostkeys ~A~%"
             (let ((value (cl-pnet-ssh:ssh-config-options-update-host-keys
                           options)))
@@ -2407,6 +2467,25 @@ of calling back in the middle of authentication."
      (show-visual-host-key client)
      (cl-pnet-ssh:ssh-client-set-ip-qos
       client (request-tty-p client command-given-p))
+     (setf *escape-char* nil
+           *escape-pending* nil
+           *escape-line-start* t)
+     (when (request-tty-p client command-given-p)
+       (setf *escape-char* (escape-char-setting client)
+             *escape-help-function* #'print-escape-help
+             *escape-forwards-function* #'print-escape-forwards
+             *escape-disconnect-function*
+             (lambda ()
+               (format *error-output* "~%Connection to ~A closed.~%"
+                       (cl-pnet-ssh:ssh-client-host client))
+               (finish-output *error-output*)
+               (finish *status*))
+             *escape-commandline-function*
+             (when (escape-commandline-enabled-p client)
+               (lambda ()
+                 (format *error-output*
+                         "~%The escape command line is not implemented.~%")
+                 (finish-output *error-output*)))))
      (start-forwards client)
      (when (and (config-local-command client)
                 (permit-local-command-p client))

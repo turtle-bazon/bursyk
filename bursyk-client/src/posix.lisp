@@ -103,7 +103,9 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
       (cl-pnet-sockets:read-octets 0 65536)
     (declare (ignore error))
     (cond
-      ((plusp count) (cl-pnet-ssh:ssh-channel-write channel octets))
+      ((plusp count)
+       (cl-pnet-ssh:ssh-channel-write
+        channel (if *escape-char* (escape-filter octets) octets)))
       ((zerop count)
        (stop-stdin)
        (cl-pnet-ssh:ssh-channel-eof channel))

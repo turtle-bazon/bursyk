@@ -187,6 +187,8 @@
    #:ssh-config-options-log-level
    #:ssh-config-options-log-verbose
    #:ssh-config-options-remote-command
+   #:ssh-config-options-escape-char
+   #:ssh-config-options-enable-escape-commandline
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null
    #:ssh-config-options-forward-agent

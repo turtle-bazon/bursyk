@@ -201,6 +201,32 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test escape-filter-handles-sequences
+  (let ((burs::*escape-char* #\~)
+        (burs::*escape-pending* nil)
+        (burs::*escape-line-start* t)
+        (help 0)
+        (forwards 0)
+        (disconnected 0))
+    (setf burs::*escape-help-function* (lambda () (incf help))
+          burs::*escape-forwards-function* (lambda () (incf forwards))
+          burs::*escape-disconnect-function* (lambda () (incf disconnected)))
+    (flet ((filter (text)
+             (setf burs::*escape-pending* nil
+                   burs::*escape-line-start* t)
+             (map 'string #'code-char
+                  (burs::escape-filter
+                   (map '(vector (unsigned-byte 8)) #'char-code text)))))
+      (is (equal "" (filter "~?")))
+      (is (= 1 help))
+      (is (equal "~" (filter "~~")))
+      (is (equal "" (filter "~.")))
+      (is (= 1 disconnected))
+      ;; A tilde away from the start of a line is ordinary input.
+      (is (equal "abc~." (filter "abc~.")))
+      (is (equal "a~b" (filter "a~b")))
+      (is (= 0 forwards)))))
+
 (test log-level-settings-map
   (multiple-value-bind (quiet verbose) (burs::log-level-settings "quiet")
     (is (eq t quiet))

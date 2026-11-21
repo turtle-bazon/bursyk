@@ -2782,6 +2782,33 @@ newline")))
     (is (search "[ED25519 256]" (first lines)))
     (is (search "[SHA256]" (car (last lines))))))
 
+(test escape-char-parses
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (ssh-config-options-escape-char options))))
+    (is (char= #\~ (value "EscapeChar ~")))
+    (is (eql 1 (value "EscapeChar ^A")))
+    (is (eql 127 (value "EscapeChar ^?")))
+    (is (eq :none (value "EscapeChar none")))
+    (is (null (value "Port 22"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "EscapeChar too-long"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test update-host-keys-parses
   (flet ((value (line)
            (let* ((config

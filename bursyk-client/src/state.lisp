@@ -4,7 +4,55 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.59")
+(defparameter +burs-version+ "0.0.2.60")
+
+;;; Interactive escape handling.  The character is active only in a pty
+;;; session, and only at the start of a line, as in ssh.
+(defvar *escape-char* nil)
+(defvar *escape-pending* nil)
+(defvar *escape-line-start* t)
+(defvar *escape-help-function* nil)
+(defvar *escape-forwards-function* nil)
+(defvar *escape-disconnect-function* nil)
+(defvar *escape-commandline-function* nil)
+
+(defun escape-filter (octets)
+  "Return OCTETS with ssh escape sequences consumed.
+
+The command callbacks are set by the application: they print help, list
+forwards, disconnect, or open the escape command line."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0)))
+    (loop for octet across octets
+          do (cond
+               (*escape-pending*
+                (setf *escape-pending* nil)
+                (case (code-char octet)
+                  (#\# (when *escape-forwards-function*
+                          (funcall *escape-forwards-function*))
+                        (setf *escape-line-start* t))
+                  (#\? (when *escape-help-function*
+                          (funcall *escape-help-function*))
+                        (setf *escape-line-start* t))
+                  (#\. (when *escape-disconnect-function*
+                          (funcall *escape-disconnect-function*)))
+                  (#\~ (vector-push-extend (char-code *escape-char*) out)
+                        (setf *escape-line-start* nil))
+                  (#\C (when *escape-commandline-function*
+                          (funcall *escape-commandline-function*))
+                        (setf *escape-line-start* t))
+                  (t
+                   (format *error-output* "Unknown escape sequence '~C'.~%"
+                           (code-char octet))
+                   (setf *escape-line-start* t))))
+               ((and *escape-char*
+                     *escape-line-start*
+                     (= octet (char-code *escape-char*)))
+                (setf *escape-pending* t))
+               (t
+                (vector-push-extend octet out)
+                (setf *escape-line-start* (member octet '(10 13))))))
+    out))
 
 (defvar *status* nil
   "The exit status the remote command reported, or NIL before it does.")
