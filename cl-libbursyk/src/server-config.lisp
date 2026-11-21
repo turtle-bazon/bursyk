@@ -141,8 +141,7 @@ socket address and has no routing domains.")
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
-  '("chrootdirectory"
-    "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
+  '("hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
     "pubkeyauthoptions" "hostkeyagent"
     "streamlocalbindmask" "streamlocalbindunlink"))
 
@@ -270,6 +269,8 @@ socket address and has no routing domains.")
   ;; asked for, kept verbatim because sshd passes it to the login shell
   ;; exactly as written.  NIL means no forced command.
   (force-command nil)
+  ;; ChrootDirectory: a path with %h/%u/%U tokens, or :NONE for no chroot.
+  (chroot-directory nil)
   ;; Banner is a file read for every connection, or :none to send nothing.
   (banner nil)
   (version-addendum nil)
@@ -683,7 +684,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
 (defparameter +ssh-server-config-match-slots+
   '(permit-root-login max-auth-tries max-sessions
     client-alive-interval client-alive-count-max
-    force-command banner authorized-keys-files accept-env permit-open
+    force-command chroot-directory banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems
@@ -1396,6 +1397,13 @@ cannot apply per connection."
            (ssh-server-config-line-error
             line "ForceCommand internal-sftp is not supported; name an external sftp-server"))
          (ssh-server-config-set-once config 'force-command value)))
+      ((string= keyword "chrootdirectory")
+       ;; sshd expands ~ and %h/%u/%U when the session starts, so the raw
+       ;; value is kept here; "none" clears the setting.
+       (let ((value (ssh-server-config-one-argument line)))
+         (ssh-server-config-set-once
+          config 'chroot-directory
+          (if (string-equal value "none") :none value))))
       ((string= keyword "banner")
        ;; sshd reads this file for each connection and ignores one it cannot
        ;; read, so the reader keeps the path and the program reads it later.

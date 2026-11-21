@@ -1,5 +1,7 @@
 (in-package #:bursyk-server)
 
+#+sbcl (require :sb-posix)
+
 ;;;; A small SSH command server over cl-pnet-ssh.  It binds a listener,
 ;;;; authenticates clients with their own keys, and runs each exec request as
 ;;;; a child process.  Nothing blocks the event loop: both directions of every
@@ -64,7 +66,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.29"
+(defparameter +bursyk-server-version+ "0.0.2.30"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -943,13 +945,14 @@ to spin on it."
   (bridge-watch bridge)
   bridge)
 
-(defun start-command (channel command &key extra-environment)
+(defun start-command (channel command &key extra-environment chroot)
   "Run COMMAND as a child, on the pty the client asked for if there is one.
 
 The channel's accepted environment requests are added to the child's own
 environment, so a SendEnv from the client arrives where the command can see
 it.  The library has already applied AcceptEnv.  EXTRA-ENVIRONMENT is added
-last, for values the server itself sets such as SSH_ORIGINAL_COMMAND."
+last, for values the server itself sets such as SSH_ORIGINAL_COMMAND.
+CHROOT, when given, is entered before the command runs."
   (let ((environment (session-environment channel)))
     (dolist (pair extra-environment)
       (setf environment
@@ -959,21 +962,22 @@ last, for values the server itself sets such as SSH_ORIGINAL_COMMAND."
             (spawn-pty-shell command (user-shell)
                              :environment environment
                              :rows (channel-rows channel)
-                             :columns (channel-columns channel))
+                             :columns (channel-columns channel)
+                             :chroot chroot)
           (attach-bridge
            channel
            (make-bridge :channel channel :pid pid
                         :master-fd master :status-fd status
                         :pty t :stderr-eof t)))
         (multiple-value-bind (pid stdin stdout stderr status)
-            (spawn-shell command :environment environment)
+            (spawn-shell command :environment environment :chroot chroot)
           (attach-bridge
            channel
            (make-bridge :channel channel :pid pid
                         :stdin-fd stdin :stdout-fd stdout
                         :stderr-fd stderr :status-fd status))))))
 
-(defun start-program (channel program arguments)
+(defun start-program (channel program arguments &key chroot)
   "Run PROGRAM with ARGUMENTS on CHANNEL, without shell expansion."
   (let ((environment (session-environment channel)))
     (if (channel-pty-p channel)
@@ -981,28 +985,30 @@ last, for values the server itself sets such as SSH_ORIGINAL_COMMAND."
             (spawn-pty-program program arguments
                                :environment environment
                                :rows (channel-rows channel)
-                               :columns (channel-columns channel))
+                               :columns (channel-columns channel)
+                               :chroot chroot)
           (attach-bridge
            channel
            (make-bridge :channel channel :pid pid
                         :master-fd master :status-fd status
                         :pty t :stderr-eof t)))
         (multiple-value-bind (pid stdin stdout stderr status)
-            (spawn-program program arguments :environment environment)
+            (spawn-program program arguments :environment environment
+                                               :chroot chroot)
           (attach-bridge
            channel
            (make-bridge :channel channel :pid pid
                         :stdin-fd stdin :stdout-fd stdout
                         :stderr-fd stderr :status-fd status))))))
 
-(defun start-login-shell (channel)
+(defun start-login-shell (channel &key chroot)
   "Run the login shell, on the pty when one was requested.
 
 A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 -T; a pty merges them, as a terminal does."
   (if (channel-pty-p channel)
-      (start-command channel nil)
-      (start-program channel (user-shell) (list "-l"))))
+      (start-command channel nil :chroot chroot)
+      (start-program channel (user-shell) (list "-l") :chroot chroot)))
 
 (defun bridge-resize (bridge columns rows)
   "Resize BRIDGE's pty, if it has one."
@@ -1041,12 +1047,18 @@ asked for, when it asked for anything."
                (and authorization
                     (cl-pnet-ssh:ssh-authorization-options-force-command
                      authorization))))
+         (chroot
+           (handler-case (session-chroot-directory session)
+             (error (condition)
+               (session-failure channel "~A" condition)
+               (return-from install-channel-handlers nil))))
          (bridge nil))
     (labels ((remember (new-bridge)
                (setf bridge new-bridge))
            (run-command (command)
              (if (command-allowed-p command)
-                 (handler-case (remember (start-command channel command))
+                 (handler-case
+                     (remember (start-command channel command :chroot chroot))
                    (error (condition)
                      (session-failure channel "~A" condition)))
                  (session-failure channel "command not allowed: ~A" command)))
@@ -1055,15 +1067,18 @@ asked for, when it asked for anything."
                  (remember
                   (start-command
                    channel forced-command
+                   :chroot chroot
                    :extra-environment
                    (and original-command
                         (list (cons "SSH_ORIGINAL_COMMAND" original-command)))))
                (error (condition) (session-failure channel "~A" condition))))
            (run-shell ()
-             (handler-case (remember (start-login-shell channel))
+             (handler-case
+                 (remember (start-login-shell channel :chroot chroot))
                (error (condition) (session-failure channel "~A" condition))))
            (run-subsystem (path)
-             (handler-case (remember (start-program channel path nil))
+             (handler-case
+                 (remember (start-program channel path nil :chroot chroot))
                (error (condition) (session-failure channel "~A" condition)))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-exec channel)
             (lambda (channel command)
@@ -1221,6 +1236,79 @@ expand_authorized_keys() makes it."
     (if (and (plusp (length value)) (char= (char value 0) #\/))
         value
         (concatenate 'string home "/" value))))
+
+(defun expand-session-path (pattern user home uid)
+  "PATTERN with sshd's %h, %u, %U and %% expanded for USER.
+
+A leading ~ is the user's home, as tilde_expand_filename does.  Unlike an
+AuthorizedKeysFile pattern, a relative result is left relative so chroot
+can refuse it."
+  (let ((pattern (if (and (plusp (length pattern))
+                          (char= (char pattern 0) #\~)
+                          (or (= (length pattern) 1)
+                              (char= (char pattern 1) #\/)))
+                     (concatenate 'string (or home "") (subseq pattern 1))
+                     pattern)))
+    (with-output-to-string (out)
+      (loop with length = (length pattern)
+            for index from 0 below length
+            for character = (char pattern index)
+            do (if (and (char= character #\%)
+                        (< (1+ index) length))
+                   (case (char pattern (1+ index))
+                     (#\h (write-string (or home "") out) (incf index))
+                     (#\u (write-string user out) (incf index))
+                     (#\U (write-string (or uid "") out) (incf index))
+                     (#\% (write-char #\% out) (incf index))
+                     (t (write-char character out)))
+                   (write-char character out))))))
+
+(defun safely-chroot-path-p (path)
+  "Whether every component of PATH is a root-owned, unwritable directory.
+
+This is sshd's safely_chroot check.  Only SBCL can inspect the ownership
+and mode here, so another implementation refuses the chroot rather than
+skipping the check."
+  (and (plusp (length path))
+       (char= (char path 0) #\/)
+       #+sbcl
+       (let ((prefixes '()))
+         (loop for index from 1 below (length path)
+               when (char= (char path index) #\/)
+                 do (push (subseq path 0 index) prefixes))
+         (push path prefixes)
+         (every (lambda (prefix)
+                  (handler-case
+                      (let ((stat (sb-posix:stat prefix)))
+                        (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
+                             (zerop (sb-posix:stat-uid stat))
+                             (zerop (logand (sb-posix:stat-mode stat) #o022))))
+                    (error () nil)))
+                (nreverse prefixes)))
+       #-sbcl
+       nil))
+
+(defun session-chroot-directory (session)
+  "SESSION's expanded ChrootDirectory, or NIL when none is configured.
+
+The path is expanded for the session's user and checked before any child
+starts, so a bad directory refuses the session instead of failing after the
+client's command has been accepted."
+  (let ((value (session-config-setting
+                session #'cl-pnet-ssh:ssh-server-config-chroot-directory)))
+    (unless (or (null value) (eq value :none))
+      (multiple-value-bind (home uid)
+          (user-home-and-uid (cl-pnet-ssh:ssh-session-user session))
+        (let ((path (expand-session-path
+                     value (cl-pnet-ssh:ssh-session-user session)
+                     home uid)))
+          (unless (and (plusp (length path))
+                       (char= (char path 0) #\/))
+            (error "ChrootDirectory ~A is not an absolute path" path))
+          (unless (safely-chroot-path-p path)
+            (error "ChrootDirectory ~A is not a root-owned, unwritable directory"
+                   path))
+          path)))))
 
 (defparameter +default-host-key-candidates+
   '("/etc/ssh/ssh_host_ed25519_key"

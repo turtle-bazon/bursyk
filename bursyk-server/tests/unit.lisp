@@ -411,8 +411,6 @@ ForceCommand two")))
 
 (test sshd-config-refuses-what-this-server-cannot-honour
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "ChrootDirectory /jail"))
-  (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "PasswordAuthentication yes"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "NotAKeyword yes"))
@@ -1838,8 +1836,8 @@ DenyGroups banned")))
                    :state :open))
          (started '()))
     (setf (cl-pnet-ssh:ssh-session-authorization session) authorization)
-    (labels ((start (channel command &key extra-environment)
-               (declare (ignore channel))
+    (labels ((start (channel command &key extra-environment chroot)
+               (declare (ignore channel chroot))
                (push (list command extra-environment) started)
                nil))
       (let ((original (symbol-function 'bursyk-server::start-command)))
@@ -1891,8 +1889,8 @@ Subsystem sftp /usr/lib/openssh/sftp-server"))
          (bursyk-server::*server-config* config)
          (started '()))
     (setf (cl-pnet-ssh:ssh-session-authorization session) authorization)
-    (labels ((start (channel command &key extra-environment)
-               (declare (ignore channel))
+    (labels ((start (channel command &key extra-environment chroot)
+               (declare (ignore channel chroot))
                (push (list command extra-environment) started)
                nil))
       (let ((original (symbol-function 'bursyk-server::start-command)))
@@ -3031,3 +3029,84 @@ PerSourcePenalties authfail:20 min:3")))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User alice
   PerSourcePenaltyExemptList 127.0.0.1")))
+
+(test sshd-config-reads-chroot-directory
+  "ChrootDirectory keeps its tokens, none disables it, and Match overrides."
+  (is (equal "/srv/%u"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-chroot-directory
+              "ChrootDirectory /srv/%u")))
+  (is (eq :none
+          (config-value
+           #'cl-pnet-ssh:ssh-server-config-chroot-directory
+           "ChrootDirectory none")))
+  (is (equal "/first"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-chroot-directory
+              "ChrootDirectory /first
+ChrootDirectory /second")))
+  (let* ((config (config-from-text
+                  "ChrootDirectory /global
+Match User alice
+  ChrootDirectory /alice"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (equal "/alice"
+               (cl-pnet-ssh:ssh-server-config-chroot-directory alice)))
+    (is (equal "/global"
+               (cl-pnet-ssh:ssh-server-config-chroot-directory bob))))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "ChrootDirectory")))
+
+(test chroot-path-expansion-and-safety
+  "ChrootDirectory expands ~ and %h/%u/%U, and refuses an unsafe directory."
+  (is (equal "/srv/alice/%"
+             (bursyk-server::expand-session-path
+              "/srv/%u/%%" "alice" "/home/alice" "1000")))
+  (is (equal "/home/alice/alice"
+             (bursyk-server::expand-session-path
+              "~/%u" "alice" "/home/alice" "1000")))
+  #+sbcl
+  (progn
+    (is (bursyk-server::safely-chroot-path-p "/"))
+    (is (not (bursyk-server::safely-chroot-path-p "/tmp")))
+    (is (not (bursyk-server::safely-chroot-path-p "relative"))))
+  (let* ((config (config-from-text "ChrootDirectory /"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (session (cl-pnet-ssh::%make-ssh-session
+                   :server server :user "root")))
+    (is (equal "/" (bursyk-server::session-chroot-directory session))))
+  (dolist (value '("/tmp" "relative"))
+    (let* ((config (config-from-text
+                    (format nil "ChrootDirectory ~A" value)))
+           (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+           (session (cl-pnet-ssh::%make-ssh-session
+                     :server server :user "root")))
+      (signals error
+        (bursyk-server::session-chroot-directory session)))))
+
+#-win32
+(test spawn-shell-refuses-an-unreachable-chroot
+  "A child that cannot chroot reports it instead of running the command."
+  #+sbcl
+  (if (zerop (sb-posix:getuid))
+      (skip "running as root, where chroot succeeds")
+      (multiple-value-bind (pid stdin stdout stderr status)
+          (bursyk-server::spawn-shell "true" :chroot "/")
+        (unwind-protect
+             (let ((out (fd-octets stdout))
+                   (err (fd-octets stderr))
+                   (code (fd-octets status)))
+               (bursyk-server::collect-child pid)
+               (is (equal "" (octets-string out)))
+               (is (search "chroot failed" (octets-string err)))
+               ;; The wrapper never ran, so no status text was written.
+               (is (equal "" (octets-string code))))
+          (fd-close stdin)
+          (fd-close stdout)
+          (fd-close stderr)
+          (fd-close status))))
+  #-sbcl
+  (skip "sb-posix is needed to tell whether this test can chroot"))

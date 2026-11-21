@@ -223,6 +223,7 @@
    #:ssh-server-config-pid-file
    #:ssh-server-config-banner
    #:ssh-server-config-force-command
+   #:ssh-server-config-chroot-directory
    #:ssh-server-config-permit-user-environment
    #:ssh-server-config-expose-auth-info
    #:ssh-server-config-refuse-connection
