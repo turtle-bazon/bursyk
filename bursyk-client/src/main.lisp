@@ -1524,6 +1524,30 @@ closed afterwards."
                     (cl-pnet-ssh:ssh-config-options-stdin-null
                      options)))))))
 
+(defun config-permit-remote-open (client)
+  "CLIENT's PermitRemoteOpen choice: NIL/:ANY, :NONE, or (HOST . PORT) entries."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (and options
+         (cl-pnet-ssh:ssh-config-options-permit-remote-open options))))
+
+(defun permit-remote-open-allowed-p (client host port)
+  "Whether PermitRemoteOpen lets CLIENT dial HOST:PORT.
+
+PORT is :STREAMLOCAL for a Unix socket path.  No name or address lookup is
+performed, matching ssh: the configured host must match exactly, or be *."
+  (let ((permit (config-permit-remote-open client)))
+    (cond
+      ((null permit) t)
+      ((eq permit :any) t)
+      ((eq permit :none) nil)
+      (t
+       (some (lambda (entry)
+               (and (or (string= (car entry) "*")
+                        (string= (car entry) host))
+                    (or (eq (cdr entry) :any)
+                        (eql (cdr entry) port))))
+             permit)))))
+
 (defun clear-all-forwardings-p (client)
   "Whether ClearAllForwardings discards every configured forward."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
@@ -1831,14 +1855,23 @@ buffered with the tunnel and flushed once the channel is open."
 
 The library calls this with the listener the server actually used and the
 peer that connected to it; NIL refuses the channel."
-  (declare (ignore client origin-address origin-port))
+  (declare (ignore origin-address origin-port))
   (let ((forward (find-if (lambda (candidate)
                             (remote-forward-match-p candidate
                                                     bind-address bind-port))
                           *remote-forwards*)))
-    (if forward
-        (values (forward-host forward) (forward-port forward))
-        (values nil nil))))
+    (cond
+      ((null forward) (values nil nil))
+      ((permit-remote-open-allowed-p client
+                                     (forward-host forward)
+                                     (forward-port forward))
+       (values (forward-host forward) (forward-port forward)))
+      (t
+       (unless (getf *options* :quiet)
+         (format *error-output*
+                 "burs: PermitRemoteOpen refuses ~A:~D~%"
+                 (forward-host forward) (forward-port forward)))
+       (values nil nil)))))
 
 (defun attach-client-tcp-target (channel forward)
   "Bridge a server-initiated streamlocal channel to FORWARD's TCP target."
@@ -1851,17 +1884,30 @@ peer that connected to it; NIL refuses the channel."
 
 (defun forwarded-streamlocal-target (client path)
   "Setup function for a server-initiated forwarded-streamlocal channel."
-  (declare (ignore client))
   (let ((forward
           (find-if (lambda (candidate)
                      (and (forward-bind-path candidate)
                           (string= (forward-bind-path candidate) path)))
                    *remote-forwards*)))
-    (and forward
-         (lambda (channel)
-           (if (forward-target-path forward)
-               (open-client-streamlocal channel (forward-target-path forward))
-               (attach-client-tcp-target channel forward))))))
+    (when forward
+      (let ((allowed
+              (if (forward-target-path forward)
+                  (permit-remote-open-allowed-p
+                   client (forward-target-path forward) :streamlocal)
+                  (permit-remote-open-allowed-p
+                   client (forward-host forward) (forward-port forward)))))
+        (if allowed
+            (lambda (channel)
+              (if (forward-target-path forward)
+                  (open-client-streamlocal channel
+                                           (forward-target-path forward))
+                  (attach-client-tcp-target channel forward)))
+            (progn
+              (unless (getf *options* :quiet)
+                (format *error-output*
+                        "burs: PermitRemoteOpen refuses ~A~%"
+                        (forward-target-name forward)))
+              nil))))))
 
 (defun start-streamlocal-remote-forward (client forward)
   "Ask the server to listen on FORWARD's Unix socket."
@@ -2101,6 +2147,16 @@ peer that connected to it; NIL refuses the channel."
                        (cl-pnet-ssh:ssh-config-options-send-env options))
     (print-list-option "setenv"
                        (cl-pnet-ssh:ssh-config-options-set-env options))
+    (let ((permit (cl-pnet-ssh:ssh-config-options-permit-remote-open
+                   options)))
+      (cond
+        ((eq permit :any) (format t "permitremoteopen any~%"))
+        ((eq permit :none) (format t "permitremoteopen none~%"))
+        ((null permit) nil)
+        (t (dolist (entry permit)
+             (format t "permitremoteopen ~A:~A~%"
+                     (car entry)
+                     (if (eq (cdr entry) :any) "*" (cdr entry)))))))
     (print-list-option
      "localforward"
      (reverse (cl-pnet-ssh:ssh-config-options-local-forwards options)))

@@ -2730,6 +2730,41 @@ newline")))
                    (ssh-known-host-status path "plain.example" blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test permit-remote-open-parses
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "PermitRemoteOpen example.org:80 [::1]:2222 *:*"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal '(("example.org" . 80) ("::1" . 2222) ("*" . :any))
+               (ssh-config-options-permit-remote-open options))))
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (ssh-config-options-permit-remote-open options))))
+    (is (eq :any (value "PermitRemoteOpen any")))
+    (is (eq :none (value "PermitRemoteOpen none")))
+    (is (null (value "Port 22"))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "PermitRemoteOpen example.org"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
 (test clear-all-forwardings-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

@@ -201,6 +201,28 @@ CLI's decision and at the plist it filled."
   (let ((forward (burs::parse-local-forward "[::1]:8080:example.org:80")))
     (is (equal "::1" (burs::forward-bind-address forward)))))
 
+(test permit-remote-open-matches
+  (flet ((allowed (permit host port)
+           (let ((client (cl-pnet-ssh::%make-ssh-client)))
+             (setf (cl-pnet-ssh:ssh-client-config-options client)
+                   (cl-pnet-ssh::%make-ssh-config-options
+                    :permit-remote-open permit))
+             (burs::permit-remote-open-allowed-p client host port))))
+    ;; Unset and "any" permit everything; "none" permits nothing.
+    (is (allowed nil "example.org" 80))
+    (is (allowed :any "example.org" 80))
+    (is (not (allowed :none "example.org" 80)))
+    (let ((permit '(("example.org" . 80))))
+      (is (allowed permit "example.org" 80))
+      (is (not (allowed permit "example.org" 81)))
+      (is (not (allowed permit "other.example" 80)))
+      ;; A streamlocal path only matches a port wildcard.
+      (is (not (allowed permit "/tmp/sock" :streamlocal))))
+    (let ((permit '(("example.org" . 80) ("*" . :any))))
+      ;; *:* permits any other destination, including a socket path.
+      (is (allowed permit "other.example" 22))
+      (is (allowed permit "/tmp/sock" :streamlocal)))))
+
 (test clear-all-forwardings-reads-the-config
   (let* ((client (cl-pnet-ssh::%make-ssh-client))
          (options (cl-pnet-ssh::%make-ssh-config-options

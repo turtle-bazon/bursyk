@@ -90,6 +90,10 @@ relative Include is anchored here.")
   (forward-x11-trusted nil)
   (gateway-ports nil)
   (exit-on-forward-failure nil)
+  ;; PermitRemoteOpen: NIL or :ANY permits every remote-forward target,
+  ;; :NONE permits none, and a list holds (HOST . PORT) entries where either
+  ;; part may be :ANY.
+  (permit-remote-open nil)
   ;; TCPKeepAlive defaults to yes, as it does in ssh.
   (tcp-keep-alive t)
   ;; RequiredRSASize: the smallest RSA modulus this client will use for a
@@ -985,6 +989,30 @@ understand them rather than silently match nothing."
         (lambda (options)
           (ssh-config-apply-session-value line options keyword)))))))
 
+(defun ssh-config-remote-open-entry (line argument)
+  "One PermitRemoteOpen ARGUMENT as (HOST . PORT), either part :ANY."
+  (let ((colon (position #\: argument :from-end t)))
+    (unless (and colon (plusp colon) (< (1+ colon) (length argument)))
+      (error (ssh-config-line-error line
+                                    "invalid PermitRemoteOpen ~S"
+                                    argument)))
+    (let ((host (subseq argument 0 colon))
+          (port (subseq argument (1+ colon))))
+      (when (and (>= (length host) 2)
+                 (char= (char host 0) #\[)
+                 (char= (char host (1- (length host))) #\]))
+        (setf host (subseq host 1 (1- (length host)))))
+      (cons host
+            (if (string= port "*")
+                :any
+                (let ((value (handler-case
+                                 (parse-integer port)
+                               (error () nil))))
+                  (unless (and value (<= 1 value 65535))
+                    (error (ssh-config-line-error
+                            line "invalid PermitRemoteOpen port ~S" port)))
+                  value))))))
+
 (defun ssh-config-apply-session-value (line options keyword)
   (let ((value (ssh-config-arg line)))
     (flet ((boolean () (ssh-config-boolean line value))
@@ -1017,6 +1045,24 @@ understand them rather than silently match nothing."
         ((string= keyword "exitonforwardfailure")
          (setf (ssh-config-options-exit-on-forward-failure options)
                (boolean)))
+        ((string= keyword "permitremoteopen")
+         ;; The first active line wins; NIL is how "not set" is spelled, so
+         ;; no seen table is needed here.
+         (unless (ssh-config-options-permit-remote-open options)
+           (let ((arguments (ssh-config-line-args line)))
+             (setf (ssh-config-options-permit-remote-open options)
+                   (cond
+                     ((and (= 1 (length arguments))
+                           (string-equal (first arguments) "any"))
+                      :any)
+                     ((and (= 1 (length arguments))
+                           (string-equal (first arguments) "none"))
+                      :none)
+                     (t
+                      (mapcar (lambda (argument)
+                                (ssh-config-remote-open-entry
+                                 line argument))
+                              arguments)))))))
         ((string= keyword "clearallforwardings")
          (setf (ssh-config-options-clear-all-forwardings options)
                (boolean)))
@@ -1093,7 +1139,7 @@ understand them rather than silently match nothing."
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
                          "gatewayports" "exitonforwardfailure"
-                         "clearallforwardings"
+                         "permitremoteopen" "clearallforwardings"
                          "tcpkeepalive" "keepalive"
                          "refuseconnection" "requiredrsasize"
                          "sessiontype" "stdinnull"
