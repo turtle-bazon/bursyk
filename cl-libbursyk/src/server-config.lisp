@@ -114,7 +114,11 @@ socket address and has no routing domains.")
     ;; 10.6 directives that describe OpenSSH's privsep helpers or features
     ;; this server refuses outright (PAM, GSSAPI, agent forwarding).
     "sshdauthpath" "sshdsessionpath" "pamservicename"
-    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"))
+    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"
+    ;; These configure protocols this server refuses (hostbased auth and
+    ;; stream-local forwarding), so their values cannot change anything.
+    "hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
+    "streamlocalbindmask" "streamlocalbindunlink"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
@@ -141,9 +145,7 @@ socket address and has no routing domains.")
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
-  '("hostbasedacceptedalgorithms" "hostbasedacceptedkeytypes"
-    "pubkeyauthoptions" "hostkeyagent"
-    "streamlocalbindmask" "streamlocalbindunlink"))
+  '("hostkeyagent"))
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)

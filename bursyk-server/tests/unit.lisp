@@ -2912,7 +2912,18 @@ PAMServiceName sshd
 GSSAPIDelegateCredentials no
 AgentSocketPath /run/agent.sock
 WarnWeakCrypto no")))
-    (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config))))))
+    (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
+  ;; Hostbased and stream-local settings configure protocols this server
+  ;; refuses, so they are accepted with a warning rather than rejected.
+  (let ((config (config-from-text
+                 "HostbasedAcceptedAlgorithms ssh-ed25519
+StreamLocalBindMask 0177
+StreamLocalBindUnlink yes")))
+    (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
+  ;; A host-key agent would change which keys are presented, so it is
+  ;; refused rather than ignored.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "HostKeyAgent /run/agent.sock")))
 
 (test sshd-config-reads-pubkey-auth-options
   "PubkeyAuthOptions keeps the first line's flags and probe budget."
