@@ -110,6 +110,7 @@
   watcher
   bind
   (host-keys nil)
+  (host-key-agent nil)
   ;; The pure backend presents these; libssh has no bind option for them,
   ;; so MAKE-SSH-SERVER refuses a non-empty list here.
   (host-certificates nil)
@@ -176,6 +177,9 @@
   remote-address
   (phase :key-exchange)
   (client-version nil)
+  (kex-shared nil)
+  (kex-hash nil)
+  (kex-signature-pending nil)
   (user nil)
   (authenticated nil)
   ;; The key blob that authenticated the user, exactly as offered: a

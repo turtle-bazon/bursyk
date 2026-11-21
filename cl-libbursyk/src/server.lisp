@@ -49,26 +49,48 @@
     (ssh-session-start-login-grace-timer session)
     session))
 
-(defun ssh-server-host-key-list (host-key)
-  "HOST-KEY as a list of loaded private keys.
+(defun ssh-server-host-key-list (host-key &optional host-key-agent)
+  "HOST-KEY as a list of loaded private or agent-backed keys.
 
 HOST-KEY is one key, one path, or a list of those.  Every key must be a type
 the server can present; a key it could not sign with would otherwise be
-advertised and then fail the first KEX."
+advertised and then fail the first KEX.  When HOST-KEY-AGENT is given, a
+path whose private half cannot be read falls back to its public key and the
+agent signs for it."
   (let ((values (if (listp host-key) host-key (list host-key))))
     (unless values
       (error 'ssh-connection-error :detail "no host key given"))
     (mapcar (lambda (value)
-              (let ((key (if (typep value 'ssh-private-key)
-                             value
-                             (ssh-load-private-key value))))
+              (let ((key
+                      (cond
+                        ((or (typep value 'ssh-private-key)
+                             (typep value 'ssh-agent-host-key))
+                         value)
+                        (t
+                         (handler-case (ssh-load-private-key value)
+                           (error (condition)
+                             (if (null host-key-agent)
+                                 (error condition)
+                                 (let ((blob
+                                         (or (ssh-public-key-file-blob value)
+                                             (ssh-public-key-file-blob
+                                              (concatenate
+                                               'string
+                                               (namestring value) ".pub")))))
+                                   (if blob
+                                       (%make-ssh-agent-host-key
+                                        :blob blob
+                                        :type (nth-value
+                                               0 (ssh-public-key-parts blob))
+                                        :path value)
+                                       (error condition))))))))))
                 (unless (some (lambda (algorithm)
                                 (ssh-server-host-key-algorithm-p
                                  key algorithm))
                               +ssh-server-host-key-preference+)
                   (error 'ssh-connection-error
                          :detail (format nil "unsupported host key type ~A"
-                                         (ssh-private-key-type key))))
+                                         (ssh-host-key-type key))))
                 key))
             values)))
 
@@ -124,6 +146,7 @@ presented."
                         &key
                           host-key
                           host-certificate
+                          host-key-agent
                           authorized-keys
                           authorize
                           authorize-user
@@ -240,7 +263,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                        (format nil "~A ~A" version addendum)
                        version))
          (keys (ssh-server-check-host-keys
-                (ssh-server-host-key-list host-key)
+                (ssh-server-host-key-list host-key host-key-agent)
                 (and sshd-config
                      (ssh-server-config-required-rsa-size sshd-config))))
          (certificates
@@ -251,6 +274,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :port port
                   :version software
                   :host-keys keys
+                  :host-key-agent host-key-agent
                   :host-certificates certificates
                   :authorized-keys authorized-keys
                   :authorize authorize

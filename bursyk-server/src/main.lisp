@@ -68,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.35"
+(defparameter +bursyk-server-version+ "0.0.2.36"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1692,6 +1692,10 @@ unprivileged run simple."
             found)
           (list (home-file ".ssh/id_ed25519")))))
 
+(defun host-key-agent ()
+  "The HostKeyAgent socket, or NIL."
+  (config-setting #'cl-pnet-ssh:ssh-server-config-host-key-agent))
+
 (defun host-certificate-files ()
   "The --host-certificate files, then the config's HostCertificate files."
   (append (reverse (getf *options* :host-certificate))
@@ -2393,9 +2397,14 @@ guess, so only an explicit PidFile is written."
   (load-server-config)
   (check-certificate-config)
   (let ((host-keys (host-key-files)))
-    (dolist (host-key host-keys)
-      (unless (probe-file host-key)
-        (fail "host key not found: ~A" host-key)))
+    (let ((agent (host-key-agent)))
+      (dolist (host-key host-keys)
+        (unless (or (probe-file host-key)
+                    (and agent
+                         (or (probe-file (concatenate
+                                          'string (namestring host-key) ".pub"))
+                             (probe-file host-key))))
+          (fail "host key not found: ~A" host-key))))
     ;; sshd logs a HostCertificate it cannot load and serves the plain key,
     ;; so a bad certificate never stops the listener.
     (dolist (host-certificate (host-certificate-files))
@@ -2410,6 +2419,7 @@ guess, so only an explicit PidFile is written."
            (server-address)
            (server-port)
            :host-key host-keys
+           :host-key-agent (host-key-agent)
            :host-certificate (host-certificate-files)
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p

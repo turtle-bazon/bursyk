@@ -217,8 +217,27 @@ came up."
           (ssh-session-ignore-next-kex-packet session)
           (getf (ssh-session-negotiated session) :guess-wrong))))
 
+(defun ssh-server-finish-kex (session signature)
+  "Derive keys from SESSION's stored KEX state and send the reply."
+  (unless (ssh-session-closed-p session)
+    (let ((shared (ssh-session-kex-shared session))
+          (hash (ssh-session-kex-hash session)))
+      (setf (ssh-session-derived-keys session)
+            (ssh-session-keys (ssh-session-negotiated session) shared hash
+                              (ssh-session-session-id session) :server t)
+            (ssh-session-kex-shared session) nil
+            (ssh-session-kex-hash session) nil
+            (ssh-session-kex-signature-pending session) nil)
+      (ssh-server-send-kex-reply session
+                                 (ssh-session-ephemeral-public session)
+                                 signature)
+      (ssh-server-send-newkeys session))))
+
 (defun ssh-server-handle-kex-init (session payload)
-  "Answer the client's curve25519 offer: host key, ephemeral key, signature."
+  "Answer the client's curve25519 offer: host key, ephemeral key, signature.
+
+A private host key signs now.  An agent-backed key sends the sign request
+and returns; the agent's callback finishes the KEX."
   (let* ((reader (ssh-make-reader payload))
          (client-public (progn (ssh-read-u8 reader) (ssh-read-string reader)))
          (algorithm (getf (ssh-session-negotiated session) :host-key))
@@ -227,8 +246,7 @@ came up."
          (private nil)
          (server-public nil)
          (shared nil)
-         (hash nil)
-         (signature nil))
+         (hash nil))
     (unless (ssh-session-negotiated session)
       (error 'ssh-protocol-error :detail "ECDH_INIT before KEXINIT"))
     (when algorithm
@@ -248,18 +266,34 @@ came up."
                 (ssh-session-client-kexinit session)
                 (ssh-session-server-kexinit session)
                 host-key-blob
-                client-public server-public shared)
-          signature (ssh-server-host-key-signature host-key algorithm hash))
+                client-public server-public shared))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
           (ssh-session-ephemeral-private session) private
           (ssh-session-ephemeral-public session) server-public
           (ssh-session-host-key-blob session) host-key-blob
-          (ssh-session-derived-keys session)
-          (ssh-session-keys (ssh-session-negotiated session) shared hash
-                            (ssh-session-session-id session) :server t))
-    (ssh-server-send-kex-reply session server-public signature)
-    (ssh-server-send-newkeys session)))
+          (ssh-session-kex-shared session) shared
+          (ssh-session-kex-hash session) hash)
+    (if (ssh-agent-host-key-p host-key)
+        (progn
+          (setf (ssh-session-kex-signature-pending session) t)
+          (ssh-agent-sign
+           (ssh-public-key-blob-of host-key)
+           hash
+           :path (ssh-server-host-key-agent (ssh-session-server session))
+           :flags (ssh-agent-host-key-signature-flags algorithm)
+           :on-signature
+           (lambda (signature)
+             (when (ssh-session-kex-signature-pending session)
+               (ssh-server-finish-kex session signature)))
+           :on-error
+           (lambda (condition)
+             (when (ssh-session-kex-signature-pending session)
+               (setf (ssh-session-kex-signature-pending session) nil)
+               (ssh-session-fail session condition)))))
+        (ssh-server-finish-kex
+         session
+         (ssh-server-host-key-signature host-key algorithm hash)))))
 
 (defun ssh-server-send-kex-reply (session server-public signature)
   "Send KEX_ECDH_REPLY: our host key, ephemeral key and signature."

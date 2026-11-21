@@ -75,7 +75,8 @@ prohibit-password and means the same thing.")
     "persourcepenalties" "persourcepenaltyexemptlist" "usedns"
     "verifyreversemapping" "reversemappingcheck" "useprivilegeseparation"
     "hostcertificate" "kexalgorithms" "versionaddendum" "fingerprinthash"
-    "securitykeyprovider" "ignoreuserknownhosts" "strictmodes")
+    "securitykeyprovider" "ignoreuserknownhosts" "strictmodes"
+    "hostkeyagent")
   "sshd_config keywords OpenSSH allows only outside a Match block.
 
 Inside a Match block sshd refuses one of these with \"Directive ... is not
@@ -137,7 +138,7 @@ socket address and has no routing domains.")
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
-  '("hostkeyagent"))
+  '())
 
 (defstruct (ssh-server-config (:constructor %make-ssh-server-config))
   (path nil)
@@ -148,6 +149,9 @@ socket address and has no routing domains.")
   (listen-addresses-from-command-line nil)
   (address-family nil)
   (host-key-files '())
+  ;; HostKeyAgent: an agent socket that signs for host keys whose private
+  ;; half is not on disk, or NIL.
+  (host-key-agent nil)
   ;; HostCertificate files, in the order read.  Each must certify one of
   ;; HostKey's public keys; sshd pairs them at startup and drops the rest.
   (host-certificate-files '())
@@ -821,6 +825,11 @@ cannot apply per connection."
        (push (ssh-config-expand-home
               (ssh-server-config-one-argument line))
              (ssh-server-config-host-key-files config)))
+      ((string= keyword "hostkeyagent")
+       (let ((value (ssh-server-config-one-argument line)))
+         (ssh-server-config-set-once
+          config 'host-key-agent
+          (if (string-equal value "none") nil value))))
       ((string= keyword "hostcertificate")
        (push (ssh-config-expand-home
               (ssh-server-config-one-argument line))

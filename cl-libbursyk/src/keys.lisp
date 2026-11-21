@@ -16,6 +16,12 @@
   ;; hands paths to libssh, so a parsed key is useful to it only with one.
   (path nil))
 
+(defstruct (ssh-agent-host-key (:constructor %make-ssh-agent-host-key))
+  "A host key whose private half lives in an ssh-agent."
+  (blob nil :type (or null ssh-octets))
+  (type nil :type (or null string))
+  (path nil))
+
 (defun ssh-read-octets-file (path)
   "PATH as octets, or signal."
   (with-open-file (stream path :direction :input
@@ -542,21 +548,23 @@ hold one key."
       (setf (ssh-private-key-path key) path)
       key)))
 
-(defun ssh-public-key-blob-of (private-key)
-  "The public key blob of PRIVATE-KEY."
-  (let ((type (ssh-private-key-type private-key)))
-    (ssh-make-public-key-blob
-     type
-     (if (and (> (length type) (length "ecdsa-sha2-"))
-              (string= "ecdsa-sha2-" type
-                       :end2 (length "ecdsa-sha2-")))
-         ;; An ECDSA public key is its curve name and point, both strings;
-         ;; the private key stores only the point.
-         (let ((writer (ssh-writer)))
-           (ssh-write-text writer (subseq type (length "ecdsa-sha2-")))
-           (ssh-write-string writer (ssh-private-key-public private-key))
-           (ssh-writer-output writer))
-         (ssh-private-key-public private-key)))))
+(defun ssh-public-key-blob-of (key)
+  "The public key blob of private KEY, or an agent-backed host key."
+  (if (ssh-agent-host-key-p key)
+      (ssh-agent-host-key-blob key)
+      (let ((type (ssh-private-key-type key)))
+        (ssh-make-public-key-blob
+         type
+         (if (and (> (length type) (length "ecdsa-sha2-"))
+                  (string= "ecdsa-sha2-" type
+                           :end2 (length "ecdsa-sha2-")))
+             ;; An ECDSA public key is its curve name and point, both strings;
+             ;; the private key stores only the point.
+             (let ((writer (ssh-writer)))
+               (ssh-write-text writer (subseq type (length "ecdsa-sha2-")))
+               (ssh-write-string writer (ssh-private-key-public key))
+               (ssh-writer-output writer))
+             (ssh-private-key-public key))))))
 
 ;;;; ---- OpenSSH certificates ----
 ;;;;

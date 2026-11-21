@@ -3883,3 +3883,108 @@ the application's trust hook."
                             nil :options '("HostbasedAuthentication no"))
                            t)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test server-host-key-list-falls-back-to-the-agent
+  "A HostKey whose private half is absent becomes an agent-backed key when
+HostKeyAgent is configured."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-hostkey"))
+             (key-path (merge-pathnames "host_key" directory)))
+        (ensure-directories-exist key-path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring key-path)))
+               (let* ((private (ssh-load-private-key key-path))
+                      (blob (ssh-public-key-blob-of private))
+                      (public-path (concatenate 'string
+                                                (namestring key-path) ".pub")))
+                 (ignore-errors (delete-file key-path))
+                 (let ((keys (cl-pnet-ssh::ssh-server-host-key-list
+                              (list key-path) "/tmp/agent.sock")))
+                   (is (= 1 (length keys)))
+                   (is (cl-pnet-ssh::ssh-agent-host-key-p (first keys)))
+                   (is (equalp blob
+                               (ssh-public-key-blob-of (first keys))))
+                   (is (equalp blob
+                               (cl-pnet-ssh::ssh-public-key-file-blob
+                                public-path))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test server-kex-signs-with-an-agent-host-key
+  "An agent-backed host key sends the exchange hash to the agent and finishes
+the KEX from its signature."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-kex"))
+             (key-path (merge-pathnames "host_key" directory))
+             (agent-path (namestring (merge-pathnames "agent.sock" directory))))
+        (ensure-directories-exist key-path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring key-path)))
+               (let* ((private (ssh-load-private-key key-path))
+                      (blob (ssh-public-key-blob-of private))
+                      (agent
+                        (fake-agent-open
+                         agent-path
+                         (lambda (payload)
+                           (let ((reader (ssh-make-reader payload)))
+                             (is (= (ssh-read-u8 reader)
+                                    cl-pnet-ssh::+ssh-agentc-sign-request+))
+                             (is (equalp blob (ssh-read-string reader)))
+                             (let* ((data (ssh-read-string reader))
+                                    (signature
+                                      (cl-pnet-ssh::ssh-ed25519-signature-blob
+                                       private data))
+                                    (writer (ssh-writer)))
+                               (ssh-write-u8
+                                writer cl-pnet-ssh::+ssh-agent-sign-response+)
+                               (ssh-write-string writer signature)
+                               (ssh-writer-output writer))))))
+                      (server
+                        (cl-pnet-ssh::%make-ssh-server
+                         :host-keys
+                         (list (cl-pnet-ssh::%make-ssh-agent-host-key
+                                :blob blob :type "ssh-ed25519"
+                                :path key-path))
+                         :host-key-agent agent-path))
+                      (session
+                        (cl-pnet-ssh::%make-ssh-session
+                         :server server
+                         :client-version "SSH-2.0-test-client"
+                         :server-version "SSH-2.0-test-server"
+                         :client-kexinit (make-array 1 :element-type
+                                                     '(unsigned-byte 8)
+                                                     :initial-element 0)
+                         :server-kexinit (make-array 1 :element-type
+                                                     '(unsigned-byte 8)
+                                                     :initial-element 0)
+                         :negotiated
+                         (list :kex "curve25519-sha256"
+                               :host-key "ssh-ed25519"
+                               :cipher-c2s "chacha20-poly1305@openssh.com"
+                               :cipher-s2c "chacha20-poly1305@openssh.com"
+                               :mac-c2s "hmac-sha2-256"
+                               :mac-s2c "hmac-sha2-256"
+                               :ext-info nil :strict nil)))
+                      (writer (ssh-writer)))
+                 (multiple-value-bind (client-private client-public)
+                     (ssh-curve25519-keypair)
+                   (declare (ignore client-private))
+                   (ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-kex-ecdh-init+)
+                   (ssh-write-string writer client-public))
+                 (cl-pnet-ssh::ssh-server-handle-kex-init
+                  session (ssh-writer-output writer))
+                 (is (cl-pnet-ssh::ssh-session-kex-signature-pending session))
+                 (loop repeat 10000
+                       until (cl-pnet-ssh::ssh-session-derived-keys session)
+                       do (cl-pnet:event-loop-run-once))
+                 (is (not (null (cl-pnet-ssh::ssh-session-derived-keys
+                                 session))))
+                 (is (not (cl-pnet-ssh::ssh-session-kex-signature-pending
+                           session)))
+                 (fake-agent-close agent)))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))

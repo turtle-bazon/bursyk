@@ -1079,6 +1079,7 @@ this program's error, because a configured list is meant exactly as written."
                         &key
                           host-key
                           host-certificate
+                          host-key-agent
                           authorized-keys
                           authorize
                           authorize-user
@@ -1162,6 +1163,7 @@ list, applied by the same inactivity accounting as the pure backend."
                   :address address
                   :port port
                   :host-keys keys
+                  :host-key-agent host-key-agent
                   :authorized-keys authorized-keys
                   :authorize authorize
                   :authorize-user authorize-user

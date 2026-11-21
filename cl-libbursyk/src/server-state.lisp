@@ -14,6 +14,9 @@
   (port 22)
   listener
   (host-keys nil)
+  ;; HostKeyAgent: the agent socket that signs for host keys whose private
+  ;; half is not on disk, or NIL.
+  (host-key-agent nil)
   ;; HostCertificate blobs paired with those keys.  A certificate is
   ;; presented instead of its plain key when the client selects a
   ;; certificate algorithm.
@@ -121,6 +124,10 @@ present after RequiredRSASize, for callers that only want to describe it."
   (ephemeral-private nil)
   (ephemeral-public nil)
   (host-key-blob nil)
+  ;; A KEX waiting for an agent-backed host key's signature.
+  (kex-shared nil)
+  (kex-hash nil)
+  (kex-signature-pending nil)
   (derived-keys nil)
   (strict-kex nil)
   (ignore-next-kex-packet nil)
@@ -407,7 +414,8 @@ server was built without a value."
   (unless (ssh-session-closed session)
     (setf (ssh-session-closed session) t
           (ssh-session-phase session) :closed
-          (ssh-session-close-reason session) reason)
+          (ssh-session-close-reason session) reason
+          (ssh-session-kex-signature-pending session) nil)
     (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
     (ssh-session-terminate-channels session reason kind)

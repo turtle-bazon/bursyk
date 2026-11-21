@@ -2922,10 +2922,11 @@ GSSAPIDelegateCredentials no
 AgentSocketPath /run/agent.sock
 WarnWeakCrypto no")))
     (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
-  ;; A host-key agent would change which keys are presented, so it is
-  ;; refused rather than ignored.
-  (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "HostKeyAgent /run/agent.sock")))
+  ;; HostKeyAgent is implemented, not ignored.
+  (is (equal "/run/agent.sock"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-host-key-agent
+              "HostKeyAgent /run/agent.sock"))))
 
 (test sshd-config-reads-pubkey-auth-options
   "PubkeyAuthOptions keeps the first line's flags and probe budget."
@@ -3320,3 +3321,17 @@ Match User alice
            (is (not (bursyk-server::hostbased-known-host-p
                      session "client.example" other))))
       (ignore-errors (delete-file path)))))
+
+(test sshd-config-reads-host-key-agent
+  "HostKeyAgent names an agent socket, none clears it, and it is global-only."
+  (is (equal "/run/agent.sock"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-host-key-agent
+              "HostKeyAgent /run/agent.sock")))
+  (is (null
+       (config-value
+        #'cl-pnet-ssh:ssh-server-config-host-key-agent
+        "HostKeyAgent none")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match User alice
+  HostKeyAgent /run/agent.sock")))

@@ -100,6 +100,12 @@ with SSH-CONCAT around it would hand the peer the text itself as a length."
 
 ;;; ---- Host key selection ----
 
+(defun ssh-host-key-type (key)
+  "The key type of a private or agent-backed host KEY."
+  (if (ssh-agent-host-key-p key)
+      (ssh-agent-host-key-type key)
+      (ssh-private-key-type key)))
+
 (defun ssh-host-certificate-algorithm-p (algorithm)
   "Whether ALGORITHM names a certificate host key this build can present.
 
@@ -155,7 +161,7 @@ algorithm needs it; a plain algorithm never uses it."
              (ssh-certificate-host-key-algorithm-p certificate algorithm)
              (ssh-octets= (ssh-certificate-plain-blob certificate)
                           (ssh-public-key-blob-of key))))
-      (let ((type (ssh-private-key-type key)))
+      (let ((type (ssh-host-key-type key)))
         (and type
              (cond
                ((string= algorithm "ssh-ed25519")
@@ -205,12 +211,24 @@ key otherwise.  Both are what the exchange hash and KEX_ECDH_REPLY carry."
         (return-from ssh-server-host-key-presentation
           (values key (or certificate (ssh-public-key-blob-of key))))))))
 
+(defun ssh-agent-host-key-signature-flags (algorithm)
+  "The agent sign-request flags selecting ALGORITHM's RSA digest."
+  (let ((plain (or (ssh-host-certificate-signature-algorithm algorithm)
+                   algorithm)))
+    (cond ((string= plain "rsa-sha2-512") 4)
+          ((string= plain "rsa-sha2-256") 2)
+          (t 0))))
+
 (defun ssh-server-host-key-signature (key algorithm message)
   "A signature blob of MESSAGE under host KEY for negotiated ALGORITHM.
 
 RSA is the one type whose wire signature name differs from the key type:
 rsa-sha2-512 and rsa-sha2-256 select the digest while the key stays ssh-rsa.
-A certificate algorithm signs with the plain algorithm under the same name."
+A certificate algorithm signs with the plain algorithm under the same name.
+An agent-backed key cannot sign synchronously; the KEX path asks the agent."
+  (when (ssh-agent-host-key-p key)
+    (error 'ssh-protocol-error
+           :detail "agent-backed host key needs an asynchronous signature"))
   (let* ((algorithm (or (ssh-host-certificate-signature-algorithm algorithm)
                         algorithm))
          (digest (ssh-rsa-digest-keyword algorithm)))
