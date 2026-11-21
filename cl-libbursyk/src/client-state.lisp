@@ -54,6 +54,9 @@
   ;; PubkeyAcceptedAlgorithms: key types that may authenticate.  NIL offers
   ;; every signer; a list of patterns filters them before the first request.
   (pubkey-accepted-algorithms nil)
+  ;; CASignatureAlgorithms: signature algorithms a host certificate's CA may
+  ;; use.  NIL means this build's default, which excludes SHA-1 ssh-rsa.
+  (ca-signature-algorithms nil)
   ;; RequiredRSASize: the smallest RSA modulus accepted in a host key or an
   ;; authentication key, as ssh's RequiredRSASize directive sets it.
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

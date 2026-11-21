@@ -1989,6 +1989,14 @@ peer that connected to it; NIL refuses the channel."
     (format t "requiredrsasize ~D~%"
             (or (cl-pnet-ssh:ssh-config-options-required-rsa-size options)
                 cl-pnet-ssh::+ssh-rsa-minimum-modulus-size+))
+    (format t "casignaturealgorithms ~{~A~^,~}~%"
+            (or (cl-pnet-ssh::ssh-config-client-algorithms
+                 options
+                 #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms
+                 cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+                 "CASignatureAlgorithms"
+                 :all cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+)
+                cl-pnet-ssh::+ssh-server-ca-signature-algorithms+))
     (format t "streamlocalbindunlink ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
                  options)

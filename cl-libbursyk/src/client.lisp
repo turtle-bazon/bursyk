@@ -170,6 +170,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                                on-forwarded-streamlocal
                                &key kex-algorithms host-key-algorithms
                                  ciphers macs pubkey-accepted-algorithms
+                                 ca-signature-algorithms
                                  (required-rsa-size
                                   +ssh-rsa-minimum-modulus-size+))
   "The CLIENT structure, before any connection exists."
@@ -190,6 +191,7 @@ A ProxyCommand needs none of that: the helper is what reaches the server."
                     :ciphers ciphers
                     :macs macs
                     :pubkey-accepted-algorithms pubkey-accepted-algorithms
+                    :ca-signature-algorithms ca-signature-algorithms
                     :required-rsa-size required-rsa-size
                     :on-open on-open
                     :on-error on-error
@@ -249,6 +251,7 @@ is applied here, before any request names a key the configuration forbade."
                              proxy-command
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
+                             ca-signature-algorithms
                              (required-rsa-size
                               +ssh-rsa-minimum-modulus-size+)
                              on-open on-error on-close on-forwarded-tcpip
@@ -306,6 +309,7 @@ role-neutral."
                            :macs macs
                            :pubkey-accepted-algorithms
                            pubkey-accepted-algorithms
+                           :ca-signature-algorithms ca-signature-algorithms
                            :required-rsa-size required-rsa-size)
    private-key agent passphrase))
 

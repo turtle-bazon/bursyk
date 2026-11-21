@@ -2706,6 +2706,32 @@ newline")))
                    "127.0.0.1:18083 127.0.0.1:22")
                  (reverse (ssh-config-options-local-forwards more)))))))
 
+(test ca-signature-algorithms-parses
+  (flet ((parameters (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (cl-pnet-ssh::ssh-config-client-parameters "alias" options))))
+    ;; Unset leaves the build's default, which excludes SHA-1 ssh-rsa.
+    (is (null (getf (parameters "Port 22") :ca-signature-algorithms)))
+    (is (equal '("ssh-ed25519")
+               (getf (parameters "CASignatureAlgorithms ssh-ed25519")
+                     :ca-signature-algorithms)))
+    ;; ssh-rsa is not in the default but may be opted into, by prefix or
+    ;; by naming it alone.
+    (is (member "ssh-rsa"
+                (getf (parameters "CASignatureAlgorithms +ssh-rsa")
+                      :ca-signature-algorithms)
+                :test #'string=))
+    (is (equal '("ssh-rsa")
+               (getf (parameters "CASignatureAlgorithms ssh-rsa")
+                     :ca-signature-algorithms)))))
+
 (test required-rsa-size-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
@@ -3873,6 +3899,56 @@ too, and a refused policy never calls it."
     (is (= 0 (ssh-read-u32 reader)))
     ;; Nothing is sent before the transport is ready.
     (is (eq :connecting (cl-pnet-ssh:ssh-client-phase client)))))
+
+(test client-host-certificate-obeys-ca-signature-algorithms
+  "A host certificate is trusted only when its CA signature algorithm is
+allowed by CASignatureAlgorithms."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-caalg"))
+             (ca (merge-pathnames "ca" directory))
+             (host-key (merge-pathnames "host_key" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring host-key)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "host-id" "-h"
+                      "-n" "example.org" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "host_key.pub" directory))))
+               (with-open-file (out known-hosts :direction :output
+                                               :if-exists :supersede
+                                               :if-does-not-exist :create)
+                 (with-open-file (in (merge-pathnames "ca.pub" directory))
+                   (format out "@cert-authority example.org ~A~%"
+                           (string-trim '(#\Space #\Return #\Newline)
+                                        (read-line in)))))
+               (let* ((certificate
+                        (ssh-certificate-parse
+                         (cl-pnet-ssh::ssh-public-key-file-blob
+                          (merge-pathnames "host_key-cert.pub" directory))))
+                      (client
+                        (cl-pnet-ssh::%make-ssh-client
+                         :host "example.org"
+                         :host-key-host "example.org"
+                         :known-hosts (list known-hosts)
+                         :host-key-policy :strict)))
+                 (is (cl-pnet-ssh::ssh-client-host-certificate-trusted-p
+                      client certificate))
+                 ;; The certificate's CA signed it with ed25519.
+                 (setf (cl-pnet-ssh::ssh-client-ca-signature-algorithms client)
+                       '("rsa-sha2-512"))
+                 (is (not (cl-pnet-ssh::ssh-client-host-certificate-trusted-p
+                           client certificate)))
+                 (setf (cl-pnet-ssh::ssh-client-ca-signature-algorithms client)
+                       '("ssh-ed25519"))
+                 (is (cl-pnet-ssh::ssh-client-host-certificate-trusted-p
+                      client certificate))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test client-keys-obey-required-rsa-size
   "RequiredRSASize rejects small RSA host keys and authentication keys."

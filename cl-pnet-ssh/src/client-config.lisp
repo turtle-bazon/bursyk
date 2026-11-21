@@ -98,14 +98,16 @@ mean the feature is off to MAKE-SSH-CLIENT."
   "VALUE as a non-negative count, or NIL when it was not configured."
   (and (integerp value) value))
 
-(defun ssh-config-client-algorithms (options accessor supported option)
+(defun ssh-config-client-algorithms (options accessor supported option
+                                     &key (all supported))
   "OPTIONS' algorithm choice as this build's ordered offer, or NIL for default.
 
 Turning it into a list here means an algorithm this build lacks stops the
-client instead of quietly widening what it offers."
+client instead of quietly widening what it offers.  ALL is the set a pattern
+may name when that differs from the default offer."
   (let ((names (funcall accessor options)))
     (when names
-      (ssh-resolve-algorithm-list names supported option))))
+      (ssh-resolve-algorithm-list names supported option :all all))))
 
 (defun ssh-config-client-parameters (host options
                                      &key user port private-key agent passphrase
@@ -145,6 +147,11 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-client-algorithms
          options #'ssh-config-options-pubkey-accepted-algorithms
          +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms")
+        :ca-signature-algorithms
+        (ssh-config-client-algorithms
+         options #'ssh-config-options-ca-signature-algorithms
+         +ssh-server-ca-signature-algorithms+ "CASignatureAlgorithms"
+         :all +ssh-server-ca-signature-algorithm-names+)
         :required-rsa-size
         (or (ssh-config-options-required-rsa-size options)
             +ssh-rsa-minimum-modulus-size+)
@@ -423,6 +430,7 @@ uses whichever of the two it saw first instead of chaining them."
            :macs (getf parameters :macs)
            :pubkey-accepted-algorithms
            (getf parameters :pubkey-accepted-algorithms)
+           :ca-signature-algorithms (getf parameters :ca-signature-algorithms)
            :required-rsa-size (getf parameters :required-rsa-size)
            :connect-timeout (getf parameters :connect-timeout)
            :server-alive-interval (getf parameters :server-alive-interval)

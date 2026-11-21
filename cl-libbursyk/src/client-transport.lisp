@@ -309,7 +309,8 @@ uses."
          (<= (ssh-certificate-valid-after certificate) now)
          (< now (ssh-certificate-valid-before certificate))
          (ssh-certificate-signature-valid-p certificate)
-         (ssh-certificate-signature-algorithm-allowed-p certificate nil)
+         (ssh-certificate-signature-algorithm-allowed-p
+          certificate (ssh-client-ca-signature-algorithms client))
          (or (null (ssh-certificate-principals certificate))
              (member name (ssh-certificate-principals certificate)
                      :test #'string=)))))

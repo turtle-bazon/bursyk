@@ -53,6 +53,9 @@ relative Include is anchored here.")
   (strict-host-key-checking nil)
   (host-key-algorithms nil)
   (pubkey-accepted-algorithms nil)
+  ;; CASignatureAlgorithms: signature algorithms a certificate authority may
+  ;; use; SHA-1 ssh-rsa is not in the default list.
+  (ca-signature-algorithms nil)
   (kex-algorithms nil)
   (ciphers nil)
   (macs nil)
@@ -847,6 +850,12 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-host-key-algorithms options)
                 (ssh-config-split-list (ssh-config-arg line))))))
+      ((string= keyword "casignaturealgorithms")
+       (ssh-config-set-once
+        seen options :ca-signature-algorithms
+        (lambda (options)
+          (setf (ssh-config-options-ca-signature-algorithms options)
+                (ssh-config-split-list (ssh-config-arg line))))))
       ((member keyword '("pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes")
                :test #'string=)
        (ssh-config-set-once
@@ -983,7 +992,7 @@ understand them rather than silently match nothing."
        (ssh-config-apply-policy line options seen context))
       ((member keyword '("ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
                          "pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes"
-                         "compression" "rekeylimit")
+                         "casignaturealgorithms" "compression" "rekeylimit")
                :test #'string=)
        (ssh-config-apply-algorithms line options seen))
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
