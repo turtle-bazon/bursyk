@@ -64,7 +64,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.22"
+(defparameter +bursyk-server-version+ "0.0.2.23"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1324,59 +1324,68 @@ string that names no substitution."
   "The lines AuthorizedPrincipalsCommand prints for CERTIFICATE, or NIL.
 
 The command is run as COMMAND-USER, which this build can only do when that
-is the account running the server: there is no privilege separation to switch
-users.  A command that cannot run is logged and authorizes nothing."
-  (let* ((arguments (split-command-arguments command))
-         (ca (cl-pnet-ssh:ssh-certificate-signature-key certificate))
-         (substitutions
-           (list
-            (cons #\% "%")
-            (cons #\U (or uid ""))
-            (cons #\u user)
-            (cons #\h (or home ""))
-            (cons #\t (cl-pnet-ssh:ssh-certificate-key-type certificate))
-            (cons #\T (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts ca)))
-            (cons #\f (cl-pnet-ssh:ssh-key-fingerprint key-blob))
-            (cons #\F (cl-pnet-ssh:ssh-key-fingerprint ca))
-            (cons #\k (cl-pnet-ssh:ssh-octets-base64 key-blob))
-            (cons #\K (cl-pnet-ssh:ssh-octets-base64 ca))
-            (cons #\i (cl-pnet-ssh:ssh-certificate-key-id certificate))
-            (cons #\s (format nil "~D"
-                              (cl-pnet-ssh:ssh-certificate-serial
-                               certificate))))
-           ))
-    (unless (and arguments (plusp (length arguments)))
+is the account running the server: there is no privilege separation to
+switch users.  sshd requires the user whenever the command is set, and a
+command that cannot run authorizes nothing."
+  (let ((arguments
+          (handler-case (split-command-arguments command)
+            (error (condition)
+              (log-at :error
+                      "AuthorizedPrincipalsCommand is not a valid command: ~A"
+                      condition)
+              (return-from authorized-principals-command-lines nil)))))
+    (unless (plusp (length arguments))
       (log-at :error "AuthorizedPrincipalsCommand names no program")
       (return-from authorized-principals-command-lines nil))
-    (when (and command-user
-               (not (string= (expand-command-tokens command-user
-                                                    (list (cons #\u user)))
-                             (current-user-name))))
+    (unless command-user
+      (log-at :error
+              "No user for AuthorizedPrincipalsCommand specified, skipping")
+      (return-from authorized-principals-command-lines nil))
+    (unless (string= (expand-command-tokens command-user
+                                            (list (cons #\u user)))
+                     (current-user-name))
       (log-at :error
               "AuthorizedPrincipalsCommandUser ~A is not supported: this server cannot switch users"
               command-user)
       (return-from authorized-principals-command-lines nil))
-    (handler-case
-        (multiple-value-bind (output error-output status)
-            (uiop:run-program
-             (cons (first arguments)
-                   (mapcar (lambda (argument)
-                             (expand-command-tokens argument substitutions))
-                           (rest arguments)))
-             :output :string
-             :error-output :string
-             :ignore-error-status t)
-          (declare (ignore error-output))
-          (if (zerop status)
-              (uiop:split-string output :separator '(#\Newline))
-              (progn
-                (log-at :error
-                        "AuthorizedPrincipalsCommand exited with status ~D"
-                        status)
-                nil)))
-      (error (condition)
-        (log-at :error "AuthorizedPrincipalsCommand failed: ~A" condition)
-        nil))))
+    (let* ((ca (cl-pnet-ssh:ssh-certificate-signature-key certificate))
+           (substitutions
+             (list
+              (cons #\% "%")
+              (cons #\U (or uid ""))
+              (cons #\u user)
+              (cons #\h (or home ""))
+              (cons #\t (cl-pnet-ssh:ssh-certificate-key-type certificate))
+              (cons #\T (nth-value 0 (cl-pnet-ssh:ssh-public-key-parts ca)))
+              (cons #\f (cl-pnet-ssh:ssh-key-fingerprint key-blob))
+              (cons #\F (cl-pnet-ssh:ssh-key-fingerprint ca))
+              (cons #\k (cl-pnet-ssh:ssh-octets-base64 key-blob))
+              (cons #\K (cl-pnet-ssh:ssh-octets-base64 ca))
+              (cons #\i (cl-pnet-ssh:ssh-certificate-key-id certificate))
+              (cons #\s (format nil "~D"
+                                (cl-pnet-ssh:ssh-certificate-serial
+                                 certificate))))))
+      (handler-case
+          (multiple-value-bind (output error-output status)
+              (uiop:run-program
+               (cons (first arguments)
+                     (mapcar (lambda (argument)
+                               (expand-command-tokens argument substitutions))
+                             (rest arguments)))
+               :output :string
+               :error-output :string
+               :ignore-error-status t)
+            (declare (ignore error-output))
+            (if (zerop status)
+                (uiop:split-string output :separator '(#\Newline))
+                (progn
+                  (log-at :error
+                          "AuthorizedPrincipalsCommand exited with status ~D"
+                          status)
+                  nil)))
+        (error (condition)
+          (log-at :error "AuthorizedPrincipalsCommand failed: ~A" condition)
+          nil)))))
 
 (defun authorized-keys-command-lines
     (command command-user user home uid key-blob)

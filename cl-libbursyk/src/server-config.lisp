@@ -825,6 +825,12 @@ cannot apply per connection."
          (when (zerop (length value))
            (ssh-server-config-line-error
             line "AuthorizedPrincipalsCommand needs a command"))
+         ;; sshd's parse_command, shared with AuthorizedKeysCommand: the
+         ;; program must be an absolute path, or the word "none".
+         (unless (or (char= (char value 0) #\/)
+                     (string-equal value "none"))
+           (ssh-server-config-line-error
+            line "AuthorizedPrincipalsCommand must be an absolute path"))
          (ssh-server-config-set-once
           config 'authorized-principals-command value)))
       ((string= keyword "authorizedprincipalscommanduser")
@@ -1355,20 +1361,33 @@ take precedence over it, exactly as sshd's -o does."
     (reverse-slot ssh-server-config-warnings))
   config)
 
-(defun ssh-server-config-check-authorized-keys-command (config)
-  "Refuse AuthorizedKeysCommand without AuthorizedKeysCommandUser.
+(defun ssh-server-config-check-command-users (config)
+  "Refuse an authorization command without its user.
 
-This is sshd's startup check.  A Match block can still set the command and
+This is sshd's startup check for AuthorizedKeysCommand and
+AuthorizedPrincipalsCommand.  A Match block can still set the command and
 inherit a user from the global section, so the check is made on the global
-config once it has been read rather than per line."
-  (let ((command (ssh-server-config-authorized-keys-command config)))
-    (when (and command
-               (not (eq command :none))
+config once it has been read rather than per line.  \"none\" disables a
+command and needs no user, as sshd's check allows."
+  (let ((keys-command (ssh-server-config-authorized-keys-command config))
+        (principals-command
+          (ssh-server-config-authorized-principals-command config))
+        (path (and (ssh-server-config-path config)
+                   (namestring (ssh-server-config-path config)))))
+    (when (and keys-command
+               (not (eq keys-command :none))
                (null (ssh-server-config-authorized-keys-command-user config)))
       (error 'ssh-server-config-error
-             :path (and (ssh-server-config-path config)
-                        (namestring (ssh-server-config-path config)))
-             :detail "AuthorizedKeysCommand set without AuthorizedKeysCommandUser"))))
+             :path path
+             :detail "AuthorizedKeysCommand set without AuthorizedKeysCommandUser"))
+    (when (and principals-command
+               (not (string-equal principals-command "none"))
+               (null (ssh-server-config-authorized-principals-command-user
+                      config)))
+      (error 'ssh-server-config-error
+             :path path
+             :detail
+             "AuthorizedPrincipalsCommand set without AuthorizedPrincipalsCommandUser"))))
 
 (defun ssh-server-config-load (path &key options)
   "Parse the sshd_config at PATH into an SSH-SERVER-CONFIG.
@@ -1387,5 +1406,5 @@ error: the caller decides whether a default file is optional."
                :detail "cannot read the server config"))
       (ssh-server-config-read-file config path 0))
     (ssh-server-config-finalize config)
-    (ssh-server-config-check-authorized-keys-command config)
+    (ssh-server-config-check-command-users config)
     config))

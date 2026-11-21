@@ -2438,6 +2438,34 @@ Match User bob
     (is (eq :none
             (cl-pnet-ssh:ssh-server-config-authorized-keys-command bob)))))
 
+(test sshd-config-reads-authorizedprincipalscommand
+  "The principals command keeps its arguments, needs an absolute program and
+a user, and may be disabled with none."
+  (is (equal "/usr/local/bin/find-principals %u"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authorized-principals-command
+              "AuthorizedPrincipalsCommand /usr/local/bin/find-principals %u
+AuthorizedPrincipalsCommandUser keys")))
+  (is (equal "keys"
+             (config-value
+              #'cl-pnet-ssh:ssh-server-config-authorized-principals-command-user
+              "AuthorizedPrincipalsCommand /usr/local/bin/find-principals
+AuthorizedPrincipalsCommandUser keys")))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text
+     "AuthorizedPrincipalsCommand find-principals
+AuthorizedPrincipalsCommandUser keys"))
+  ;; sshd's startup check refuses a command with no account to run it as,
+  ;; but "none" needs none.
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AuthorizedPrincipalsCommand /usr/local/bin/find-principals"))
+  (is (not (null (config-from-text "AuthorizedPrincipalsCommand none"))))
+  ;; A command only inside a Match block does not fail the global startup
+  ;; check; it authorizes nothing at connection time until a user is set.
+  (is (not (null (config-from-text
+                  "Match User alice
+  AuthorizedPrincipalsCommand /usr/local/bin/find-principals")))))
+
 #-win32
 (defun authorized-keys-command-temp-path (prefix)
   "An unused path under the temporary directory."
@@ -2709,3 +2737,75 @@ SetEnv SSH_USER_AUTH=/wrong"))
                    :server server :user "alice" :authorized-key key)))
     (is (null (bursyk-server::write-auth-info-file session)))
     (is (null (bursyk-server::auth-info-file session)))))
+
+;;; ---- AuthorizedPrincipalsCommand ----
+
+#-win32
+(test authorized-principals-command-requires-a-user
+  "Without AuthorizedPrincipalsCommandUser nothing runs, and another account
+is refused because this server cannot switch users."
+  (let* ((user (bursyk-server::current-user-name))
+         (marker (authorized-keys-command-temp-path "principals-ran"))
+         (script (authorized-keys-command-script
+                  (format nil "printf ran > ~A; printf 'turtle\\n'"
+                          (namestring marker)))))
+    (unwind-protect
+         (progn
+           (is (null (bursyk-server::authorized-principals-command-lines
+                      (namestring script) nil user nil nil nil nil)))
+           (is (not (probe-file marker)))
+           (is (null (bursyk-server::authorized-principals-command-lines
+                      (namestring script) "not-the-server-account"
+                      user nil nil nil nil)))
+           (is (not (probe-file marker)))
+           ;; Invalid quotes are refused rather than signalling into auth.
+           (is (null (bursyk-server::authorized-principals-command-lines
+                      "\"unclosed" user user nil nil nil nil)))
+           (is (not (probe-file marker))))
+      (ignore-errors (delete-file script))
+      (ignore-errors (delete-file marker)))))
+
+#-win32
+(test authorized-principals-command-prints-principals
+  "The command runs as the server's account and its output is the principal
+list; its arguments expand the certificate's tokens."
+  (if (not (certificate-test-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory
+               (certificate-test-directory "bursyk-principals-command"))
+             (ca (merge-pathnames "ca" directory))
+             (user-key (merge-pathnames "user" directory))
+             (args (authorized-keys-command-temp-path "principals-args")))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring ca))
+               (certificate-test-keygen "-q" "-t" "ed25519" "-N" ""
+                                        "-f" (namestring user-key))
+               (certificate-test-keygen
+                "-q" "-s" (namestring ca) "-I" "principals-id"
+                "-n" "turtle" "-V" "-1m:+52w"
+                (namestring (merge-pathnames "user.pub" directory)))
+               (let* ((cert-blob
+                        (certificate-test-key-blob
+                         (merge-pathnames "user-cert.pub" directory)))
+                      (certificate (cl-pnet-ssh:ssh-certificate-parse cert-blob))
+                      (script
+                        (authorized-keys-command-script
+                         (format nil
+                                 "printf '%s\\n' \"$@\" > ~A; printf 'turtle\\n'"
+                                 (namestring args))))
+                      (server-user (bursyk-server::current-user-name)))
+                 ;; The trailing newline leaves an empty last line, which
+                 ;; the principals matcher ignores like any blank line.
+                 (is (equal '("turtle" "")
+                            (bursyk-server::authorized-principals-command-lines
+                             (format nil "~A %u %i" (namestring script))
+                             server-user "turtle" nil nil
+                             cert-blob certificate)))
+                 (is (equal (list "turtle" "principals-id")
+                            (uiop:read-file-lines args)))))
+          (ignore-errors (delete-file args))
+          (ignore-errors
+           (uiop:delete-directory-tree directory :validate t))))))
