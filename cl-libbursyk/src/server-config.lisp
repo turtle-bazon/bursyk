@@ -689,7 +689,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     force-command chroot-directory banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
-    authentication-methods subsystems
+    authentication-methods subsystems log-level
     gateway-ports allow-tcp-forwarding disable-forwarding set-env
     expose-auth-info refuse-connection
     unused-connection-timeout channel-timeouts
@@ -781,10 +781,7 @@ cannot apply per connection."
       (when (member keyword +ssh-server-config-global-only-keywords+
                     :test #'string=)
         (ssh-server-config-line-error
-         line "~A is not allowed within a Match block" keyword))
-      (when (string= keyword "loglevel")
-        (ssh-server-config-line-error
-         line "LogLevel is not allowed within a Match block by this server; per-connection logging is not implemented")))
+         line "~A is not allowed within a Match block" keyword)))
     (cond
       ;; ---- where to listen ----
       ((string= keyword "port")

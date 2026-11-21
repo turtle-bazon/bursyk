@@ -103,12 +103,13 @@ and NIL while the line is still incomplete."
 (defun ssh-server-receive (session data)
   "The event loop has DATA for SESSION, or NIL at the end of the connection."
   (unless (ssh-session-closed-p session)
-    (if (null data)
-        (ssh-session-finish session :peer-closed :close)
-        (progn
-          (ssh-session-note-input session)
-          (ssh-session-buffer-append session data)
-          (ssh-server-advance session)))))
+    (let ((*ssh-log-enabled* (ssh-session-log-enabled-p session)))
+      (if (null data)
+          (ssh-session-finish session :peer-closed :close)
+          (progn
+            (ssh-session-note-input session)
+            (ssh-session-buffer-append session data)
+            (ssh-server-advance session))))))
 
 (defun ssh-server-handle-payload (session payload)
   "Dispatch one decrypted protocol message."

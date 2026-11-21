@@ -1188,6 +1188,17 @@ method lists, each in the order it must be completed."
     (declare (ignore data))
     (format nil "publickey ~A ~A" type (ssh-octets-base64 key-blob))))
 
+(defun ssh-session-log-enabled-p (session)
+  "Whether SESSION's effective LogLevel asks for protocol detail.
+
+sshd's VERBOSE level does not include DEBUG, so only DEBUG and above let the
+library's milestones through.  With no configured level the application's
+own global setting decides."
+  (let ((level (ssh-session-setting session
+                                   #'ssh-server-config-log-level)))
+    (or (null level)
+        (member level '(:debug :debug1 :debug2 :debug3) :test #'eq))))
+
 (defun ssh-session-resolve-config (session user)
   "Resolve SESSION's Match blocks for USER and remember the result.
 

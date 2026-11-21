@@ -66,7 +66,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.31"
+(defparameter +bursyk-server-version+ "0.0.2.32"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -259,6 +259,19 @@ SESSION means there is no connection yet and the startup config is meant."
   (if session
       (cl-pnet-ssh:ssh-session-effective-config session)
       *server-config*))
+
+(defun session-log-level (session)
+  "SESSION's Match-resolved LogLevel, or the program's global level."
+  (or (session-config-setting
+       session #'cl-pnet-ssh:ssh-server-config-log-level)
+      *log-level*))
+
+(defun log-at-session (session level control &rest arguments)
+  "LOG-AT with SESSION's LogLevel, for connection-scoped messages."
+  (let ((*log-level* (session-log-level session)))
+    (when (log-allowed-p level)
+      (format *error-output* "bursyk-server: ~?~%" control arguments)
+      (finish-output *error-output*))))
 
 (defun config-file-path ()
   "The sshd_config to read, or NIL for none.
@@ -521,13 +534,13 @@ client can half-close its target, and the reply can still come back."
 (defun start-remote-forward (session bind-address bind-port)
   "Listener for a client's tcpip-forward request; returns the bound port."
   (unless (remote-forwarding-allowed-p session)
-    (log-at :error "remote forwarding refused by policy")
+    (log-at-session session :error "remote forwarding refused by policy")
     (return-from start-remote-forward nil))
   (let ((address (remote-bind-address session bind-address)))
     (unless address
-      (log-at :error
-              "refusing a remote forward bound to ~A; set GatewayPorts to allow it"
-              bind-address)
+      (log-at-session session :error
+                      "refusing a remote forward bound to ~A; set GatewayPorts to allow it"
+                      bind-address)
       (return-from start-remote-forward nil))
     (let* ((forward (%make-remote-forward
                      :session session
@@ -546,8 +559,9 @@ client can half-close its target, and the reply can still come back."
                               (remote-forward-close forward)))
                (error () nil))))
       (unless listener
-        (log-at :error "remote forward could not listen on ~A:~D"
-                address bind-port)
+        (log-at-session session :error
+                        "remote forward could not listen on ~A:~D"
+                        address bind-port)
         (return-from start-remote-forward nil))
       (setf (remote-forward-bind-port forward)
             (or (cl-pnet:listener-port listener) bind-port)
@@ -1943,10 +1957,11 @@ guess, so only an explicit PidFile is written."
            :accept-env (accept-env-names)
            :on-channel #'install-channel-handlers
            :on-session (lambda (session)
-                         (log-at :info "accepted ~A from ~A"
-                                 (cl-pnet-ssh:ssh-session-user session)
-                                 (cl-pnet-ssh:ssh-session-remote-address
-                                  session))
+                         (log-at-session
+                          session :info "accepted ~A from ~A"
+                          (cl-pnet-ssh:ssh-session-user session)
+                          (cl-pnet-ssh:ssh-session-remote-address
+                           session))
                          ;; sshd writes this once authentication succeeds,
                          ;; before any channel can run.
                          (write-auth-info-file session))
@@ -1954,8 +1969,9 @@ guess, so only an explicit PidFile is written."
            (lambda (session host port origin origin-port)
              (declare (ignore origin origin-port))
              (let ((allowed (tcpip-allowed-p session host port)))
-               (log-at :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
-                       host port allowed)
+               (log-at-session
+                session :verbose "direct-tcpip to ~A:~D: ~:[refused~;allowed~]"
+                host port allowed)
                allowed))
            ;; The libssh backend has no forwarded-tcpip channels yet, so it
            ;; must not be handed these hooks: its MAKE-SSH-SERVER does not
@@ -1972,16 +1988,19 @@ guess, so only an explicit PidFile is written."
            (lambda (session bind-address bind-port)
              (cancel-remote-forward session bind-address bind-port))
            :on-close (lambda (session reason)
-                       (log-at :info "closed session for ~A: ~A"
-                               (cl-pnet-ssh:ssh-session-user session)
-                               (close-reason-text reason))
+                       (log-at-session
+                        session :info "closed session for ~A: ~A"
+                        (cl-pnet-ssh:ssh-session-user session)
+                        (close-reason-text reason))
                        (delete-auth-info-file session)
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session
                          (delete-auth-info-file session)
                          (close-remote-forwards session))
-                       (log-at :error "~A" condition))))
+                       (if session
+                           (log-at-session session :error "~A" condition)
+                           (log-at :error "~A" condition)))))
     (log-at :info "listening on ~A:~D"
             (cl-pnet-ssh:ssh-server-address *server*)
             (cl-pnet-ssh:ssh-server-port *server*))

@@ -15,6 +15,7 @@
    #:ssh-client-banner
    #:ssh-client-connect-host
    #:*ssh-log-function*
+   #:*ssh-log-enabled*
    #:ssh-log
    ;; channels
    #:ssh-open-session

@@ -9,8 +9,12 @@
 (defvar *ssh-log-function* nil
   "A function of one string, called at connection milestones, or NIL.")
 
+(defvar *ssh-log-enabled* t
+  "Whether SSH-LOG may report; a server binds this per connection so a
+Match LogLevel can suppress protocol detail without changing the reporter.")
+
 (defun ssh-log (format-string &rest arguments)
   "Report a protocol milestone through *SSH-LOG-FUNCTION*, if one is bound."
-  (when *ssh-log-function*
+  (when (and *ssh-log-enabled* *ssh-log-function*)
     (ignore-errors
       (funcall *ssh-log-function* (apply #'format nil format-string arguments)))))

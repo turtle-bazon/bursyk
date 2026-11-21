@@ -772,9 +772,18 @@ Match LocalPort 2222
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User alice
  Port 2200"))
-  (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "Match User alice
- LogLevel DEBUG"))
+  ;; 10.6 allows LogLevel in Match; the connection's level overrides the
+  ;; global one for messages about that connection.
+  (let* ((config (config-from-text
+                  "LogLevel INFO
+Match User alice
+  LogLevel DEBUG"))
+         (alice (cl-pnet-ssh:ssh-server-config-for-connection
+                 config :user "alice"))
+         (bob (cl-pnet-ssh:ssh-server-config-for-connection
+               config :user "bob")))
+    (is (eq :debug (cl-pnet-ssh:ssh-server-config-log-level alice)))
+    (is (eq :info (cl-pnet-ssh:ssh-server-config-log-level bob))))
   ;; PermitUserEnvironment is global-only in OpenSSH 9.2 as well.
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User alice
@@ -3121,3 +3130,30 @@ Match User alice
           (fd-close status))))
   #-sbcl
   (skip "sb-posix is needed to tell whether this test can chroot"))
+
+(test match-loglevel-controls-session-messages
+  "A Match LogLevel filters this server's connection messages and the
+library's protocol milestones."
+  (let* ((config (config-from-text
+                  "LogLevel ERROR
+Match User alice
+  LogLevel DEBUG"))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+         (alice (cl-pnet-ssh::%make-ssh-session
+                 :server server :user "alice"))
+         (bob (cl-pnet-ssh::%make-ssh-session
+               :server server :user "bob")))
+    (cl-pnet-ssh:ssh-session-resolve-config alice "alice")
+    (cl-pnet-ssh:ssh-session-resolve-config bob "bob")
+    (is (eq :debug (bursyk-server::session-log-level alice)))
+    (is (eq :error (bursyk-server::session-log-level bob)))
+    (is (not (null (cl-pnet-ssh::ssh-session-log-enabled-p alice))))
+    (is (null (cl-pnet-ssh::ssh-session-log-enabled-p bob)))
+    (let ((bursyk-server::*log-level* :info)
+          (out (make-string-output-stream)))
+      (let ((*error-output* out))
+        (bursyk-server::log-at-session alice :info "hello ~A" "alice")
+        (bursyk-server::log-at-session bob :info "hello ~A" "bob"))
+      (let ((text (get-output-stream-string out)))
+        (is (search "hello alice" text))
+        (is (not (search "hello bob" text)))))))
