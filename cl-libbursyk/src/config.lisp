@@ -19,6 +19,57 @@ relative Include is anchored here.")
 
 (defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.19")
 
+;;; Every keyword ssh's readconf.c accepts, plus this client's own
+;;; HostbasedKey extension.  The parser below handles the ones that can
+;;; change a connection; the rest are valid ssh_config that simply has
+;;; nothing to configure here.  A keyword outside this set is a typo or
+;;; belongs to a different program, and OpenSSH refuses it unless
+;;; IgnoreUnknown names it, so this parser does the same.
+(defparameter +ssh-config-client-keywords+
+  '(
+    "addkeystoagent" "addressfamily" "afstokenpassing" "batchmode" "bindaddress"
+    "bindinterface" "canonicaldomains" "canonicalizefallbacklocal"
+    "canonicalizehostname" "canonicalizemaxdots" "canonicalizepermittedcnames"
+    "casignaturealgorithms" "certificatefile" "challengeresponseauthentication"
+    "channeltimeout" "checkhostip" "cipher" "ciphers" "clearallforwardings"
+    "compression" "compressionlevel" "connectionattempts" "connecttimeout"
+    "controlmaster" "controlpath" "controlpersist" "dsaauthentication"
+    "dynamicforward" "enableescapecommandline" "enablesshkeysign" "escapechar"
+    "exitonforwardfailure" "fallbacktorsh" "fingerprinthash"
+    "forkafterauthentication" "forwardagent" "forwardx11" "forwardx11timeout"
+    "forwardx11trusted" "gatewayports" "globalknownhostsfile"
+    "globalknownhostsfile2" "gssapiauthentication" "gssapidelegatecredentials"
+    "hashknownhosts" "host" "hostbasedacceptedalgorithms" "hostbasedauthentication"
+    "hostbasedkey" "hostbasedkeytypes" "hostkeyalgorithms" "hostkeyalias"
+    "hostname" "identitiesonly" "identityagent" "identityfile" "identityfile2"
+    "ignoreunknown" "include" "ipqos" "kbdinteractiveauthentication"
+    "kbdinteractivedevices" "keepalive" "kerberosauthentication"
+    "kerberostgtpassing" "kexalgorithms" "knownhostscommand" "localcommand"
+    "localforward" "loglevel" "logverbose" "macs" "match"
+    "nohostauthenticationforlocalhost" "numberofpasswordprompts"
+    "obscurekeystroketiming" "passwordauthentication" "permitlocalcommand"
+    "permitremoteopen" "pkcs11provider" "port" "preferredauthentications"
+    "protocol" "proxycommand" "proxyjump" "proxyusefdpass"
+    "pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes" "pubkeyauthentication"
+    "refuseconnection" "rekeylimit" "remotecommand" "remoteforward" "requesttty"
+    "requiredrsasize" "revokedhostkeys" "rhostsauthentication"
+    "rhostsrsaauthentication" "rsaauthentication" "securitykeyprovider" "sendenv"
+    "serveralivecountmax" "serveraliveinterval" "sessiontype" "setenv"
+    "skeyauthentication" "smartcarddevice" "stdinnull" "streamlocalbindmask"
+    "streamlocalbindunlink" "stricthostkeychecking" "syslogfacility" "tag"
+    "tcpkeepalive" "tisauthentication" "tunnel" "tunneldevice" "updatehostkeys"
+    "useprivilegedport" "user" "userknownhostsfile" "userknownhostsfile2"
+    "useroaming" "usersh" "verifyhostkeydns" "versionaddendum" "visualhostkey"
+    "warnweakcrypto" "xauthlocation")
+  "The client keywords this parser knows by name.
+
+This is OpenSSH 10.6's keyword table with HostbasedKey, which OpenSSH does
+not have and this client uses to name its host key for hostbased
+authentication.  Knowing a name does not mean acting on it: a keyword that
+has nothing to configure here stays accepted and ignored, exactly as before.
+The table exists so a line that is not a keyword at all can be refused the
+way ssh refuses it.")
+
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
   (directives nil))
@@ -73,6 +124,9 @@ relative Include is anchored here.")
   (no-host-authentication-for-localhost nil)
   (hash-known-hosts nil)
   (known-hosts-command nil)
+  ;; IgnoreUnknown: a comma-separated pattern list naming unknown keywords to
+  ;; accept instead of refusing, as ssh does.
+  (ignored-unknown nil)
   ;; UpdateHostKeys: :YES adds keys the server proves it owns, :NO does
   ;; nothing, and :ASK is treated as no by this non-interactive client.
   (update-host-keys nil)
@@ -1062,6 +1116,19 @@ understand them rather than silently match nothing."
           (setf (ssh-config-options-known-hosts-command options)
                 (let ((raw (ssh-config-line-raw line)))
                   (if (and raw (plusp (length raw))) raw value))))))
+      ((string= keyword "ignoreunknown")
+       (let ((arguments (ssh-config-line-args line)))
+         (unless (= 1 (length arguments))
+           (error (ssh-config-line-error
+                   line "IgnoreUnknown takes exactly one argument")))
+         (when (zerop (length (first arguments)))
+           (error (ssh-config-line-error
+                   line "IgnoreUnknown requires an argument")))
+         (ssh-config-set-once
+          seen options :ignored-unknown
+          (lambda (options)
+            (setf (ssh-config-options-ignored-unknown options)
+                  (first arguments))))))
       ((string= keyword "fingerprinthash")
        (ssh-config-set-once
         seen options :fingerprint-hash
@@ -1523,6 +1590,29 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-number-of-password-prompts options)
                (integer :minimum 1)))))))
 
+(defun ssh-config-known-client-keyword-p (keyword)
+  "Whether KEYWORD is one ssh's client configuration parser accepts."
+  (member keyword +ssh-config-client-keywords+ :test #'string=))
+
+(defun ssh-config-check-client-keyword (line options)
+  "Refuse LINE's keyword when it is not an ssh_config keyword at all.
+
+A name in +SSH-CONFIG-CLIENT-KEYWORDS+ is always accepted, even when this
+client has nothing to do with it: an ssh_config written for OpenSSH must keep
+loading.  A name outside the table is a typo or belongs to another program,
+and OpenSSH refuses it with \"Bad configuration option\" unless IgnoreUnknown
+already named it.  The check happens whether or not the surrounding Host
+block is active, as ssh's parse_token does."
+  (let ((keyword (ssh-config-line-keyword line)))
+    (unless (ssh-config-known-client-keyword-p keyword)
+      (let ((ignored (ssh-config-options-ignored-unknown options)))
+        (unless (and ignored
+                     (ssh-config-pattern-list-match-p
+                      (list ignored) keyword :case-insensitive t))
+          (error (ssh-config-line-error line
+                                        "Bad configuration option: ~A"
+                                        keyword)))))))
+
 (defun ssh-config-apply-directive (line options seen context)
   "Apply one non-block directive when the current block is selected."
   (let ((keyword (ssh-config-line-keyword line)))
@@ -1549,7 +1639,7 @@ understand them rather than silently match nothing."
                          "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"
-                         "addressfamily" "batchmode")
+                         "addressfamily" "batchmode" "ignoreunknown")
                :test #'string=)
        (ssh-config-apply-policy line options seen context))
       ((member keyword '("ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
@@ -1753,6 +1843,7 @@ Returns CONFIG."
                                     (advance (1+ index) matched))
                                   #'report)))
                               (t
+                               (ssh-config-check-client-keyword line options)
                                (when parsing
                                  (ssh-config-apply-directive
                                   line options seen context))

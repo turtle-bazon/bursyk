@@ -2592,6 +2592,9 @@ peer that connected to it; NIL refuses the channel."
                     options)))
       (when command
         (format t "knownhostscommand ~A~%" command)))
+    (let ((ignored (cl-pnet-ssh:ssh-config-options-ignored-unknown options)))
+      (when ignored
+        (format t "ignoreunknown ~A~%" ignored)))
     (let ((revoked (reverse
                     (cl-pnet-ssh:ssh-config-options-revoked-host-keys
                      options))))

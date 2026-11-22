@@ -170,6 +170,7 @@
    #:ssh-config-options-global-known-hosts
    #:ssh-config-options-hash-known-hosts
    #:ssh-config-options-known-hosts-command
+   #:ssh-config-options-ignored-unknown
    #:ssh-config-options-update-host-keys
    #:ssh-config-options-fingerprint-hash
    #:ssh-config-options-visual-host-key

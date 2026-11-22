@@ -852,6 +852,65 @@ callback; without it the same callback trusts the key."
                         :on-options (lambda (value) (setf options value)))
     (is (null (cl-pnet-ssh:ssh-config-options-batch-mode options)))))
 
+(test ignore-unknown-is-parsed
+  "IgnoreUnknown names patterns whose keywords are refused, not silently
+dropped, and a Host block's inactivity does not hide a typo."
+  (flet ((failure (&rest lines)
+           (let ((condition nil)
+                 (options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (value) (setf condition value)))
+             (values condition options))))
+    ;; No IgnoreUnknown: an unrecognised keyword is fatal, as in ssh.
+    (multiple-value-bind (condition options)
+        (failure "Frobnicate yes")
+      (declare (ignore options))
+      (is (typep condition 'ssh-config-error))
+      (is (search "Bad configuration option"
+                  (cl-pnet-ssh::ssh-error-detail condition))))
+    ;; A known keyword with nothing to configure here still loads.
+    (multiple-value-bind (condition options)
+        (failure "IdentityAgent none" "Port 2200")
+      (is (null condition))
+      (is (eql 2200 (cl-pnet-ssh:ssh-config-options-port options))))
+    ;; IgnoreUnknown makes the name acceptable and later lines still apply.
+    (multiple-value-bind (condition options)
+        (failure "IgnoreUnknown Frobnicate" "Frobnicate yes" "Port 2201")
+      (is (null condition))
+      (is (equal "Frobnicate"
+                 (cl-pnet-ssh:ssh-config-options-ignored-unknown options)))
+      (is (eql 2201 (cl-pnet-ssh:ssh-config-options-port options))))
+    ;; It is a comma-separated, case-insensitive pattern list.
+    (multiple-value-bind (condition options)
+        (failure "IgnoreUnknown foo*,bar" "FooBaz yes")
+      (is (null condition))
+      (is (typep options 'cl-pnet-ssh::ssh-config-options)))
+    ;; A negated pattern vetoes the one before it.
+    (multiple-value-bind (condition options)
+        (failure "IgnoreUnknown foo*,!foobaz" "FooBaz yes")
+      (declare (ignore options))
+      (is (typep condition 'ssh-config-error)))
+    ;; ssh checks the keyword before asking whether the block is active.
+    (multiple-value-bind (condition options)
+        (failure "Host other" "Frobnicate yes")
+      (declare (ignore options))
+      (is (typep condition 'ssh-config-error)))
+    ;; Only the first IgnoreUnknown counts, like every other first-value-wins
+    ;; parameter.
+    (multiple-value-bind (condition options)
+        (failure "IgnoreUnknown Frobnicate" "IgnoreUnknown Other"
+                 "Frobnicate yes")
+      (declare (ignore options))
+      (is (null condition))
+      (is (equal "Frobnicate"
+                 (cl-pnet-ssh:ssh-config-options-ignored-unknown options))))))
+
+
 (test client-version-addendum
   "VersionAddendum parses as the rest of the line, expands its % tokens, and
 leaves the greeting alone for none."
