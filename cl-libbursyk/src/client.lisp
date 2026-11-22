@@ -343,6 +343,8 @@ helper is what reaches the server."
                                  known-hosts-command
                                  (add-keys-to-agent :no)
                                  (certificate-files '())
+                                 no-host-authentication-for-localhost
+                                 host-key-alias
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
@@ -388,6 +390,9 @@ helper is what reaches the server."
                     :known-hosts-command known-hosts-command
                     :add-keys-to-agent add-keys-to-agent
                     :certificate-files certificate-files
+                    :no-host-authentication-for-localhost
+                    no-host-authentication-for-localhost
+                    :host-key-alias host-key-alias
                     :hostbased-authentication hostbased-authentication
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
@@ -515,6 +520,8 @@ is applied here, before any request names a key the configuration forbade."
                              known-hosts-command
                              (add-keys-to-agent :no)
                              (certificate-files '())
+                             no-host-authentication-for-localhost
+                             host-key-alias
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
@@ -559,6 +566,10 @@ CERTIFICATE-FILES lists user certificate files; each is offered with the
 private key it certifies, and naming one stops the KEY-cert.pub automatic
 lookup, as in ssh.
 The default known-hosts file is ~/.ssh/known_hosts.
+
+NO-HOST-AUTHENTICATION-FOR-LOCALHOST, when true, accepts a loopback peer's
+host key without consulting known_hosts and without recording it, unless
+HOST-KEY-ALIAS names the host.
 
 CONNECT-TIMEOUT, when positive, fails the client if it has not authenticated
 within that many seconds.  SERVER-ALIVE-INTERVAL, when positive, sends
@@ -607,6 +618,9 @@ role-neutral."
                            :known-hosts-command known-hosts-command
                            :add-keys-to-agent add-keys-to-agent
                            :certificate-files certificate-files
+                           :no-host-authentication-for-localhost
+                           no-host-authentication-for-localhost
+                           :host-key-alias host-key-alias
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms

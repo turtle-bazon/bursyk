@@ -124,6 +124,9 @@ MAKE-SSH-CLIENT's own defaults."
         :host-key-host (or (ssh-config-options-host-key-alias options)
                            (ssh-config-options-hostname options)
                            host)
+        :host-key-alias (ssh-config-options-host-key-alias options)
+        :no-host-authentication-for-localhost
+        (ssh-config-options-no-host-authentication-for-localhost options)
         :port (or port (ssh-config-options-port options) 22)
         :user (or user (ssh-config-options-user options) (ssh-default-user))
         :private-key (ssh-config-client-identities options private-key)

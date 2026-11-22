@@ -2464,6 +2464,11 @@ peer that connected to it; NIL refuses the channel."
             (if (cl-pnet-ssh:ssh-config-options-check-host-ip options)
                 "yes"
                 "no"))
+    (format t "nohostauthenticationforlocalhost ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-no-host-authentication-for-localhost
+                 options)
+                "yes"
+                "no"))
     (format t "visualhostkey ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-visual-host-key options)
                 "yes"

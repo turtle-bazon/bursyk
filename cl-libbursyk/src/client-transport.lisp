@@ -393,6 +393,25 @@ usable record was fetched.  SECURE is the DNSSEC authenticated-data result."
                     (setf status :mismatch))))))))
     (values status (ssh-client-host-key-dns-secure client))))
 
+(defun ssh-loopback-address-p (address)
+  "Whether ADDRESS, a numeric peer address, is a loopback one.
+
+Inet 127/8 and inet6 ::1, including an IPv4-mapped ::ffff:127.x.x.x, are
+loopback to sockaddr_is_local and therefore to ssh."
+  (when (and address (plusp (length address)))
+    (let ((text (string-downcase address)))
+      (let ((zone (position #\% text)))
+        (when zone (setf text (subseq text 0 zone))))
+      (cond
+        ((string= text "::1") t)
+        ((and (> (length text) 7)
+              (string= text "::ffff:" :end1 7))
+         (ssh-loopback-address-p (subseq text 7)))
+        ((and (>= (length text) 4)
+              (string= text "127." :end1 4))
+         t)
+        (t nil)))))
+
 (defun ssh-client-verify-host-key-main (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal.
 
@@ -401,6 +420,16 @@ names its CA and the certificate itself checks out.  Otherwise OpenSSH
 drops the certificate and checks the plain key it certifies, so a host with
 only a plain known_hosts entry still connects.  A @revoked line for the
 certificate, its plain key or its CA refuses it without that fallback."
+  ;; NoHostAuthenticationForLocalhost: loopback addresses are trusted as-is,
+  ;; because on an NFS-mounted home the same name may mean a different machine.
+  (when (and (ssh-client-no-host-authentication-for-localhost client)
+             (null (ssh-client-host-key-alias client))
+             (ssh-loopback-address-p (ssh-client-remote-address client)))
+    (ssh-log "forcing acceptance of the host key for ~A"
+             (ssh-client-host-spec client))
+    (setf (ssh-client-update-host-keys client) :no
+          (ssh-client-check-host-ip client) nil)
+    (return-from ssh-client-verify-host-key-main t))
   (unless (ssh-key-rsa-size-allowed-p
            host-key (ssh-client-required-rsa-size client))
     (error 'ssh-host-key-error

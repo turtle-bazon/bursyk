@@ -68,6 +68,12 @@
   ;; CertificateFile: user certificate files paired with the matching
   ;; private key, in the order the configuration listed them.
   (certificate-files '())
+  ;; NoHostAuthenticationForLocalhost: a loopback peer's host key is accepted
+  ;; without consulting known_hosts, unless a HostKeyAlias names it.
+  (no-host-authentication-for-localhost nil)
+  ;; HostKeyAlias: the name known_hosts is checked under when it is an alias
+  ;; rather than the host's own name.
+  (host-key-alias nil)
   ;; CanonicalizeHostname and the resolver used to try its candidates.
   (canonicalize-hostname :no)
   (canonical-domains '())

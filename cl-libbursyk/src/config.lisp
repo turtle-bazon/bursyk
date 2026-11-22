@@ -69,6 +69,8 @@ relative Include is anchored here.")
   (identities-only nil)
   (known-hosts nil)
   (global-known-hosts nil)
+  ;; NoHostAuthenticationForLocalhost: trust a loopback host's key as-is.
+  (no-host-authentication-for-localhost nil)
   (hash-known-hosts nil)
   (known-hosts-command nil)
   ;; UpdateHostKeys: :YES adds keys the server proves it owns, :NO does
@@ -1033,6 +1035,13 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-check-host-ip options)
                 (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "nohostauthenticationforlocalhost")
+       (ssh-config-set-once
+        seen options :no-host-authentication-for-localhost
+        (lambda (options)
+          (setf (ssh-config-options-no-host-authentication-for-localhost
+                 options)
+                (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "verifyhostkeydns")
        (ssh-config-set-once
         seen options :verify-host-key-dns
@@ -1477,6 +1486,7 @@ understand them rather than silently match nothing."
                          "updatehostkeys"
                          "fingerprinthash"
                          "visualhostkey" "checkhostip" "verifyhostkeydns"
+                         "nohostauthenticationforlocalhost"
                          "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"
