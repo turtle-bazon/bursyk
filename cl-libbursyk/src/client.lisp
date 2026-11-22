@@ -22,11 +22,14 @@ and RSA follow because many existing accounts still have only one of those.")
   "The first default identity file that exists, or NIL."
   (first (ssh-default-private-keys)))
 
-(defun ssh-load-key-signer (private-key passphrase &key add-to-agent)
+(defun ssh-load-key-signer (private-key passphrase &key add-to-agent
+                                                      certificate-files-specified)
   "PRIVATE-KEY, already loaded or a path, as a signer.
 
 ADD-TO-AGENT, when given, is the agent path (or T for SSH_AUTH_SOCK); the
-loaded key is offered to it before being used, as AddKeysToAgent does."
+loaded key is offered to it before being used, as AddKeysToAgent does.
+CERTIFICATE-FILES-SPECIFIED suppresses the KEY-cert.pub lookup, because an
+explicit CertificateFile takes its place."
   (let ((key (if (typep private-key 'ssh-private-key)
                  private-key
                  (ssh-load-private-key private-key :passphrase passphrase))))
@@ -36,13 +39,17 @@ loaded key is offered to it before being used, as AddKeysToAgent does."
        :on-error (lambda (condition)
                    (ssh-log "could not add a key to the agent: ~A"
                             condition))))
-    (ssh-private-key-signer key)))
+    (ssh-private-key-signer
+     key :certificate-files-specified certificate-files-specified)))
 
-(defun ssh-load-key-signers (private-keys passphrase &key add-to-agent)
+(defun ssh-load-key-signers (private-keys passphrase &key add-to-agent
+                                                        certificate-files-specified)
   "Signers for PRIVATE-KEYS, each already loaded or a path, in order."
   (mapcar (lambda (key)
-            (ssh-load-key-signer key passphrase
-                                 :add-to-agent add-to-agent))
+            (ssh-load-key-signer
+             key passphrase
+             :add-to-agent add-to-agent
+             :certificate-files-specified certificate-files-specified))
           (if (listp private-keys) private-keys (list private-keys))))
 
 (defun ssh-default-key-sources (private-key)
@@ -60,16 +67,18 @@ loaded key is offered to it before being used, as AddKeysToAgent does."
                            "or create ~/.ssh/id_ed25519, id_ecdsa or id_rsa")))
 
 (defun ssh-report-key-signers (keys passphrase on-signers on-error
-                               &key add-to-agent)
+                               &key add-to-agent certificate-files-specified)
   "Load KEY files and deliver their signers, or report why not."
   (handler-case
       (funcall on-signers
-               (ssh-load-key-signers keys passphrase
-                                     :add-to-agent add-to-agent))
+               (ssh-load-key-signers
+                keys passphrase
+                :add-to-agent add-to-agent
+                :certificate-files-specified certificate-files-specified))
     (error (condition) (funcall on-error condition))))
 
 (defun ssh-report-agent-keys (agent keys passphrase on-signers on-error
-                              &key add-to-agent)
+                              &key add-to-agent certificate-files-specified)
   "Deliver the agent's signers followed by KEY files, tolerating either."
   (ssh-agent-signers
    :path agent
@@ -79,14 +88,17 @@ loaded key is offered to it before being used, as AddKeysToAgent does."
                               (append signers
                                       (ssh-load-key-signers
                                        keys passphrase
-                                       :add-to-agent add-to-agent)))
+                                       :add-to-agent add-to-agent
+                                       :certificate-files-specified
+                                       certificate-files-specified)))
                    (error (condition) (funcall on-error condition))))
    ;; An agent that cannot answer is not fatal while a file remains.
    :on-error (lambda (condition)
                (declare (ignore condition))
                (ssh-report-key-signers
                 keys passphrase on-signers on-error
-                :add-to-agent add-to-agent))))
+                :add-to-agent add-to-agent
+                :certificate-files-specified certificate-files-specified))))
 
 (defun ssh-report-agent-signers (agent on-signers on-error)
   "Deliver the agent's signers, or say that it holds no usable key."
@@ -102,7 +114,7 @@ loaded key is offered to it before being used, as AddKeysToAgent does."
    :on-error on-error))
 
 (defun ssh-resolve-signers (private-key agent passphrase on-signers on-error
-                            &key add-keys-to-agent)
+                            &key add-keys-to-agent certificate-files)
   "Find the signers authentication may try, in order, without blocking.
 
 The agent's ssh-ed25519 keys are offered first, then the key files, which
@@ -111,20 +123,37 @@ default ~/.ssh/id_ed25519 fills in when no file is named.  AGENT is T for
 SSH_AUTH_SOCK or a socket path; without an explicit key the environment's
 agent is used when SSH_AUTH_SOCK is set.  A failing agent does not hide
 working key files, and vice versa.  ON-ERROR receives an
-ssh-authentication-error only when nothing is left to try."
+ssh-authentication-error only when nothing is left to try.
+
+CERTIFICATE-FILES are CertificateFile paths.  Each certificate is attached
+to the signer whose key it certifies, file or agent, and the automatic
+KEY-cert.pub lookup is disabled, as in ssh."
   (let* ((keys (ssh-default-key-sources private-key))
          (agent (or agent
                     (and (null private-key)
                          (uiop:getenv "SSH_AUTH_SOCK")
-                         t))))
+                         t)))
+         (certificates (ssh-load-certificate-files certificate-files))
+         (certificate-files-specified (not (null certificates)))
+         (deliver
+           (if certificates
+               (lambda (signers)
+                 (funcall on-signers
+                          (ssh-signers-with-certificates
+                           signers certificates)))
+               on-signers)))
     (let ((add-to-agent (and add-keys-to-agent agent)))
       (cond
         ((and keys agent)
-         (ssh-report-agent-keys agent keys passphrase on-signers on-error
-                                :add-to-agent add-to-agent))
-        (agent (ssh-report-agent-signers agent on-signers on-error))
-        (keys (ssh-report-key-signers keys passphrase on-signers on-error
-                                      :add-to-agent add-to-agent))
+         (ssh-report-agent-keys agent keys passphrase deliver on-error
+                                :add-to-agent add-to-agent
+                                :certificate-files-specified
+                                certificate-files-specified))
+        (agent (ssh-report-agent-signers agent deliver on-error))
+        (keys (ssh-report-key-signers
+               keys passphrase deliver on-error
+               :add-to-agent add-to-agent
+               :certificate-files-specified certificate-files-specified))
         (t (funcall on-error (ssh-no-key-condition)))))))
 
 (defun ssh-connect-error (client status)
@@ -313,6 +342,7 @@ helper is what reaches the server."
                                  hash-known-hosts
                                  known-hosts-command
                                  (add-keys-to-agent :no)
+                                 (certificate-files '())
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
@@ -357,6 +387,7 @@ helper is what reaches the server."
                     :hash-known-hosts hash-known-hosts
                     :known-hosts-command known-hosts-command
                     :add-keys-to-agent add-keys-to-agent
+                    :certificate-files certificate-files
                     :hostbased-authentication hostbased-authentication
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
@@ -466,7 +497,8 @@ is applied here, before any request names a key the configuration forbade."
          (ssh-open-connection client)
          (ssh-client-fail client condition)))
    :add-keys-to-agent
-   (eq (ssh-client-add-keys-to-agent client) :yes))
+   (eq (ssh-client-add-keys-to-agent client) :yes)
+   :certificate-files (ssh-client-certificate-files client))
   client)
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
@@ -482,6 +514,7 @@ is applied here, before any request names a key the configuration forbade."
                              hash-known-hosts
                              known-hosts-command
                              (add-keys-to-agent :no)
+                             (certificate-files '())
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
@@ -522,6 +555,9 @@ protected file.  With no PRIVATE-KEY every default identity file that exists
 (~/.ssh/id_ed25519, id_ecdsa, then ~/.ssh/id_rsa) is added.  AGENT (T for
 SSH_AUTH_SOCK, or a socket path) offers every key the agent can sign with;
 when both are available the agent's keys are tried first, as OpenSSH does.
+CERTIFICATE-FILES lists user certificate files; each is offered with the
+private key it certifies, and naming one stops the KEY-cert.pub automatic
+lookup, as in ssh.
 The default known-hosts file is ~/.ssh/known_hosts.
 
 CONNECT-TIMEOUT, when positive, fails the client if it has not authenticated
@@ -570,6 +606,7 @@ role-neutral."
                            :hash-known-hosts hash-known-hosts
                            :known-hosts-command known-hosts-command
                            :add-keys-to-agent add-keys-to-agent
+                           :certificate-files certificate-files
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms

@@ -65,15 +65,20 @@ that name implies.  The other key types use their own certificate name."
       "rsa-sha2-256-cert-v01@openssh.com"
       (ssh-certificate-key-type certificate)))
 
-(defun ssh-private-key-signer (key)
+(defun ssh-private-key-signer (key &key certificate-files-specified)
   "A signer backed by a loaded private KEY.
 
 The signature needs no I/O, so ON-SIGNATURE runs before SIGN returns.
 ed25519, RSA and ECDSA keys all sign locally.  When KEY's file has a
 matching CERT.pub beside it, the signer offers the certificate and names its
-certificate type, while the signature is still made by the private key."
+certificate type, while the signature is still made by the private key.
+
+CERTIFICATE-FILES-SPECIFIED suppresses that automatic lookup: ssh uses the
+CERT.pub beside a key only when no CertificateFile was configured."
   (multiple-value-bind (certificate certificate-blob)
-      (ssh-private-key-certificate key)
+      (if certificate-files-specified
+          (values nil nil)
+          (ssh-private-key-certificate key))
     (let ((type (ssh-private-key-type key)))
       (when (and (null certificate) (string= type "ssh-rsa"))
         ;; The request names the signature algorithm, not the key type, so an
@@ -89,6 +94,80 @@ certificate type, while the signature is still made by the private key."
                    (funcall on-signature
                             (ssh-private-key-signature-blob key data))
                  (error (condition) (funcall on-error condition))))))))
+
+(defun ssh-load-certificate-files (paths)
+  "Load the certificates named by PATHS, as (CERT-BLOB . CERTIFICATE) pairs.
+
+A missing or unreadable file, a file that does not hold a key, and a key that
+is not a user certificate are logged and skipped, as ssh does: one bad
+CertificateFile must not hide a good one.  The plain key each certificate
+certifies is available as SSH-CERTIFICATE-PLAIN-BLOB."
+  (let ((certificates '()))
+    (dolist (path paths)
+      (let ((blob (and path (ssh-public-key-file-blob path))))
+        (cond
+          ((null blob)
+           (ssh-log "could not load certificate file ~A" path))
+          ((not (ssh-certificate-blob-p blob))
+           (ssh-log "~A is not a certificate" path))
+          (t
+           (let ((certificate (ssh-certificate-parse blob)))
+             (cond
+               ((null certificate)
+                (ssh-log "~A is not a readable certificate" path))
+               ((/= (ssh-certificate-cert-type certificate) 1)
+                (ssh-log "ignoring certificate ~A: not a user certificate"
+                         path))
+               (t
+                (push (cons blob certificate) certificates))))))))
+    (nreverse certificates)))
+
+(defun ssh-signer-plain-blob (signer)
+  "SIGNER's public key without a certificate wrapper, when it has one."
+  (let ((blob (ssh-signer-blob signer)))
+    (if (ssh-certificate-blob-p blob)
+        (let ((certificate (ssh-certificate-parse blob)))
+          (if certificate
+              (ssh-certificate-plain-blob certificate)
+              blob))
+        blob)))
+
+(defun ssh-signer-with-certificate (signer certificate blob)
+  "SIGNER offering CERTIFICATE, whose wire blob is BLOB.
+
+The private key is still SIGNER's, so its signing function is reused; only
+the advertised type and public blob change."
+  (%make-ssh-signer
+   :type (ssh-certificate-signer-type certificate)
+   :blob blob
+   :sign (ssh-signer-sign signer)))
+
+(defun ssh-signers-with-certificates (signers certificates)
+  "SIGNERS with each matching certificate in CERTIFICATES offered instead.
+
+A certificate applies to the signer whose plain public key it certifies,
+whether that key came from a file or an agent, which is what ssh does when it
+pairs a certificate with the private key that can complete its signature.
+Certified signers move to the front, because ssh tries certificates listed in
+the configuration before uncertified keys."
+  (if (null certificates)
+      signers
+      (let ((certified '())
+            (rest '()))
+        (dolist (signer signers)
+          (let* ((plain (ssh-signer-plain-blob signer))
+                 (pair
+                   (find-if (lambda (candidate)
+                              (ssh-octets=
+                               plain
+                               (ssh-certificate-plain-blob (cdr candidate))))
+                            certificates)))
+            (if pair
+                (push (ssh-signer-with-certificate
+                       signer (cdr pair) (car pair))
+                      certified)
+                (push signer rest))))
+        (append (nreverse certified) (nreverse rest)))))
 
 (defparameter +ssh-agent-key-types+
   '("ssh-ed25519" "ssh-rsa"

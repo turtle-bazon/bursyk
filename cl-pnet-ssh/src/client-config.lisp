@@ -127,6 +127,8 @@ MAKE-SSH-CLIENT's own defaults."
         :port (or port (ssh-config-options-port options) 22)
         :user (or user (ssh-config-options-user options) (ssh-default-user))
         :private-key (ssh-config-client-identities options private-key)
+        :certificate-files
+        (reverse (ssh-config-options-certificate-files options))
         :agent (ssh-config-client-agent options agent)
         :passphrase passphrase
         :known-hosts (ssh-config-client-known-hosts options known-hosts)

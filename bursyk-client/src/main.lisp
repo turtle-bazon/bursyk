@@ -474,9 +474,6 @@ still disables the feature and therefore silences the refusal."
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
-      (when (cl-pnet-ssh:ssh-config-options-certificate-files options)
-        (unsupported "CertificateFile"
-                     "only the KEY-cert.pub beside an IdentityFile is used"))
       (when (cl-pnet-ssh:ssh-config-options-bind-address options)
         (unsupported "BindAddress"
                      "binding the source address is not implemented"))
@@ -2509,6 +2506,9 @@ peer that connected to it; NIL refuses the channel."
      "identityfile"
      (or (reverse (cl-pnet-ssh:ssh-config-options-identity-files options))
          (reverse (getf *options* :identity))))
+    (print-list-option
+     "certificatefile"
+     (reverse (cl-pnet-ssh:ssh-config-options-certificate-files options)))
     (print-list-option
      "userknownhostsfile"
      (or (cl-pnet-ssh:ssh-config-options-known-hosts options)

@@ -557,6 +557,160 @@ its CA, and is admitted only for a principal and address its options allow."
                                                       "example.org")))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+(defun ssh-test-resolved-signers (key &rest arguments)
+  "The signers SSH-RESOLVE-SIGNERS reports for KEY, or :ERROR."
+  (let ((result :error))
+    (apply #'cl-pnet-ssh::ssh-resolve-signers key nil nil
+           (lambda (signers) (setf result signers))
+           (lambda (condition)
+             (declare (ignore condition))
+             (setf result :error))
+           arguments)
+    result))
+
+(test certificate-files-pair-with-their-private-key
+  "CertificateFile attaches the listed certificate to the key it certifies
+and suppresses the automatic KEY-cert.pub lookup, while a certificate for
+another key is not attached."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-certfile"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory))
+             (other (merge-pathnames "other" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring user)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring other)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "explicit-id"
+                      "-n" "turtle" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "user.pub" directory))))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "other-id"
+                      "-n" "turtle" "-V" "-1m:+52w"
+                      (namestring (merge-pathnames "other.pub" directory))))
+               ;; Move the certificate off its automatic path, so only an
+               ;; explicit CertificateFile can find it.
+               (rename-file
+                (merge-pathnames "user-cert.pub" directory)
+                (merge-pathnames "explicit-cert.pub" directory))
+               (let* ((explicit
+                        (merge-pathnames "explicit-cert.pub" directory))
+                      (cert-blob (ssh-test-certificate-blob explicit))
+                      (signers
+                        (ssh-test-resolved-signers
+                         user :certificate-files (list explicit))))
+                 (is (= 1 (length signers)))
+                 (is (string= "ssh-ed25519-cert-v01@openssh.com"
+                              (cl-pnet-ssh::ssh-signer-type
+                               (first signers))))
+                 (is (equalp cert-blob
+                             (cl-pnet-ssh::ssh-signer-blob
+                              (first signers))))
+                 ;; Without CertificateFile the moved cert is invisible and
+                 ;; the key is offered plain, not certified.
+                 (let ((plain (ssh-test-resolved-signers user)))
+                   (is (= 1 (length plain)))
+                   (is (string= "ssh-ed25519"
+                                (cl-pnet-ssh::ssh-signer-type
+                                 (first plain)))))
+                 ;; A certificate that certifies a different key must not be
+                 ;; offered with this key.
+                 (let ((mismatch
+                         (ssh-test-resolved-signers
+                          user
+                          :certificate-files
+                          (list (merge-pathnames "other-cert.pub"
+                                                 directory)))))
+                   (is (= 1 (length mismatch)))
+                   (is (string= "ssh-ed25519"
+                                (cl-pnet-ssh::ssh-signer-type
+                                 (first mismatch)))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test client-certificate-file-authenticates
+  "A CertificateFile kept away from the key's -cert.pub path still logs in:
+the private key it certifies is offered with the certificate's identity."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-certfile-login"))
+             (server-key (merge-pathnames "host_key" directory))
+             (ca (merge-pathnames "ca" directory))
+             (ca-pub (merge-pathnames "ca.pub" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (explicit (merge-pathnames "explicit-cert.pub" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (stderr (make-string-output-stream))
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-keygen
+                (list "-q" "-s" (namestring ca) "-I" "certfile-login"
+                      "-n" "tester" "-V" "-1m:+52w"
+                      (namestring
+                       (merge-pathnames "client_key.pub" directory))))
+               (rename-file
+                (merge-pathnames "client_key-cert.pub" directory) explicit)
+               ;; cert-authority, not the bare CA key, admits the user.
+               (with-open-file (output authorized :direction :output
+                                                 :if-exists :supersede
+                                                 :if-does-not-exist :create)
+                 (with-open-file (input ca-pub)
+                   (format output "cert-authority ~A~%"
+                           (string-trim '(#\Space #\Return #\Newline)
+                                        (read-line input)))))
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      ;; The library consults AUTHORIZE before its own
+                      ;; authorized_keys lookup, which does not admit
+                      ;; certificates; this mirrors bursyk-server.
+                      :authorize
+                      (lambda (user key-blob address session)
+                        (declare (ignore session))
+                        (let ((certificate
+                                (and (ssh-certificate-blob-p key-blob)
+                                     (ssh-certificate-parse key-blob))))
+                          (if certificate
+                              (ssh-certificate-authorized-key-match
+                               authorized certificate user
+                               :address address)
+                              (ssh-authorized-key-blob-match
+                               authorized key-blob :address address))))
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (let ((status
+                       (ssh-test-loopback-run
+                        server client-key known-hosts stdout stderr
+                        :certificate-files (list explicit))))
+                 (is (= 3 status))
+                 (is (string= "hello"
+                              (get-output-stream-string stdout)))
+                 (is (string= "oops"
+                              (get-output-stream-string stderr)))))
+          (when server (ssh-server-close server))
+          (ignore-errors
+           (uiop:delete-directory-tree directory :validate t))))))
+
 (test certificate-option-merge-follows-sshd
   "Permission flags are ANDed, restrictive values are combined, and two
 different force-command clauses cannot be merged."
@@ -1128,7 +1282,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
                               &key (host-key-policy :accept-new)
                                 hostbased-key canonicalize-hostname
-                                canonical-domains resolver
+                                canonical-domains resolver certificate-files
                                 verify-host-key-dns host-key-dns-resolver)
   "Start a client against SERVER and return the command's exit status.
 
@@ -1149,6 +1303,7 @@ certificate was trusted rather than added on first use."
             :port (ssh-server-port server)
             :user "tester"
             :private-key client-key
+            :certificate-files certificate-files
             :known-hosts known-hosts
             :host-key-policy host-key-policy
             :hostbased-authentication (and hostbased-key t)

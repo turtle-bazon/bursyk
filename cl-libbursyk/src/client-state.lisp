@@ -65,6 +65,9 @@
   (known-hosts-command nil)
   ;; AddKeysToAgent: :YES adds file-loaded keys to the agent.
   (add-keys-to-agent :no)
+  ;; CertificateFile: user certificate files paired with the matching
+  ;; private key, in the order the configuration listed them.
+  (certificate-files '())
   ;; CanonicalizeHostname and the resolver used to try its candidates.
   (canonicalize-hostname :no)
   (canonical-domains '())
