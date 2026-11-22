@@ -169,8 +169,10 @@ way ssh refuses it.")
   (obscure-keystroke-timing nil)
   (preferred-authentications nil)
   (pubkey-authentication nil)
-  (password-authentication nil)
-  (kbd-interactive-authentication nil)
+  ;; Both default to yes in ssh; a slot of NIL would otherwise make an
+  ;; unset keyword indistinguishable from an explicit "no" in -G.
+  (password-authentication t)
+  (kbd-interactive-authentication t)
   (number-of-password-prompts nil)
   (send-env nil)
   ;; SetEnv: NAME=VALUE pairs sent to the server on every session, in the

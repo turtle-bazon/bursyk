@@ -2540,7 +2540,9 @@ peer that connected to it; NIL refuses the channel."
           (handler-case
               (cl-pnet-ssh:ssh-config-client-source
                (getf *options* :config)
-               (command-line-option-list))
+               ;; -c and -m are dedicated flags rather than -o lines, so
+               ;; they have to be folded in before the file is resolved.
+               (resolver-option-list))
             (cl-pnet-ssh:ssh-config-error (condition)
               (fail "~A" condition)))))
     (cl-pnet-ssh:ssh-config-canonicalize
@@ -2568,374 +2570,535 @@ peer that connected to it; NIL refuses the channel."
   (finish-output)
   (uiop:quit 0))
 
+(defun print-list-oneline (name values)
+  "Print NAME and VALUES on one line, with ssh -G's \"none\" for empty."
+  (format t "~A" name)
+  (if values
+      (dolist (value values)
+        (format t " ~A" value))
+      (format t " none"))
+  (format t "~%"))
+
 (defun print-config-options (host options canonical)
-  "Print OPTIONS resolved for HOST, whose canonical name is CANONICAL."
+  "Print OPTIONS resolved for HOST, whose canonical name is CANONICAL.
+
+The field set, order and spellings follow OpenSSH 10.6's dump_client_config,
+so a script that reads `ssh -G` finds the same configuration from burs.
+Values where this build makes a different choice (its own algorithm offers
+and known-hosts files) are printed as this client will actually use them."
   (let ((hostname (or canonical
                       (cl-pnet-ssh:ssh-config-options-hostname options)
                       host)))
-    (format t "host ~A~%" host)
-    (format t "hostname ~A~%" hostname)
-    (when (cl-pnet-ssh:ssh-config-options-version-addendum options)
-      (format t "versionaddendum ~A~%"
-              (or (cl-pnet-ssh::ssh-config-client-version-addendum
-                   options host
-                   :user (getf *options* :user)
-                   :port (client-port))
-                  "")))
-    (format t "canonicalizehostname ~A~%"
-            (case (cl-pnet-ssh:ssh-config-options-canonicalize-hostname
-                   options)
-              (:yes "true") (:no "false") (t "always")))
-    (print-list-option
-     "canonicaldomains"
-     (cl-pnet-ssh:ssh-config-options-canonical-domains options))
-    (format t "canonicalizemaxdots ~D~%"
-            (cl-pnet-ssh:ssh-config-options-canonicalize-max-dots options))
-    (format t "canonicalizefallbacklocal ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-canonicalize-fallback-local
-                 options)
-                "yes"
-                "no"))
-    (format t "canonicalizepermittedcnames")
-    (let ((rules
-            (cl-pnet-ssh:ssh-config-options-canonicalize-permitted-cnames
-             options)))
-      (if (or (null rules)
-              (and (null (rest rules))
-                   (string-equal (caar rules) "none")))
-          (format t " none")
-          (dolist (rule rules)
-            (format t " ~A:~A" (car rule) (cdr rule)))))
-    (format t "~%")
-    (format t "verifyhostkeydns ~A~%"
-            (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
-                   options)
-              (:ask "ask") (:yes "true") (t "false")))
-    ;; ssh -G spells yes and no as true and false here, and omits
-    ;; ControlPath entirely when multiplexing has no socket.
-    (let ((master (cl-pnet-ssh:ssh-config-options-control-master options)))
-      (format t "controlmaster ~A~%"
-              (case master
-                ((:yes) "true")
-                ((nil :no) "false")
-                (t (string-downcase (symbol-name master))))))
-    (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
-      (when (and path (not (eq path :none)) (not (string-equal path "none")))
-        (format t "controlpath ~A~%"
-                (mux-expand-control-path
-                 (mux-tilde-expand path)
-                 :original host
-                 :hostname hostname
-                 :port (or (cl-pnet-ssh:ssh-config-options-port options) 22)
-                 :user (or (cl-pnet-ssh:ssh-config-options-user options)
-                           (getf *options* :user)
-                           (uiop:getenv "USER")
-                           "root")))))
-    (let ((persist (cl-pnet-ssh:ssh-config-options-control-persist options)))
-      (format t "controlpersist ~A~%"
-              (cond ((or (null persist) (eq persist :no)) "no")
-                    ((eq persist :yes) "yes")
-                    (t (format nil "~D" persist)))))
-    (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
-      (when alias
-        (format t "hostkeyalias ~A~%" alias)))
-    (format t "user ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-user options)
-                (getf *options* :user)
-                (cl-pnet-ssh:ssh-default-user)))
-    (format t "port ~D~%"
-            (or (cl-pnet-ssh:ssh-config-options-port options)
-                (client-port)
-                22))
-    (format t "addressfamily ~(~A~)~%"
-            (or (cl-pnet-ssh:ssh-config-options-address-family options)
-                "any"))
-    (format t "batchmode ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-batch-mode options)
-                "yes"
-                "no"))
-    (format t "gssapiauthentication ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-gssapi-authentication
-                 options)
-                "yes"
-                "no"))
-    (format t "gssapidelegatecredentials ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
-                 options)
-                "yes"
-                "no"))
-    (format t "proxyusefdpass ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)
-                "yes"
-                "no"))
-    ;; ssh prints Tunnel's multistate name: ethernet, point-to-point,
-    ;; true for the default device, or false when disabled.
-    (format t "tunnel ~A~%"
-            (case (cl-pnet-ssh:ssh-config-options-tunnel options)
-              (:ethernet "ethernet")
-              (:point-to-point "point-to-point")
-              ((:yes) "true")
-              (t "false")))
-    (format t "forwardx11timeout ~D~%"
-            (or (cl-pnet-ssh:ssh-config-options-forward-x11-timeout options)
-                1200))
-    (format t "requesttty ~A~%"
-            (or (tty-setting-name (getf *options* :request-tty))
-                (cl-pnet-ssh:ssh-config-options-request-tty options)
-                "auto"))
-    (flet ((ip-qos-name (value)
-             (cond
-               ((eq value :none) "none")
-               (t (or (car (rassoc value cl-pnet-ssh::+ssh-config-ip-qos-names+
-                                   :test #'eql))
-                      (format nil "0x~2,'0x" value))))))
-      (format t "ipqos ~A ~A~%"
-              (ip-qos-name
-               (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
-              (ip-qos-name
-               (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
-    (let ((bind (cl-pnet-ssh:ssh-config-options-bind-interface options)))
-      (when bind
-        (format t "bindinterface ~A~%" bind)))
-    (let ((devices
-            (cl-pnet-ssh:ssh-config-options-kbd-interactive-devices options)))
-      (when devices
-        (format t "kbdinteractivedevices ~A~%" devices)))
-    (let ((provider
-            (cl-pnet-ssh:ssh-config-options-pkcs11-provider options)))
-      (when (and provider (not (eq provider :none)))
-        (format t "pkcs11provider ~A~%" provider)))
-    (let ((provider
-            (cl-pnet-ssh:ssh-config-options-security-key-provider options)))
-      ;; ssh clears "none" after parsing, so no line appears; otherwise
-      ;; the default provider is internal.
-      (unless (eq provider :none)
-        (format t "securitykeyprovider ~A~%"
-                (or provider "internal"))))
-    (format t "syslogfacility ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-syslog-facility options)
-                "USER"))
-    (let ((device (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
-      (format t "tunneldevice ~A:~A~%"
-              (if device
-                  (if (eq (car device) :any) "any" (car device))
-                  "any")
-              (if (and device (not (eq (cdr device) :any)))
-                  (cdr device)
-                  "any")))
-    (format t "xauthlocation ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
-                "/usr/bin/xauth"))
-    (format t "checkhostip ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-check-host-ip options)
-                "yes"
-                "no"))
-    (format t "nohostauthenticationforlocalhost ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-no-host-authentication-for-localhost
-                 options)
-                "yes"
-                "no"))
-    (format t "visualhostkey ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-visual-host-key options)
-                "yes"
-                "no"))
-    (format t "fingerprinthash ~A~%"
-            (string-upcase
-             (symbol-name
-              (or (cl-pnet-ssh:ssh-config-options-fingerprint-hash options)
-                  :sha256))))
-    (format t "loglevel ~A~%"
-            (string-upcase
-             (or (cl-pnet-ssh:ssh-config-options-log-level options)
-                 "info")))
-    (dolist (line (cl-pnet-ssh:ssh-config-options-log-verbose options))
-      (format t "logverbose ~A~%" line))
-    (format t "channeltimeout")
-    (let ((timeouts
-            (cl-pnet-ssh:ssh-config-options-channel-timeouts options)))
-      (if (consp timeouts)
-          (dolist (argument timeouts)
-            (format t " ~A" argument))
-          (format t " none")))
-    (format t "~%")
-    (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
-      (when local
-        (format t "localcommand ~A~%" local)))
-    (format t "permitlocalcommand ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-permit-local-command
-                 options)
-                "yes"
-                "no"))
-    (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
-      (when remote
-        (format t "remotecommand ~A~%" remote)))
-    (format t "forkafterauthentication ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-fork-after-authentication
-                 options)
-                "yes"
-                "no"))
-    (format t "sessiontype ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-session-type options)
-                "default"))
-    (format t "stdinnull ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-stdin-null options)
-                "yes"
-                "no"))
-    (print-list-option
-     "identityfile"
-     (or (reverse (cl-pnet-ssh:ssh-config-options-identity-files options))
-         (reverse (getf *options* :identity))))
-    (print-list-option
-     "certificatefile"
-     (reverse (cl-pnet-ssh:ssh-config-options-certificate-files options)))
-    (print-list-option
-     "userknownhostsfile"
-     (or (cl-pnet-ssh:ssh-config-options-known-hosts options)
-         (and (getf *options* :known-hosts)
-              (list (getf *options* :known-hosts)))))
-    (format t "clearallforwardings ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-clear-all-forwardings
-                 options)
-                "yes"
-                "no"))
-    (format t "connectionattempts ~D~%"
-            (or (cl-pnet-ssh:ssh-config-options-connection-attempts options)
-                1))
-    (format t "tcpkeepalive ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-tcp-keep-alive options)
-                "yes"
-                "no"))
-    (format t "exitonforwardfailure ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-exit-on-forward-failure
-                 options)
-                "yes"
-                "no"))
-    (format t "hashknownhosts ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-hash-known-hosts options)
-                "yes"
-                "no"))
-    (format t "escapechar ~A~%"
-            (let ((value (cl-pnet-ssh:ssh-config-options-escape-char options)))
-              (cond ((eq value :none) "none")
-                    ((null value) "~")
-                    (t (format nil "~C" value)))))
-    (format t "enableescapecommandline ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-enable-escape-commandline
-                 options)
-                "yes"
-                "no"))
-    (format t "warnweakcrypto ~A~%"
-            (if (eq (cl-pnet-ssh:ssh-config-options-warn-weak-crypto options)
-                    :no)
-                "no"
-                "yes"))
-    (format t "hostbasedauthentication ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-hostbased-authentication
-                 options)
-                "yes"
-                "no"))
-    (print-list-option
-     "hostbasedacceptedalgorithms"
-     (or (cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
-          options)
-         cl-pnet-ssh::+ssh-signature-algorithms+))
-    (format t "enablesshkeysign ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-enable-ssh-keysign options)
-                "yes"
-                "no"))
-    (format t "addkeystoagent ~A~%"
-            (let ((value (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
-                          options)))
-              (case value
-                (:yes "yes") (:ask "ask") (:confirm "confirm")
-                (t "no"))))
-    (format t "updatehostkeys ~A~%"
-            (let ((value (cl-pnet-ssh:ssh-config-options-update-host-keys
-                          options)))
-              (cond ((eq value :yes) "yes")
-                    ((eq value :ask) "ask")
-                    ((eq value :no) "no")
-                    (t "yes"))))
-    (let ((command (cl-pnet-ssh:ssh-config-options-known-hosts-command
-                    options)))
-      (when command
-        (format t "knownhostscommand ~A~%" command)))
-    (let ((ignored (cl-pnet-ssh:ssh-config-options-ignored-unknown options)))
-      (when ignored
-        (format t "ignoreunknown ~A~%" ignored)))
-    (let ((revoked (reverse
-                    (cl-pnet-ssh:ssh-config-options-revoked-host-keys
-                     options))))
-      (when revoked
-        (format t "revokedhostkeys~{ ~A~}~%"
-                (mapcar #'namestring revoked))))
-    (format t "stricthostkeychecking ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
-                 options)
-                (case (getf *options* :policy)
-                  (:insecure "no")
-                  (:accept-new "accept-new")
-                  (t "yes"))))
-    (format t "requiredrsasize ~D~%"
-            (or (cl-pnet-ssh:ssh-config-options-required-rsa-size options)
-                cl-pnet-ssh::+ssh-rsa-minimum-modulus-size+))
-    (format t "obscurekeystroketiming ~A~%"
-            (let ((value
-                    (or (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
+    (flet ((yes-no (value) (if value "yes" "no"))
+           (true-false (value) (if value "true" "false"))
+           (paths (values) (mapcar #'namestring values))
+           (algorithms (accessor supported option &optional all)
+             (or (cl-pnet-ssh::ssh-config-client-algorithms
+                  options accessor supported option
+                  :all (or all supported))
+                 supported)))
+      (format t "host ~A~%" host)
+      (format t "user ~A~%"
+              (or (cl-pnet-ssh:ssh-config-options-user options)
+                  (getf *options* :user)
+                  (cl-pnet-ssh:ssh-default-user)))
+      (format t "hostname ~A~%" hostname)
+      (format t "port ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-port options)
+                  (client-port)
+                  22))
+      (let ((family (or (cl-pnet-ssh:ssh-config-options-address-family
                          options)
-                        cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)))
-              (cond ((zerop value) "no")
-                    ((= value cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)
-                     "yes")
-                    (t (format nil "~D" value)))))
-    (format t "casignaturealgorithms ~{~A~^,~}~%"
-            (or (cl-pnet-ssh::ssh-config-client-algorithms
-                 options
-                 #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms
-                 cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
-                 "CASignatureAlgorithms"
-                 :all cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+)
-                cl-pnet-ssh::+ssh-server-ca-signature-algorithms+))
-    (format t "streamlocalbindunlink ~A~%"
-            (if (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
-                 options)
-                "yes"
-                "no"))
-    (print-list-option "sendenv"
-                       (cl-pnet-ssh:ssh-config-options-send-env options))
-    (print-list-option "setenv"
-                       (cl-pnet-ssh:ssh-config-options-set-env options))
-    (let ((permit (cl-pnet-ssh:ssh-config-options-permit-remote-open
-                   options)))
-      (cond
-        ((eq permit :any) (format t "permitremoteopen any~%"))
-        ((eq permit :none) (format t "permitremoteopen none~%"))
-        ((null permit) nil)
-        (t (dolist (entry permit)
-             (format t "permitremoteopen ~A:~A~%"
-                     (car entry)
-                     (if (eq (cdr entry) :any) "*" (cdr entry)))))))
-    (print-list-option
-     "localforward"
-     (reverse (cl-pnet-ssh:ssh-config-options-local-forwards options)))
-    (print-list-option
-     "remoteforward"
-     (reverse (cl-pnet-ssh:ssh-config-options-remote-forwards options)))
-    (print-list-option
-     "dynamicforward"
-     (reverse (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
-    (format t "proxyjump ~A~%"
-            (or (let ((jump (cl-pnet-ssh:ssh-config-options-proxy-jump
-                             options)))
-                  (cond ((null jump) nil)
-                        ((listp jump) (format nil "~{~A~^,~}" jump))
-                        (t jump)))
-                (getf *options* :jump)
-                "none"))
-    (format t "proxycommand ~A~%"
-            (or (cl-pnet-ssh:ssh-config-options-proxy-command options)
-                (getf *options* :proxy-command)
-                "none"))))
+                        (getf *options* :address-family))))
+        (format t "addressfamily ~A~%"
+                (cond ((null family) "any")
+                      ((stringp family) (string-downcase family))
+                      (t (string-downcase (symbol-name family))))))
+      (format t "batchmode ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-batch-mode options)))
+      (format t "canonicalizefallbacklocal ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-canonicalize-fallback-local
+                options)))
+      (format t "canonicalizehostname ~A~%"
+              (case (cl-pnet-ssh:ssh-config-options-canonicalize-hostname
+                     options)
+                (:yes "true") (:no "false") (t "always")))
+      (format t "checkhostip ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-check-host-ip options)))
+      ;; -C is a dedicated flag rather than an -o line, so both sources
+      ;; need consulting here.
+      (format t "compression ~A~%"
+              (yes-no (or (getf *options* :compression)
+                          (cl-pnet-ssh:ssh-config-options-compression
+                           options))))
+      ;; ssh -G spells yes and no as true and false here, and omits
+      ;; ControlPath entirely when multiplexing has no socket.
+      (let ((master (cl-pnet-ssh:ssh-config-options-control-master options)))
+        (format t "controlmaster ~A~%"
+                (case master
+                  ((:yes) "true")
+                  ((nil :no) "false")
+                  (t (string-downcase (symbol-name master))))))
+      (format t "enablesshkeysign ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-enable-ssh-keysign
+                       options)))
+      (format t "clearallforwardings ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-clear-all-forwardings
+                       options)))
+      (format t "exitonforwardfailure ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-exit-on-forward-failure
+                options)))
+      (format t "fingerprinthash ~A~%"
+              (string-upcase
+               (symbol-name
+                (or (cl-pnet-ssh:ssh-config-options-fingerprint-hash options)
+                    :sha256))))
+      (let ((cli (getf *options* :x11-forward)))
+        (format t "forwardx11 ~A~%"
+                (cond ((eq cli :no) "no")
+                      ((member cli '(:yes :trust) :test #'eq) "yes")
+                      (t (yes-no
+                          (cl-pnet-ssh:ssh-config-options-forward-x11
+                           options))))))
+      (format t "forwardx11trusted ~A~%"
+              (yes-no
+               (if (eq (getf *options* :x11-forward) :trust)
+                   t
+                   (cl-pnet-ssh:ssh-config-options-forward-x11-trusted
+                    options))))
+      (format t "gatewayports ~A~%"
+              (yes-no (or (getf *options* :gateway-ports)
+                          (cl-pnet-ssh:ssh-config-options-gateway-ports
+                           options))))
+      ;; GSSAPI is not built in here, so its default is off even though
+      ;; OpenSSH's GSSAPI build prints on.  A configured value still shows.
+      (format t "gssapiauthentication ~A~%"
+              (yes-no (or (getf *options* :gssapi-auth)
+                          (cl-pnet-ssh:ssh-config-options-gssapi-authentication
+                           options))))
+      (format t "gssapidelegatecredentials ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
+                options)))
+      (format t "hashknownhosts ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-hash-known-hosts
+                       options)))
+      (format t "hostbasedauthentication ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-hostbased-authentication
+                options)))
+      (format t "identitiesonly ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-identities-only
+                       options)))
+      (format t "kbdinteractiveauthentication ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-kbd-interactive-authentication
+                options)))
+      (format t "nohostauthenticationforlocalhost ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-no-host-authentication-for-localhost
+                options)))
+      (format t "passwordauthentication ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-password-authentication
+                       options)))
+      (format t "permitlocalcommand ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-permit-local-command
+                       options)))
+      (format t "proxyusefdpass ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass
+                       options)))
+      ;; PubkeyAuthentication is a multistate in 10.6, so yes prints true.
+      (format t "pubkeyauthentication ~A~%"
+              (if (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication
+                       options)
+                      :no)
+                  "false"
+                  "true"))
+      (format t "requesttty ~A~%"
+              (or (tty-setting-name (getf *options* :request-tty))
+                  (cl-pnet-ssh:ssh-config-options-request-tty options)
+                  "auto"))
+      (format t "sessiontype ~A~%"
+              (or (cl-pnet-ssh:ssh-config-options-session-type options)
+                  "default"))
+      (format t "stdinnull ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-stdin-null options)))
+      (format t "forkafterauthentication ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-fork-after-authentication
+                options)))
+      (format t "streamlocalbindunlink ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
+                       options)))
+      (format t "stricthostkeychecking ~A~%"
+              (or (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
+                   options)
+                  (case (getf *options* :policy)
+                    (:insecure "no")
+                    (:accept-new "accept-new")
+                    (t "yes"))))
+      ;; TCPKeepAlive's multistate prints true/false in 10.6.
+      (format t "tcpkeepalive ~A~%"
+              (true-false
+               (cl-pnet-ssh:ssh-config-options-tcp-keep-alive options)))
+      ;; ssh prints Tunnel's multistate name: ethernet, point-to-point,
+      ;; true for the default device, or false when disabled.  A -w flag
+      ;; asks for point-to-point.
+      (format t "tunnel ~A~%"
+              (cond
+                ((getf *options* :tunnel) "point-to-point")
+                (t (case (cl-pnet-ssh:ssh-config-options-tunnel options)
+                     (:ethernet "ethernet")
+                     (:point-to-point "point-to-point")
+                     ((:yes) "true")
+                     (t "false")))))
+      (format t "verifyhostkeydns ~A~%"
+              (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
+                     options)
+                (:ask "ask") (:yes "true") (t "false")))
+      (format t "visualhostkey ~A~%"
+              (yes-no (cl-pnet-ssh:ssh-config-options-visual-host-key
+                       options)))
+      ;; 10.6 prints true/false/ask here, and turns UpdateHostKeys off by
+      ;; default when UserKnownHostsFile was named explicitly.
+      (format t "updatehostkeys ~A~%"
+              (case (or (cl-pnet-ssh:ssh-config-options-update-host-keys
+                         options)
+                        (if (cl-pnet-ssh:ssh-config-options-known-hosts
+                             options)
+                            :no
+                            :yes))
+                (:yes "true")
+                (:ask "ask")
+                (t "false")))
+      (format t "enableescapecommandline ~A~%"
+              (yes-no
+               (cl-pnet-ssh:ssh-config-options-enable-escape-commandline
+                options)))
+      (format t "warnweakcrypto ~A~%"
+              (yes-no
+               (not (eq (cl-pnet-ssh:ssh-config-options-warn-weak-crypto
+                         options)
+                        :no))))
+
+      ;; Integer options.
+      (format t "canonicalizemaxdots ~D~%"
+              (cl-pnet-ssh:ssh-config-options-canonicalize-max-dots options))
+      (format t "connectionattempts ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-connection-attempts options)
+                  1))
+      (format t "forwardx11timeout ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-forward-x11-timeout options)
+                  1200))
+      (format t "numberofpasswordprompts ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-number-of-password-prompts
+                   options)
+                  3))
+      (format t "serveralivecountmax ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-server-alive-count-max
+                   options)
+                  3))
+      (format t "serveraliveinterval ~D~%"
+              (let ((value
+                      (cl-pnet-ssh:ssh-config-options-server-alive-interval
+                       options)))
+                (if (integerp value) value 0)))
+      (format t "requiredrsasize ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-required-rsa-size options)
+                  cl-pnet-ssh::+ssh-rsa-minimum-modulus-size+))
+      (format t "obscurekeystroketiming ~A~%"
+              (let ((value
+                      (or (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
+                           options)
+                          cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)))
+                (cond ((zerop value) "no")
+                      ((= value cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)
+                       "yes")
+                      (t (format nil "~D" value)))))
+
+      ;; String options.  dump_cfg_string prints a line only when the
+      ;; value is set, so the optional ones stay silent here.
+      (let ((value (or (getf *options* :bind-address)
+                       (cl-pnet-ssh:ssh-config-options-bind-address
+                        options))))
+        (when value
+          (format t "bindaddress ~A~%" value)))
+      (let ((value (or (getf *options* :bind-interface)
+                       (cl-pnet-ssh:ssh-config-options-bind-interface
+                        options))))
+        (when value
+          (format t "bindinterface ~A~%" value)))
+      (format t "ciphers ~{~A~^,~}~%"
+              (algorithms #'cl-pnet-ssh:ssh-config-options-ciphers
+                          cl-pnet-ssh::+ssh-ciphers+ "Ciphers"))
+      (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
+        (when (and path (not (eq path :none)) (not (string-equal path "none")))
+          (format t "controlpath ~A~%"
+                  (mux-expand-control-path
+                   (mux-tilde-expand path)
+                   :original host
+                   :hostname hostname
+                   :port (or (cl-pnet-ssh:ssh-config-options-port options)
+                             (client-port)
+                             22)
+                   :user (or (cl-pnet-ssh:ssh-config-options-user options)
+                             (getf *options* :user)
+                             (uiop:getenv "USER")
+                             "root")))))
+      (format t "hostkeyalgorithms ~{~A~^,~}~%"
+              (algorithms
+               #'cl-pnet-ssh:ssh-config-options-host-key-algorithms
+               cl-pnet-ssh::+ssh-host-key-algorithms+ "HostKeyAlgorithms"))
+      (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
+        (when alias
+          (format t "hostkeyalias ~A~%" alias)))
+      (format t "hostbasedacceptedalgorithms ~{~A~^,~}~%"
+              (algorithms
+               #'cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
+               cl-pnet-ssh::+ssh-signature-algorithms+
+               "HostbasedAcceptedAlgorithms"))
+      (let ((value (or (getf *options* :agent)
+                       (cl-pnet-ssh:ssh-config-options-identity-agent
+                        options))))
+        (when value
+          (format t "identityagent ~A~%"
+                  (case value
+                    (:none "none")
+                    (:environment "SSH_AUTH_SOCK")
+                    (t value)))))
+      (let ((ignored (cl-pnet-ssh:ssh-config-options-ignored-unknown options)))
+        (when ignored
+          (format t "ignoreunknown ~A~%" ignored)))
+      (let ((devices
+              (cl-pnet-ssh:ssh-config-options-kbd-interactive-devices
+               options)))
+        (when devices
+          (format t "kbdinteractivedevices ~A~%" devices)))
+      (format t "kexalgorithms ~{~A~^,~}~%"
+              (algorithms
+               #'cl-pnet-ssh:ssh-config-options-kex-algorithms
+               cl-pnet-ssh::+ssh-kex-real-algorithms+ "KexAlgorithms"))
+      (format t "casignaturealgorithms ~{~A~^,~}~%"
+              (algorithms
+               #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms
+               cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+               "CASignatureAlgorithms"
+               cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+))
+      (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
+        (when local
+          (format t "localcommand ~A~%" local)))
+      (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
+        (when remote
+          (format t "remotecommand ~A~%" remote)))
+      (format t "loglevel ~A~%"
+              (string-upcase
+               (or (cl-pnet-ssh:ssh-config-options-log-level options)
+                   "info")))
+      (format t "macs ~{~A~^,~}~%"
+              (algorithms #'cl-pnet-ssh:ssh-config-options-macs
+                          cl-pnet-ssh::+ssh-macs+ "MACs"))
+      (let ((provider (or (getf *options* :pkcs11)
+                          (cl-pnet-ssh:ssh-config-options-pkcs11-provider
+                           options))))
+        (when (and provider (not (eq provider :none)))
+          (format t "pkcs11provider ~A~%" provider)))
+      (let ((provider
+              (cl-pnet-ssh:ssh-config-options-security-key-provider options)))
+        ;; ssh clears "none" after parsing, so no line appears; otherwise
+        ;; the default provider is internal.
+        (unless (eq provider :none)
+          (format t "securitykeyprovider ~A~%"
+                  (or provider "internal"))))
+      (let ((methods
+              (cl-pnet-ssh:ssh-config-options-preferred-authentications
+               options)))
+        (when methods
+          (format t "preferredauthentications ~{~A~^,~}~%" methods)))
+      (format t "pubkeyacceptedalgorithms ~{~A~^,~}~%"
+              (algorithms
+               #'cl-pnet-ssh:ssh-config-options-pubkey-accepted-algorithms
+               cl-pnet-ssh::+ssh-signature-algorithms+
+               "PubkeyAcceptedAlgorithms"))
+      (format t "xauthlocation ~A~%"
+              (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
+                  "/usr/bin/xauth"))
+      (let ((command (cl-pnet-ssh:ssh-config-options-known-hosts-command
+                      options)))
+        (when command
+          (format t "knownhostscommand ~A~%" command)))
+      (let ((tag (cl-pnet-ssh:ssh-config-options-tag options)))
+        (when tag
+          (format t "tag ~A~%" tag)))
+      (when (cl-pnet-ssh:ssh-config-options-version-addendum options)
+        (format t "versionaddendum ~A~%"
+                (or (cl-pnet-ssh::ssh-config-client-version-addendum
+                     options host
+                     :user (getf *options* :user)
+                     :port (client-port))
+                    "")))
+
+      ;; Forwarding lines.
+      (print-list-option
+       "dynamicforward"
+       (reverse (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
+      (print-list-option
+       "localforward"
+       (reverse (cl-pnet-ssh:ssh-config-options-local-forwards options)))
+      (print-list-option
+       "remoteforward"
+       (reverse (cl-pnet-ssh:ssh-config-options-remote-forwards options)))
+
+      ;; String arrays.
+      (let ((files (or (reverse
+                        (cl-pnet-ssh:ssh-config-options-identity-files
+                         options))
+                       (reverse (getf *options* :identity)))))
+        (if files
+            (print-list-option "identityfile" (paths files))
+            (dolist (name cl-pnet-ssh::+ssh-default-identity-names+)
+              (format t "identityfile ~~/.ssh/~A~%" name))))
+      (print-list-option
+       "certificatefile"
+       (paths (reverse
+               (cl-pnet-ssh:ssh-config-options-certificate-files options))))
+      (print-list-oneline
+       "canonicaldomains"
+       (cl-pnet-ssh:ssh-config-options-canonical-domains options))
+      (print-list-oneline
+       "globalknownhostsfile"
+       (paths (cl-pnet-ssh:ssh-config-options-global-known-hosts options)))
+      (print-list-oneline
+       "userknownhostsfile"
+       (let ((files (cl-pnet-ssh:ssh-config-options-known-hosts options))
+             (cli (getf *options* :known-hosts)))
+         (cond (cli (list cli))
+               (files (paths files))
+               (t (list "~/.ssh/known_hosts")))))
+      (print-list-oneline
+       "revokedhostkeys"
+       (paths (reverse
+               (cl-pnet-ssh:ssh-config-options-revoked-host-keys options))))
+      (print-list-option "sendenv"
+                         (cl-pnet-ssh:ssh-config-options-send-env options))
+      (print-list-option "setenv"
+                         (cl-pnet-ssh:ssh-config-options-set-env options))
+      (print-list-oneline
+       "logverbose"
+       (cl-pnet-ssh:ssh-config-options-log-verbose options))
+      (print-list-oneline
+       "channeltimeout"
+       (let ((timeouts
+               (cl-pnet-ssh:ssh-config-options-channel-timeouts options)))
+         (if (consp timeouts) timeouts nil)))
+
+      ;; Special cases, in 10.6's order.
+      (let ((permit (cl-pnet-ssh:ssh-config-options-permit-remote-open
+                     options)))
+        (print-list-oneline
+         "permitremoteopen"
+         (cond
+           ((eq permit :none) (list "none"))
+           ((or (null permit) (eq permit :any)) (list "any"))
+           (t (mapcar (lambda (entry)
+                        (format nil "~A:~A"
+                                (car entry)
+                                (if (eq (cdr entry) :any)
+                                    "*"
+                                    (cdr entry))))
+                      permit)))))
+      (format t "addkeystoagent ~A~%"
+              (case (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
+                     options)
+                (:yes "true")
+                (:ask "ask")
+                (:confirm "confirm")
+                (t "false")))
+      (format t "forwardagent ~A~%"
+              (let ((value (or (getf *options* :forward-agent)
+                               (cl-pnet-ssh:ssh-config-options-forward-agent
+                                options))))
+                (cond ((eq value :no) "no")
+                      (value "yes")
+                      (t "no"))))
+      (format t "connecttimeout ~A~%"
+              (let ((value
+                      (cl-pnet-ssh:ssh-config-options-connect-timeout
+                       options)))
+                (if (integerp value) (format nil "~D" value) "none")))
+      (let ((device (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
+        (format t "tunneldevice ~A:~A~%"
+                (if device
+                    (if (eq (car device) :any) "any" (car device))
+                    "any")
+                (if (and device (not (eq (cdr device) :any)))
+                    (cdr device)
+                    "any")))
+      (format t "canonicalizepermittedcnames")
+      (let ((rules
+              (cl-pnet-ssh:ssh-config-options-canonicalize-permitted-cnames
+               options)))
+        (if (or (null rules)
+                (and (null (rest rules))
+                     (string-equal (caar rules) "none")))
+            (format t " none")
+            (dolist (rule rules)
+              (format t " ~A:~A" (car rule) (cdr rule)))))
+      (format t "~%")
+      (let ((persist (cl-pnet-ssh:ssh-config-options-control-persist options)))
+        (format t "controlpersist ~A~%"
+                (cond ((or (null persist) (eq persist :no)) "no")
+                      ((eq persist :yes) "yes")
+                      (t (format nil "~D" persist)))))
+      (format t "escapechar ~A~%"
+              (let ((value (cl-pnet-ssh:ssh-config-options-escape-char
+                            options)))
+                (cond ((eq value :none) "none")
+                      ((null value) "~")
+                      (t (format nil "~C" value)))))
+      (flet ((ip-qos-name (value)
+               (cond
+                 ((eq value :none) "none")
+                 (t (or (car (rassoc value cl-pnet-ssh::+ssh-config-ip-qos-names+
+                                     :test #'eql))
+                        (format nil "0x~2,'0x" value))))))
+        (format t "ipqos ~A ~A~%"
+                (ip-qos-name
+                 (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
+                (ip-qos-name
+                 (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
+      (format t "rekeylimit ~A~%"
+              (let ((arguments
+                      (cl-pnet-ssh:ssh-config-options-rekey-limit options)))
+                (if arguments
+                    (format nil "~{~A~^ ~}" arguments)
+                    "0 0")))
+      (format t "streamlocalbindmask 0~O~%"
+              (or (cl-pnet-ssh:ssh-config-options-streamlocal-bind-mask
+                   options)
+                  #o177))
+      (format t "syslogfacility ~A~%"
+              (or (cl-pnet-ssh:ssh-config-options-syslog-facility options)
+                  "USER"))
+
+      ;; ProxyCommand and ProxyJump share one line: ssh prints the jump
+      ;; specification when there is one, otherwise the command, and
+      ;; nothing when neither is configured.
+      (let ((jump (or (let ((value
+                             (cl-pnet-ssh:ssh-config-options-proxy-jump
+                              options)))
+                        (cond ((null value) nil)
+                              ((listp value) (format nil "~{~A~^,~}" value))
+                              (t value)))
+                      (getf *options* :jump))))
+        (if jump
+            (format t "proxyjump ~A~%" jump)
+            (let ((command (or (cl-pnet-ssh:ssh-config-options-proxy-command
+                                options)
+                               (getf *options* :proxy-command))))
+              (when (and command (not (string-equal command "none")))
+                (format t "proxycommand ~A~%" command))))))))
 
 ;;; ---- Entry point ----
 

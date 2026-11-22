@@ -706,3 +706,91 @@ this session's fixed offset."
       (is (<= 0.0199 delay))
       (is (< delay 0.022))))
   (is (= 20 cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)))
+
+;;; ---- -G output ----
+
+(test print-config-reports-openssh-defaults
+  "The lines ssh -G always prints appear even when nothing configured them,
+and ProxyJump/ProxyCommand stay off the output when unset."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "Port 22"))))
+         (options nil))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "alias.example"
+     :on-options (lambda (value) (setf options value)))
+    (let ((burs::*options* (empty-options))
+          (text (with-output-to-string (*standard-output*)
+                  (burs::print-config-options
+                   "alias.example" options nil))))
+      (dolist (line '("canonicaldomains none"
+                      "globalknownhostsfile none"
+                      "userknownhostsfile ~/.ssh/known_hosts"
+                      "revokedhostkeys none"
+                      "logverbose none"
+                      "channeltimeout none"
+                      "permitremoteopen any"
+                      "addkeystoagent false"
+                      "forwardagent no"
+                      "connecttimeout none"
+                      "tunneldevice any:any"
+                      "canonicalizepermittedcnames none"
+                      "controlpersist no"
+                      "rekeylimit 0 0"
+                      "streamlocalbindmask 0177"
+                      "syslogfacility USER"
+                      "compression no"
+                      "identitiesonly no"
+                      "kbdinteractiveauthentication yes"
+                      "passwordauthentication yes"
+                      "pubkeyauthentication true"
+                      "tcpkeepalive true"
+                      "updatehostkeys true"
+                      "numberofpasswordprompts 3"
+                      "serveralivecountmax 3"
+                      "serveraliveinterval 0"
+                      "ipqos ef none"))
+        (is (search line text) line))
+      (is (search "identityfile" text))
+      (is (not (search "proxyjump" text)))
+      (is (not (search "proxycommand" text))))))
+
+(test print-config-reports-configured-values
+  "Values from the file are printed the way OpenSSH spells them."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "PasswordAuthentication no")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "KbdInteractiveAuthentication no")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "ServerAliveInterval 30")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "ServerAliveCountMax 5")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "NumberOfPasswordPrompts 1")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "Tag work")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "PermitRemoteOpen host:22")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "UpdateHostKeys ask"))))
+         (options nil))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "alias.example"
+     :on-options (lambda (value) (setf options value)))
+    (let ((burs::*options* (empty-options))
+          (text (with-output-to-string (*standard-output*)
+                  (burs::print-config-options
+                   "alias.example" options nil))))
+      (dolist (line '("passwordauthentication no"
+                      "kbdinteractiveauthentication no"
+                      "serveraliveinterval 30"
+                      "serveralivecountmax 5"
+                      "numberofpasswordprompts 1"
+                      "tag work"
+                      "permitremoteopen host:22"
+                      "updatehostkeys ask"))
+        (is (search line text) line)))))

@@ -201,7 +201,15 @@
    #:ssh-config-options-permit-remote-open
    #:ssh-config-options-tcp-keep-alive
    #:ssh-config-options-connection-attempts
+   #:ssh-config-options-connect-timeout
+   #:ssh-config-options-server-alive-interval
+   #:ssh-config-options-server-alive-count-max
    #:ssh-config-options-required-rsa-size
+   #:ssh-config-options-ciphers
+   #:ssh-config-options-macs
+   #:ssh-config-options-kex-algorithms
+   #:ssh-config-options-host-key-algorithms
+   #:ssh-config-options-pubkey-accepted-algorithms
    #:ssh-config-options-ca-signature-algorithms
    #:ssh-config-options-streamlocal-bind-mask
    #:ssh-config-options-streamlocal-bind-unlink
@@ -243,6 +251,10 @@
    #:ssh-config-options-rekey-limit
    #:ssh-config-options-preferred-authentications
    #:ssh-config-options-pubkey-authentication
+   #:ssh-config-options-password-authentication
+   #:ssh-config-options-kbd-interactive-authentication
+   #:ssh-config-options-number-of-password-prompts
+   #:ssh-config-options-tag
    #:ssh-config-options-forward-x11
    #:ssh-config-options-forward-x11-trusted
    #:ssh-config-client-source
