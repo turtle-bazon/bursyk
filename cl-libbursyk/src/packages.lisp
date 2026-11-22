@@ -138,6 +138,10 @@
    #:ssh-config-load
    #:ssh-config-combine
    #:ssh-config-resolve
+   #:ssh-config-canonicalize
+   #:ssh-config-canonicalize-host
+   #:ssh-config-permitted-cnames-p
+   #:ssh-config-canonical-cname
    #:ssh-config-option-line
    #:ssh-config-option-lines
    #:ssh-config-add-options
@@ -160,6 +164,7 @@
    #:ssh-config-options-canonicalize-max-dots
    #:ssh-config-options-canonicalize-fallback-local
    #:ssh-config-options-canonicalize-permitted-cnames
+   #:ssh-config-options-final-pass-wanted
    #:ssh-config-options-identities-only
    #:ssh-config-options-known-hosts
    #:ssh-config-options-global-known-hosts

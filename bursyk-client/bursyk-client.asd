@@ -2,7 +2,7 @@
   :description "SSH client command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.67"
+  :version "0.0.2.68"
   :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cl-pnet-socks #:clingon
                ;; SSHFP queries for VerifyHostKeyDNS; the SSH library finds
                ;; these packages at call time.

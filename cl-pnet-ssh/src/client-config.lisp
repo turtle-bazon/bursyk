@@ -112,7 +112,8 @@ may name when that differs from the default offer."
 (defun ssh-config-client-parameters (host options
                                      &key user port private-key agent passphrase
                                        known-hosts host-key-policy
-                                       host-key-callback proxy-command)
+                                       host-key-callback proxy-command
+                                       resolver canonicalized)
   "MAKE-SSH-CLIENT's arguments for HOST, given resolved OPTIONS.
 
 USER and PORT win over the file; the remaining keywords are explicit
@@ -166,7 +167,11 @@ MAKE-SSH-CLIENT's own defaults."
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
         :canonicalize-hostname
-        (ssh-config-options-canonicalize-hostname options)
+        (if canonicalized
+            ;; The config layer already canonicalized this name, with
+            ;; ProxyJump in view; the client must not try again.
+            :no
+            (ssh-config-options-canonicalize-hostname options))
         :canonical-domains
         (ssh-config-options-canonical-domains options)
         :canonicalize-max-dots
@@ -212,7 +217,8 @@ MAKE-SSH-CLIENT's own defaults."
          (ssh-config-options-server-alive-count-max options))
         :proxy-command
         (ssh-proxy-command-value
-         (or proxy-command (ssh-config-options-proxy-command options)))))
+         (or proxy-command (ssh-config-options-proxy-command options)))
+        :resolver resolver))
 
 ;;; ---- ProxyJump descriptors ----
 
@@ -523,7 +529,8 @@ the destination's user and port do not apply to it."
            :passphrase (getf overrides :passphrase)
            :known-hosts (getf overrides :known-hosts)
            :host-key-policy (getf overrides :host-key-policy)
-           :host-key-callback (getf overrides :host-key-callback))))
+           :host-key-callback (getf overrides :host-key-callback)
+           :resolver (getf overrides :resolver))))
     (when (getf descriptor :user)
       (setf (getf parameters :user) (getf descriptor :user)))
     (when (getf descriptor :port)
@@ -607,6 +614,8 @@ in the tunnel's buffers."
                  :known-hosts (getf overrides :known-hosts)
                  :host-key-policy (getf overrides :host-key-policy)
                  :host-key-callback (getf overrides :host-key-callback)
+                 :resolver (getf overrides :resolver)
+                 :canonicalized t
                  :proxy-command proxy-command)))
     (cond
       (hops
@@ -629,14 +638,15 @@ in the tunnel's buffers."
 
 (defun ssh-config-client-overrides (user port private-key agent passphrase
                                     known-hosts host-key-policy
-                                    host-key-callback)
+                                    host-key-callback resolver)
   "The explicit command-line answers, as a plist for the chain builder."
   (list :user user :port port
         :private-key private-key :agent agent
         :passphrase passphrase
         :known-hosts known-hosts
         :host-key-policy host-key-policy
-        :host-key-callback host-key-callback))
+        :host-key-callback host-key-callback
+        :resolver resolver))
 
 (defun ssh-config-build-client (source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
@@ -668,7 +678,7 @@ in the tunnel's buffers."
               known-hosts host-key-policy host-key-callback proxy-jump
               proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close on-forwarded-tcpip
-              on-forwarded-streamlocal)
+              on-forwarded-streamlocal resolver canonical-resolver)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -678,11 +688,13 @@ arguments win.  OPTIONS are free-form -o answers, each a \"Keyword value\"
 string or a (KEYWORD . VALUE) cons; they are applied before CONFIG, so any
 keyword wins over the file.  EXEC-MATCHER answers Match exec; ON-CLIENT
 receives an asynchronous client; ON-CONFIG-ERROR reports resolution
-failures."
+failures.  RESOLVER dials addresses for the built clients; CANONICAL-RESOLVER
+performs the CanonicalizeHostname lookup and may report a CNAME as its
+second value."
   (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
-                     known-hosts host-key-policy host-key-callback))
+                     known-hosts host-key-policy host-key-callback resolver))
          (finished nil)
          (client nil)
          (on-built (lambda (value)
@@ -691,15 +703,20 @@ failures."
          (fail (lambda (condition)
                  (setf finished t)
                  (ssh-config-client-error condition on-config-error))))
-    (ssh-config-resolve
+    (ssh-config-canonicalize
      source host
      :original-host (or original-host host)
      :user user
      :port port
      :exec-matcher exec-matcher
+     :resolver (or canonical-resolver #'burzay:resolve-host-canonical)
+     :direct (lambda (options)
+               (and (null (ssh-config-proxy-command options proxy-command))
+                    (null (ssh-config-proxy-jumps options proxy-jump))))
      :on-options
-     (lambda (options)
-       (ssh-config-build-client source host options proxy-jump proxy-command
+     (lambda (options canonical-host)
+       (ssh-config-build-client source canonical-host options
+                                proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
                                 :on-forwarded-tcpip on-forwarded-tcpip

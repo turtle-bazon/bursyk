@@ -5,6 +5,7 @@
   :version "0.0.1.2"
   :depends-on ((:feature (:not :ssh-backend-ffi) #:cl-libbursyk)
                (:feature :ssh-backend-ffi #:cl-plibssh)
+               #:burzay
                #:cl-pnet
                #:iterate
                #:uiop)

@@ -2326,9 +2326,20 @@ peer that connected to it; NIL refuses the channel."
 
 ;;; ---- -G: print the effective configuration ----
 
+(defun synchronous-canonical-resolver (host on-success on-error)
+  "Resolve HOST on this thread, for the synchronous -G path."
+  (handler-case
+      (multiple-value-bind (address canonical)
+          (cl-pnet-sockets:lookup-host-canonical host)
+        (if canonical
+            (funcall on-success address canonical)
+            (funcall on-success address)))
+    (error (condition) (funcall on-error condition))))
+
 (defun resolve-config-options (host)
-  "HOST's ssh_config as SSH-CONFIG-OPTIONS, synchronously."
+  "HOST's ssh_config as SSH-CONFIG-OPTIONS and its canonical name, in order."
   (let ((result nil)
+        (canonical nil)
         (failure nil)
         (source
           (handler-case
@@ -2337,32 +2348,42 @@ peer that connected to it; NIL refuses the channel."
                (command-line-option-list))
             (cl-pnet-ssh:ssh-config-error (condition)
               (fail "~A" condition)))))
-    (cl-pnet-ssh:ssh-config-resolve
+    (cl-pnet-ssh:ssh-config-canonicalize
      source host
      :original-host host
      :user (getf *options* :user)
      :port (client-port)
      :exec-matcher #'match-exec
-     :on-options (lambda (options) (setf result options))
+     :resolver #'synchronous-canonical-resolver
+     :on-options (lambda (options canonical-host)
+                   (setf result options canonical canonical-host))
      :on-error (lambda (condition) (setf failure condition)))
     (if failure
         (fail "~A" failure)
-        result)))
+        (values result canonical))))
 
 (defun print-list-option (name values)
   (dolist (value values)
     (format t "~A ~A~%" name value)))
 
 (defun print-config (host)
-  (let* ((options (resolve-config-options host))
-         (hostname (or (cl-pnet-ssh:ssh-config-options-hostname options)
-                       host)))
+  (multiple-value-bind (options canonical)
+      (resolve-config-options host)
+    (print-config-options host options canonical))
+  (finish-output)
+  (uiop:quit 0))
+
+(defun print-config-options (host options canonical)
+  "Print OPTIONS resolved for HOST, whose canonical name is CANONICAL."
+  (let ((hostname (or canonical
+                      (cl-pnet-ssh:ssh-config-options-hostname options)
+                      host)))
     (format t "host ~A~%" host)
     (format t "hostname ~A~%" hostname)
     (format t "canonicalizehostname ~A~%"
-            (string-downcase
-             (symbol-name
-              (cl-pnet-ssh:ssh-config-options-canonicalize-hostname options))))
+            (case (cl-pnet-ssh:ssh-config-options-canonicalize-hostname
+                   options)
+              (:yes "true") (:no "false") (t "always")))
     (print-list-option
      "canonicaldomains"
      (cl-pnet-ssh:ssh-config-options-canonical-domains options))
@@ -2373,10 +2394,21 @@ peer that connected to it; NIL refuses the channel."
                  options)
                 "yes"
                 "no"))
+    (format t "canonicalizepermittedcnames")
+    (let ((rules
+            (cl-pnet-ssh:ssh-config-options-canonicalize-permitted-cnames
+             options)))
+      (if (or (null rules)
+              (and (null (rest rules))
+                   (string-equal (caar rules) "none")))
+          (format t " none")
+          (dolist (rule rules)
+            (format t " ~A:~A" (car rule) (cdr rule)))))
+    (format t "~%")
     (format t "verifyhostkeydns ~A~%"
             (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
                    options)
-              (:yes "yes") (:ask "ask") (t "no")))
+              (:ask "ask") (:yes "true") (t "false")))
     ;; ssh -G spells yes and no as true and false here, and omits
     ;; ControlPath entirely when multiplexing has no socket.
     (let ((master (cl-pnet-ssh:ssh-config-options-control-master options)))
@@ -2607,9 +2639,7 @@ peer that connected to it; NIL refuses the channel."
     (format t "proxycommand ~A~%"
             (or (cl-pnet-ssh:ssh-config-options-proxy-command options)
                 (getf *options* :proxy-command)
-                "none")))
-  (finish-output)
-  (uiop:quit 0))
+                "none"))))
 
 ;;; ---- Entry point ----
 

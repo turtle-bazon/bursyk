@@ -3057,6 +3057,275 @@ newline")))
     (is (= 1 (ssh-config-options-canonicalize-max-dots options)))
     (is (eq t (ssh-config-options-canonicalize-fallback-local options)))))
 
+(test canonicalize-permitted-cnames-parses
+  (let ((options nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::%make-ssh-config
+      :directives
+      (list (cl-pnet-ssh::ssh-config-option-line
+             "CanonicalizePermittedCNAMEs *.example:*.internal foo:bar *:*")))
+     "alias"
+     :on-options (lambda (value) (setf options value)))
+    (is (equal '(("*.example" . "*.internal") ("foo" . "bar") ("*" . "*"))
+               (ssh-config-options-canonicalize-permitted-cnames options)))
+    (is (ssh-config-permitted-cnames-p options)))
+  (let ((options nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::%make-ssh-config
+      :directives
+      (list (cl-pnet-ssh::ssh-config-option-line
+             "CanonicalizePermittedCNAMEs none")))
+     "alias"
+     :on-options (lambda (value) (setf options value)))
+    (is (equal '(("none" . ""))
+               (ssh-config-options-canonicalize-permitted-cnames options)))
+    (is (not (ssh-config-permitted-cnames-p options))))
+  (let ((failure nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::%make-ssh-config
+      :directives
+      (list (cl-pnet-ssh::ssh-config-option-line
+             "CanonicalizePermittedCNAMEs source-only")))
+     "alias"
+     :on-error (lambda (condition) (setf failure condition)))
+    (is (typep failure 'ssh-config-error)))
+  (let ((failure nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::%make-ssh-config
+      :directives
+      (list (cl-pnet-ssh::ssh-config-option-line
+             "CanonicalizePermittedCNAMEs none *:*")))
+     "alias"
+     :on-error (lambda (condition) (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
+
+(defun canonicalize-test-resolver (answers)
+  "A resolver answering from ANSWERS, a list of (REQUEST . (ADDRESS CNAME))."
+  (lambda (host on-success on-error)
+    (let ((answer (assoc host answers :test #'string=)))
+      (if answer
+          (destructuring-bind (address canonical) (cdr answer)
+            (if canonical
+                (funcall on-success address canonical)
+                (funcall on-success address)))
+          (funcall on-error
+                   (make-condition 'simple-error
+                                   :format-control "unexpected ~A"
+                                   :format-arguments (list host)))))))
+
+(test canonicalize-second-pass-applies-canonical-host
+  "After canonicalization the configuration is read again for the new name."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "Host short.example")
+                  (cl-pnet-ssh::ssh-config-option-line "User canonical")
+                  (cl-pnet-ssh::ssh-config-option-line "Port 2200"))))
+         (options nil)
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (canonicalize-test-resolver
+                '(("short.example." "127.0.0.1" "short.example")))
+     :on-options (lambda (value host)
+                   (setf options value canonical host))
+     :on-error #'error)
+    (is (equal "short.example" canonical))
+    (is (equal "canonical" (ssh-config-options-user options)))
+    (is (equal "short.example" (ssh-config-options-hostname options)))
+    (is (= 2200 (ssh-config-options-port options)))))
+
+(test canonicalize-follows-permitted-cname
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizePermittedCNAMEs *.example:*.internal"))))
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (canonicalize-test-resolver
+                '(("short.example." "127.0.0.1" "Real.Internal")))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal "real.internal" canonical))))
+
+(test canonicalize-does-not-follow-cname-when-hosting-canonicalization-off
+  "CanonicalizePermittedCNAMEs alone must not follow a CNAME, as ssh.c's
+check_follow_cname() refuses when CanonicalizeHostname is no."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizePermittedCNAMEs *:*"))))
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "alias"
+     :resolver (lambda (host on-success on-error)
+                 (declare (ignore host on-success on-error))
+                 (error "canonicalization is off, so no lookup may run"))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal "alias" canonical))))
+
+(test canonicalize-rejects-unpermitted-cname
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizePermittedCNAMEs *.example:*.other"))))
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (canonicalize-test-resolver
+                '(("short.example." "127.0.0.1" "real.internal")))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal "short.example" canonical))))
+
+(test canonicalize-fallback-local-refuses-unresolved
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeFallbackLocal no"))))
+         (condition nil))
+    (handler-case
+        (ssh-config-canonicalize
+         config "short"
+         :resolver (lambda (host on-success on-error)
+                     (declare (ignore host on-success))
+                     (funcall on-error
+                              (make-condition 'simple-error
+                                              :format-control "no")))
+         :on-options (lambda (options host)
+                       (declare (ignore options host))
+                       (is nil "canonicalization should not succeed"))
+         :on-error #'error)
+      (ssh-config-error (error) (setf condition error)))
+    (is (typep condition 'ssh-config-error))))
+
+(test canonicalize-match-final-requests-second-pass
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname no")
+                  (cl-pnet-ssh::ssh-config-option-line "Match final")
+                  (cl-pnet-ssh::ssh-config-option-line "User final"))))
+         (options nil)
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "Host"
+     :resolver (lambda (host on-success on-error)
+                 (declare (ignore host on-success on-error))
+                 (error "a final-only pass must not resolve"))
+     :on-options (lambda (value host)
+                   (setf options value canonical host))
+     :on-error #'error)
+    (is (equal "host" canonical))
+    (is (equal "final" (ssh-config-options-user options)))))
+
+(test canonicalize-proxied-name-is-left-alone
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyCommand nc %h %p"))))
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (lambda (host on-success on-error)
+                 (declare (ignore host on-success on-error))
+                 (error "a proxied name must not resolve"))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal "short" canonical))))
+
+(test canonicalize-proxy-jump-is-left-alone
+  "ProxyJump is a proxy for these purposes, so no lookup happens."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyJump jump.example"))))
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (lambda (host on-success on-error)
+                 (declare (ignore host on-success on-error))
+                 (error "a proxied name must not resolve"))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal "short" canonical))))
+
+(test canonicalize-match-canonical-matches-on-the-second-pass
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname no")
+                  (cl-pnet-ssh::ssh-config-option-line "Match final")
+                  (cl-pnet-ssh::ssh-config-option-line "User final")
+                  (cl-pnet-ssh::ssh-config-option-line "Match canonical")
+                  (cl-pnet-ssh::ssh-config-option-line "Port 2222"))))
+         (options nil))
+    (ssh-config-canonicalize
+     config "host"
+     :on-options (lambda (value host)
+                   (declare (ignore host))
+                   (setf options value))
+     :on-error #'error)
+    (is (equal "final" (ssh-config-options-user options)))
+    (is (= 2222 (ssh-config-options-port options)))))
+
+(test canonicalize-client-built-target-is-not-canonicalized-again
+  "The config layer owns canonicalization; the client must not repeat it."
+  (let ((options (facade-options '(:canonicalize-hostname :yes))))
+    (is (eq :no
+            (getf (cl-pnet-ssh::ssh-config-client-parameters
+                   "host" options :canonicalized t)
+                  :canonicalize-hostname)))
+    (is (eq :yes
+            (getf (cl-pnet-ssh::ssh-config-client-parameters
+                   "host" options)
+                  :canonicalize-hostname)))))
+
 (test client-loopback-canonical-domains
   "A short name is found by appending CanonicalDomains."
   (if (not (ssh-keygen-available-p))

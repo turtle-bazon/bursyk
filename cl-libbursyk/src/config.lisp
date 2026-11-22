@@ -42,6 +42,9 @@ relative Include is anchored here.")
 
 (defstruct (ssh-config-options (:constructor %make-ssh-config-options))
   (hostname nil)
+  ;; Set when a Match final line asked for the second configuration pass that
+  ;; OpenSSH runs after hostname canonicalization.
+  (final-pass-wanted nil)
   ;; CanonicalizeHostname and its search rules.
   (canonicalize-hostname :no)
   (canonical-domains '())
@@ -651,6 +654,37 @@ does that without a temporary file."
     (setf (gethash key seen) t)
     (funcall thunk options)))
 
+(defun ssh-config-permitted-cnames-value (line)
+  "LINE's CanonicalizePermittedCNAMEs rules, as (SOURCE . TARGET) pairs.
+
+OpenSSH accepts \"none\" alone (disables CNAME following), \"*\" (allow
+everything), or \"source-list:target-list\".  Each list is comma-separated
+glob patterns; both arguments are lowercased and matched case-insensitively."
+  (let ((arguments (ssh-config-line-args line)))
+    (when (null arguments)
+      (error (ssh-config-line-error line "requires an argument")))
+    (when (and (some (lambda (argument) (string-equal argument "none"))
+                     arguments)
+               (not (and (null (rest arguments))
+                         (string-equal (first arguments) "none"))))
+      (error (ssh-config-line-error line "\"none\" must appear alone")))
+    (loop for argument in arguments
+          collect
+          (cond
+            ((string-equal argument "none")
+             (cons "none" ""))
+            ((string= argument "*")
+             (cons "*" "*"))
+            (t
+             (let* ((argument (string-downcase argument))
+                    (colon (position #\: argument)))
+               (when (or (null colon)
+                         (= colon (1- (length argument))))
+                 (error (ssh-config-line-error
+                         line "invalid permitted CNAME ~S" argument)))
+               (cons (subseq argument 0 colon)
+                     (subseq argument (1+ colon)))))))))
+
 ;;; ---- Host patterns ----
 
 (defun ssh-config-pattern-list-match-p (patterns text &key case-insensitive)
@@ -673,10 +707,16 @@ enough.  Commas in a pattern are separators, as in ssh_config."
               (return-from ssh-config-pattern-list-match-p nil)
               (setf matched t)))))))
 
-(defun ssh-config-host-block-matches-p (line context)
+(defun ssh-config-host-block-matches-p (line options context)
+  "Whether LINE's Host pattern matches the name this pass works on.
+
+The first pass follows a HostName directive that has already been read; the
+final pass follows the canonical name placed in HOSTNAME by its caller.
+ORIGINAL-HOST remains the name the user typed, for %n and OriginalHost."
   (ssh-config-pattern-list-match-p
    (ssh-config-line-args line)
-   (ssh-config-context-original-host context)
+   (or (ssh-config-options-hostname options)
+       (ssh-config-context-original-host context))
    :case-insensitive t))
 
 (defun ssh-config-ipv4-integer (octets)
@@ -818,13 +858,15 @@ understand them rather than silently match nothing."
         seen options :canonicalize-hostname
         (lambda (options)
           (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("yes" "no" "always" "none")
+            (unless (member value '("yes" "no" "always" "true" "false")
                             :test #'string=)
               (error (ssh-config-line-error line
                                             "invalid CanonicalizeHostname ~S"
                                             value)))
             (setf (ssh-config-options-canonicalize-hostname options)
-                  (intern (string-upcase value) :keyword))))))
+                  (cond ((string= value "always") :always)
+                        ((member value '("true" "yes") :test #'string=) :yes)
+                        (t :no)))))))
       ((string= keyword "canonicaldomains")
        (ssh-config-set-once
         seen options :canonical-domains
@@ -849,7 +891,7 @@ understand them rather than silently match nothing."
         seen options :canonicalize-permitted-cnames
         (lambda (options)
           (setf (ssh-config-options-canonicalize-permitted-cnames options)
-                (ssh-config-line-args line)))))
+                (ssh-config-permitted-cnames-value line)))))
       ((string= keyword "hostkeyalias")
        (ssh-config-set-once
         seen options :host-key-alias
@@ -1509,8 +1551,14 @@ understand them rather than silently match nothing."
       (t (error (ssh-config-line-error line "unknown Match condition ~S"
                                        keyword))))))
 
-(defun ssh-config-eval-match (line options context exec-matcher on-result on-error)
-  "Evaluate a Match line, possibly continuing from EXEC-MATCHER's callback."
+(defun ssh-config-eval-match (line options context exec-matcher final-pass
+                               on-result on-error)
+  "Evaluate a Match line, possibly continuing from EXEC-MATCHER's callback.
+
+FINAL-PASS is true while the configuration is re-read after hostname
+canonicalization (or because a Match final line asked for it).  Match final
+records that the second pass is wanted and, like Match canonical, matches
+only during that pass."
   (let ((tokens (ssh-config-line-args line))
         (result t)
         (stopped nil))
@@ -1538,6 +1586,11 @@ understand them rather than silently match nothing."
                    (setf result (and result (not negated)))
                    (advance nil))))
                ((member keyword '("final" "canonical") :test #'string=)
+                (when (and (string= keyword "final") (not negated))
+                  (setf (ssh-config-options-final-pass-wanted options) t))
+                ;; Both criteria look at the pass, not at the hostname.
+                (setf result
+                      (and result (if negated (not final-pass) final-pass)))
                 (advance (rest remaining)))
                ((null (cdr remaining))
                 (setf stopped t)
@@ -1575,6 +1628,7 @@ understand them rather than silently match nothing."
 (defun ssh-config-resolve (config host
                            &key original-host user port tag
                              exec-matcher local-addresses
+                             final-pass options seen
                              on-options on-error)
   "Turn CONFIG into SSH-CONFIG-OPTIONS for HOST.
 
@@ -1585,10 +1639,15 @@ may run before this function returns unless a Match exec had to wait.
 EXEC-MATCHER is (COMMAND ON-RESULT ON-ERROR) and must call ON-RESULT with a
 boolean; without it a Match exec is an error rather than a blocking POPEN.
 
+FINAL-PASS re-reads the configuration the way OpenSSH does after hostname
+canonicalization: HOST is the canonical name, OPTIONS and SEEN continue the
+first pass, and Match canonical/final are active.  The caller sets OPTIONS'
+HOSTNAME to HOST before the pass, as ssh.c does.
+
 Returns CONFIG."
   (let* ((directives (coerce (or (ssh-config-directives config) '()) 'vector))
-         (options (%make-ssh-config-options))
-         (seen (make-hash-table :test #'equal))
+         (options (or options (%make-ssh-config-options)))
+         (seen (or seen (make-hash-table :test #'equal)))
          (context (%make-ssh-config-context
                    :original-host (or original-host host)
                    :user (or user (ssh-default-user))
@@ -1614,12 +1673,12 @@ Returns CONFIG."
                               ((string= (ssh-config-line-keyword line) "host")
                                (setf parsing
                                      (ssh-config-host-block-matches-p
-                                      line context))
+                                      line options context))
                                (incf index))
                               ((string= (ssh-config-line-keyword line) "match")
                                (return
                                  (ssh-config-eval-match
-                                  line options context exec-matcher
+                                  line options context exec-matcher final-pass
                                   (lambda (matched)
                                     (advance (1+ index) matched))
                                   #'report)))
@@ -1632,6 +1691,204 @@ Returns CONFIG."
              (error (condition) (report condition)))))
       (advance 0 t))
     config))
+
+;;; ---- Canonicalization ----
+;;;
+;;; resolve_canonicalize() in ssh.c: try CanonicalDomains candidates, follow a
+;;; CNAME when CanonicalizePermittedCNAMEs allows it, then re-read the
+;;; configuration so stanzas matching the canonical name take effect.
+
+(defun ssh-config-permitted-cnames-p (options)
+  "Whether OPTIONS has a CanonicalizePermittedCNAMEs rule that permits CNAMEs."
+  (let ((rules (ssh-config-options-canonicalize-permitted-cnames options)))
+    (and rules
+         (not (and (null (rest rules))
+                   (string-equal (caar rules) "none"))))))
+
+(defun ssh-config-canonical-cname (rules host cname)
+  "The name HOST becomes when RULES permit following CNAME, else NIL.
+
+Mirrors check_follow_cname(): both the name being replaced and the canonical
+name must match their side of some rule, and the result is lowercased."
+  (when (and rules cname (not (string= host cname)))
+    (dolist (rule rules)
+      (when (and (ssh-config-pattern-list-match-p
+                  (list (car rule)) host :case-insensitive t)
+                 (ssh-config-pattern-list-match-p
+                  (list (cdr rule)) cname :case-insensitive t))
+        (return-from ssh-config-canonical-cname
+          (string-downcase cname))))))
+
+(defun ssh-config-canonicalize-host
+    (host options direct resolve on-host on-error)
+  "Compute HOST's canonical name and call ON-HOST with it.
+
+DIRECT is true when neither a ProxyCommand nor a ProxyJump carries the
+connection; only then (or with CanonicalizeHostname=always) is a name that a
+proxy will interpret handed to the resolver.  RESOLVE is
+(HOST ON-SUCCESS ON-ERROR) and calls ON-SUCCESS with (ADDRESS &OPTIONAL
+CANONICAL-NAME).  Mirrors resolve_canonicalize() in ssh.c."
+  (let ((mode (ssh-config-options-canonicalize-hostname options))
+        (rules (ssh-config-options-canonicalize-permitted-cnames options))
+        (permitted (ssh-config-permitted-cnames-p options))
+        (finished nil))
+    (labels
+        ((finish (name)
+           (unless finished
+             (setf finished t)
+             (funcall on-host name)))
+         (fail (condition)
+           (unless finished
+             (setf finished t)
+             (funcall on-error condition)))
+         (follow (name canonical)
+           (finish (or (ssh-config-canonical-cname rules name canonical)
+                       name)))
+         (resolved (name)
+           (lambda (address &optional canonical)
+             (declare (ignore address))
+             (follow name canonical)))
+         (not-found (name)
+           (if (ssh-config-options-canonicalize-fallback-local options)
+               (cname-only name)
+               (fail (make-condition
+                      'ssh-config-error
+                      :detail (format nil "Could not resolve host \"~A\""
+                                      name)))))
+         (cname-only (name)
+           ;; The second ssh.c block: no CanonicalDomains result, but the
+           ;; system resolver's own search rules may still yield a CNAME.
+           (cond
+             ((or (not permitted)
+                  (not (or direct (eq mode :always))))
+              (finish name))
+             (t
+              (funcall resolve
+                       name
+                       (resolved name)
+                       (lambda (condition)
+                         ;; A proxied name that does not resolve is left
+                         ;; alone; a direct one is fatal in ssh.
+                         (if direct
+                             (fail condition)
+                             (finish name)))))))
+         (try-domains (domains)
+           (if (null domains)
+               (not-found host)
+               (let ((domain (first domains)))
+                 (if (string-equal domain "none")
+                     (not-found host)
+                     (let ((candidate
+                             (if (zerop (length domain))
+                                 (format nil "~A." host)
+                                 (format nil "~A.~A." host domain))))
+                       (funcall resolve
+                                candidate
+                                (lambda (address &optional canonical)
+                                  (declare (ignore address))
+                                  (follow (subseq candidate
+                                                  0 (1- (length candidate)))
+                                          canonical))
+                                (lambda (condition)
+                                  (declare (ignore condition))
+                                  (try-domains (rest domains))))))))))
+      (cond
+        ((and host (burzay:numeric-address-p host))
+         (finish host))
+        ((eq mode :no)
+         (finish host))
+        ((and (not direct) (not (eq mode :always)))
+         (finish host))
+        ((and (plusp (length host))
+              (char= (char host (1- (length host))) #\.))
+         ;; Already fully qualified: resolve as-is, then drop the final dot.
+         (funcall resolve
+                  host
+                  (lambda (address &optional canonical)
+                    (declare (ignore address))
+                    (follow (subseq host 0 (1- (length host))) canonical))
+                  (lambda (condition)
+                    (declare (ignore condition))
+                    (not-found host))))
+        ((> (count #\. host)
+            (ssh-config-options-canonicalize-max-dots options))
+         (cname-only host))
+        (t
+         (try-domains (ssh-config-options-canonical-domains options)))))))
+
+(defun ssh-config-options-direct-p (options)
+  "Whether OPTIONS lets the hostname be resolved locally, not by a proxy.
+
+ssh.c calls this `direct`: no ProxyCommand and no ProxyJump."
+  (let ((command (ssh-config-options-proxy-command options))
+        (jump (ssh-config-options-proxy-jump options)))
+    (and (or (null command)
+             (let ((text (string-trim '(#\Space #\Tab)
+                                      (if (stringp command)
+                                          command
+                                          (princ-to-string command)))))
+               (or (zerop (length text)) (string-equal text "none"))))
+         (or (null jump)
+             (let ((text (string-trim '(#\Space #\Tab) jump)))
+               (or (zerop (length text)) (string-equal text "none")))))))
+
+(defun ssh-config-canonicalize
+    (config host
+     &key original-host user port tag exec-matcher local-addresses
+       (resolver #'burzay:resolve-host-canonical) direct
+       on-options on-error)
+  "Resolve CONFIG for HOST, canonicalize the name, and re-read if needed.
+
+This is ssh.c's sequence: resolve the first pass, apply resolve_canonicalize(),
+then, when canonicalization ran or a Match final line asked for it, re-read the
+configuration with the canonical name in HOSTNAME and Match canonical/final
+active.  ON-OPTIONS receives (OPTIONS CANONICAL-HOST); the caller builds the
+client from those.  RESOLVER is (HOST ON-SUCCESS ON-ERROR) and may report a
+canonical name as ON-SUCCESS's second argument."
+  (let ((seen (make-hash-table :test #'equal))
+        (original (or original-host host)))
+    (labels
+        ((finish (options canonical)
+           (when on-options (funcall on-options options canonical)))
+         (second-pass (options canonical)
+           (if (or (ssh-config-options-final-pass-wanted options)
+                   (not (eq (ssh-config-options-canonicalize-hostname options)
+                            :no)))
+               (progn
+                 (setf (ssh-config-options-hostname options) canonical)
+                 (ssh-config-resolve
+                  config canonical
+                  :original-host original
+                  :user user :port port :tag tag
+                  :exec-matcher exec-matcher
+                  :local-addresses local-addresses
+                  :final-pass t :options options :seen seen
+                  :on-options (lambda (options) (finish options canonical))
+                  :on-error on-error))
+               (finish options canonical)))
+         (first-pass (options)
+           (let* ((input (or (ssh-config-options-hostname options) host))
+                  (direct
+                    (cond ((functionp direct) (funcall direct options))
+                          ((null direct) (ssh-config-options-direct-p options))
+                          (t direct)))
+                  (effective
+                    (if (and input (not (burzay:numeric-address-p input)))
+                        (string-downcase input)
+                        input)))
+             (ssh-config-canonicalize-host
+              effective options direct resolver
+              (lambda (canonical) (second-pass options canonical))
+              on-error))))
+      (ssh-config-resolve
+       config host
+       :original-host original
+       :user user :port port :tag tag
+       :exec-matcher exec-matcher
+       :local-addresses local-addresses
+       :seen seen
+       :on-options #'first-pass
+       :on-error on-error))))
 
 ;;; ---- ProxyCommand ----
 
