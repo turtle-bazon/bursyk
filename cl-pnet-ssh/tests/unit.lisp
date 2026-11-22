@@ -772,6 +772,86 @@ it, and HostKeyAlias turns that exception off."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test client-batch-mode-never-asks
+  "BatchMode refuses an unknown host key without consulting the confirmation
+callback; without it the same callback trusts the key."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-batchmode"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      :authorized-keys authorized
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               ;; A callback that would trust the key must not be asked.
+               (let ((asked nil)
+                     (error nil))
+                 (handler-case
+                     (ssh-test-loopback-run
+                      server client-key known-hosts
+                      (make-string-output-stream) (make-string-output-stream)
+                      :host-key-policy
+                      (lambda (client fingerprint blob)
+                        (declare (ignore client fingerprint blob))
+                        (setf asked t)
+                        t)
+                      :batch-mode t)
+                   (error (condition) (setf error condition)))
+                 (is (not (null error)))
+                 (is (null asked)))
+               ;; Without BatchMode the callback is asked and the login works.
+               (let ((asked nil)
+                     (stdout (make-string-output-stream)))
+                 (is (= 3
+                        (ssh-test-loopback-run
+                         server client-key known-hosts stdout
+                         (make-string-output-stream)
+                         :host-key-policy
+                         (lambda (client fingerprint blob)
+                           (declare (ignore client fingerprint blob))
+                           (setf asked t)
+                           t))))
+                 (is (not (null asked)))
+                 (is (string= "hello"
+                              (get-output-stream-string stdout)))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test batch-mode-is-parsed
+  "BatchMode reads as a boolean and defaults to off."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line "BatchMode yes"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq t (cl-pnet-ssh:ssh-config-options-batch-mode options))))
+  (let* ((config (cl-pnet-ssh::%make-ssh-config :directives '()))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (null (cl-pnet-ssh:ssh-config-options-batch-mode options)))))
+
 (test certificate-option-merge-follows-sshd
   "Permission flags are ANDed, restrictive values are combined, and two
 different force-command clauses cannot be merged."
@@ -1345,7 +1425,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 hostbased-key canonicalize-hostname
                                 canonical-domains resolver certificate-files
                                 no-host-authentication-for-localhost
-                                host-key-alias
+                                host-key-alias batch-mode
                                 verify-host-key-dns host-key-dns-resolver)
   "Start a client against SERVER and return the command's exit status.
 
@@ -1370,6 +1450,7 @@ certificate was trusted rather than added on first use."
             :no-host-authentication-for-localhost
             no-host-authentication-for-localhost
             :host-key-alias host-key-alias
+            :batch-mode batch-mode
             :known-hosts known-hosts
             :host-key-policy host-key-policy
             :hostbased-authentication (and hostbased-key t)

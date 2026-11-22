@@ -676,6 +676,12 @@ certificate, its plain key or its CA refuses it without that fallback."
        (error 'ssh-host-key-error
               :detail "the host key is not in known_hosts"
               :fingerprint fingerprint))
+      ;; BatchMode forbids asking, so a confirmation callback is not called;
+      ;; OpenSSH treats an unanswered confirmation as a refusal.
+      ((and (ssh-client-batch-mode client) (functionp policy))
+       (error 'ssh-host-key-error
+              :detail "the host key is not in known_hosts"
+              :fingerprint fingerprint))
       ((functionp policy)
        (if (funcall policy client fingerprint host-key)
            (ssh-client-remember-host-key client host-key)

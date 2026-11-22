@@ -174,6 +174,7 @@
    #:ssh-config-options-fingerprint-hash
    #:ssh-config-options-visual-host-key
    #:ssh-config-options-check-host-ip
+   #:ssh-config-options-batch-mode
    #:ssh-config-options-no-host-authentication-for-localhost
    #:ssh-config-options-verify-host-key-dns
    #:*ssh-dns-server*

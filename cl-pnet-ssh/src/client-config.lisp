@@ -211,6 +211,7 @@ MAKE-SSH-CLIENT's own defaults."
                              (and (null host-key-callback)
                                   (ssh-config-client-policy options)))
         :host-key-callback host-key-callback
+        :batch-mode (ssh-config-options-batch-mode options)
         :connect-timeout
         (ssh-config-client-seconds
          (ssh-config-options-connect-timeout options))
@@ -477,6 +478,7 @@ uses whichever of the two it saw first instead of chaining them."
            :known-hosts (getf parameters :known-hosts)
            :host-key-policy (getf parameters :host-key-policy)
            :host-key-callback (getf parameters :host-key-callback)
+           :batch-mode (getf parameters :batch-mode)
            :kex-algorithms (getf parameters :kex-algorithms)
            :host-key-algorithms (getf parameters :host-key-algorithms)
            :ciphers (getf parameters :ciphers)

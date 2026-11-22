@@ -2445,6 +2445,10 @@ peer that connected to it; NIL refuses the channel."
     (format t "addressfamily ~(~A~)~%"
             (or (cl-pnet-ssh:ssh-config-options-address-family options)
                 "any"))
+    (format t "batchmode ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-batch-mode options)
+                "yes"
+                "no"))
     (format t "requesttty ~A~%"
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)

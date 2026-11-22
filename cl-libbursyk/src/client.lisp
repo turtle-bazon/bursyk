@@ -345,6 +345,7 @@ helper is what reaches the server."
                                  (certificate-files '())
                                  no-host-authentication-for-localhost
                                  host-key-alias
+                                 batch-mode
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
@@ -393,6 +394,7 @@ helper is what reaches the server."
                     :no-host-authentication-for-localhost
                     no-host-authentication-for-localhost
                     :host-key-alias host-key-alias
+                    :batch-mode batch-mode
                     :hostbased-authentication hostbased-authentication
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
@@ -522,6 +524,7 @@ is applied here, before any request names a key the configuration forbade."
                              (certificate-files '())
                              no-host-authentication-for-localhost
                              host-key-alias
+                             batch-mode
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
@@ -579,6 +582,8 @@ SERVER-ALIVE-COUNT-MAX unanswered intervals (default 3).
 HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of
 (CLIENT FINGERPRINT KEY-BLOB) that returns true to trust and record an
 unknown key; HOST-KEY-CALLBACK is the same function under a clearer name.
+BATCH-MODE, when true, never asks: an unknown host key fails even when a
+confirmation callback was supplied.
 
 VERIFY-HOST-KEY-DNS is :NO, :YES or :ASK.  With :YES, a matching SSHFP record
 whose answer carries the DNSSEC authenticated-data bit trusts the host key
@@ -621,6 +626,7 @@ role-neutral."
                            :no-host-authentication-for-localhost
                            no-host-authentication-for-localhost
                            :host-key-alias host-key-alias
+                           :batch-mode batch-mode
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms
