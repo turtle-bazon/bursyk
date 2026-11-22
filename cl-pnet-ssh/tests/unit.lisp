@@ -1662,6 +1662,11 @@ certificate was trusted rather than added on first use."
            (when (fboundp '(setf cl-pnet::ev-stop-requested-p))
              (setf (cl-pnet::ev-stop-requested-p) nil)
              (cl-pnet:event-loop-run-once))
+           ;; Puma keeps the same fact under its own name and reads a stop
+           ;; that outlived its loop as "do not run"; clear it too, or the
+           ;; client below never starts.
+           (when (fboundp '(setf cl-pnet::puma-stop-requested-p))
+             (setf (cl-pnet::puma-stop-requested-p) nil))
            (cl-pnet:event-loop-run)
            (when (second state)
              (error "loopback: ~A" (second state)))
@@ -2980,6 +2985,7 @@ environment= list the server recorded for the authenticated key."
          (banner-text nil)
          (key-env nil)
          (closed nil)
+         (client nil)
          (server nil)
          (timeout nil))
     (ensure-directories-exist server-key)
@@ -3009,8 +3015,9 @@ environment= list the server recorded for the authenticated key."
                   (lambda ()
                     (setf error :timed-out)
                     (cl-pnet:event-loop-stop))))
-           (make-ssh-client
-            "127.0.0.1"
+           (setf client
+                 (make-ssh-client
+                  "127.0.0.1"
             :port (ssh-server-port server)
             :user "tester"
             :private-key client-key
@@ -3028,7 +3035,7 @@ environment= list the server recorded for the authenticated key."
             :on-close (lambda (client reason)
                         (declare (ignore client reason))
                         (setf closed t)
-                        (cl-pnet:event-loop-stop)))
+                        (cl-pnet:event-loop-stop))))
            ;; EVENT-LOOP-STOP is delivered asynchronously, so a run started
            ;; immediately after the previous test's run can consume the stale
            ;; wakeup and return before touching the new connection.  Retrying
@@ -3039,6 +3046,7 @@ environment= list the server recorded for the authenticated key."
                  do (cl-pnet:event-loop-run))
            (values opened error greeting banner-text key-env))
       (when timeout (cl-pnet:timer-stop timeout))
+      (when client (ignore-errors (ssh-client-close client)))
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
