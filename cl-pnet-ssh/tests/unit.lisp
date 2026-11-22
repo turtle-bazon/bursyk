@@ -8,6 +8,14 @@
 (def-suite cl-pnet-ssh :description "SSH client unit and live tests")
 (in-suite cl-pnet-ssh)
 
+;;; The pure-backend-only tests share this form.  The libssh build has a
+;;; different transport and does not expose the internal functions these
+;;; tests drive, so it reports them as skips instead of failures.
+(defmacro def-pure-test (name &body body)
+  `(test ,name
+     #+ssh-backend-ffi (skip "the pure SSH backend is not built")
+     #-ssh-backend-ffi (progn ,@body)))
+
 ;;; ---- helpers ----
 
 (defun hex-octets (string)
@@ -568,7 +576,7 @@ its CA, and is admitted only for a principal and address its options allow."
            arguments)
     result))
 
-(test certificate-files-pair-with-their-private-key
+(def-pure-test certificate-files-pair-with-their-private-key
   "CertificateFile attaches the listed certificate to the key it certifies
 and suppresses the automatic KEY-cert.pub lookup, while a certificate for
 another key is not attached."
@@ -634,7 +642,7 @@ another key is not attached."
                                  (first mismatch)))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-certificate-file-authenticates
+(def-pure-test client-certificate-file-authenticates
   "A CertificateFile kept away from the key's -cert.pub path still logs in:
 the private key it certifies is offered with the certificate's identity."
   (if (not (ssh-keygen-available-p))
@@ -711,7 +719,7 @@ the private key it certifies is offered with the certificate's identity."
           (ignore-errors
            (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-no-host-authentication-for-localhost
+(def-pure-test client-no-host-authentication-for-localhost
   "NoHostAuthenticationForLocalhost accepts a loopback key without recording
 it, and HostKeyAlias turns that exception off."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-nohostauth"))
@@ -772,7 +780,7 @@ it, and HostKeyAlias turns that exception off."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(test client-batch-mode-never-asks
+(def-pure-test client-batch-mode-never-asks
   "BatchMode refuses an unknown host key without consulting the confirmation
 callback; without it the same callback trusts the key."
   (if (not (ssh-keygen-available-p))
@@ -911,7 +919,7 @@ dropped, and a Host block's inactivity does not hide a typo."
                  (cl-pnet-ssh:ssh-config-options-ignored-unknown options))))))
 
 
-(test client-version-addendum
+(def-pure-test client-version-addendum
   "VersionAddendum parses as the rest of the line, expands its % tokens, and
 leaves the greeting alone for none."
   (let* ((config
@@ -981,7 +989,7 @@ leaves the greeting alone for none."
     (is (equal "SSH-2.0-test"
                (cl-pnet-ssh::ssh-client-version-string client)))))
 
-(test client-version-addendum-reaches-the-server
+(def-pure-test client-version-addendum-reaches-the-server
   "A login still verifies when the addendum is part of the greeting, and the
 server records the full string."
   (if (not (ssh-keygen-available-p))
@@ -1863,7 +1871,7 @@ share the test, so each must dispatch the same channel requests."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(test server-loopback-exec
+(def-pure-test server-loopback-exec
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (multiple-value-bind (stdout stderr status) (ssh-test-loopback-result)
@@ -2146,7 +2154,7 @@ and an agent channel reaches the client's own agent socket."
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-binds-a-direct-connection
+(def-pure-test client-binds-a-direct-connection
   "BindAddress and BindInterface change where a direct connection comes
 from, and a source the kernel cannot assign fails the connection."
   (if (not (ssh-keygen-available-p))
@@ -2166,7 +2174,7 @@ from, and a source the kernel cannot assign fails the connection."
         (signals error
           (ssh-test-loopback-result :bind-address "192.0.2.1")))))
 
-(test server-loopback-exec-rsa-host-key
+(def-pure-test server-loopback-exec-rsa-host-key
   ;; An ssh-rsa key serves rsa-sha2-512/256, so the client must negotiate one
   ;; of those and verify an RSA signature over the exchange hash.
   (if (not (ssh-keygen-available-p))
@@ -2211,7 +2219,7 @@ from, and a source the kernel cannot assign fails the connection."
 (test server-loopback-no-pty-key-option
   (skip "the pure client transport is not built"))
 
-(test server-loopback-exec-ecdsa-host-key
+(def-pure-test server-loopback-exec-ecdsa-host-key
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (multiple-value-bind (stdout stderr status)
@@ -2220,7 +2228,7 @@ from, and a source the kernel cannot assign fails the connection."
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
 
-(test server-loopback-host-certificate
+(def-pure-test server-loopback-host-certificate
   ;; The server presents the certificate, the client checks its CA against
   ;; @cert-authority in known_hosts, and the KEX signature is verified with
   ;; the plain key inside the certificate.
@@ -2281,7 +2289,7 @@ from, and a source the kernel cannot assign fails the connection."
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test server-loopback-authentication-methods
+(def-pure-test server-loopback-authentication-methods
   "publickey,publickey requires two different keys, and ExposeAuthInfo
 records both successful methods."
   (if (not (ssh-keygen-available-p))
@@ -2372,7 +2380,7 @@ records both successful methods."
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test host-certificate-known-hosts-policy
+(def-pure-test host-certificate-known-hosts-policy
   "A @cert-authority line trusts the certificate; a @revoked line for the
 certificate, its plain key or its CA refuses it."
   (if (not (ssh-keygen-available-p))
@@ -2463,7 +2471,7 @@ certificate, its plain key or its CA refuses it."
                           keys "rsa-sha2-512")))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test server-host-certificate-advertisement
+(def-pure-test server-host-certificate-advertisement
   "A paired certificate outranks its plain key, and is what KEX_ECDH_REPLY
 carries; without it only the plain algorithm is offered."
   (if (not (ssh-keygen-available-p))
@@ -2880,7 +2888,7 @@ carries; without it only the plain algorithm is offered."
                    (cl-pnet-ssh::ssh-server-channel-state channel))))
       (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
 
-(test server-channel-global-timeout-closes-all-channels
+(def-pure-test server-channel-global-timeout-closes-all-channels
   "A global ChannelTimeout runs from the newest activity on any open channel
 and closes them all together."
   (let* ((config (ssh-server-config-load
@@ -2915,7 +2923,7 @@ and closes them all together."
            (is (eq :closed (cl-pnet-ssh::ssh-server-channel-state second))))
       (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
 
-(test server-loopback-exec-multiple-host-keys
+(def-pure-test server-loopback-exec-multiple-host-keys
   ;; The server advertises several key types and the client picks the one it
   ;; prefers; the KEX must succeed whichever key is chosen.
   (if (not (ssh-keygen-available-p))
@@ -3548,7 +3556,7 @@ path that selects the agent socket to forward."
          (cl-pnet-ssh:ssh-config-options-no-host-authentication-for-localhost
           options)))))
 
-(test loopback-address-detection
+(def-pure-test loopback-address-detection
   "Only 127/8, ::1 and their IPv4-mapped form count as loopback."
   (is (cl-pnet-ssh::ssh-loopback-address-p "127.0.0.1"))
   (is (cl-pnet-ssh::ssh-loopback-address-p "127.255.1.2"))
@@ -3729,7 +3737,7 @@ path that selects the agent socket to forward."
      (merge-pathnames "" (first (cl-pnet-ssh::ssh-client-known-hosts client)))
      :validate t)))
 
-(test client-accepts-a-secure-sshfp-record
+(def-pure-test client-accepts-a-secure-sshfp-record
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-sshfp"))
@@ -3780,7 +3788,7 @@ path that selects the agent socket to forward."
                      (ssh-test-delete-dns-client client)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test sshfp-dns-query-reads-a-secure-record
+(def-pure-test sshfp-dns-query-reads-a-secure-record
   "The default resolver sends an SSHFP query and reads the AD bit."
   (let* ((server (cl-pnet:udp-listen "127.0.0.1" 0))
          (connection (and server
@@ -3838,7 +3846,7 @@ path that selects the agent socket to forward."
            (is (= 2 (second (first result)))))
       (when server (ignore-errors (cl-pnet:udp-close server))))))
 
-(test client-loopback-sshfp-trust
+(def-pure-test client-loopback-sshfp-trust
   "A strict client trusts an unknown host only through a secure SSHFP record."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -4197,7 +4205,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                    "host" options)
                   :canonicalize-hostname)))))
 
-(test client-loopback-canonical-domains
+(def-pure-test client-loopback-canonical-domains
   "A short name is found by appending CanonicalDomains."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -4271,7 +4279,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                        (ssh-config-options-hostbased-keys options))))
     (is (eq t (ssh-config-options-enable-ssh-keysign options)))))
 
-(test client-builds-a-hostbased-request
+(def-pure-test client-builds-a-hostbased-request
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-request"))
@@ -4315,7 +4323,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                         (ssh-public-key-blob-of key) signature data)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-loopback-hostbased-authentication
+(def-pure-test client-loopback-hostbased-authentication
   "The client authenticates with a host key and the server's hostbased hook."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -4457,7 +4465,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                         :on-options (lambda (value) (setf options value)))
     (is (null (ssh-config-options-known-hosts-command options)))))
 
-(test client-known-hosts-command-supplies-keys
+(def-pure-test client-known-hosts-command-supplies-keys
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khc"))
          (script (merge-pathnames "keys.sh" directory))
          (blob (ssh-make-public-key-blob "ssh-ed25519"
@@ -4503,7 +4511,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                         :on-options (lambda (value) (setf options value)))
     (is (null (ssh-config-options-check-host-ip options)))))
 
-(test client-check-host-ip-records-and-refuses
+(def-pure-test client-check-host-ip-records-and-refuses
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-checkip"))
          (path (merge-pathnames "known_hosts" directory))
          (blob (ssh-make-public-key-blob "ssh-ed25519"
@@ -5206,7 +5214,7 @@ so a malformed duplicate is a configuration error rather than ignored."
     (is (eq stage :bind-address))
     (is (= 22 errno))))
 
-(test proxy-fdpass-adopts-the-helper-socket
+(def-pure-test proxy-fdpass-adopts-the-helper-socket
   "The connected descriptor a helper sends replaces the control socket, and
 the client greets over it."
   (multiple-value-bind (control-parent control-helper)
@@ -5947,7 +5955,7 @@ refuse a session's agent request, and the defaults allow it."
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists any)))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists nil)))))
 
-(test pubkey-ok-budget-delays-max-auth-tries
+(def-pure-test pubkey-ok-budget-delays-max-auth-tries
   "The first max-pk-ok rejected probes are not charged to MaxAuthTries."
   (let* ((config (ssh-server-config-load
                   nil :options '("PubkeyAuthOptions max-pk-ok:2")))
@@ -6145,7 +6153,7 @@ and DisableForwarding or no-port-forwarding vetoes them."
     (is (null (cl-pnet-ssh:ssh-session-permits-direct-streamlocal-p
                session "/tmp/sock")))))
 
-(test server-accepts-a-direct-streamlocal-open
+(def-pure-test server-accepts-a-direct-streamlocal-open
   "A permitted direct-streamlocal open records the socket path."
   (let* ((config (ssh-server-config-load
                   nil :options '("AllowStreamLocalForwarding yes")))
@@ -6228,7 +6236,7 @@ must not be disabled by the key or the connection."
     (is (null (cl-pnet-ssh:ssh-session-permits-streamlocal-forward-p
                session "/tmp/sock")))))
 
-(test server-handles-streamlocal-forward-requests
+(def-pure-test server-handles-streamlocal-forward-requests
   "A streamlocal-forward request reaches the application hook; a cancel does
 too, and a refused policy never calls it."
   (let* ((config (ssh-server-config-load
@@ -6285,7 +6293,7 @@ too, and a refused policy never calls it."
      session (cl-pnet-ssh:ssh-writer-output writer))
     (is (null called))))
 
-(test server-opens-a-forwarded-streamlocal-channel
+(def-pure-test server-opens-a-forwarded-streamlocal-channel
   "The forwarded-streamlocal channel carries the listen path and reserved field."
   (let* ((config (ssh-server-config-load
                   nil :options '("AllowStreamLocalForwarding yes")))
@@ -6300,7 +6308,7 @@ too, and a refused policy never calls it."
     (is (equal "/tmp/sock"
                (cl-pnet-ssh:ssh-server-channel-streamlocal-path channel)))))
 
-(test client-opens-a-direct-streamlocal-channel
+(def-pure-test client-opens-a-direct-streamlocal-channel
   "The client's open carries the socket path and the two reserved fields."
   (let* ((client (cl-pnet-ssh::%make-ssh-client))
          (channel (ssh-open-direct-streamlocal client "/tmp/sock"))
@@ -6314,7 +6322,7 @@ too, and a refused policy never calls it."
     ;; Nothing is sent before the transport is ready.
     (is (eq :connecting (cl-pnet-ssh:ssh-client-phase client)))))
 
-(test client-refuses-a-revoked-host-key
+(def-pure-test client-refuses-a-revoked-host-key
   "RevokedHostKeys refuses a listed host key, and an unreadable list fails
 closed rather than being ignored."
   (if (not (ssh-keygen-available-p))
@@ -6352,7 +6360,7 @@ closed rather than being ignored."
                               (client :revoked-host-keys '()) blob))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-host-certificate-obeys-ca-signature-algorithms
+(def-pure-test client-host-certificate-obeys-ca-signature-algorithms
   "A host certificate is trusted only when its CA signature algorithm is
 allowed by CASignatureAlgorithms."
   (if (not (ssh-keygen-available-p))
@@ -6402,7 +6410,7 @@ allowed by CASignatureAlgorithms."
                       client certificate))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-keys-obey-required-rsa-size
+(def-pure-test client-keys-obey-required-rsa-size
   "RequiredRSASize rejects small RSA host keys and authentication keys."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -6450,7 +6458,7 @@ allowed by CASignatureAlgorithms."
                               client (ssh-public-key-blob-of ed-key)))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test client-accepts-a-forwarded-streamlocal-channel
+(def-pure-test client-accepts-a-forwarded-streamlocal-channel
   "A requested path is accepted and handed to the application's setup hook;
 an unrequested one is refused with a CHANNEL_OPEN_FAILURE."
   (flet ((open-message (path)
@@ -6515,7 +6523,7 @@ an unrequested one is refused with a CHANNEL_OPEN_FAILURE."
         (is (= cl-pnet-ssh::+ssh-msg-channel-open-failure+ (ssh-read-u8 reader)))
         (is (= 7 (ssh-read-u32 reader)))))))
 
-(test server-accepts-a-hostbased-request
+(def-pure-test server-accepts-a-hostbased-request
   "A hostbased request is verified with the client host key and handed to
 the application's trust hook."
   (if (not (ssh-keygen-available-p))
@@ -6585,7 +6593,7 @@ the application's trust hook."
                            t)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test server-host-key-list-falls-back-to-the-agent
+(def-pure-test server-host-key-list-falls-back-to-the-agent
   "A HostKey whose private half is absent becomes an agent-backed key when
 HostKeyAgent is configured."
   (if (not (ssh-keygen-available-p))
@@ -6613,7 +6621,7 @@ HostKeyAgent is configured."
                                 public-path))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test server-kex-signs-with-an-agent-host-key
+(def-pure-test server-kex-signs-with-an-agent-host-key
   "An agent-backed host key sends the exchange hash to the agent and finishes
 the KEX from its signature."
   (if (not (ssh-keygen-available-p))
@@ -6815,7 +6823,7 @@ hands the client their resolved seconds; none is exclusive and disables all."
         (declare (ignore options))
         (is (typep condition 'ssh-config-error))))))
 
-(test channel-timeout-matches-channel-types
+(def-pure-test channel-timeout-matches-channel-types
   "The first ChannelTimeout pattern matching a channel's type wins, and the
 last global entry is the connection-wide one, as ssh applies them in order."
   (let ((client (cl-pnet-ssh::%make-ssh-client
@@ -6843,7 +6851,7 @@ last global entry is the connection-wide one, as ssh applies them in order."
                (cl-pnet-ssh::%make-ssh-client
                 :channel-timeouts '(("session" . 5))))))))
 
-(test channel-timeout-closes-idle-channels
+(def-pure-test channel-timeout-closes-idle-channels
   "The timer closes an idle channel at its own limit and leaves a busy one
 alone; a global limit closes every channel after the connection goes quiet."
   (flet ((channel (client id last-used limit)
@@ -6966,7 +6974,7 @@ active value."
       (is (search "unsupported option"
                   (cl-pnet-ssh::ssh-error-detail condition))))))
 
-(test warn-weak-crypto-fires-once-without-pq
+(def-pure-test warn-weak-crypto-fires-once-without-pq
   "The post-quantum notice appears after the initial exchange only when
 KexAlgorithms was not set, the exchange is classical and the warning is on."
   (flet ((warnings (&rest client-arguments)
@@ -7160,7 +7168,7 @@ validated, so -G reports what ssh would and a bad line fails the same way."
 
 ;;; ---- ping@openssh.com and keystroke chaff ----
 
-(test ext-info-records-the-ping-extension
+(def-pure-test ext-info-records-the-ping-extension
   "EXT_INFO enables chaff only for ping@openssh.com version 0; other names are
 ignored and an unsupported version leaves chaff off."
   (flet ((payload (&rest extensions)
@@ -7187,7 +7195,7 @@ ignored and an unsupported version leaves chaff off."
        client (payload (cons "unknown@example.com" "0")))
       (is (not (supports-p client))))))
 
-(test server-advertises-ping-version-zero
+(def-pure-test server-advertises-ping-version-zero
   "The server EXT_INFO names server-sig-algs and ping@openssh.com version 0."
   (let* ((payload (cl-pnet-ssh::ssh-server-ext-info-payload))
          (reader (cl-pnet-ssh::ssh-make-reader payload))
@@ -7221,7 +7229,7 @@ ignored and an unsupported version leaves chaff off."
         (is (= 193 (cl-pnet-ssh::ssh-read-u8 pong-reader)))
         (is (equalp data (cl-pnet-ssh::ssh-read-string pong-reader)))))))
 
-(test chaff-needs-the-ping-extension
+(def-pure-test chaff-needs-the-ping-extension
   "No PING goes out until EXT_INFO allowed it, and a ready client accepts one."
   (let ((client (cl-pnet-ssh::%make-ssh-client)))
     (is (null (cl-pnet-ssh:ssh-client-send-chaff client)))
