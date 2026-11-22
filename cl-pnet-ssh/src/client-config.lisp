@@ -263,6 +263,8 @@ MAKE-SSH-CLIENT's own defaults."
          (or proxy-command (ssh-config-options-proxy-command options)))
         :proxy-use-fdpass
         (ssh-config-options-proxy-use-fdpass options)
+        :bind-address (ssh-config-options-bind-address options)
+        :bind-interface (ssh-config-options-bind-interface options)
         :resolver resolver))
 
 ;;; ---- ProxyJump descriptors ----
@@ -561,6 +563,8 @@ uses whichever of the two it saw first instead of chaining them."
            :server-alive-count-max (getf parameters :server-alive-count-max)
            :proxy-command (getf parameters :proxy-command)
            :proxy-use-fdpass (getf parameters :proxy-use-fdpass)
+           :bind-address (getf parameters :bind-address)
+           :bind-interface (getf parameters :bind-interface)
            :on-open on-open
            :on-error on-error
            :on-close on-close
@@ -635,6 +639,12 @@ in the tunnel's buffers."
                 (or previous-port (getf hop :port)))
                (setf previous-port port)))
     (setf (ssh-config-chain-tunnels chain) (nreverse tunnels))
+    ;; Only a connection to a real peer is bound, as in ssh: the target of a
+    ;; ProxyJump chain and every jump after the first dial a loopback tunnel
+    ;; this process made, which is not the connection BindAddress describes.
+    (when hops
+      (setf (getf target-parameters :bind-address) nil
+            (getf target-parameters :bind-interface) nil))
     (let ((target
             (ssh-config-launch-client
              target-parameters target-options "127.0.0.1" previous-port
@@ -673,10 +683,19 @@ in the tunnel's buffers."
     (cond
       (hops
        (ssh-config-start-chain
-        (mapcar (lambda (entry)
-                  (ssh-config-hop-parameters
-                   (car entry) (cdr entry) overrides))
-                hops)
+        (let ((first t))
+          (mapcar (lambda (entry)
+                    (let ((parameters
+                            (ssh-config-hop-parameters
+                             (car entry) (cdr entry) overrides)))
+                      ;; Each jump after the first dials a loopback tunnel,
+                      ;; so only the first is a connection to bind.
+                      (unless first
+                        (setf (getf parameters :bind-address) nil
+                              (getf parameters :bind-interface) nil))
+                      (setf first nil)
+                      parameters))
+                  hops))
         overrides options target on-open on-error on-close
         :on-forwarded-tcpip on-forwarded-tcpip
         :on-forwarded-streamlocal on-forwarded-streamlocal))

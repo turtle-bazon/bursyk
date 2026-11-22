@@ -1602,7 +1602,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 canonical-domains resolver certificate-files
                                 no-host-authentication-for-localhost
                                 host-key-alias batch-mode version-addendum
-                                verify-host-key-dns host-key-dns-resolver)
+                                verify-host-key-dns host-key-dns-resolver
+                                bind-address bind-interface)
   "Start a client against SERVER and return the command's exit status.
 
 HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
@@ -1637,6 +1638,8 @@ certificate was trusted rather than added on first use."
             :resolver resolver
             :verify-host-key-dns (or verify-host-key-dns :no)
             :host-key-dns-resolver host-key-dns-resolver
+            :bind-address bind-address
+            :bind-interface bind-interface
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -1662,11 +1665,13 @@ certificate was trusted rather than added on first use."
            (first state))
       (when timeout (cl-pnet:timer-stop timeout)))))
 
-(defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519")))
+(defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
+                                      bind-address bind-interface)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
 prove an RSA or ECDSA host key is negotiated and its signature verified.
+BIND-ADDRESS and BIND-INTERFACE are passed to the client's source binding.
 Returns (VALUES STDOUT STDERR STATUS)."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop"))
          (server-key (merge-pathnames "host_key" directory))
@@ -1697,7 +1702,9 @@ Returns (VALUES STDOUT STDERR STATUS)."
                           (lambda (channel command)
                             (ssh-test-run-command channel command))))))
            (let ((status (ssh-test-loopback-run
-                          server client-key known-hosts stdout stderr)))
+                          server client-key known-hosts stdout stderr
+                          :bind-address bind-address
+                          :bind-interface bind-interface)))
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
                      status)))
@@ -1847,6 +1854,26 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+(test client-binds-a-direct-connection
+  "BindAddress and BindInterface change where a direct connection comes
+from, and a source the kernel cannot assign fails the connection."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (progn
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-loopback-result :bind-address "127.0.0.1")
+          (declare (ignore stderr))
+          (is (equal "hello" stdout))
+          (is (eql 3 status)))
+        #+linux
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-loopback-result :bind-interface "lo")
+          (declare (ignore stderr))
+          (is (equal "hello" stdout))
+          (is (eql 3 status)))
+        (signals error
+          (ssh-test-loopback-result :bind-address "192.0.2.1")))))
 
 (test server-loopback-exec-rsa-host-key
   ;; An ssh-rsa key serves rsa-sha2-512/256, so the client must negotiate one
@@ -4809,6 +4836,42 @@ so a malformed duplicate is a configuration error rather than ignored."
   (is (not (getf (cl-pnet-ssh::ssh-config-client-parameters
                   "alias" (facade-options nil))
                  :proxy-use-fdpass))))
+
+(test facade-carries-source-binding
+  (let ((parameters (cl-pnet-ssh::ssh-config-client-parameters
+                     "alias"
+                     (facade-options '(:bind-address "127.0.0.2"
+                                       :bind-interface "eth0")))))
+    (is (equal "127.0.0.2" (getf parameters :bind-address)))
+    (is (equal "eth0" (getf parameters :bind-interface))))
+  (let ((parameters (cl-pnet-ssh::ssh-config-client-parameters
+                     "alias" (facade-options nil))))
+    (is (null (getf parameters :bind-address)))
+    (is (null (getf parameters :bind-interface)))))
+
+(test connect-tcp-rejects-an-unusable-source
+  ;; A source address the kernel cannot assign, one from the other family,
+  ;; and a malformed literal all stop before a packet is sent.
+  (multiple-value-bind (fd state errno stage)
+      (cl-pnet-sockets:connect-tcp "127.0.0.1" 22
+                                   :bind-address "192.0.2.1")
+    (declare (ignore state))
+    (is (null fd))
+    (is (eq stage :bind-address))
+    (is (plusp errno)))
+  (multiple-value-bind (fd state errno stage)
+      (cl-pnet-sockets:connect-tcp "127.0.0.1" 22 :bind-address "::1")
+    (declare (ignore state))
+    (is (null fd))
+    (is (eq stage :bind-address))
+    (is (= 22 errno)))
+  (multiple-value-bind (fd state errno stage)
+      (cl-pnet-sockets:connect-tcp "127.0.0.1" 22
+                                   :bind-address "999.1.1.1")
+    (declare (ignore state))
+    (is (null fd))
+    (is (eq stage :bind-address))
+    (is (= 22 errno))))
 
 (test proxy-fdpass-adopts-the-helper-socket
   "The connected descriptor a helper sends replaces the control socket, and

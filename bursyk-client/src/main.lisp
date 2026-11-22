@@ -406,10 +406,6 @@ a name this build lacks is an error instead of a silently widened offer."
       (fail "invalid escape character ~A" (getf *options* :escape-char))))
   (when (getf *options* :pkcs11)
     (unsupported "-I" "PKCS#11 keys are not implemented"))
-  (when (getf *options* :bind-interface)
-    (unsupported "-B" "binding the source interface is not implemented"))
-  (when (getf *options* :bind-address)
-    (unsupported "-b" "binding the source address is not implemented"))
   (when (getf *options* :tunnel)
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
   (when (getf *options* :gssapi-auth)
@@ -474,12 +470,6 @@ still disables the feature and therefore silences the refusal."
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
-      (when (cl-pnet-ssh:ssh-config-options-bind-address options)
-        (unsupported "BindAddress"
-                     "binding the source address is not implemented"))
-      (when (cl-pnet-ssh:ssh-config-options-bind-interface options)
-        (unsupported "BindInterface"
-                     "binding the source interface is not implemented"))
       (when (cl-pnet-ssh:ssh-config-options-gssapi-authentication options)
         (unsupported "GSSAPIAuthentication"
                      "GSSAPI authentication is not implemented"))
@@ -602,6 +592,14 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
       (push (format nil "MACs ~A" (getf *options* :macs)) options))
     (when (getf *options* :ciphers)
       (push (format nil "Ciphers ~A" (getf *options* :ciphers)) options))
+    ;; A dedicated -b or -B outranks an -o for the same keyword, as every
+    ;; dedicated flag does; they also make -G report what will be dialled.
+    (when (getf *options* :bind-address)
+      (push (format nil "BindAddress ~A" (getf *options* :bind-address))
+            options))
+    (when (getf *options* :bind-interface)
+      (push (format nil "BindInterface ~A" (getf *options* :bind-interface))
+            options))
     options))
 
 (defun apply-command-line-options ()

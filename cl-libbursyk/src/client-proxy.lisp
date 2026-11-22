@@ -126,6 +126,12 @@ callback, where a blocking wait on an already-exited helper can hang."
        (not (ssh-proxy-closed proxy))
        (ssh-proxy-write-fd proxy)))
 
+(defun ssh-proxy-name (proxy)
+  "A short name for PROXY's transport in messages."
+  (if (ssh-proxy-command proxy)
+      "the ProxyCommand"
+      "the connection"))
+
 (defun ssh-proxy-flush (client)
   "Write queued bytes until the helper's stdin blocks or the queue drains."
   (let ((proxy (ssh-client-pipe client)))
@@ -141,7 +147,8 @@ callback, where a blocking wait on an already-exited helper can hang."
                       (incf (ssh-proxy-position proxy) count))
                      ((and (minusp count) (/= errno +ssh-eagain+))
                       (ssh-proxy-fail
-                       client "the ProxyCommand stopped reading its input (~A)"
+                       client "~A stopped reading its input (~A)"
+                       (ssh-proxy-name proxy)
                        (cl-pnet-sockets:c-strerror errno))
                       (return))
                      (t (return)))))
@@ -305,13 +312,14 @@ socket the helper sends back."
           ((and octets (plusp count))
            (ssh-client-receive client octets))
           ((zerop count)
-           ;; The helper closed its output: one close, not a hang.
+           ;; The peer closed its output: one close, not a hang.
            (ssh-client-receive client nil))
           ((= errno +ssh-eagain+)
            nil)
           (t
            (ssh-proxy-fail
-            client "reading from the ProxyCommand failed (~A)"
+            client "reading from ~A failed (~A)"
+            (ssh-proxy-name proxy)
             (cl-pnet-sockets:c-strerror errno))))))))
 
 (defun ssh-proxy-close (client)

@@ -194,6 +194,20 @@ KEY-cert.pub lookup is disabled, as in ssh."
 
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
+  (cond
+    ((and (or (ssh-client-bind-address client)
+              (ssh-client-bind-interface client))
+          (not (ssh-client-bind-address-resolved-p client address)))
+     (ssh-client-resolve-bind-address
+      client address (lambda () (ssh-dial-bound client address))))
+    ((or (ssh-client-bind-address client)
+         (ssh-client-bind-interface client))
+     (ssh-dial-bound client address))
+    (t
+     (ssh-dial-direct client address))))
+
+(defun ssh-dial-direct (client address)
+  "Dial ADDRESS without a bound source, through CL-PNET."
   (let ((port (or (ssh-client-connect-port client) (ssh-client-port client))))
     (setf (ssh-client-remote-address client) address)
     (ssh-log "connecting to ~A:~D" address port)
@@ -213,6 +227,86 @@ KEY-cert.pub lookup is disabled, as in ssh."
                            :detail (format nil "could not connect to ~A:~D"
                                            (ssh-client-connect-host client)
                                            port))))))
+  client)
+
+(defun ssh-client-bind-description (client)
+  "How to name CLIENT's configured source, for error messages."
+  (let ((address (or (ssh-client-bind-address-resolved client)
+                     (ssh-client-bind-address client))))
+    (or address
+        (format nil "interface ~A" (ssh-client-bind-interface client)))))
+
+(defun ssh-proxy-connect-complete (client)
+  "Finish a non-blocking bound connect once FD turns writable."
+  (let ((proxy (ssh-client-pipe client)))
+    (when (and proxy (not (ssh-proxy-closed proxy)))
+      (let ((fd (ssh-proxy-read-fd proxy)))
+        (ssh-proxy-cancel-write-watcher proxy)
+        (multiple-value-bind (errno answered)
+            (cl-pnet-sockets:socket-error fd)
+          (cond
+            ((not answered)
+             (ssh-proxy-close client)
+             (ssh-connect-error client errno))
+            ((zerop errno)
+             (setf (ssh-proxy-read-watcher proxy)
+                   (cl-pnet:fd-watch
+                    fd
+                    :on-readable
+                    (lambda (watcher)
+                      (declare (ignore watcher))
+                      (ssh-proxy-readable client))))
+             (ssh-log "connected")
+             (ssh-client-connected client nil))
+            (t
+             (ssh-proxy-close client)
+             (ssh-connect-error client errno))))))))
+
+(defun ssh-dial-bound (client address)
+  "Dial ADDRESS from CLIENT's BindAddress or BindInterface.
+
+The descriptor is a socket rather than a CL-PNET connection, so it travels
+through the same event-loop watchers the proxy path uses."
+  (let* ((port (or (ssh-client-connect-port client) (ssh-client-port client)))
+         (bind (or (ssh-client-bind-address-resolved client)
+                   (ssh-client-bind-address client)))
+         (interface (ssh-client-bind-interface client)))
+    (setf (ssh-client-remote-address client) address)
+    (ssh-log "connecting to ~A:~D bound to ~A"
+             address port (ssh-client-bind-description client))
+    (multiple-value-bind (fd state errno stage)
+        (cl-pnet-sockets:connect-tcp address port
+                                     :bind-address bind
+                                     :bind-interface interface)
+      (cond
+        ((null fd)
+         (if (eq stage :connect)
+             (ssh-connect-error client errno)
+             (ssh-client-fail
+              client
+              (make-condition
+               'ssh-connection-error
+               :detail
+               (format nil "could not bind ~A for ~A:~D (~A)"
+                       (ssh-client-bind-description client)
+                       (ssh-client-connect-host client)
+                       port
+                       (cl-pnet-sockets:c-strerror errno))))))
+        ((eq state :connected)
+         (setf (ssh-client-pipe client)
+               (%make-ssh-proxy :read-fd fd :write-fd fd :close-fds t))
+         (ssh-proxy-connect-complete client))
+        (t
+         (let ((proxy (%make-ssh-proxy :read-fd fd :write-fd fd
+                                       :close-fds t)))
+           (setf (ssh-client-pipe client) proxy
+                 (ssh-proxy-write-watcher proxy)
+                 (cl-pnet:fd-watch
+                  fd
+                  :on-writable
+                  (lambda (watcher)
+                    (declare (ignore watcher))
+                    (ssh-proxy-connect-complete client)))))))))
   client)
 
 (defun ssh-canonicalize-candidates (client)
@@ -282,52 +376,100 @@ client's callbacks."
       (ssh-open-transport client))
   client)
 
+(defun ssh-client-bind-address-resolved-p (client remote-address)
+  "Whether CLIENT's source address is ready for REMOTE-ADDRESS's family.
+
+A numeric BindAddress needs nothing, and an interface's address is picked
+by the socket layer once the remote family is known."
+  (let ((raw (ssh-client-bind-address client))
+        (cached (ssh-client-bind-address-resolved client)))
+    (cond
+      ((null raw) t)
+      ((burzay:numeric-address-p raw) t)
+      (cached
+       (eql (cl-pnet-sockets:ipv6-address-p cached)
+            (cl-pnet-sockets:ipv6-address-p remote-address)))
+      (t nil))))
+
+(defun ssh-client-resolve-bind-address (client remote-address done)
+  "Resolve CLIENT's BindAddress for REMOTE-ADDRESS's family, then call DONE."
+  (let* ((family (if (cl-pnet-sockets:ipv6-address-p remote-address)
+                     :inet6
+                     :inet))
+         (name (ssh-client-bind-address client))
+         (resolver (ssh-client-resolver client)))
+    (flet ((succeed (address)
+             (setf (ssh-client-bind-address-resolved client) address)
+             (funcall done))
+           (fail (condition)
+             (ssh-client-fail
+              client
+              (make-condition
+               'ssh-connection-error
+               :detail (format nil "could not resolve BindAddress ~A: ~A"
+                               name condition)))))
+      (handler-case
+          ;; The default resolver can ask the system for one family, which
+          ;; is what makes "BindAddress localhost" match an IPv4 peer.  A
+          ;; caller-supplied resolver keeps its (HOST ON-SUCCESS ON-ERROR)
+          ;; shape; a family mismatch then fails at bind.
+          (if (or (null resolver) (eq resolver :system))
+              (burzay:resolve-host name #'succeed #'fail :family family)
+              (funcall resolver name #'succeed #'fail))
+        (error (condition) (fail condition))))))
+
 (defun ssh-open-transport (client)
   "Resolve CONNECT-HOST without blocking the loop, then dial it.
 
 CL-PNET's connect takes a numeric address, so a name has to be resolved
 first, and BURZAY does that on a worker thread.  CanonicalDomains candidates
 are tried before the name itself.  A ProxyCommand needs none of that: the
-helper is what reaches the server."
+helper is what reaches the server.  BindAddress is resolved once the remote
+address is known, because it has to be in the same family."
   (if (ssh-client-proxy-command client)
       (ssh-open-proxy-connection client)
-      (let ((resolve (or (ssh-client-resolver client) #'burzay:resolve-host))
-            (original (ssh-client-connect-host client)))
-        (labels ((dial (name)
-                   (lambda (address)
-                     (setf (ssh-client-connect-host client) name)
-                     (ssh-dial client address)))
-                 (try (names)
-                   (if names
+      (ssh-open-direct-transport client))
+  client)
+
+(defun ssh-open-direct-transport (client)
+  "Resolve and dial CONNECT-HOST for a connection that is not proxied."
+  (let ((resolve (or (ssh-client-resolver client) #'burzay:resolve-host))
+        (original (ssh-client-connect-host client)))
+    (labels ((dial (name)
+               (lambda (address)
+                 (setf (ssh-client-connect-host client) name)
+                 (ssh-dial client address)))
+             (try (names)
+               (if names
+                   (progn
+                     (ssh-log "resolving ~A" (first names))
+                     (funcall resolve (first names)
+                              (dial (first names))
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (try (rest names)))))
+                   (if (ssh-client-canonicalize-fallback-local client)
                        (progn
-                         (ssh-log "resolving ~A" (first names))
-                         (funcall resolve (first names)
-                                  (dial (first names))
+                         (ssh-log "resolving ~A" original)
+                         (funcall resolve original (dial original)
                                   (lambda (condition)
-                                    (declare (ignore condition))
-                                    (try (rest names)))))
-                       (if (ssh-client-canonicalize-fallback-local client)
-                           (progn
-                             (ssh-log "resolving ~A" original)
-                             (funcall resolve original (dial original)
-                                      (lambda (condition)
-                                        (ssh-resolution-error
-                                         client condition))))
-                           (ssh-resolution-error
-                            client
-                            (make-condition
-                             'simple-error
-                             :format-control
-                             "no CanonicalDomains candidate resolved ~A"
-                             :format-arguments (list original)))))))
-          (let ((candidates (ssh-canonicalize-candidates client)))
-            (if candidates
-                (try candidates)
-                (progn
-                  (ssh-log "resolving ~A" original)
-                  (funcall resolve original (dial original)
-                           (lambda (condition)
-                             (ssh-resolution-error client condition))))))))))
+                                    (ssh-resolution-error
+                                     client condition))))
+                       (ssh-resolution-error
+                        client
+                        (make-condition
+                         'simple-error
+                         :format-control
+                         "no CanonicalDomains candidate resolved ~A"
+                         :format-arguments (list original)))))))
+      (let ((candidates (ssh-canonicalize-candidates client)))
+        (if candidates
+            (try candidates)
+            (progn
+              (ssh-log "resolving ~A" original)
+              (funcall resolve original (dial original)
+                       (lambda (condition)
+                         (ssh-resolution-error client condition)))))))))
 
 (defun ssh-make-client-record (host connect-host host-key-host port connect-port
                                user known-hosts policy connect-timeout
@@ -371,7 +513,9 @@ helper is what reaches the server."
                                  (connection-attempts 1)
                                  (required-rsa-size
                                   +ssh-rsa-minimum-modulus-size+)
-                                 proxy-use-fdpass)
+                                 proxy-use-fdpass
+                                 bind-address
+                                 bind-interface)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -386,6 +530,8 @@ helper is what reaches the server."
                     :server-alive-count-max (or server-alive-count-max 3)
                     :proxy-command (ssh-proxy-command-value proxy-command)
                     :proxy-use-fdpass proxy-use-fdpass
+                    :bind-address bind-address
+                    :bind-interface bind-interface
                     :kex-algorithms kex-algorithms
                     :host-key-algorithms host-key-algorithms
                     :ciphers ciphers
@@ -528,6 +674,8 @@ is applied here, before any request names a key the configuration forbade."
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
                              proxy-use-fdpass
+                             bind-address
+                             bind-interface
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
                              ca-signature-algorithms
@@ -582,6 +730,11 @@ PROXY-USE-FDPASS, when true with PROXY-COMMAND, instead has the helper
 connect the socket and send its descriptor back over the pair, as
 ProxyUseFdpass does; a helper that exits without sending one fails the
 connection rather than falling back to a direct dial.
+
+BIND-ADDRESS is a local address a direct connection is made from, as
+ssh_config's BindAddress and ssh -b; BIND-INTERFACE names an interface
+instead, and BIND-ADDRESS wins when both are set, as in ssh.  A ProxyCommand
+carries the stream itself, so neither applies there.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY every default identity file that exists
@@ -689,7 +842,9 @@ role-neutral."
                            :set-env set-env
                            :connection-attempts connection-attempts
                            :required-rsa-size required-rsa-size
-                           :proxy-use-fdpass proxy-use-fdpass)
+                           :proxy-use-fdpass proxy-use-fdpass
+                           :bind-address bind-address
+                           :bind-interface bind-interface)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

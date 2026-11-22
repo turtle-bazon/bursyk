@@ -143,6 +143,11 @@
   ;; ProxyUseFdpass: the helper connects the socket itself and hands the
   ;; connected descriptor back over a socketpair instead of carrying bytes.
   proxy-use-fdpass
+  ;; BindAddress / BindInterface: where a direct connection comes from.
+  ;; The numeric form of BIND-ADDRESS is cached once resolved.
+  bind-address
+  bind-interface
+  bind-address-resolved
   ;; The running helper and its pipes, once SSH-OPEN-PROXY-CONNECTION starts
   ;; it.  NIL on the direct TCP path.
   pipe
@@ -255,6 +260,20 @@
     ((ssh-client-pipe client) (ssh-proxy-close client))
     ((ssh-client-connection client)
      (cl-pnet:close-connection (ssh-client-connection client)))))
+
+(defun ssh-client-transport-fd (client)
+  "The socket CLIENT reads from, when its transport is a socket.
+
+A ProxyCommand pipe is not one, and neither is an unconnected client, so
+both answer NIL.  A bound direct connection (and a descriptor received
+with ProxyUseFdpass) is a socket stored without a CL-PNET connection."
+  (or (let ((connection (ssh-client-connection client)))
+        (and connection (cl-pnet:connection-fileno connection)))
+      (let ((proxy (ssh-client-pipe client)))
+        (when (and proxy
+                   (not (ssh-proxy-closed proxy))
+                   (ssh-proxy-close-fds proxy))
+          (ssh-proxy-read-fd proxy)))))
 
 ;;; ---- Connect timeout and server-alive keepalives ----
 

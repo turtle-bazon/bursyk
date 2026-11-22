@@ -709,6 +709,16 @@ this session's fixed offset."
 
 ;;; ---- -G output ----
 
+(test command-line-source-binding-reaches-config
+  "A dedicated -b or -B becomes a config line, so resolution and -G both
+see the source that will actually be used."
+  (let ((burs::*options* (empty-options)))
+    (setf (getf burs::*options* :bind-address) "127.0.0.2"
+          (getf burs::*options* :bind-interface) "eth0")
+    (let ((lines (burs::resolver-option-list)))
+      (is (member "BindAddress 127.0.0.2" lines :test #'equal))
+      (is (member "BindInterface eth0" lines :test #'equal)))))
+
 (test print-config-reports-openssh-defaults
   "The lines ssh -G always prints appear even when nothing configured them,
 and ProxyJump/ProxyCommand stay off the output when unset."
@@ -777,6 +787,10 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                   (cl-pnet-ssh::ssh-config-option-line
                    "PermitRemoteOpen host:22")
                   (cl-pnet-ssh::ssh-config-option-line
+                   "BindAddress 127.0.0.2")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "BindInterface eth0")
+                  (cl-pnet-ssh::ssh-config-option-line
                    "ProxyCommand nc %h %p")
                   (cl-pnet-ssh::ssh-config-option-line
                    "ProxyUseFdpass yes")
@@ -792,6 +806,8 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                    "alias.example" options nil))))
       (dolist (line '("passwordauthentication no"
                       "kbdinteractiveauthentication no"
+                      "bindaddress 127.0.0.2"
+                      "bindinterface eth0"
                       "serveraliveinterval 30"
                       "serveralivecountmax 5"
                       "numberofpasswordprompts 1"
