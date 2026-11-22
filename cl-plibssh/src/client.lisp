@@ -283,6 +283,12 @@ host is named but no descriptor is passed: libssh dials nothing itself."
 
 ;;; ---- Session pump ----
 
+(defun ssh-plibssh-client-write-descriptor (client)
+  "CLIENT's descriptor for the writable watcher, duplicated on first use."
+  (or (ssh-client-write-fd client)
+      (setf (ssh-client-write-fd client)
+            (ssh-plibssh-dup-fd (ssh-client-fd client)))))
+
 (defun ssh-plibssh-client-sync-watchers (client)
   "Arm the write watch exactly when libssh is waiting to send."
   (let ((watcher (ssh-client-write-watcher client))
@@ -293,7 +299,7 @@ host is named but no descriptor is passed: libssh dials nothing itself."
         (unless watcher
           (setf (ssh-client-write-watcher client)
                 (cl-pnet:fd-watch
-                 fd
+                 (ssh-plibssh-client-write-descriptor client)
                  :on-writable
                  (lambda (watcher)
                    (declare (ignore watcher))
@@ -594,17 +600,20 @@ and is freed."
   (let ((watcher (ssh-client-watcher client))
         (write-watcher (ssh-client-write-watcher client))
         (session (ssh-client-session client))
-        (fd (ssh-client-fd client)))
+        (fd (ssh-client-fd client))
+        (write-fd (ssh-client-write-fd client)))
     (setf (ssh-client-watcher client) nil
           (ssh-client-write-watcher client) nil
           (ssh-client-session client) nil
-          (ssh-client-fd client) nil)
+          (ssh-client-fd client) nil
+          (ssh-client-write-fd client) nil)
     (when watcher (cl-pnet:fd-unwatch watcher))
     (when write-watcher (cl-pnet:fd-unwatch write-watcher))
     (when session
       (ssh-disconnect session)
       (ssh-free session))
     (ssh-plibssh-close-fd fd)
+    (when write-fd (ssh-plibssh-close-fd write-fd))
     (iter (for key in (ssh-client-key-handles client))
       (ssh-key-free key))
     (setf (ssh-client-key-handles client) nil)))
@@ -718,6 +727,8 @@ helper and hands back a socketpair to watch."
                           connect-timeout
                           server-alive-interval
                           (server-alive-count-max 3)
+                          (obscure-keystroke-timing
+                           +ssh-keystroke-default-interval-ms+)
                           proxy-command
                           kex-algorithms
                           host-key-algorithms
@@ -753,6 +764,7 @@ stream on its pipes instead of dialling."
                  :connect-timeout connect-timeout
                  :server-alive-interval server-alive-interval
                  :server-alive-count-max (or server-alive-count-max 3)
+                 :obscure-keystroke-timing obscure-keystroke-timing
                  :proxy-command (ssh-proxy-command-value proxy-command)
                  :kex-algorithms kex-algorithms
                  :host-key-algorithms host-key-algorithms

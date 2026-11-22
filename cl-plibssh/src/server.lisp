@@ -80,6 +80,12 @@
     (declare (ignore id))
     (collect channel)))
 
+(defun ssh-plibssh-session-write-descriptor (session)
+  "SESSION's descriptor for the writable watcher, duplicated on first use."
+  (or (ssh-session-write-fd session)
+      (setf (ssh-session-write-fd session)
+            (ssh-plibssh-dup-fd (ssh-session-fd session)))))
+
 (defun ssh-plibssh-session-sync-watchers (session)
   "Arm the write watch exactly when libssh has bytes it could not send."
   (let ((watcher (ssh-session-write-watcher session))
@@ -90,7 +96,7 @@
         (unless watcher
           (setf (ssh-session-write-watcher session)
                 (cl-pnet:fd-watch
-                 fd
+                 (ssh-plibssh-session-write-descriptor session)
                  :on-writable
                  (lambda (watcher)
                    (declare (ignore watcher))
@@ -955,16 +961,19 @@ application's ON-CLOSE runs without waiting for the peer's half."
   "Stop watching SESSION's descriptor and let libssh free it."
   (let ((watcher (ssh-session-watcher session))
         (write-watcher (ssh-session-write-watcher session))
-        (handle (ssh-session-handle session)))
+        (handle (ssh-session-handle session))
+        (write-fd (ssh-session-write-fd session)))
     (setf (ssh-session-watcher session) nil
           (ssh-session-write-watcher session) nil
           (ssh-session-handle session) nil
-          (ssh-session-fd session) nil)
+          (ssh-session-fd session) nil
+          (ssh-session-write-fd session) nil)
     (when watcher (cl-pnet:fd-unwatch watcher))
     (when write-watcher (cl-pnet:fd-unwatch write-watcher))
     (when handle
       (ssh-disconnect handle)
-      (ssh-free handle))))
+      (ssh-free handle))
+    (when write-fd (ssh-plibssh-close-fd write-fd))))
 
 (defun ssh-session-finish (session reason kind)
   "Close SESSION once, reporting REASON through the callback KIND selects."

@@ -6,6 +6,22 @@
 ;;;; The public structures keep the same names and accessors as the pure
 ;;;; backend, so callers and the tests do not know which one is selected.
 
+(defun ssh-plibssh-dup-fd (fd)
+  "A second descriptor for FD's socket, for the other watcher direction.
+
+CL-PNET's libuv and puma backends allow one watcher per descriptor; libev
+allows a read and a write watcher on the same one.  A dup shares the open
+file description but has its own number, so a writable watcher can sit
+beside the readable one on every backend."
+  (let ((copy (ssh-dup-fd fd)))
+    (when (minusp copy)
+      (error 'ssh-connection-error
+             :detail (format nil "could not duplicate socket ~D (~A)"
+                             fd
+                             (cl-pnet-sockets:c-strerror
+                              (cl-pnet-sockets:c-errno)))))
+    copy))
+
 ;;; ---- Client state ----
 
 (defstruct (ssh-client (:constructor %make-ssh-client))
@@ -20,6 +36,8 @@
   (user nil)
   session
   (fd nil)
+  ;; A dup of FD for the writable watcher; see SSH-PLIBSSH-DUP-FD.
+  write-fd
   watcher
   write-watcher
   (phase :connecting)
@@ -34,6 +52,10 @@
   server-version
   ;; The server's authentication banner, once it has sent one.
   banner
+  ;; ObscureKeystrokeTiming is owned by the application, which reads and
+  ;; writes it through the same accessor in either backend.  libssh itself
+  ;; does not act on it.
+  (obscure-keystroke-timing +ssh-keystroke-default-interval-ms+)
   ;; A helper program carrying the stream, or NIL to dial directly.  libssh
   ;; runs it itself and expands %h, %p and %r before starting it.
   proxy-command
@@ -172,6 +194,8 @@
   server
   handle
   (fd nil)
+  ;; A dup of FD for the writable watcher; see SSH-PLIBSSH-DUP-FD.
+  write-fd
   watcher
   write-watcher
   remote-address

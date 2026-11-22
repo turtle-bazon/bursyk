@@ -14,6 +14,16 @@
 (unless (cffi:foreign-library-loaded-p 'libssh)
   (cffi:use-foreign-library libssh))
 
+;;; A session needs a readable watcher and, while libssh has bytes it could
+;;; not send, a writable one.  CL-PNET's libuv and puma backends register one
+;;; watcher per descriptor, unlike libev, so the write side polls a dup of
+;;; the socket instead.  The descriptor and the file description are shared;
+;;; only the number the event loop registers is different.
+#+unix
+(cffi:defcfun ("dup" ssh-dup-fd) :int (fd :int))
+#+windows
+(cffi:defcfun ("_dup" ssh-dup-fd) :int (fd :int))
+
 (cffi:defctype ssh-session :pointer)
 (cffi:defctype ssh-channel :pointer)
 (cffi:defctype ssh-key :pointer)
