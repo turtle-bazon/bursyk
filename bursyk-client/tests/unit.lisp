@@ -20,9 +20,10 @@
         :no-command nil :stdin-null nil :subsystem nil :stdio-forward nil
         :local-forward nil :remote-forward nil :dynamic-forward nil
         :query nil :help nil :version nil :print-config nil
-        :background nil :background-child nil
+        :background nil :background-child nil :control-master-daemon nil
         :control-master nil :control-path nil
-        :control-command nil :pkcs11 nil :bind-interface nil
+        :control-command nil :host nil :no-control-persist nil
+        :pkcs11 nil :bind-interface nil
         :bind-address nil :gssapi-auth nil :tunnel nil :x11-forward nil
         :escape-char nil))
 
@@ -568,6 +569,108 @@ CLI's decision and at the plist it filled."
     ;; An invalid -p is a usage error; FAIL quits, so only exercise the
     ;; valid paths here and leave the exit to the live command-line tests.
     (is (= 22 (parse-integer "22x" :junk-allowed t)))))
+
+;;; ---- connection multiplexing ----
+
+(test control-master-command-line-flags
+  (multiple-value-bind (destination command options)
+      (parse '("-M" "-S" "/tmp/cm.sock" "-O" "check" "host.example"))
+    (is (equal "host.example" destination))
+    (is (null command))
+    (is (eq t (getf options :control-master)))
+    (is (equal "/tmp/cm.sock" (getf options :control-path)))
+    (is (equal "check" (getf options :control-command)))))
+
+(test mux-frame-and-payload-round-trip
+  (let ((frame (burs::mux-frame (vector 1 2 3))))
+    (is (equalp #(0 0 0 3 1 2 3) frame))
+    (is (= 3 (burs::mux-u32 frame 0))))
+  (let* ((payload (burs::mux-request-payload
+                   burs::+mux-c-new-session+ 7
+                   (cons "host" "example.org")
+                   2222))
+         (reader (cl-pnet-ssh:ssh-make-reader payload 0)))
+    (is (= burs::+mux-c-new-session+
+           (cl-pnet-ssh:ssh-read-u32 reader)))
+    (is (= 7 (cl-pnet-ssh:ssh-read-u32 reader)))
+    (is (equal "example.org" (cl-pnet-ssh:ssh-read-text reader)))
+    (is (= 2222 (cl-pnet-ssh:ssh-read-u32 reader)))))
+
+(test mux-expands-control-path-tokens
+  (is (equal "/tmp/cm-alice@203.0.113.7-2222"
+             (burs::mux-expand-control-path
+              "/tmp/cm-%r@%h-%p"
+              :original "alias" :hostname "203.0.113.7"
+              :port 2222 :user "alice")))
+  (is (equal "alias-100%"
+             (burs::mux-expand-control-path
+              "%n-100%%" :original "alias")))
+  ;; %C is the SHA1 connection hash, so it is forty lowercase hex digits.
+  (let ((expanded (burs::mux-expand-control-path
+                   "%C" :original "alias" :hostname "203.0.113.7"
+                   :port 2222 :user "alice")))
+    (is (= 40 (length expanded)))
+    (is (every (lambda (character)
+                 (find character "0123456789abcdef"))
+               expanded)))
+  ;; Unknown tokens are left alone rather than silently swallowed.
+  (is (equal "%z" (burs::mux-expand-control-path
+                   "%z" :original "alias"))))
+
+(test mux-expands-a-leading-tilde
+  (let ((home (uiop:getenv "HOME"))
+        (missing (burs::mux-tilde-expand "~definitely-no-such-user/x")))
+    (is (string= (concatenate 'string home "/.ssh/cm")
+                 (burs::mux-tilde-expand "~/.ssh/cm")))
+    (is (string= home (burs::mux-tilde-expand "~")))
+    (is (equal "relative/socket"
+               (burs::mux-tilde-expand "relative/socket")))
+    (is (equal "~definitely-no-such-user/x" missing))))
+
+(test mux-forward-plists-describe-every-forward
+  (let ((burs::*options* (empty-options))
+        (local (burs::%make-forward :bind-address "127.0.0.1"
+                                    :bind-port 8080
+                                    :host "target.example" :port 80))
+        (remote (burs::%make-forward :bind-port 9000
+                                     :host "elsewhere.example" :port 25))
+        (dynamic (burs::%make-dynamic-forward
+                  :bind-address "127.0.0.1" :bind-port 1080)))
+    (setf (getf burs::*options* :local-forward) (list local)
+          (getf burs::*options* :remote-forward) (list remote)
+          (getf burs::*options* :dynamic-forward) (list dynamic))
+    (let ((specs (burs::mux-forward-plists)))
+      (is (= 3 (length specs)))
+      (let ((first (first specs))
+            (second (second specs))
+            (third (third specs)))
+        (is (= burs::+mux-fwd-local+ (getf first :type)))
+        (is (equal "127.0.0.1" (getf first :listen-host)))
+        (is (= 8080 (getf first :listen-port)))
+        (is (equal "target.example" (getf first :connect-host)))
+        (is (= 80 (getf first :connect-port)))
+        (is (= burs::+mux-fwd-remote+ (getf second :type)))
+        (is (equal "elsewhere.example" (getf second :connect-host)))
+        (is (= burs::+mux-fwd-dynamic+ (getf third :type)))
+        (is (= 1080 (getf third :listen-port)))
+        (is (equal "" (getf third :connect-host)))))))
+
+(test mux-config-forward-plists-parse-file-lines
+  (let* ((options
+           (cl-pnet-ssh::%make-ssh-config-options
+            :local-forwards '("8080 target.example:80")
+            :remote-forwards '("9000 elsewhere.example:25")
+            :dynamic-forwards '("127.0.0.1:1080")))
+         (specs (burs::mux-config-forward-plists options)))
+    (is (= 3 (length specs)))
+    (is (= burs::+mux-fwd-local+ (getf (first specs) :type)))
+    (is (= 8080 (getf (first specs) :listen-port)))
+    (is (equal "target.example" (getf (first specs) :connect-host)))
+    (is (= burs::+mux-fwd-remote+ (getf (second specs) :type)))
+    (is (= 9000 (getf (second specs) :listen-port)))
+    (is (= burs::+mux-fwd-dynamic+ (getf (third specs) :type)))
+    (is (= 1080 (getf (third specs) :listen-port))))
+  (is (null (burs::mux-config-forward-plists nil))))
 
 ;;; ---- version ----
 

@@ -82,6 +82,9 @@ for every invocation keeps two parses from sharing state."
               :long "background")
    (burs-flag :background-child "Internal: signal the waiting parent"
               :long "background-child")
+   (burs-flag :control-master-daemon
+              "Internal: keep a control master alive"
+              :long "control-master-daemon")
    (burs-flag :print-config "Print the effective configuration and exit"
               :short #\G :long "print-config")
    (burs-flag :gateway-ports "Allow remote hosts to use forwarded ports"
@@ -319,6 +322,8 @@ the order the old push-based parser kept them in."
             (getf *options* :print-config) (flag :print-config)
             (getf *options* :background) (flag :background)
             (getf *options* :background-child) (flag :background-child)
+            (getf *options* :control-master-daemon)
+            (flag :control-master-daemon)
             (getf *options* :control-master) (flag :control-master)
             (getf *options* :control-path) (value :control-path)
             (getf *options* :control-command) (value :control-command)
@@ -405,12 +410,6 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-B" "binding the source interface is not implemented"))
   (when (getf *options* :bind-address)
     (unsupported "-b" "binding the source address is not implemented"))
-  (when (getf *options* :control-master)
-    (unsupported "-M" "connection sharing is not implemented"))
-  (when (getf *options* :control-path)
-    (unsupported "-S" "connection sharing is not implemented"))
-  (when (getf *options* :control-command)
-    (unsupported "-O" "connection sharing is not implemented"))
   (when (getf *options* :tunnel)
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
   (when (getf *options* :gssapi-auth)
@@ -1088,6 +1087,10 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
     (stop-winch)
     (stop-stdin)
     (stop-forwards)
+    ;; Stop listening before the connection goes away, so a client cannot
+    ;; connect to a master that is already closing.
+    (when *mux-master*
+      (mux-master-stop *mux-master*))
     ;; Close the client before leaving: a ProxyCommand's helper is a child
     ;; process, and quitting without closing would leave it running.
     (when *client*
@@ -2230,7 +2233,7 @@ peer that connected to it; NIL refuses the channel."
                    (forward-bind-path forward))))))
   forward)
 
-(defun start-remote-forward (client forward)
+(defun start-remote-forward (client forward &key on-allocated on-failed)
   "Ask CLIENT's server to listen for FORWARD and relay to this machine."
   (when (forward-bind-path forward)
     (return-from start-remote-forward
@@ -2251,10 +2254,13 @@ peer that connected to it; NIL refuses the channel."
                (cl-pnet-ssh::ssh-read-u32 reader)))
        (log-line "remote forward ~A:~D to ~A:~D"
                  address (forward-bind-port forward)
-                 (forward-host forward) (forward-port forward)))
+                 (forward-host forward) (forward-port forward))
+       (when on-allocated
+         (funcall on-allocated (forward-bind-port forward))))
      :on-failure
      (lambda ()
        (setf *remote-forwards* (delete forward *remote-forwards*))
+       (when on-failed (funcall on-failed))
        (if (exit-on-forward-failure-p client)
            (finish 255)
            (unless (getf *options* :quiet)
@@ -2371,6 +2377,31 @@ peer that connected to it; NIL refuses the channel."
             (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
                    options)
               (:yes "yes") (:ask "ask") (t "no")))
+    ;; ssh -G spells yes and no as true and false here, and omits
+    ;; ControlPath entirely when multiplexing has no socket.
+    (let ((master (cl-pnet-ssh:ssh-config-options-control-master options)))
+      (format t "controlmaster ~A~%"
+              (case master
+                ((:yes) "true")
+                ((nil :no) "false")
+                (t (string-downcase (symbol-name master))))))
+    (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
+      (when (and path (not (eq path :none)) (not (string-equal path "none")))
+        (format t "controlpath ~A~%"
+                (mux-expand-control-path
+                 (mux-tilde-expand path)
+                 :original host
+                 :hostname hostname
+                 :port (or (cl-pnet-ssh:ssh-config-options-port options) 22)
+                 :user (or (cl-pnet-ssh:ssh-config-options-user options)
+                           (getf *options* :user)
+                           (uiop:getenv "USER")
+                           "root")))))
+    (let ((persist (cl-pnet-ssh:ssh-config-options-control-persist options)))
+      (format t "controlpersist ~A~%"
+              (cond ((or (null persist) (eq persist :no)) "no")
+                    ((eq persist :yes) "yes")
+                    (t (format nil "~D" persist)))))
     (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
       (when alias
         (format t "hostkeyalias ~A~%" alias)))
@@ -2654,57 +2685,67 @@ of calling back in the middle of authentication."
    :on-forwarded-streamlocal #'forwarded-streamlocal-target
    :on-open
    (lambda (client)
-     (let ((remote (config-remote-command client)))
-       (when remote
-         (when command-given-p
-           (fail "Cannot execute command-line and remote command."))
-         (setf command (expand-remote-command client remote)
-               command-given-p t)))
-     (show-banner client)
-     (show-visual-host-key client)
-     (cl-pnet-ssh:ssh-client-set-ip-qos
-      client (request-tty-p client command-given-p))
-     (setf *escape-char* nil
-           *escape-pending* nil
-           *escape-line-start* t)
-     (when (request-tty-p client command-given-p)
-       (setf *escape-char* (escape-char-setting client)
-             *escape-help-function* #'print-escape-help
-             *escape-forwards-function* #'print-escape-forwards
-             *escape-disconnect-function*
-             (lambda ()
-               (format *error-output* "~%Connection to ~A closed.~%"
-                       (cl-pnet-ssh:ssh-client-host client))
-               (finish-output *error-output*)
-               (finish *status*))
-             *escape-commandline-function*
-             (when (escape-commandline-enabled-p client)
-               #'escape-commandline)))
-     (start-forwards client)
-     (when (and (config-local-command client)
-                (permit-local-command-p client))
-       (run-local-command client))
-     (let ((background (or (getf *options* :background)
-                           (config-fork-after-authentication-p client)
-                           *background-child*)))
-       (when (and background
-                  (not command-given-p)
-                  (not (getf *options* :no-command))
-                  (not (session-type-none-p client))
-                  (null (config-remote-command client)))
-         (fail "Cannot fork into background without a command to execute."))
-       (when background
-         (background-ready)))
-     (cond
-       ((getf *options* :stdio-forward)
-        (multiple-value-bind (target port)
-            (parse-host-port (getf *options* :stdio-forward))
-          (start-stdio-forward client target port)))
-       ((or (getf *options* :no-command) (session-type-none-p client)) nil)
-       (t
-        (when (and (subsystem-request-p) (not command-given-p))
-          (fail "SessionType subsystem requires a subsystem name"))
-        (start-session client command command-given-p))))
+     (if *mux-daemon*
+         ;; A detached master exists only to carry other sessions.  Its
+         ;; readiness line tells the launching client that the socket is up.
+         (progn
+           (mux-start-configured-master client)
+           (format t "BURS-MASTER-READY~%")
+           (finish-output)
+           (mux-detach-standard-streams))
+         (progn
+           (let ((remote (config-remote-command client)))
+             (when remote
+               (when command-given-p
+                 (fail "Cannot execute command-line and remote command."))
+               (setf command (expand-remote-command client remote)
+                     command-given-p t)))
+           (show-banner client)
+           (show-visual-host-key client)
+           (cl-pnet-ssh:ssh-client-set-ip-qos
+            client (request-tty-p client command-given-p))
+           (mux-start-configured-master client)
+           (setf *escape-char* nil
+                 *escape-pending* nil
+                 *escape-line-start* t)
+           (when (request-tty-p client command-given-p)
+             (setf *escape-char* (escape-char-setting client)
+                   *escape-help-function* #'print-escape-help
+                   *escape-forwards-function* #'print-escape-forwards
+                   *escape-disconnect-function*
+                   (lambda ()
+                     (format *error-output* "~%Connection to ~A closed.~%"
+                             (cl-pnet-ssh:ssh-client-host client))
+                     (finish-output *error-output*)
+                     (finish *status*))
+                   *escape-commandline-function*
+                   (when (escape-commandline-enabled-p client)
+                     #'escape-commandline)))
+           (start-forwards client)
+           (when (and (config-local-command client)
+                      (permit-local-command-p client))
+             (run-local-command client))
+           (let ((background (or (getf *options* :background)
+                                 (config-fork-after-authentication-p client)
+                                 *background-child*)))
+             (when (and background
+                        (not command-given-p)
+                        (not (getf *options* :no-command))
+                        (not (session-type-none-p client))
+                        (null (config-remote-command client)))
+               (fail "Cannot fork into background without a command to execute."))
+             (when background
+               (background-ready)))
+           (cond
+             ((getf *options* :stdio-forward)
+              (multiple-value-bind (target port)
+                  (parse-host-port (getf *options* :stdio-forward))
+                (start-stdio-forward client target port)))
+             ((or (getf *options* :no-command) (session-type-none-p client)) nil)
+             (t
+              (when (and (subsystem-request-p) (not command-given-p))
+                (fail "SessionType subsystem requires a subsystem name"))
+              (start-session client command command-given-p))))))
    :on-error (lambda (client condition)
                (show-banner client)
                (format *error-output* "burs: ~A~%" condition)
@@ -2761,12 +2802,21 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
             (uiop:quit 255))
           (multiple-value-bind (host user) (split-destination destination)
             (when user (setf (getf *options* :user) user))
+            (setf (getf *options* :host) host)
             (when (and (getf *options* :subsystem) (null command))
               (fail "-s requires a subsystem name"))
             (when (and (getf *options* :stdio-forward) command)
               (fail "-W cannot be combined with a remote command"))
             (when (getf *options* :print-config)
               (print-config host))
+            (setf *mux-daemon*
+                  (and (getf *options* :control-master-daemon) t))
+            (when *mux-daemon*
+              (mux-detach-process)
+              ;; A daemon has no session of its own; it only listens.
+              (setf (getf *options* :control-master) t))
+            (mux-prepare host (and command (join-command command))
+                         (and command t))
             (handler-case
                 (start-client host (and command (join-command command))
                               (and command t))

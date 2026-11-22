@@ -4,7 +4,7 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.66")
+(defparameter +burs-version+ "0.0.2.67")
 
 (defvar *background-child* nil
   "True in the re-executed child that will signal authentication success.")
@@ -99,7 +99,9 @@ forwards, disconnect, or open the escape command line."
     :no-command nil :stdin-null nil :subsystem nil :stdio-forward nil
     :local-forward nil :remote-forward nil :dynamic-forward nil
     :query nil :help nil :version nil :print-config nil
-    :background nil :control-master nil :control-path nil :control-command nil
+    :background nil :background-child nil :control-master-daemon nil
+    :control-master nil :control-path nil :control-command nil
+    :host nil :no-control-persist nil
     :pkcs11 nil :bind-interface nil :bind-address nil :gssapi-auth nil
     :tunnel nil :x11-forward nil :escape-char nil)
   "The command line as parsed, before ~/.ssh/config is applied.")

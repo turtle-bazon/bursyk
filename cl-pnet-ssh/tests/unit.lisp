@@ -3694,6 +3694,56 @@ newline")))
     (is (null (value "KeepAlive no")))
     (is (eq t (value "Port 22")))))
 
+(test control-master-parses
+  (flet ((options (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             options)))
+    (is (eq :yes (ssh-config-options-control-master
+                  (options "ControlMaster yes"))))
+    (is (eq :autoask (ssh-config-options-control-master
+                      (options "ControlMaster autoask"))))
+    (is (eq :no (ssh-config-options-control-master
+                 (options "ControlMaster no"))))
+    (is (equal "/tmp/cm-%r@%h:%p"
+               (ssh-config-options-control-path
+                (options "ControlPath /tmp/cm-%r@%h:%p"))))
+    (is (eq :none (ssh-config-options-control-path
+                   (options "ControlPath none"))))
+    (is (eq :yes (ssh-config-options-control-persist
+                  (options "ControlPersist yes"))))
+    (is (eq :no (ssh-config-options-control-persist
+                 (options "ControlPersist no"))))
+    (is (eql 30 (ssh-config-options-control-persist
+                 (options "ControlPersist 30"))))
+    ;; Unset values stay NIL so "no" is distinguishable from a default.
+    (let ((options (options "Port 22")))
+      (is (null (ssh-config-options-control-master options)))
+      (is (null (ssh-config-options-control-path options)))
+      (is (null (ssh-config-options-control-persist options))))
+    (let ((failure nil))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::ssh-config-option-line
+               "ControlMaster sometimes")))
+       "alias" :on-error (lambda (condition) (setf failure condition)))
+      (is (typep failure 'ssh-config-error)))
+    (let ((failure nil))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::ssh-config-option-line
+               "ControlPersist later")))
+       "alias" :on-error (lambda (condition) (setf failure condition)))
+      (is (typep failure 'ssh-config-error)))))
+
 (test exit-on-forward-failure-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
@@ -5354,3 +5404,81 @@ the KEX from its signature."
                            session)))
                  (fake-agent-close agent)))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+;;; Descriptor passing backs the multiplexing control protocol: a session's
+;;; three standard descriptors travel over the Unix control socket after its
+;;; request, one SCM_RIGHTS message each with a dummy byte.
+#-win32
+(test unix-socket-passes-descriptors
+  (let* ((path (format nil "/tmp/cl-pnet-fd-~D-~D.sock"
+                       (get-universal-time) (random 1000000)))
+         (listener (cl-pnet-sockets:listen-unix path :backlog 4))
+         (sender nil)
+         (receiver nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (fd state)
+               (cl-pnet-sockets:connect-unix path)
+             (is (member state '(:connected :pending)))
+             (setf sender fd))
+           (loop repeat 10000
+                 until receiver
+                 do (setf receiver
+                          (cl-pnet-sockets:accept-socket listener)))
+           (is (not (null sender)))
+           (is (not (null receiver)))
+           (when (and sender receiver)
+             (cffi:with-foreign-object (pipe :int 2)
+               (is (zerop (cffi:foreign-funcall "pipe" :pointer pipe :int)))
+               (let ((read-end (cffi:mem-aref pipe :int 0))
+                     (write-end (cffi:mem-aref pipe :int 1))
+                     (sent nil)
+                     (received nil))
+                 (unwind-protect
+                      (progn
+                        (cffi:with-foreign-string (data "hello")
+                          (is (= 5 (cffi:foreign-funcall
+                                    "write" :int write-end
+                                    :pointer data :size 5 :long))))
+                        (loop repeat 10000
+                              until sent
+                              do (setf sent
+                                       (cl-pnet-sockets:send-fd sender
+                                                                read-end)))
+                        (is (not (null sent)))
+                        (loop repeat 10000
+                              until received
+                              do (setf received
+                                       (cl-pnet-sockets:receive-fd receiver)))
+                        (is (and received (not (minusp received))))
+                        (when (and received (not (minusp received)))
+                          ;; The descriptor is the same pipe read end, so the
+                          ;; bytes written before sending are still there.
+                          (cffi:with-foreign-object (buffer :char 8)
+                            (let ((count (cffi:foreign-funcall
+                                          "read" :int received
+                                          :pointer buffer :size 8 :long)))
+                              (is (= 5 count))
+                              (is (equal "hello"
+                                         (cffi:foreign-string-to-lisp
+                                          buffer :count 5))))))
+                        ;; RECEIVE-FD consumed the dummy byte, so a plain read
+                        ;; sees the next octet untouched.
+                        (loop repeat 10000
+                              do (multiple-value-bind (count error)
+                                     (cl-pnet-sockets:send-octets
+                                      sender (vector 42))
+                                   (declare (ignore error))
+                                   (when (plusp count) (return))))
+                        (multiple-value-bind (octets count)
+                            (cl-pnet-sockets:receive-octets receiver 8)
+                          (is (= 1 count))
+                          (is (= 42 (aref octets 0)))))
+                   (when (and received (not (minusp received)))
+                     (cffi:foreign-funcall "close" :int received :int))
+                   (cffi:foreign-funcall "close" :int read-end :int)
+                   (cffi:foreign-funcall "close" :int write-end :int)))))
+      (when sender (cl-pnet-sockets:close-open-fd sender))
+      (when receiver (cl-pnet-sockets:close-open-fd receiver))
+      (cl-pnet-sockets:close-open-fd listener)
+      (ignore-errors (delete-file path))))))

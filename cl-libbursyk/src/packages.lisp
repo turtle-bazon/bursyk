@@ -204,6 +204,9 @@
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null
    #:ssh-config-options-fork-after-authentication
+   #:ssh-config-options-control-master
+   #:ssh-config-options-control-path
+   #:ssh-config-options-control-persist
    #:ssh-config-options-forward-agent
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files

@@ -2,7 +2,7 @@
   :description "SSH client command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.66"
+  :version "0.0.2.67"
   :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cl-pnet-socks #:clingon
                ;; SSHFP queries for VerifyHostKeyDNS; the SSH library finds
                ;; these packages at call time.
@@ -15,6 +15,10 @@
                              (:file "state")
                              (:file "posix" :if-feature (:not :win32))
                              (:file "windows" :if-feature :win32)
+                             ;; Connection sharing: the mux protocol and the
+                             ;; control master.  MAIN wires it into the
+                             ;; ordinary connection path.
+                             (:file "mux")
                              (:file "main"))))
   :build-operation "program-op"
   :build-pathname "../_build/burs"

@@ -155,6 +155,15 @@ relative Include is anchored here.")
   (session-type nil)
   (stdin-null nil)
   (fork-after-authentication nil)
+  ;; ControlMaster, ControlPath and ControlPersist: whether this client may
+  ;; listen for multiplexed sessions, where the control socket lives, and how
+  ;; long a background master outlives its last session.  :YES, :NO, :ASK,
+  ;; :AUTO and :AUTOASK are the ControlMaster values; :NONE on the path means
+  ;; multiplexing is disabled, and :NO or a number of seconds is the persist
+  ;; timeout.
+  (control-master nil)
+  (control-path nil)
+  (control-persist nil)
   (tag nil)
   ;; LogLevel and LogVerbose: how much this client logs, and per-area
   ;; overrides.  LogVerbose is accepted for ssh_config compatibility; this
@@ -1369,6 +1378,23 @@ understand them rather than silently match nothing."
         ((string= keyword "forkafterauthentication")
          (setf (ssh-config-options-fork-after-authentication options)
                (boolean)))
+        ((string= keyword "controlmaster")
+         (let ((setting (string-downcase value)))
+           (unless (member setting '("yes" "no" "ask" "auto" "autoask")
+                           :test #'string=)
+             (error (ssh-config-line-error line
+                                           "invalid ControlMaster ~S" value)))
+           (setf (ssh-config-options-control-master options)
+                 (intern (string-upcase setting) :keyword))))
+        ((string= keyword "controlpath")
+         (setf (ssh-config-options-control-path options)
+               (if (string-equal value "none") :none value)))
+        ((string= keyword "controlpersist")
+         (setf (ssh-config-options-control-persist options)
+               (cond
+                 ((string-equal value "yes") :yes)
+                 ((string-equal value "no") :no)
+                 (t (ssh-config-seconds line value)))))
         ((string= keyword "requesttty")
          (setf (ssh-config-options-request-tty options) (string-downcase value)))
         ((string= keyword "preferredauthentications")
@@ -1433,6 +1459,7 @@ understand them rather than silently match nothing."
                          "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
                          "forkafterauthentication"
+                         "controlmaster" "controlpath" "controlpersist"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
                          "localforward" "remoteforward" "dynamicforward"
