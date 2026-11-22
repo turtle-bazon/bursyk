@@ -744,6 +744,7 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "identitiesonly no"
                       "kbdinteractiveauthentication yes"
                       "passwordauthentication yes"
+                      "proxyusefdpass no"
                       "pubkeyauthentication true"
                       "tcpkeepalive true"
                       "updatehostkeys true"
@@ -776,6 +777,10 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                   (cl-pnet-ssh::ssh-config-option-line
                    "PermitRemoteOpen host:22")
                   (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyCommand nc %h %p")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "ProxyUseFdpass yes")
+                  (cl-pnet-ssh::ssh-config-option-line
                    "UpdateHostKeys ask"))))
          (options nil))
     (cl-pnet-ssh:ssh-config-resolve
@@ -792,5 +797,7 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "numberofpasswordprompts 1"
                       "tag work"
                       "permitremoteopen host:22"
+                      "proxycommand nc %h %p"
+                      "proxyusefdpass yes"
                       "updatehostkeys ask"))
         (is (search line text) line)))))

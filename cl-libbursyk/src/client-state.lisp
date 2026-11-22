@@ -140,6 +140,9 @@
   ;; ProxyCommand: a helper program carrying the stream on its stdin/stdout.
   ;; NIL means dial the address directly.
   proxy-command
+  ;; ProxyUseFdpass: the helper connects the socket itself and hands the
+  ;; connected descriptor back over a socketpair instead of carrying bytes.
+  proxy-use-fdpass
   ;; The running helper and its pipes, once SSH-OPEN-PROXY-CONNECTION starts
   ;; it.  NIL on the direct TCP path.
   pipe

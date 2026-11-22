@@ -27,6 +27,13 @@
   write-fd
   read-watcher
   write-watcher
+  ;; ProxyUseFdpass: the socketpair end on which the helper sends the
+  ;; connected descriptor, and a watcher waiting for it.
+  control-fd
+  control-watcher
+  ;; Whether READ-FD and WRITE-FD are raw descriptors this structure owns.
+  ;; Pipe mode leaves them to the streams; fdpass mode owns them.
+  (close-fds nil)
   (queue (make-array 0 :element-type '(unsigned-byte 8)
                        :adjustable t :fill-pointer 0))
   (position 0)
@@ -161,6 +168,131 @@ callback, where a blocking wait on an already-exited helper can hang."
       (setf (ssh-proxy-write-watcher proxy) nil)
       (ignore-errors (cl-pnet:fd-unwatch watcher)))))
 
+(defun ssh-proxy-cancel-control-watcher (proxy)
+  (let ((watcher (ssh-proxy-control-watcher proxy)))
+    (when watcher
+      (setf (ssh-proxy-control-watcher proxy) nil)
+      (ignore-errors (cl-pnet:fd-unwatch watcher)))))
+
+;;; ---- ProxyUseFdpass ----
+
+(defun ssh-proxy-fdpass-child-stream (fd)
+  "FD as a stream for the helper's stdin and stdout.
+
+A real SBCL file stream is what makes RUN-PROGRAM hand the descriptor
+itself to the child; wrapping it in a Lisp-visible stream would make the
+child inherit a pipe, and a pipe cannot carry SCM_RIGHTS."
+  #+sbcl
+  (sb-sys:make-fd-stream fd :input t :output t :buffering :none)
+  #-sbcl
+  (progn
+    (declare (ignore fd))
+    (error 'ssh-connection-error
+           :detail "ProxyUseFdpass needs a Lisp that can hand a descriptor to a child")))
+
+(defun ssh-proxy-launch-fdpass-helper (command fd)
+  "Run COMMAND with FD as both its stdin and stdout, returning the process.
+
+The child keeps its own descriptor for FD, so this side closes the stream
+at once; the parent waits on its end of the socketpair for the connected
+socket the helper sends back."
+  (let ((stream nil))
+    (unwind-protect
+         (progn
+           (setf stream (ssh-proxy-fdpass-child-stream fd))
+           (uiop:launch-program (list "/bin/sh" "-c" command)
+                                :input stream :output stream))
+      (if stream
+          (ignore-errors (close stream))
+          (ignore-errors (cl-pnet-sockets:c-close fd))))))
+
+(defun ssh-proxy-adopt-fd (client fd)
+  "Use FD, a connected socket the helper sent, as CLIENT's transport."
+  (let ((proxy (ssh-client-pipe client)))
+    (cond
+      ((or (null proxy) (ssh-proxy-closed proxy))
+       (ignore-errors (cl-pnet-sockets:c-close fd)))
+      (t
+       ;; The control socket has done its job; the connected socket replaces
+       ;; it and is now this structure's to close.
+       (ssh-proxy-cancel-control-watcher proxy)
+       (when (ssh-proxy-control-fd proxy)
+         (ignore-errors
+          (cl-pnet-sockets:c-close (ssh-proxy-control-fd proxy)))
+         (setf (ssh-proxy-control-fd proxy) nil))
+       (cl-pnet-sockets:set-nonblocking fd)
+       (setf (ssh-proxy-read-fd proxy) fd
+             (ssh-proxy-write-fd proxy) fd
+             (ssh-proxy-close-fds proxy) t
+             (ssh-proxy-read-watcher proxy)
+             (cl-pnet:fd-watch
+              fd
+              :on-readable
+              (lambda (watcher)
+                (declare (ignore watcher))
+                (ssh-proxy-readable client))))
+       (ssh-log "ProxyUseFdpass received the connected socket")
+       (ssh-client-connected client nil)))))
+
+(defun ssh-proxy-fdpass-receive (client)
+  "Take the helper's connected descriptor, then start the handshake on it."
+  (let ((proxy (ssh-client-pipe client)))
+    (when (and proxy
+               (not (ssh-proxy-closed proxy))
+               (ssh-proxy-control-fd proxy))
+      (multiple-value-bind (fd errno)
+          (cl-pnet-sockets:receive-fd (ssh-proxy-control-fd proxy))
+        (cond
+          (fd (ssh-proxy-adopt-fd client fd))
+          ((eql errno +ssh-eagain+) nil)
+          ((zerop errno)
+           (ssh-proxy-fail
+            client
+            "the ProxyCommand closed the descriptor channel without passing a connection"))
+          (t
+           (ssh-proxy-fail
+            client "receiving a ProxyCommand descriptor failed (~A)"
+            (cl-pnet-sockets:c-strerror errno))))))))
+
+(defun ssh-open-fdpass-connection (client)
+  "Run CLIENT's ProxyCommand with a socketpair and take back a connected fd."
+  (handler-case
+      (let ((command (ssh-proxy-expand-command
+                      (ssh-client-proxy-command client) client)))
+        (if (string= command "-")
+            (ssh-proxy-fail
+             client "ProxyCommand=- and ProxyUseFDPass are incompatible")
+            (multiple-value-bind (parent child errno)
+                (cl-pnet-sockets:make-socketpair)
+              (if (null parent)
+                  (ssh-proxy-fail
+                   client
+                   "could not create the ProxyUseFdpass socketpair (~A)"
+                   (cl-pnet-sockets:c-strerror errno))
+                  (let ((process nil))
+                    (handler-case
+                        (setf process
+                              (ssh-proxy-launch-fdpass-helper command child))
+                      (error (condition)
+                        (ignore-errors (cl-pnet-sockets:c-close parent))
+                        (error condition)))
+                    (cl-pnet-sockets:set-nonblocking parent)
+                    (let ((proxy (%make-ssh-proxy
+                                  :command command
+                                  :process process
+                                  :control-fd parent)))
+                      (ssh-log "started ProxyUseFdpass helper: ~A" command)
+                      (setf (ssh-client-pipe client) proxy
+                            (ssh-proxy-control-watcher proxy)
+                            (cl-pnet:fd-watch
+                             parent
+                             :on-readable
+                             (lambda (watcher)
+                               (declare (ignore watcher))
+                               (ssh-proxy-fdpass-receive client))))))))))
+    (error (condition) (ssh-client-fail client condition)))
+  client)
+
 (defun ssh-proxy-readable (client)
   "Hand what the helper wrote to the protocol, and report its exit as EOF."
   (let ((proxy (ssh-client-pipe client)))
@@ -194,11 +326,13 @@ callback, where a blocking wait on an already-exited helper can hang."
   (unless (ssh-proxy-closed proxy)
     (setf (ssh-proxy-closed proxy) t)
     (dolist (watcher (list (ssh-proxy-read-watcher proxy)
-                           (ssh-proxy-write-watcher proxy)))
+                           (ssh-proxy-write-watcher proxy)
+                           (ssh-proxy-control-watcher proxy)))
       (when watcher
         (ignore-errors (cl-pnet:fd-unwatch watcher))))
     (setf (ssh-proxy-read-watcher proxy) nil
-          (ssh-proxy-write-watcher proxy) nil)
+          (ssh-proxy-write-watcher proxy) nil
+          (ssh-proxy-control-watcher proxy) nil)
     ;; Close the helper's stdin and the read end first: EOF and EPIPE make a
     ;; well-behaved helper (nc, socat) exit on its own before the kill below.
     (dolist (stream (list (ssh-proxy-input-stream proxy)
@@ -207,47 +341,63 @@ callback, where a blocking wait on an already-exited helper can hang."
         (ignore-errors (close stream))))
     (setf (ssh-proxy-input-stream proxy) nil
           (ssh-proxy-output-stream proxy) nil)
+    ;; In fdpass mode the descriptors are ours rather than a stream's.
+    (when (ssh-proxy-close-fds proxy)
+      (let ((read-fd (ssh-proxy-read-fd proxy))
+            (write-fd (ssh-proxy-write-fd proxy)))
+        (when read-fd
+          (ignore-errors (cl-pnet-sockets:c-close read-fd)))
+        (when (and write-fd (/= write-fd read-fd))
+          (ignore-errors (cl-pnet-sockets:c-close write-fd)))))
+    (when (ssh-proxy-control-fd proxy)
+      (ignore-errors (cl-pnet-sockets:c-close (ssh-proxy-control-fd proxy))))
     (when (ssh-proxy-process proxy)
       (ssh-proxy-kill-process (ssh-proxy-process proxy))
       (setf (ssh-proxy-process proxy) nil))
     (setf (ssh-proxy-read-fd proxy) nil
-          (ssh-proxy-write-fd proxy) nil)))
+          (ssh-proxy-write-fd proxy) nil
+          (ssh-proxy-control-fd proxy) nil)))
 
 (defun ssh-open-proxy-connection (client)
-  "Start CLIENT's ProxyCommand and begin the handshake over its pipes."
-  (handler-case
-      (let* ((command (ssh-proxy-expand-command
-                       (ssh-client-proxy-command client) client))
-             (process (ssh-proxy-launch-helper command))
-             (input (uiop:process-info-input process))
-             (output (uiop:process-info-output process)))
-        (handler-case
-            (let* ((write-fd (ssh-proxy-stream-fd input))
-                   (read-fd (ssh-proxy-stream-fd output))
-                   (proxy (%make-ssh-proxy
-                           :command command
-                           :process process
-                           :input-stream input
-                           :output-stream output
-                           :write-fd write-fd
-                           :read-fd read-fd)))
-              (cl-pnet-sockets:set-nonblocking write-fd)
-              (cl-pnet-sockets:set-nonblocking read-fd)
-              (setf (ssh-client-pipe client) proxy)
-              (setf (ssh-proxy-read-watcher proxy)
-                    (cl-pnet:fd-watch
-                     read-fd
-                     :on-readable
-                     (lambda (watcher)
-                       (declare (ignore watcher))
-                       (ssh-proxy-readable client))))
-              ;; GREET through the pipe: CONNECTED only needs the transport
-              ;; ready, and the version line then queues on the same path.
-              (ssh-client-connected client nil))
-          (error (condition)
-            (ssh-proxy-kill-process process)
-            (ignore-errors (close input))
-            (ignore-errors (close output))
-            (error condition))))
-    (error (condition) (ssh-client-fail client condition)))
+  "Start CLIENT's ProxyCommand and begin the handshake over its pipes.
+
+ProxyUseFdpass changes the contract: the helper connects the socket and
+sends the descriptor back, so that path waits for it before greeting."
+  (if (ssh-client-proxy-use-fdpass client)
+      (ssh-open-fdpass-connection client)
+      (handler-case
+          (let* ((command (ssh-proxy-expand-command
+                           (ssh-client-proxy-command client) client))
+                 (process (ssh-proxy-launch-helper command))
+                 (input (uiop:process-info-input process))
+                 (output (uiop:process-info-output process)))
+            (handler-case
+                (let* ((write-fd (ssh-proxy-stream-fd input))
+                       (read-fd (ssh-proxy-stream-fd output))
+                       (proxy (%make-ssh-proxy
+                               :command command
+                               :process process
+                               :input-stream input
+                               :output-stream output
+                               :write-fd write-fd
+                               :read-fd read-fd)))
+                  (cl-pnet-sockets:set-nonblocking write-fd)
+                  (cl-pnet-sockets:set-nonblocking read-fd)
+                  (setf (ssh-client-pipe client) proxy)
+                  (setf (ssh-proxy-read-watcher proxy)
+                        (cl-pnet:fd-watch
+                         read-fd
+                         :on-readable
+                         (lambda (watcher)
+                           (declare (ignore watcher))
+                           (ssh-proxy-readable client))))
+                  ;; GREET through the pipe: CONNECTED only needs the transport
+                  ;; ready, and the version line then queues on the same path.
+                  (ssh-client-connected client nil))
+              (error (condition)
+                (ssh-proxy-kill-process process)
+                (ignore-errors (close input))
+                (ignore-errors (close output))
+                (error condition))))
+        (error (condition) (ssh-client-fail client condition))))
   client)

@@ -261,6 +261,8 @@ MAKE-SSH-CLIENT's own defaults."
         :proxy-command
         (ssh-proxy-command-value
          (or proxy-command (ssh-config-options-proxy-command options)))
+        :proxy-use-fdpass
+        (ssh-config-options-proxy-use-fdpass options)
         :resolver resolver))
 
 ;;; ---- ProxyJump descriptors ----
@@ -558,6 +560,7 @@ uses whichever of the two it saw first instead of chaining them."
            :server-alive-interval (getf parameters :server-alive-interval)
            :server-alive-count-max (getf parameters :server-alive-count-max)
            :proxy-command (getf parameters :proxy-command)
+           :proxy-use-fdpass (getf parameters :proxy-use-fdpass)
            :on-open on-open
            :on-error on-error
            :on-close on-close

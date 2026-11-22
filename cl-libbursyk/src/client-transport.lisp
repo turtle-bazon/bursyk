@@ -36,11 +36,13 @@ RFC 4253 requires."
   ;; the interactive value once it decides whether to request a pty.
   (ssh-client-set-ip-qos client nil)
   (unless (ssh-client-tcp-keep-alive client)
-    (let ((fd (cl-pnet:connection-fileno connection)))
-      (when fd
-        (cl-pnet-sockets:set-socket-option
-         fd cl-pnet-sockets:+sol-socket+
-         cl-pnet-sockets:+so-keepalive+ 0))))
+    (let ((connection (ssh-client-connection client)))
+      (when connection
+        (let ((fd (cl-pnet:connection-fileno connection)))
+          (when fd
+            (cl-pnet-sockets:set-socket-option
+             fd cl-pnet-sockets:+sol-socket+
+             cl-pnet-sockets:+so-keepalive+ 0))))))
   (ssh-client-send-bytes
    client
    (ssh-string-octets (concatenate 'string

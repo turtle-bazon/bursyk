@@ -337,8 +337,7 @@ helper is what reaches the server."
                                on-forwarded-streamlocal
                                &key kex-algorithms host-key-algorithms
                                  ciphers macs pubkey-accepted-algorithms
-                                 ca-signature-algorithms
-                                 (revoked-host-keys '())
+                                 ca-signature-algorithms                                 (revoked-host-keys '())
                                  hash-known-hosts
                                  known-hosts-command
                                  (add-keys-to-agent :no)
@@ -371,7 +370,8 @@ helper is what reaches the server."
                                  set-env
                                  (connection-attempts 1)
                                  (required-rsa-size
-                                  +ssh-rsa-minimum-modulus-size+))
+                                  +ssh-rsa-minimum-modulus-size+)
+                                 proxy-use-fdpass)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -385,6 +385,7 @@ helper is what reaches the server."
                     :server-alive-interval server-alive-interval
                     :server-alive-count-max (or server-alive-count-max 3)
                     :proxy-command (ssh-proxy-command-value proxy-command)
+                    :proxy-use-fdpass proxy-use-fdpass
                     :kex-algorithms kex-algorithms
                     :host-key-algorithms host-key-algorithms
                     :ciphers ciphers
@@ -526,6 +527,7 @@ is applied here, before any request names a key the configuration forbade."
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
+                             proxy-use-fdpass
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
                              ca-signature-algorithms
@@ -576,6 +578,10 @@ PORT and is the port dialled, so a ProxyJump tunnel can listen on loopback
 while PORT still names the server's real one.  PROXY-COMMAND, when given,
 replaces the direct connection with a helper that carries the stream on its
 stdin and stdout; %h, %n, %p, %r and %% expand as in ssh_config.
+PROXY-USE-FDPASS, when true with PROXY-COMMAND, instead has the helper
+connect the socket and send its descriptor back over the pair, as
+ProxyUseFdpass does; a helper that exits without sending one fails the
+connection rather than falling back to a direct dial.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY every default identity file that exists
@@ -682,7 +688,8 @@ role-neutral."
                            :tcp-keep-alive tcp-keep-alive
                            :set-env set-env
                            :connection-attempts connection-attempts
-                           :required-rsa-size required-rsa-size)
+                           :required-rsa-size required-rsa-size
+                           :proxy-use-fdpass proxy-use-fdpass)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

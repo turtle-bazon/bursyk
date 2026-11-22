@@ -490,11 +490,7 @@ still disables the feature and therefore silences the refusal."
                        "PKCS#11 keys are not implemented")))
       ;; ssh only consults ProxyUseFdpass when a ProxyCommand carries the
       ;; stream; with a direct connection or a ProxyJump it changes nothing.
-      (when (and (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)
-                 (or (cl-pnet-ssh:ssh-config-options-proxy-command options)
-                     (getf *options* :proxy-command)))
-        (unsupported "ProxyUseFdpass"
-                     "passing a descriptor back from the proxy is not implemented"))
+      ;; ProxyCommand=- together with it is refused by the client itself.
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
           (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))

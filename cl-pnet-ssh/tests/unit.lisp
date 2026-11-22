@@ -4802,6 +4802,55 @@ so a malformed duplicate is a configuration error rather than ignored."
   (is (equal "nc %h %p"
              (cl-pnet-ssh::ssh-proxy-command-value " nc %h %p "))))
 
+(test facade-carries-proxy-use-fdpass
+  (is (getf (cl-pnet-ssh::ssh-config-client-parameters
+             "alias" (facade-options '(:proxy-use-fdpass t)))
+            :proxy-use-fdpass))
+  (is (not (getf (cl-pnet-ssh::ssh-config-client-parameters
+                  "alias" (facade-options nil))
+                 :proxy-use-fdpass))))
+
+(test proxy-fdpass-adopts-the-helper-socket
+  "The connected descriptor a helper sends replaces the control socket, and
+the client greets over it."
+  (multiple-value-bind (control-parent control-helper)
+      (cl-pnet-sockets:make-socketpair)
+    (multiple-value-bind (adopted-peer adopted-server)
+        (cl-pnet-sockets:make-socketpair)
+      (let ((client nil)
+            (proxy nil))
+        (unwind-protect
+             (progn
+               (setf client
+                     (cl-pnet-ssh::%make-ssh-client
+                      :host "fdpass.example"
+                      :connect-host "fdpass.example"
+                      :host-key-host "fdpass.example"
+                      :port 22 :connect-port 22
+                      :client-version "SSH-2.0-fdpass")
+                     proxy
+                     (cl-pnet-ssh::%make-ssh-proxy
+                      :command "helper"
+                      :control-fd control-parent)
+                     (cl-pnet-ssh::ssh-client-pipe client) proxy)
+               (is (cl-pnet-sockets:send-fd control-helper adopted-peer))
+               (cl-pnet-ssh::ssh-proxy-fdpass-receive client)
+               ;; Adopting closed the control socket and kept the connected
+               ;; descriptor.
+               (is (null (cl-pnet-ssh::ssh-proxy-control-fd proxy)))
+               (is (integerp (cl-pnet-ssh::ssh-proxy-read-fd proxy)))
+               (multiple-value-bind (octets count errno)
+                   (cl-pnet-sockets:read-octets
+                    adopted-server (length "SSH-2.0-fdpass"))
+                 (declare (ignore errno))
+                 (is (plusp count))
+                 (is (equal "SSH-2.0-fdpass"
+                            (map 'string #'code-char octets)))))
+          (when proxy
+            (cl-pnet-ssh::ssh-proxy-shutdown proxy))
+          (ignore-errors (cl-pnet-sockets:c-close control-helper))
+          (ignore-errors (cl-pnet-sockets:c-close adopted-peer))
+          (ignore-errors (cl-pnet-sockets:c-close adopted-server)))))))
 #-ssh-backend-ffi
 (test proxy-command-expands-ssh-escapes
   (let ((client (cl-pnet-ssh::%make-ssh-client
