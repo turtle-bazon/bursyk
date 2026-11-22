@@ -824,10 +824,17 @@ disables that pattern's timeout."
       (values (subseq argument 0 equals) seconds))))
 
 (defun ssh-config-set-once (seen options key thunk)
-  "Apply THUNK unless KEY was already set, as OpenSSH keeps first values."
-  (unless (gethash key seen)
-    (setf (gethash key seen) t)
-    (funcall thunk options)))
+  "Apply THUNK unless KEY was already set, as OpenSSH keeps first values.
+
+A later active line is still parsed and validated: readconf checks every
+argument before its first-value test, so a malformed duplicate is an error
+even though its value cannot win.  Running the thunk on a copy leaves those
+checks in place without letting the discarded value touch the result."
+  (if (gethash key seen)
+      (funcall thunk (copy-structure options))
+      (progn
+        (setf (gethash key seen) t)
+        (funcall thunk options))))
 
 (defun ssh-config-canonical-client-keyword (keyword)
   "KEYWORD itself, or the name ssh's opcode table gives an obsolete alias.

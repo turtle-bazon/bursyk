@@ -4524,6 +4524,35 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
        "alias" :on-error (lambda (condition) (setf failure condition)))
       (is (typep failure 'ssh-config-error)))))
 
+(test duplicate-active-lines-are-still-validated
+  "A later active line cannot win, but readconf still parses its arguments,
+so a malformed duplicate is a configuration error rather than ignored."
+  (flet ((resolve (lines)
+           (let ((failure nil)
+                 (options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (condition) (setf failure condition)))
+             (values failure options))))
+    (multiple-value-bind (failure)
+        (resolve '("BatchMode yes" "BatchMode sometimes"))
+      (is (typep failure 'ssh-config-error)))
+    (multiple-value-bind (failure)
+        (resolve '("Port 2222" "Port nope"))
+      (is (typep failure 'ssh-config-error)))
+    (multiple-value-bind (failure)
+        (resolve '("Compression no" "Compression maybe"))
+      (is (typep failure 'ssh-config-error)))
+    ;; A valid duplicate is still ignored rather than layered on.
+    (multiple-value-bind (failure options)
+        (resolve '("ServerAliveInterval 10" "ServerAliveInterval 20"))
+      (is (null failure))
+      (is (eql 10 (ssh-config-options-server-alive-interval options))))))
+
 (test exit-on-forward-failure-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
