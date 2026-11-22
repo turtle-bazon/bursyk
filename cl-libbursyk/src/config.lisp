@@ -2462,6 +2462,27 @@ canonical name as ON-SUCCESS's second argument."
        :on-options #'first-pass
        :on-error on-error))))
 
+;;; ---- AddressFamily ----
+
+(defun ssh-normalize-address-family (value)
+  "VALUE as NIL for any, or :INET / :INET6.
+
+The ssh_config reader already stores a keyword, but MAKE-SSH-CLIENT is a
+public entry point too, so the spellings a caller might pass are accepted
+here as well.  Anything else is a programming error rather than a config
+line, so a plain ERROR names the bad value."
+  (cond
+    ((null value) nil)
+    ((eq value :any) nil)
+    ((eq value :inet) :inet)
+    ((eq value :inet6) :inet6)
+    ((stringp value)
+     (cond ((string-equal value "any") nil)
+           ((string-equal value "inet") :inet)
+           ((string-equal value "inet6") :inet6)
+           (t (error "invalid AddressFamily ~S" value))))
+    (t (error "invalid AddressFamily ~S" value))))
+
 ;;; ---- ProxyCommand ----
 
 (defun ssh-proxy-command-value (command)

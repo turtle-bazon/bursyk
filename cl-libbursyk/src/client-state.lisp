@@ -199,6 +199,10 @@
   bind-address
   bind-interface
   bind-address-resolved
+  ;; AddressFamily: NIL for any, or :INET / :INET6 to ask the resolver for one
+  ;; family and reject an address of the other.  A caller-supplied resolver
+  ;; chooses its own family; the result is checked before dialling.
+  (address-family nil)
   ;; The running helper and its pipes, once SSH-OPEN-PROXY-CONNECTION starts
   ;; it.  NIL on the direct TCP path.
   pipe

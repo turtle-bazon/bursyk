@@ -838,10 +838,9 @@ cannot apply per connection."
       ((string= keyword "addressfamily")
        (let ((value (string-downcase
                      (ssh-server-config-one-argument line))))
-         (unless (member value '("inet" "any") :test #'string=)
-           (ssh-server-config-line-error
-            line "AddressFamily ~A is not supported; this server binds one IPv4 listener"
-            value))
+         (unless (member value '("inet" "inet6" "any") :test #'string=)
+           (ssh-server-config-line-error line "invalid AddressFamily ~S"
+                                         value))
          (ssh-server-config-set-once config 'address-family value)))
       ;; ---- host keys and authentication ----
       ((string= keyword "hostkey")

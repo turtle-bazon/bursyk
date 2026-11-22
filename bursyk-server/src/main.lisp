@@ -13,7 +13,7 @@
     :no-tcp-forwarding nil :permit-open nil
     :no-remote-forwarding nil :gateway-ports nil
     :config-file nil :option nil :login-grace-time nil
-    :verbose 0 :quiet nil)
+    :address-family nil :verbose 0 :quiet nil)
   "The command line as parsed.
 
 A NIL value means the option was not given, so an sshd_config setting can
@@ -79,8 +79,9 @@ version rather than a generic library string.")
 
 (defun usage ()
   (format *error-output*
-          "usage: bursyk-server [-a ADDRESS] [-p PORT] [-f SSHD_CONFIG]~%~
-           ~15@T[-g LOGIN_GRACE_TIME] [-H HOST_KEY]... [-A AUTHORIZED_KEYS]~%~
+          "usage: bursyk-server [-4|-6] [-a ADDRESS] [-p PORT]~%~
+           ~15@T[-f SSHD_CONFIG] [-g LOGIN_GRACE_TIME]~%~
+           ~15@T[-H HOST_KEY]... [-A AUTHORIZED_KEYS]~%~
            ~15@T[--host-certificate CERT_FILE]...~%~
            ~15@T[-e NAME]... [-c PREFIX]... [-S NAME=PATH]...~%~
            ~15@T[-o KEYWORD=VALUE]... [-v]... [-q]~%~
@@ -123,6 +124,8 @@ version rather than a generic library string.")
         ((member name '("-f" "--config") :test #'string=) :config-file)
         ((member name '("-g" "--login-grace-time") :test #'string=)
          :login-grace-time)
+        ((string= name "-4") :address-family-4)
+        ((string= name "-6") :address-family-6)
         ((member name '("-o" "--option") :test #'string=) :option)
         ((member name '("-v" "--verbose") :test #'string=) :verbose)
         ((member name '("-q" "--quiet") :test #'string=) :quiet)
@@ -171,7 +174,8 @@ version rather than a generic library string.")
         ((option-key argument)
          (let ((key (option-key argument)))
            (if (member key '(:no-tcp-forwarding :no-remote-forwarding
-                             :gateway-ports :quiet :verbose))
+                             :gateway-ports :quiet :verbose
+                             :address-family-4 :address-family-6))
                (progn
                  (record-option key t)
                  (setf arguments (cdr arguments)))
@@ -323,14 +327,57 @@ explicit -f that does not exist is an error, as in sshd."
   (first (config-setting
           #'cl-pnet-ssh:ssh-server-config-listen-addresses)))
 
+(defun numeric-ipv4-address-p (text)
+  "Whether TEXT is a dotted quad rather than a name to resolve."
+  (and (plusp (length text))
+       (= 3 (count #\. text))
+       (every (lambda (character)
+                (or (digit-char-p character) (char= character #\.)))
+              text)))
+
+(defun server-address-family ()
+  "The family to bind: -4 or -6, then AddressFamily, then any."
+  (cond
+    ((getf *options* :address-family-4) "inet")
+    ((getf *options* :address-family-6) "inet6")
+    ((getf *options* :address-family) (getf *options* :address-family))
+    (t (or (config-setting #'cl-pnet-ssh:ssh-server-config-address-family)
+           "any"))))
+
+(defun wildcard-address (family)
+  "The wildcard address FAMILY listens on."
+  (if (string-equal family "inet6") "::" "0.0.0.0"))
+
+(defun address-matches-family-p (address family)
+  "Whether an explicit ADDRESS may be used with FAMILY.
+
+Only numeric literals are classified; anything else is left for the
+listener, so a name is never rejected merely because it is not a literal."
+  (cond
+    ((string-equal family "any") t)
+    ((cl-pnet-sockets:ipv6-address-p address)
+     (string-equal family "inet6"))
+    ((numeric-ipv4-address-p address)
+     (string-equal family "inet"))
+    (t t)))
+
 (defun server-address ()
-  "The address to bind: -a, then ListenAddress, then every IPv4 address."
-  (or (getf *options* :address)
-      (let ((listen (config-listen-address)))
-        (and listen (if (string= (car listen) "*")
-                        "0.0.0.0"
-                        (car listen))))
-      "0.0.0.0"))
+  "The address to bind: -a, then ListenAddress, then the family's wildcard."
+  (let* ((family (server-address-family))
+         (address
+           (or (getf *options* :address)
+               (let ((listen (config-listen-address)))
+                 (and listen
+                      (not (string= (car listen) "*"))
+                      (car listen)))
+               (wildcard-address family))))
+    (unless (address-matches-family-p address family)
+      ;; sshd resolves the address with the configured family; a literal in
+      ;; the other one cannot be bound, so say so instead of binding it and
+      ;; pretending AddressFamily was honoured.
+      (error "ListenAddress ~A does not match AddressFamily ~A"
+             address family))
+    address))
 
 (defun server-port ()
   "The port to bind: -p, then ListenAddress's port, then Port, then 22."

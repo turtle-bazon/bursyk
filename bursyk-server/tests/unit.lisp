@@ -153,6 +153,18 @@ that ends the stream too."
     (is (equal '("*.example.com:443" "db:5432")
                (getf bursyk-server::*options* :permit-open)))))
 
+(test address-family-flags-parse
+  ;; -4 and -6 are their own flags, not -a or -p with a value, and each
+  ;; records the family the listener will bind.
+  (let ((bursyk-server::*options* nil))
+    (bursyk-server::parse-arguments '("-4"))
+    (is (eq t (getf bursyk-server::*options* :address-family-4)))
+    (is (null (getf bursyk-server::*options* :address-family-6))))
+  (let ((bursyk-server::*options* nil))
+    (bursyk-server::parse-arguments '("-6"))
+    (is (eq t (getf bursyk-server::*options* :address-family-6)))
+    (is (null (getf bursyk-server::*options* :address-family-4)))))
+
 (test remote-forward-bind-policy
   (let ((bursyk-server::*options* nil))
     (is (string= "127.0.0.1"
@@ -418,13 +430,16 @@ ForceCommand two")))
     (config-from-text "Port 1
 Port 2"))
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "AddressFamily inet6")))
+    (config-from-text "AddressFamily ipv7")))
 
 (test sshd-config-accepts-what-describes-this-server
   (is (null (cl-pnet-ssh:ssh-server-config-warnings
              (config-from-text
               "PasswordAuthentication no
 PermitRootLogin yes"))))
+  (is (equal "inet6"
+             (config-value #'cl-pnet-ssh:ssh-server-config-address-family
+                           "AddressFamily inet6")))
   (is (equal '("ignoring printmotd; this server has nothing for it to configure")
              (cl-pnet-ssh:ssh-server-config-warnings
               (config-from-text "PrintMotd no")))))
@@ -1429,6 +1444,39 @@ ListenAddress 127.0.0.2")))
 ListenAddress 127.0.0.2:2201")))
     (is (= 2201 (bursyk-server::server-port)))
     (is (equal "127.0.0.2" (bursyk-server::server-address)))))
+
+(test server-address-follows-address-family
+  ;; AddressFamily picks the wildcard the server binds, -4 and -6 outrank
+  ;; it, and an explicit literal is used only when it belongs to the family.
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config* nil))
+    (is (equal "0.0.0.0" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "AddressFamily inet6")))
+    (is (equal "::" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "AddressFamily inet6
+ListenAddress *")))
+    (is (equal "::" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* '(:address-family-6 t))
+        (bursyk-server::*server-config* nil))
+    (is (equal "::" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* '(:address-family-4 t))
+        (bursyk-server::*server-config*
+          (config-from-text "AddressFamily inet6")))
+    (is (equal "0.0.0.0" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "AddressFamily inet6
+ListenAddress ::1")))
+    (is (equal "::1" (bursyk-server::server-address))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config*
+          (config-from-text "AddressFamily inet6
+ListenAddress 127.0.0.1")))
+    (signals error (bursyk-server::server-address))))
 
 (test -f-none-reads-no-config-file
   (let ((bursyk-server::*options* (list :config-file "none")))

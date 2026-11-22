@@ -780,6 +780,58 @@ it, and HostKeyAlias turns that exception off."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(def-pure-test client-dials-ipv6-when-asked
+  "AddressFamily :INET6 resolves and dials ::1, while :INET rejects that
+address before a socket is opened."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-ipv6"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (handler-case
+                   (setf server
+                         (make-ssh-server
+                          "::1" 0
+                          :host-key server-key
+                          :authorized-keys authorized
+                          :on-channel
+                          (lambda (channel)
+                            (setf (cl-pnet-ssh::ssh-server-channel-on-exec
+                                   channel)
+                                  (lambda (channel command)
+                                    (ssh-test-run-command channel command))))))
+                 (cl-pnet-ssh:ssh-connection-error ()
+                   (skip "IPv6 loopback is unavailable")))
+               (is (= 3
+                      (ssh-test-loopback-run
+                       server client-key known-hosts
+                       (make-string-output-stream)
+                       (make-string-output-stream)
+                       :host "::1" :address-family :inet6)))
+               ;; The same literal is not an IPv4 address, so :INET must
+               ;; fail rather than silently dial it.
+               (signals error
+                 (ssh-test-loopback-run
+                  server client-key known-hosts
+                  (make-string-output-stream)
+                  (make-string-output-stream)
+                  :host "::1" :address-family :inet)))
+          (when server (ssh-server-close server))
+          (ignore-errors
+           (uiop:delete-directory-tree directory :validate t))))))
+
 (def-pure-test client-batch-mode-never-asks
   "BatchMode refuses an unknown host key without consulting the confirmation
 callback; without it the same callback trusts the key."
@@ -1605,7 +1657,9 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
     (ssh-channel-exec channel "printf hello; printf oops >&2; exit 3")))
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
-                              &key (host-key-policy :accept-new)
+                              &key (host "127.0.0.1")
+                                address-family
+                                (host-key-policy :accept-new)
                                 hostbased-key canonicalize-hostname
                                 canonical-domains resolver certificate-files
                                 no-host-authentication-for-localhost
@@ -1615,10 +1669,13 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 rekey-limit rekey-interval)
   "Start a client against SERVER and return the command's exit status.
 
-HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
-certificate was trusted rather than added on first use."
+HOST is the name dialled and checked in known_hosts; ADDRESS-FAMILY asks the
+pure client for one family, as -4 or -6 does.  HOST-KEY-POLICY is passed to
+MAKE-SSH-CLIENT; :STRICT proves a host certificate was trusted rather than
+added on first use."
   (let ((state (list :none nil))
         (timeout nil))
+    #+ssh-backend-ffi (declare (ignore address-family))
     (unwind-protect
          (progn
            (setf timeout
@@ -1628,7 +1685,7 @@ certificate was trusted rather than added on first use."
                     (setf (second state) :timed-out)
                     (cl-pnet:event-loop-stop))))
            (make-ssh-client
-            (if canonicalize-hostname "short" "127.0.0.1")
+            (if canonicalize-hostname "short" host)
             :port (ssh-server-port server)
             :user "tester"
             :private-key client-key
@@ -1649,6 +1706,8 @@ certificate was trusted rather than added on first use."
             :host-key-dns-resolver host-key-dns-resolver
             :bind-address bind-address
             :bind-interface bind-interface
+            #-ssh-backend-ffi
+            :address-family address-family
             :rekey-limit rekey-limit
             :rekey-interval rekey-interval
             ;; Exercise the timer wiring too: both timers must start with
@@ -3228,6 +3287,36 @@ newline")))
   (is (= 2222 (cl-pnet-ssh::ssh-config-port-number "2222")))
   (is (null (cl-pnet-ssh::ssh-config-port-number "22x")))
   (is (null (cl-pnet-ssh::ssh-config-port-number "2222-with"))))
+
+(test address-family-normalizes-and-reaches-client-parameters
+  ;; The config reader stores a keyword; the public keyword also accepts the
+  ;; spellings a caller may pass, and :ANY means no restriction.
+  (dolist (pair '((nil . nil) (:any . nil) (:inet . :inet) (:inet6 . :inet6)
+                  ("any" . nil) ("inet" . :inet) ("inet6" . :inet6)))
+    (is (eq (cdr pair)
+            (cl-pnet-ssh::ssh-normalize-address-family (car pair)))))
+  (signals error (cl-pnet-ssh::ssh-normalize-address-family :bogus))
+  (is (eq :inet6
+          (getf (cl-pnet-ssh::ssh-config-client-parameters
+                 "host.example"
+                 (facade-options '(:address-family :inet6)))
+                :address-family)))
+  (is (null
+       (getf (cl-pnet-ssh::ssh-config-client-parameters
+              "host.example" (facade-options nil))
+             :address-family))))
+
+(def-pure-test address-family-check-classifies-numeric-addresses
+  (flet ((fits (family address)
+           (let ((client (cl-pnet-ssh::%make-ssh-client
+                          :address-family family)))
+             (cl-pnet-ssh::ssh-client-address-in-family-p client address))))
+    (is (fits nil "127.0.0.1"))
+    (is (fits nil "::1"))
+    (is (fits :inet "127.0.0.1"))
+    (is (not (fits :inet "::1")))
+    (is (fits :inet6 "::1"))
+    (is (not (fits :inet6 "127.0.0.1")))))
 
 (test ssh-config-seconds-parses-bare-and-suffixed-times
   ;; A bare number has no suffix, so the final flush runs after the loop; a

@@ -6,9 +6,10 @@
 ;;;;
 ;;;; The option surface follows ssh(1): the same short flags, clustered where
 ;;;; they are flags and with an attached value where they take one.  Features
-;;;; this client cannot honour (agent forwarding in the libssh build,
-;;;; compression, remote forwarding, control sockets, TUN devices) are
-;;;; refused with a diagnostic instead of being silently ignored.
+;;;; this client cannot honour (agent forwarding and address-family
+;;;; selection in the libssh build, compression, remote forwarding, control
+;;;; sockets, TUN devices) are refused with a diagnostic instead of being
+;;;; silently ignored.
 
 ;;; ---- Command line ----
 
@@ -431,9 +432,16 @@ a name this build lacks is an error instead of a silently widened offer."
     (check-algorithm-list "KexAlgorithms" (getf *options* :kex-algorithms)
                           cl-pnet-ssh:+ssh-kex-real-algorithms+))
   (when (getf *options* :address-family)
-    (unless (member (getf *options* :address-family) '("inet" "any")
-                    :test #'string-equal)
-      (unsupported "-6" "this build resolves IPv4 addresses only")))
+    (let ((family (getf *options* :address-family)))
+      (unless (member family '("inet" "inet6" "any") :test #'string-equal)
+        (fail "invalid address family ~A" family))
+      ;; The pure backend asks the resolver for one family.  libssh has no
+      ;; such option and resolves the name itself, so a family it cannot
+      ;; enforce is refused rather than quietly ignored.
+      #+ssh-backend-ffi
+      (unless (string-equal family "any")
+        (unsupported "AddressFamily"
+                     "the libssh backend chooses the address family itself"))))
   (when (and (getf *options* :stdio-forward)
              (getf *options* :subsystem))
     (fail "-W and -s cannot be combined"))
@@ -454,7 +462,8 @@ a name this build lacks is an error instead of a silently widened offer."
   "Fail when CLIENT's resolved config asks for a feature this build lacks.
 
 The command line is checked before connecting, but Compression and, in the
-libssh build, agent and X11 forwarding can arrive from ~/.ssh/config too.
+libssh build, agent forwarding, X11 forwarding and AddressFamily can arrive
+from ~/.ssh/config too.
 Dropping them silently would leave the user believing they are on, so they
 are refused with the same message the matching flag gets.  An explicit -x
 still disables X11 and therefore silences the refusal."
@@ -501,10 +510,11 @@ still disables X11 and therefore silences the refusal."
            "PreferredAuthentications"
            (format nil "~{~A~^,~} excludes publickey, the only method implemented"
                    methods))))
-      (when (eq (cl-pnet-ssh:ssh-config-options-address-family options)
-                :inet6)
-        (unsupported "AddressFamily inet6"
-                     "this build resolves IPv4 addresses only")))))
+      #+ssh-backend-ffi
+      (when (member (cl-pnet-ssh:ssh-config-options-address-family options)
+                    '(:inet :inet6))
+        (unsupported "AddressFamily"
+                     "the libssh backend chooses the address family itself")))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -546,8 +556,9 @@ itself never blocks: this matcher is what a caller supplies."
     ((string-equal name "ProxyJump") (setf (getf *options* :jump) value))
     ((string-equal name "ProxyCommand")
      (setf (getf *options* :proxy-command) value))
-    ((string-equal name "AddressFamily")
-     (setf (getf *options* :address-family) (string-downcase value)))
+    ;; AddressFamily is not copied into *OPTIONS* here: -o values already
+    ;; reach the config through RESOLVER-OPTION-LIST, and writing this slot
+    ;; would let an -o override the dedicated -4 or -6, which comes first.
     ((string-equal name "Ciphers") (setf (getf *options* :ciphers) value))
     ((string-equal name "MACs") (setf (getf *options* :macs) value))
     ((string-equal name "KexAlgorithms")
@@ -601,6 +612,12 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
             options))
     (when (getf *options* :bind-interface)
       (push (format nil "BindInterface ~A" (getf *options* :bind-interface))
+            options))
+    ;; -4, -6 and --address-family pick the address family.  As with the
+    ;; other dedicated flags, this line comes before the -o values so it
+    ;; wins the first-value rule.
+    (when (getf *options* :address-family)
+      (push (format nil "AddressFamily ~A" (getf *options* :address-family))
             options))
     ;; -A and -a are dedicated flags, so they outrank an -o or the file.
     ;; OpenSSH applies them after reading the file; prepending the same

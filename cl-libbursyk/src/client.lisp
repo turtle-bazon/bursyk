@@ -424,30 +424,72 @@ address is known, because it has to be in the same family."
       (ssh-open-direct-transport client))
   client)
 
+(defun ssh-client-address-family-name (client)
+  "CLIENT's AddressFamily as the word an error message uses."
+  (case (ssh-client-address-family client)
+    (:inet "IPv4")
+    (:inet6 "IPv6")
+    (t "any")))
+
+(defun ssh-client-address-in-family-p (client address)
+  "Whether numeric ADDRESS belongs to CLIENT's AddressFamily."
+  (case (ssh-client-address-family client)
+    (:inet (not (cl-pnet-sockets:ipv6-address-p address)))
+    (:inet6 (cl-pnet-sockets:ipv6-address-p address))
+    (t t)))
+
+(defun ssh-client-resolve-host (client host on-success on-error)
+  "Resolve HOST for CLIENT, honouring AddressFamily when it can.
+
+The default resolver and :SYSTEM pass the family to BURZAY, which asks the
+operating system for IPv4 or IPv6 alone.  A caller-supplied resolver keeps
+its (HOST ON-SUCCESS ON-ERROR) shape and chooses the family itself; the
+address it returns is still checked against CLIENT's AddressFamily before
+dialling.  HOST is left alone when it is already a numeric address, just as
+BURZAY does."
+  (let ((resolver (ssh-client-resolver client)))
+    (if (or (null resolver) (eq resolver :system))
+        (burzay:resolve-host host on-success on-error
+                             :family (ssh-client-address-family client))
+        (funcall resolver host on-success on-error))))
+
 (defun ssh-open-direct-transport (client)
   "Resolve and dial CONNECT-HOST for a connection that is not proxied."
-  (let ((resolve (or (ssh-client-resolver client) #'burzay:resolve-host))
-        (original (ssh-client-connect-host client)))
-    (labels ((dial (name)
+  (let ((original (ssh-client-connect-host client)))
+    (labels ((dial (name on-failure)
+               ;; NAME becomes CONNECT-HOST before the family check, so an
+               ;; error names the candidate that actually resolved badly.
                (lambda (address)
                  (setf (ssh-client-connect-host client) name)
-                 (ssh-dial client address)))
+                 (if (ssh-client-address-in-family-p client address)
+                     (ssh-dial client address)
+                     (funcall on-failure
+                              (make-condition
+                               'simple-error
+                               :format-control "~A is not an ~A address"
+                               :format-arguments
+                               (list address
+                                     (ssh-client-address-family-name
+                                      client)))))))
              (try (names)
                (if names
-                   (progn
+                   (let ((next (lambda (condition)
+                                 (declare (ignore condition))
+                                 (try (rest names)))))
                      (ssh-log "resolving ~A" (first names))
-                     (funcall resolve (first names)
-                              (dial (first names))
-                              (lambda (condition)
-                                (declare (ignore condition))
-                                (try (rest names)))))
+                     (ssh-client-resolve-host client (first names)
+                                              (dial (first names) next)
+                                              next))
                    (if (ssh-client-canonicalize-fallback-local client)
                        (progn
                          (ssh-log "resolving ~A" original)
-                         (funcall resolve original (dial original)
-                                  (lambda (condition)
-                                    (ssh-resolution-error
-                                     client condition))))
+                         (ssh-client-resolve-host
+                          client original
+                          (dial original
+                                (lambda (condition)
+                                  (ssh-resolution-error client condition)))
+                          (lambda (condition)
+                            (ssh-resolution-error client condition))))
                        (ssh-resolution-error
                         client
                         (make-condition
@@ -460,9 +502,13 @@ address is known, because it has to be in the same family."
             (try candidates)
             (progn
               (ssh-log "resolving ~A" original)
-              (funcall resolve original (dial original)
-                       (lambda (condition)
-                         (ssh-resolution-error client condition)))))))))
+              (ssh-client-resolve-host
+               client original
+               (dial original
+                     (lambda (condition)
+                       (ssh-resolution-error client condition)))
+               (lambda (condition)
+                 (ssh-resolution-error client condition)))))))))
 
 (defun ssh-make-client-record (host connect-host host-key-host port connect-port
                                user known-hosts policy connect-timeout
@@ -510,6 +556,7 @@ address is known, because it has to be in the same family."
                                  proxy-use-fdpass
                                  bind-address
                                  bind-interface
+                                 address-family
                                  forward-agent
                                  forward-agent-sock-path
                                  forward-x11
@@ -532,6 +579,8 @@ address is known, because it has to be in the same family."
                     :proxy-use-fdpass proxy-use-fdpass
                     :bind-address bind-address
                     :bind-interface bind-interface
+                    :address-family
+                    (ssh-normalize-address-family address-family)
                     :forward-agent forward-agent
                     :forward-agent-sock-path forward-agent-sock-path
                     :forward-x11 forward-x11
@@ -684,6 +733,7 @@ is applied here, before any request names a key the configuration forbade."
                              proxy-use-fdpass
                              bind-address
                              bind-interface
+                             address-family
                              forward-agent
                              forward-agent-sock-path
                              forward-x11
@@ -750,6 +800,12 @@ BIND-ADDRESS is a local address a direct connection is made from, as
 ssh_config's BindAddress and ssh -b; BIND-INTERFACE names an interface
 instead, and BIND-ADDRESS wins when both are set, as in ssh.  A ProxyCommand
 carries the stream itself, so neither applies there.
+
+ADDRESS-FAMILY is NIL for any, or :INET / :INET6 to resolve and dial only
+IPv4 or IPv6, as ssh -4, ssh -6 and AddressFamily do.  The default system
+resolver receives the family; a caller-supplied RESOLVER keeps its
+(HOST ON-SUCCESS ON-ERROR) shape, and its answer is checked against
+ADDRESS-FAMILY before the connection is dialled.
 
 FORWARD-AGENT, when true, asks the peer to forward its agent connections,
 as ssh -A and ssh_config's ForwardAgent; FORWARD-AGENT-SOCK-PATH names the
@@ -881,6 +937,7 @@ role-neutral."
                            :proxy-use-fdpass proxy-use-fdpass
                            :bind-address bind-address
                            :bind-interface bind-interface
+                           :address-family address-family
                            :forward-agent forward-agent
                            :forward-agent-sock-path forward-agent-sock-path
                            :forward-x11 forward-x11

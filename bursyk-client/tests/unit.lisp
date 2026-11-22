@@ -719,6 +719,21 @@ see the source that will actually be used."
       (is (member "BindAddress 127.0.0.2" lines :test #'equal))
       (is (member "BindInterface eth0" lines :test #'equal)))))
 
+(test command-line-address-family-reaches-config
+  "-4, -6 and --address-family become an AddressFamily line, so resolution
+and -G both see the family that will be dialled; no flag leaves the file
+alone."
+  (flet ((lines (family)
+           (let ((burs::*options* (empty-options)))
+             (setf (getf burs::*options* :address-family) family)
+             (burs::resolver-option-list))))
+    (is (member "AddressFamily inet" (lines "inet") :test #'equal))
+    (is (member "AddressFamily inet6" (lines "inet6") :test #'equal))
+    (is (member "AddressFamily any" (lines "any") :test #'equal))
+    (is (notany (lambda (line)
+                  (search "AddressFamily" line :test #'char-equal))
+                (lines nil)))))
+
 (test command-line-agent-forwarding-reaches-config
   "-A and -a outrank the file and -o through the same first-value rule the
 other dedicated flags use; neither flag leaves the config alone."

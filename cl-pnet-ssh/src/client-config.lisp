@@ -271,6 +271,7 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-proxy-use-fdpass options)
         :bind-address (ssh-config-options-bind-address options)
         :bind-interface (ssh-config-options-bind-interface options)
+        :address-family (ssh-config-options-address-family options)
         :forward-agent (ssh-config-options-forward-agent options)
         :forward-agent-sock-path
         (ssh-config-options-forward-agent-sock-path options)
@@ -576,6 +577,12 @@ uses whichever of the two it saw first instead of chaining them."
            :proxy-use-fdpass (getf parameters :proxy-use-fdpass)
            :bind-address (getf parameters :bind-address)
            :bind-interface (getf parameters :bind-interface)
+           ;; AddressFamily needs a resolver that can ask for one family.
+           ;; libssh resolves the name itself and has no such option, so the
+           ;; pure backend takes it and the libssh build refuses it instead
+           ;; of silently dialling the other family.
+           #-ssh-backend-ffi
+           :address-family (getf parameters :address-family)
            ;; Agent forwarding is a pure-backend feature; the libssh client
            ;; has no channel interface for a local agent socket, so asking
            ;; for it there would silently do nothing.
