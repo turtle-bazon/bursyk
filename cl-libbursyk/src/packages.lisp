@@ -302,6 +302,10 @@
    #:ssh-server-config-gateway-ports
    #:ssh-server-config-allow-tcp-forwarding
    #:ssh-server-config-allow-agent-forwarding
+   #:ssh-server-config-x11-forwarding
+   #:ssh-server-config-x11-display-offset
+   #:ssh-server-config-x11-use-localhost
+   #:ssh-server-config-xauth-location
    #:ssh-server-config-agent-socket-path
    #:ssh-server-config-allow-streamlocal-forwarding
    #:ssh-server-config-streamlocal-bind-mask
@@ -392,6 +396,7 @@
    #:ssh-authorization-options-permit-port-forwarding-p
    #:ssh-authorization-options-permit-agent-forwarding-p
    #:ssh-session-permits-agent-forwarding-p
+   #:ssh-session-permits-x11-p
    #:ssh-authorization-options-permit-address-p
    #:ssh-authorization-options-permit-now-p
    #:ssh-authorization-options-permit-open-p

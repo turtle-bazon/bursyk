@@ -501,7 +501,7 @@ DisableForwarding all answer failure, as sshd's session_auth_agent_req does."
        (ssh-server-handle-agent-request
         session channel want-reply (string= request "agent-req")))
       ((string= request "x11-req")
-       (ssh-server-channel-reply channel nil want-reply))
+       (ssh-server-handle-x11-request session channel reader want-reply))
       (t (ssh-server-channel-reply channel nil want-reply)))))
 
 ;;; ---- Data, flow control and closing ----

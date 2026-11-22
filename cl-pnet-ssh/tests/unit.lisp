@@ -5743,6 +5743,392 @@ refuse a session's agent request, and the defaults allow it."
                         "no-pty,no-x11-forwarding")))
       (is (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session)))))
 
+(test x11-display-parsing
+  ;; DISPLAY is HOST:NUMBER.SCREEN, with the host left out or spelled "unix"
+  ;; for the local socket and bracketed for an IPv6 literal.
+  (flet ((parse (string)
+           (let ((display (cl-pnet-ssh::ssh-x11-parse-display string)))
+             (when display
+               (list (cl-pnet-ssh::ssh-x11-display-host display)
+                     (cl-pnet-ssh::ssh-x11-display-number display)
+                     (cl-pnet-ssh::ssh-x11-display-screen display))))))
+    (is (equal '("localhost" 10 0) (parse "localhost:10.0")))
+    (is (equal '("localhost" 10 3) (parse "localhost:10.3")))
+    (is (equal '(nil 0 0) (parse ":0")))
+    (is (equal '("unix" 10 0) (parse "unix:10")))
+    (is (equal '("127.0.0.1" 1 2) (parse "127.0.0.1:1.2")))
+    (is (equal '("::1" 10 1) (parse "[::1]:10.1")))
+    (is (null (parse "nocolon")))
+    (is (null (parse "host:")))
+    (is (null (parse "host:abc")))
+    (is (null (parse "host:10.")))
+    (is (null (parse "host:-1")))
+    (is (null (parse "")))
+    (is (null (parse nil)))))
+
+(test x11-display-names-the-local-server
+  (let ((local (cl-pnet-ssh::ssh-x11-parse-display ":10.0"))
+        (remote (cl-pnet-ssh::ssh-x11-parse-display "example:12.1")))
+    (is (string= "localhost:10.0"
+                 (cl-pnet-ssh::ssh-x11-display-string local)))
+    (is (cl-pnet-ssh::ssh-x11-display-unix-p local))
+    (is (string= "/tmp/.X11-unix/X10"
+                 (cl-pnet-ssh::ssh-x11-display-socket-path local)))
+    (is (null (cl-pnet-ssh::ssh-x11-display-host-port local)))
+    (is (not (cl-pnet-ssh::ssh-x11-display-unix-p remote)))
+    (is (null (cl-pnet-ssh::ssh-x11-display-socket-path remote)))
+    (multiple-value-bind (host port)
+        (cl-pnet-ssh::ssh-x11-display-host-port remote)
+      (is (string= "example" host))
+      (is (= 6012 port)))))
+
+(test x11-authority-round-trip-keeps-octets
+  ;; Cookie data is arbitrary bytes: a round trip through characters would
+  ;; corrupt anything above 127.  The file also keeps unrelated displays.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-x11"))
+         (path (namestring (merge-pathnames "Xauthority" directory)))
+         (display (cl-pnet-ssh::ssh-x11-parse-display ":10.0"))
+         (other (cl-pnet-ssh::ssh-x11-parse-display ":11.0"))
+         (data (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-contents
+                              '(0 1 2 3 4 5 6 7
+                                128 200 255 127 64 32 16 8))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist path)
+           (cl-pnet-ssh::ssh-x11-write-cookie
+            path display "MIT-MAGIC-COOKIE-1" data)
+           (multiple-value-bind (name cookie)
+               (cl-pnet-ssh::ssh-x11-authority-cookie path display)
+             (is (cl-pnet-ssh::ssh-x11-octets-equal-text-p
+                  name "MIT-MAGIC-COOKIE-1"))
+             (is (equalp data cookie)))
+           (cl-pnet-ssh::ssh-x11-write-cookie
+            path other "MIT-MAGIC-COOKIE-1" data)
+           (is (= 2 (length (cl-pnet-ssh::ssh-x11-authority-entries path))))
+           (is (cl-pnet-ssh::ssh-x11-remove-cookie path display))
+           (is (= 1 (length (cl-pnet-ssh::ssh-x11-authority-entries path))))
+           (is (null (nth-value 0
+                                (cl-pnet-ssh::ssh-x11-authority-cookie
+                                 path display))))
+           (multiple-value-bind (name cookie)
+               (cl-pnet-ssh::ssh-x11-authority-cookie path other)
+             (declare (ignore name))
+             (is (equalp data cookie))))
+      (ignore-errors (delete-file path)))))
+
+(test x11-authority-cookie-matches-internet-and-wild-families
+  ;; Forwarding only needs the cookie, not the family that issued it, so an
+  ;; Internet entry matches too; a wildcard entry applies to any display.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-x11-families"))
+         (path (namestring (merge-pathnames "Xauthority" directory)))
+         (display (cl-pnet-ssh::ssh-x11-parse-display ":10.0"))
+         (as-octets (lambda (text)
+                      (let ((out (make-array (length text)
+                                             :element-type '(unsigned-byte 8))))
+                        (loop for character across text
+                              for index from 0
+                              do (setf (aref out index) (char-code character)))
+                        out)))
+         (data (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-element 7)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist path)
+           (cl-pnet-ssh::ssh-x11-write-authority-entries
+            path
+            (list (list :family cl-pnet-ssh::+ssh-x11-family-internet+
+                        :address (funcall as-octets "10.0.0.1")
+                        :number (funcall as-octets "10")
+                        :name (funcall as-octets "MIT-MAGIC-COOKIE-1")
+                        :data data)))
+           (multiple-value-bind (name cookie)
+               (cl-pnet-ssh::ssh-x11-authority-cookie path display)
+             (is (cl-pnet-ssh::ssh-x11-octets-equal-text-p
+                  name "MIT-MAGIC-COOKIE-1"))
+             (is (equalp data cookie)))
+           (cl-pnet-ssh::ssh-x11-write-authority-entries
+            path
+            (list (list :family cl-pnet-ssh::+ssh-x11-family-wild+
+                        :address (make-array 0 :element-type '(unsigned-byte 8))
+                        :number (make-array 0 :element-type '(unsigned-byte 8))
+                        :name (funcall as-octets "MIT-MAGIC-COOKIE-1")
+                        :data data)))
+           (multiple-value-bind (name cookie)
+               (cl-pnet-ssh::ssh-x11-authority-cookie path display)
+             (declare (ignore name))
+             (is (equalp data cookie))))
+      (ignore-errors (delete-file path)))))
+
+(test x11-cookie-hex-round-trip
+  ;; x11-req carries the fake cookie as a lower-case hex string.
+  (let ((data (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-contents
+                             (loop for index below 16 collect (* index 17)))))
+    (let ((text (cl-pnet-ssh::ssh-x11-cookie-hex data)))
+      (is (= 32 (length text)))
+      (is (equal (coerce data 'list) (coerce (cl-pnet-ssh::ssh-x11-hex-cookie text) 'list)))))
+  (is (null (cl-pnet-ssh::ssh-x11-hex-cookie "abc")))
+  (is (null (cl-pnet-ssh::ssh-x11-hex-cookie "zz")))
+  (is (null (cl-pnet-ssh::ssh-x11-hex-cookie nil))))
+
+(defun x11-test-setup-message (cookie order)
+  "An X11 connection setup header carrying COOKIE for MIT-MAGIC-COOKIE-1."
+  (let* ((name (map '(simple-array (unsigned-byte 8) (*))
+                    #'char-code "MIT-MAGIC-COOKIE-1"))
+         (data-length (length cookie))
+         (name-aligned (cl-pnet-ssh::ssh-x11-align4 (length name)))
+         (data-aligned (cl-pnet-ssh::ssh-x11-align4 data-length))
+         (out (make-array (+ 12 name-aligned data-aligned)
+                          :element-type '(unsigned-byte 8)
+                          :initial-element 0)))
+    (setf (aref out 0) (char-code order)
+          (aref out 1) 11)
+    (labels ((set-u16 (position value)
+               (if (char= order #\B)
+                   (setf (aref out position) (ldb (byte 8 8) value)
+                         (aref out (1+ position)) (ldb (byte 8 0) value))
+                   (setf (aref out position) (ldb (byte 8 0) value)
+                         (aref out (1+ position)) (ldb (byte 8 8) value)))))
+      (set-u16 6 (length name))
+      (set-u16 8 data-length))
+    (replace out name :start1 12)
+    (replace out cookie :start1 (+ 12 name-aligned))
+    out))
+
+(test x11-substitute-cookie-waits-for-the-whole-header
+  ;; The setup message can be split across packets; the fake cookie must be
+  ;; replaced exactly once, so nothing is forwarded until it has arrived.
+  (dotimes (order-index 2)
+    (let* ((order (if (zerop order-index) #\l #\B))
+           (fake (make-array 16 :element-type '(unsigned-byte 8)
+                                :initial-element 1))
+           (real (make-array 16 :element-type '(unsigned-byte 8)
+                                :initial-element 2))
+           (message (x11-test-setup-message fake order)))
+      ;; The fixed header alone is not enough.
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie
+           (subseq message 0 12) fake real)
+        (is (not complete))
+        (is (equalp (subseq message 0 12) result)))
+      ;; Part of the cookie is not enough either.
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie
+           (subseq message 0 20) fake real)
+        (is (not complete))
+        (is (equalp (subseq message 0 20) result)))
+      ;; The whole message replaces the cookie and nothing else.
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie message fake real)
+        (is (eq t complete))
+        (is (equalp real (subseq result 32 (+ 32 16))))
+        (is (not (equalp message result)))))))
+
+(test x11-substitute-cookie-passes-through-other-setups
+  ;; A setup that is not MIT-MAGIC-COOKIE-1, or that carries another cookie,
+  ;; is forwarded once its header is complete.  An unknown byte order is
+  ;; passed through at the fixed header so the X server can reject it.
+  (let ((fake (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 1))
+        (real (make-array 16 :element-type '(unsigned-byte 8)
+                             :initial-element 2))
+        (other (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-element 9)))
+    (let ((message (x11-test-setup-message other #\l)))
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie message fake real)
+        (is (eq t complete))
+        (is (equalp message result))))
+    (let ((message (x11-test-setup-message fake #\l)))
+      (setf (subseq message 12 (+ 12 18))
+            (map '(simple-array (unsigned-byte 8) (*))
+                 #'char-code "XDM-AUTHORIZATION-1"))
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie message fake real)
+        (is (eq t complete))
+        (is (equalp message result))))
+    (let ((message (x11-test-setup-message fake #\l)))
+      (setf (aref message 0) (char-code #\?))
+      (multiple-value-bind (result complete)
+          (cl-pnet-ssh::ssh-x11-substitute-cookie message fake real)
+        (is (eq t complete))
+        (is (equalp message result))))))
+
+(def-pure-test client-refusal-of-x11-req-is-not-a-channel-error
+  "A refused x11-req only warns, as ssh's CONFIRM_WARN does; the session
+keeps going.  A later request failure still reaches ON-ERROR."
+  (flet ((message (type)
+           (let ((writer (ssh-writer)))
+             (ssh-write-u8 writer type)
+             (ssh-write-u32 writer 3)
+             (ssh-writer-output writer))))
+    (let* ((client (cl-pnet-ssh::%make-ssh-client))
+           (channel (cl-pnet-ssh::%make-ssh-channel
+                     :client client :local-id 3 :remote-id 9
+                     :type "session" :state :open))
+           (errors '()))
+      (setf (gethash 3 (cl-pnet-ssh::ssh-client-channels client)) channel
+            (cl-pnet-ssh::ssh-channel-on-error channel)
+            (lambda (channel condition)
+              (declare (ignore channel))
+              (push condition errors))
+            (cl-pnet-ssh::ssh-channel-x11-reply-pending channel) t)
+      ;; Success clears the flag and is otherwise silent.
+      (cl-pnet-ssh::ssh-client-handle-channel-message
+       client (message cl-pnet-ssh::+ssh-msg-channel-success+))
+      (is (null (cl-pnet-ssh::ssh-channel-x11-reply-pending channel)))
+      (is (null errors))
+      ;; Failure of the request the flag tracks is the x11-req refusal.
+      (setf (cl-pnet-ssh::ssh-channel-x11-reply-pending channel) t)
+      (cl-pnet-ssh::ssh-client-handle-channel-message
+       client (message cl-pnet-ssh::+ssh-msg-channel-failure+))
+      (is (null errors))
+      (is (null (cl-pnet-ssh::ssh-channel-x11-reply-pending channel)))
+      ;; With no x11 reply outstanding the same message is a channel error.
+      (cl-pnet-ssh::ssh-client-handle-channel-message
+       client (message cl-pnet-ssh::+ssh-msg-channel-failure+))
+      (is (= 1 (length errors))))))
+
+(def-pure-test x11-timeout-follows-openssh
+  "Untrusted forwarding expires after OpenSSH's 1200-second default, 0
+disables the limit, and trusted forwarding never expires."
+  (flet ((armed (trusted timeout)
+           (let ((client (cl-pnet-ssh::%make-ssh-client
+                          :forward-x11 t
+                          :forward-x11-trusted trusted
+                          :forward-x11-timeout timeout)))
+             (cl-pnet-ssh::ssh-client-x11-start-timeout client)
+             (cl-pnet-ssh::ssh-client-x11-refuse-time client))))
+    (let ((before (cl-pnet-ssh::ssh-client-now))
+          (deadline (armed nil nil))
+          (after (cl-pnet-ssh::ssh-client-now)))
+      (is (<= (+ before 1200) deadline (+ after 1200))))
+    (is (null (armed nil 0)))
+    (is (null (armed t nil)))
+    (is (null (armed t 600)))
+    (let ((before (cl-pnet-ssh::ssh-client-now))
+          (deadline (armed nil 600))
+          (after (cl-pnet-ssh::ssh-client-now)))
+      (is (<= (+ before 600) deadline (+ after 600))))))
+
+(def-pure-test server-x11-config-and-policy
+  "X11Forwarding and its companions parse, and a session asks for X11 only
+when the config, DisableForwarding and the key's options all allow it."
+  (flet ((session (&rest options)
+           (let* ((config (ssh-server-config-load nil :options options))
+                  (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+             (values config (cl-pnet-ssh::%make-ssh-session :server server)))))
+    (multiple-value-bind (config session)
+        (session "X11Forwarding yes" "X11DisplayOffset 20"
+                 "X11UseLocalhost yes" "XAuthLocation /usr/bin/xauth")
+      (is (eq :yes (cl-pnet-ssh:ssh-server-config-x11-forwarding config)))
+      (is (= 20 (cl-pnet-ssh:ssh-server-config-x11-display-offset config)))
+      (is (eq :yes (cl-pnet-ssh:ssh-server-config-x11-use-localhost config)))
+      (is (string= "/usr/bin/xauth"
+                   (cl-pnet-ssh:ssh-server-config-xauth-location config)))
+      (is (cl-pnet-ssh:ssh-session-permits-x11-p session)))
+    ;; X11Forwarding defaults to no.
+    (multiple-value-bind (config session) (session)
+      (is (null (cl-pnet-ssh:ssh-server-config-x11-forwarding config)))
+      (is (not (cl-pnet-ssh:ssh-session-permits-x11-p session))))
+    (multiple-value-bind (config session) (session "X11Forwarding no")
+      (declare (ignore config))
+      (is (not (cl-pnet-ssh:ssh-session-permits-x11-p session))))
+    (multiple-value-bind (config session)
+        (session "X11Forwarding yes" "DisableForwarding yes")
+      (declare (ignore config))
+      (is (not (cl-pnet-ssh:ssh-session-permits-x11-p session))))
+    (multiple-value-bind (config session) (session "X11Forwarding yes")
+      (declare (ignore config))
+      (setf (ssh-session-authorization session)
+            (nth-value 0
+                       (cl-pnet-ssh:ssh-authorized-key-options-parse
+                        "no-x11-forwarding")))
+      (is (not (cl-pnet-ssh:ssh-session-permits-x11-p session))))
+    ;; A key that only restricts something else keeps X11 forwarding.
+    (multiple-value-bind (config session) (session "X11Forwarding yes")
+      (declare (ignore config))
+      (setf (ssh-session-authorization session)
+            (nth-value 0
+                       (cl-pnet-ssh:ssh-authorized-key-options-parse
+                        "no-agent-forwarding")))
+      (is (cl-pnet-ssh:ssh-session-permits-x11-p session)))))
+
+(def-pure-test server-x11-request-binds-a-display-and-writes-the-cookie
+  "An accepted x11-req binds a display, sets DISPLAY and records the fake
+cookie in the account's Xauthority; one directive short and it refuses."
+  (flet ((attempt (options body)
+           (let* ((directory (ssh-test-directory "cl-pnet-ssh-x11-req"))
+                  (authority (namestring
+                              (merge-pathnames "Xauthority" directory)))
+                  (config (ssh-server-config-load nil :options options))
+                  (server (cl-pnet-ssh::%make-ssh-server
+                           :sshd-config config
+                           :x11-authority-file
+                           (lambda (session)
+                             (declare (ignore session))
+                             authority)))
+                  (session (cl-pnet-ssh::%make-ssh-session :server server))
+                  (channel (cl-pnet-ssh::%make-ssh-server-channel
+                            :session session
+                            :local-id 0
+                            :type "session"
+                            :state :open
+                            :remote-window 2097152
+                            :remote-max-packet 32768
+                            :local-window 2097152
+                            :local-max-packet 32768))
+                  (cookie (make-array 16 :element-type '(unsigned-byte 8)
+                                         :initial-contents
+                                         (loop for index below 16
+                                               collect (* index 17))))
+                  (writer (ssh-writer)))
+             (ensure-directories-exist authority)
+             (ssh-write-boolean writer nil)
+             (ssh-write-text writer "MIT-MAGIC-COOKIE-1")
+             (ssh-write-text writer (cl-pnet-ssh::ssh-x11-cookie-hex cookie))
+             (ssh-write-u32 writer 0)
+             (unwind-protect
+                  (let ((accepted
+                          (cl-pnet-ssh::ssh-server-handle-x11-request
+                           session channel
+                           (cl-pnet-ssh::ssh-make-reader
+                            (ssh-writer-output writer))
+                           nil)))
+                    (funcall body accepted session channel cookie authority))
+               ;; The listener belongs to the session; close it before the
+               ;; temporary directory goes away.
+               (when (cl-pnet-ssh::ssh-session-x11-forward session)
+                 (cl-pnet-ssh::ssh-session-close-x11 session))
+               (ignore-errors (delete-file authority))
+               (ignore-errors (delete-directory directory))))))
+    (attempt '("X11Forwarding yes")
+         (lambda (accepted session channel cookie authority)
+           (is (not (null accepted)))
+           (let* ((x11 (cl-pnet-ssh::ssh-session-x11-forward session))
+                  (number (cl-pnet-ssh::ssh-x11-forward-display-number x11))
+                  (display (cl-pnet-ssh::%make-ssh-x11-display
+                            :host "localhost" :number number :screen 0)))
+             (is (not (null x11)))
+             (is (>= number 10))
+             (is (string= "localhost"
+                          (cl-pnet-ssh::ssh-x11-forward-display-host x11)))
+             (is (equal (format nil "localhost:~D.0" number)
+                        (cdr (assoc "DISPLAY" (ssh-server-channel-env channel)
+                                    :test #'string=))))
+             (multiple-value-bind (name data)
+                 (cl-pnet-ssh::ssh-x11-authority-cookie authority display)
+               (is (cl-pnet-ssh::ssh-x11-octets-equal-text-p
+                    name "MIT-MAGIC-COOKIE-1"))
+               (is (equalp cookie data))))))
+    ;; X11Forwarding defaults to no, so the request is refused.
+    (attempt '()
+         (lambda (accepted session channel cookie authority)
+           (declare (ignore channel cookie authority))
+           (is (null accepted))
+           (is (null (cl-pnet-ssh::ssh-session-x11-forward session)))))))
+
 (test ssh-config-carries-the-features-the-caller-must-refuse
   ;; Agent, X11 and compression wishes can come from the file.  The parser
   ;; records them so a client can refuse a feature it lacks instead of

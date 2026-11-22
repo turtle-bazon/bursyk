@@ -31,6 +31,10 @@
                              ;; Role-neutral: shared by the client and the server.
                              (:file "wire")
                              (:file "crypto")
+                             ;; DISPLAY parsing, Xauthority cookies and the
+                             ;; fake-cookie substitution, shared by ssh and
+                             ;; sshd.
+                             (:file "x11")
                              (:file "packet")
                              (:file "keys")
                              (:file "known-hosts")
@@ -63,6 +67,10 @@
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "client-channel"
                               :if-feature (:not :ssh-backend-ffi))
+                             ;; ForwardX11: choosing the cookie, x11-req, and
+                             ;; the x11 channel's bridge to the local display.
+                             (:file "client-x11"
+                              :if-feature (:not :ssh-backend-ffi))
                              (:file "client"
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "server-state"
@@ -70,6 +78,10 @@
                              (:file "server-transport"
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "server-channel"
+                              :if-feature (:not :ssh-backend-ffi))
+                             ;; X11Forwarding: the display listener, the
+                             ;; fake cookie and the x11 channel bridge.
+                             (:file "server-x11"
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "server"
                               :if-feature (:not :ssh-backend-ffi))))))

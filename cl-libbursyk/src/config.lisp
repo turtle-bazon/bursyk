@@ -192,9 +192,9 @@ way ssh refuses it.")
   (forward-agent-sock-path nil)
   (forward-x11 nil)
   (forward-x11-trusted nil)
-  ;; ForwardX11Timeout: how long ssh waits for an untrusted X11 channel.
-  ;; This build has no X11 forwarding, but the value is still parsed and
-  ;; printed so a shared ssh_config resolves the same way.
+  ;; ForwardX11Timeout: how long untrusted forwarding keeps accepting new
+  ;; X11 channels.  NIL is OpenSSH's 1200-second default and 0 disables the
+  ;; limit, as ssh_config's NONE and 0 do.
   (forward-x11-timeout nil)
   (gateway-ports nil)
   ;; GSSAPIAuthentication and GSSAPIDelegateCredentials have no

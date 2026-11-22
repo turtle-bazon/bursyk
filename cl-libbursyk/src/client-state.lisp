@@ -89,6 +89,27 @@
   ;; of SSH_AUTH_SOCK.
   (forward-agent nil)
   (forward-agent-sock-path nil)
+  ;; ForwardX11, ForwardX11Trusted and ForwardX11Timeout: ask the server to
+  ;; forward X11 connections, whether forwarding may invent data when there
+  ;; is no cookie, and how long untrusted forwarding keeps accepting new x11
+  ;; channels (0 for no limit, NIL for OpenSSH's 1200-second default; trusted
+  ;; forwarding never expires).  XAUTHORITY is read the way every X client
+  ;; reads it, so XAUTH-LOCATION only names the xauth program OpenSSH would
+  ;; run; this implementation reads the file directly and keeps it for
+  ;; parity.
+  (forward-x11 nil)
+  (forward-x11-trusted nil)
+  (forward-x11-timeout nil)
+  (xauth-location nil)
+  ;; The DISPLAY forwarded and the real and fake cookies, once
+  ;; SSH-CLIENT-PREPARE-X11 has run.  The fake data goes to the server in
+  ;; x11-req; the real one replaces it on each forwarded connection.
+  (x11-display nil)
+  (x11-proto nil)
+  (x11-saved-data nil)
+  (x11-fake-data nil)
+  ;; ForwardX11Timeout as a deadline on SSH-CLIENT-NOW, or NIL.
+  (x11-refuse-time nil)
   ;; ObscureKeystrokeTiming: milliseconds between quantised keystrokes; 0
   ;; disables it.  The application owns stdin, so it applies this policy.
   (obscure-keystroke-timing +ssh-keystroke-default-interval-ms+)
@@ -249,6 +270,18 @@
   ;; ForwardAgent: the request goes out after the peer confirms the session,
   ;; before the pty, env and exec requests, as ssh orders it.
   (pending-agent-request nil)
+  ;; ForwardX11: the x11-req request goes out once the peer confirms the
+  ;; session, before env and exec.
+  (pending-x11-request nil)
+  ;; ssh asks for a reply to x11-req and treats a refusal as a warning, so the
+  ;; answer is matched here instead of becoming a channel error.  Replies only
+  ;; follow requests that asked for one, in order, and this is the first.
+  (x11-reply-pending nil)
+  ;; An accepted x11 channel buffers the X11 setup message until the whole
+  ;; header is present, so the fake cookie can be replaced exactly once.
+  (x11-buffer (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer 0))
+  (x11-setup-done nil)
   (want-eof nil)
   (sent-eof nil)
   (want-close nil)

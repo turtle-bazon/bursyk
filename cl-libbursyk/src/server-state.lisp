@@ -99,6 +99,10 @@
   ;; the client and relays bytes; CLEANUP, when given, removes PATH and its
   ;; directory after the session ends.
   (on-agent-forward nil)
+  ;; X11 forwarding: a function of SESSION returning the Xauthority file the
+  ;; fake cookie belongs in, or NIL to forward without writing one.  The
+  ;; application supplies it because the file follows the account's home.
+  (x11-authority-file nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))
@@ -193,6 +197,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   ;; The SSH_AUTH_SOCK listener this session forwards to the client, once a
   ;; session channel asks for agent forwarding.
   (agent-forward nil)
+  ;; The display listener this session forwards to the client, once an
+  ;; x11-req asks for X11 forwarding.
+  (x11-forward nil)
   ;; Connection timers.  LAST-INPUT-TIME is monotonic seconds and is moved
   ;; whenever bytes arrive or a probe is sent, as sshd's last_client_time is.
   login-grace-timer
@@ -209,6 +216,25 @@ present after RequiredRSASize, for callers that only want to describe it."
   (close-reason nil)
   (window 2097152)
   (max-packet 32768))
+
+(defstruct (ssh-x11-forward (:constructor %make-ssh-x11-forward))
+  session
+  ;; The listening socket on the server side, bound to 127.0.0.1 (or every
+  ;; address when X11UseLocalhost is no) on 6000 + DISPLAY-NUMBER.
+  listener
+  display-number
+  screen
+  ;; "localhost" or the machine's host name, as DISPLAY spells it.
+  (display-host "localhost")
+  proto
+  ;; The fake cookie the client sent, and the Xauthority file and display it
+  ;; was written to so the session's end can take it out again.
+  cookie
+  authority-file
+  (cookie-added nil)
+  (single nil)
+  ;; Accepted X11 connections and the channel each one is bridged to.
+  (connections (make-hash-table :test #'eq)))
 
 (defstruct (ssh-agent-forward (:constructor %make-ssh-agent-forward))
   session
@@ -323,6 +349,28 @@ present after RequiredRSASize, for callers that only want to describe it."
           (ignore-errors (funcall (ssh-agent-forward-cleanup agent)))
           (let ((path (ssh-agent-forward-path agent)))
             (when path (ignore-errors (delete-file path))))))))
+
+(defun ssh-session-close-x11 (session)
+  "Remove SESSION's X11 display listener, its connections and its cookie."
+  (let ((x11 (ssh-session-x11-forward session)))
+    (when x11
+      (setf (ssh-session-x11-forward session) nil)
+      (when (ssh-x11-forward-listener x11)
+        (ignore-errors
+         (cl-pnet:close-listener (ssh-x11-forward-listener x11)))
+        (setf (ssh-x11-forward-listener x11) nil))
+      (loop for connection being the hash-keys
+              of (ssh-x11-forward-connections x11)
+            do (ignore-errors (cl-pnet:close-connection connection)))
+      (clrhash (ssh-x11-forward-connections x11))
+      (when (and (ssh-x11-forward-cookie-added x11)
+                 (ssh-x11-forward-authority-file x11))
+        (ignore-errors
+         (ssh-x11-remove-cookie
+          (ssh-x11-forward-authority-file x11)
+          (%make-ssh-x11-display
+           :number (ssh-x11-forward-display-number x11)
+           :screen (ssh-x11-forward-screen x11))))))))
 
 (defun ssh-session-terminate-channels (session reason kind)
   "Report SESSION's end to every channel not yet closed."
@@ -471,6 +519,7 @@ server was built without a value."
     (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
     (ssh-session-close-agent-forward session)
+    (ssh-session-close-x11 session)
     (ssh-session-terminate-channels session reason kind)
     (ssh-session-close-connection session)
     (let ((server (ssh-session-server session)))

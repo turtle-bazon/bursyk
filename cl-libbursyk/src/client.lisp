@@ -511,7 +511,11 @@ address is known, because it has to be in the same family."
                                  bind-address
                                  bind-interface
                                  forward-agent
-                                 forward-agent-sock-path)
+                                 forward-agent-sock-path
+                                 forward-x11
+                                 forward-x11-trusted
+                                 forward-x11-timeout
+                                 xauth-location)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -530,6 +534,10 @@ address is known, because it has to be in the same family."
                     :bind-interface bind-interface
                     :forward-agent forward-agent
                     :forward-agent-sock-path forward-agent-sock-path
+                    :forward-x11 forward-x11
+                    :forward-x11-trusted forward-x11-trusted
+                    :forward-x11-timeout forward-x11-timeout
+                    :xauth-location xauth-location
                     :kex-algorithms kex-algorithms
                     :host-key-algorithms host-key-algorithms
                     :ciphers ciphers
@@ -678,6 +686,10 @@ is applied here, before any request names a key the configuration forbade."
                              bind-interface
                              forward-agent
                              forward-agent-sock-path
+                             forward-x11
+                             forward-x11-trusted
+                             forward-x11-timeout
+                             xauth-location
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
                              ca-signature-algorithms
@@ -745,6 +757,18 @@ agent socket to use instead of SSH_AUTH_SOCK, matching ForwardAgent's path
 form.  Each server-initiated agent channel is dialled to that socket and
 relayed.  With no usable agent socket the request is skipped, as ssh's
 check_agent_present clears it.
+
+FORWARD-X11, when true, asks the peer to forward X11 connections, as ssh -X
+and ssh_config's ForwardX11; FORWARD-X11-TRUSTED allows forwarding without a
+cookie in the user's Xauthority, as ssh -Y does, and FORWARD-X11-TIMEOUT is
+how many seconds after authentication untrusted forwarding may still open an
+x11 channel (0 for no limit, NIL for OpenSSH's 1200-second default; trusted
+forwarding never expires).  The real MIT-MAGIC-COOKIE-1 never leaves the
+client: x11-req carries a fake one, and each x11 channel's first message has
+it replaced.  This client has no X Security extension, so -X cannot create
+the weaker untrusted cookie sshd's -X would; the forwarded display has the
+same access as the local session.  XAUTH-LOCATION is accepted for ssh_config
+parity; cookies are read from $XAUTHORITY or ~/.Xauthority directly.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY every default identity file that exists
@@ -858,7 +882,11 @@ role-neutral."
                            :bind-address bind-address
                            :bind-interface bind-interface
                            :forward-agent forward-agent
-                           :forward-agent-sock-path forward-agent-sock-path)
+                           :forward-agent-sock-path forward-agent-sock-path
+                           :forward-x11 forward-x11
+                           :forward-x11-trusted forward-x11-trusted
+                           :forward-x11-timeout forward-x11-timeout
+                           :xauth-location xauth-location)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

@@ -6,9 +6,9 @@
 ;;;;
 ;;;; The option surface follows ssh(1): the same short flags, clustered where
 ;;;; they are flags and with an attached value where they take one.  Features
-;;;; this client cannot honour (agent and X11 forwarding, compression, remote
-;;;; forwarding, control sockets, TUN devices) are refused with a diagnostic
-;;;; instead of being silently ignored.
+;;;; this client cannot honour (agent forwarding in the libssh build,
+;;;; compression, remote forwarding, control sockets, TUN devices) are
+;;;; refused with a diagnostic instead of being silently ignored.
 
 ;;; ---- Command line ----
 
@@ -410,10 +410,12 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
   (when (getf *options* :gssapi-auth)
     (unsupported "-K" "GSSAPI authentication is not implemented"))
+  #+ssh-backend-ffi
   (when (eq (getf *options* :x11-forward) :yes)
-    (unsupported "-X" "X11 forwarding is not implemented"))
+    (unsupported "-X" "X11 forwarding needs the pure SSH backend"))
+  #+ssh-backend-ffi
   (when (eq (getf *options* :x11-forward) :trust)
-    (unsupported "-Y" "X11 forwarding is not implemented"))
+    (unsupported "-Y" "X11 forwarding needs the pure SSH backend"))
   #+ssh-backend-ffi
   (when (getf *options* :forward-agent)
     (unsupported "-A" "agent forwarding needs the pure SSH backend"))
@@ -451,11 +453,11 @@ a name this build lacks is an error instead of a silently widened offer."
 (defun check-config-supported (client)
   "Fail when CLIENT's resolved config asks for a feature this build lacks.
 
-The command line is checked before connecting, but Compression and X11
-forwarding can arrive from ~/.ssh/config too.  Dropping them silently would
-leave the user believing they are on, so they are refused with the same
-message the matching flag gets.  An explicit -x still disables X11 and
-therefore silences the refusal."
+The command line is checked before connecting, but Compression and, in the
+libssh build, agent and X11 forwarding can arrive from ~/.ssh/config too.
+Dropping them silently would leave the user believing they are on, so they
+are refused with the same message the matching flag gets.  An explicit -x
+still disables X11 and therefore silences the refusal."
   (let ((options (and client (cl-pnet-ssh:ssh-client-config-options client))))
     (when options
       #+ssh-backend-ffi
@@ -463,11 +465,12 @@ therefore silences the refusal."
         (unsupported "ForwardAgent" "agent forwarding needs the pure SSH backend"))
       (when (cl-pnet-ssh:ssh-config-options-compression options)
         (unsupported "Compression" "only uncompressed streams are implemented"))
+      #+ssh-backend-ffi
       (when (and (or (cl-pnet-ssh:ssh-config-options-forward-x11 options)
                      (cl-pnet-ssh:ssh-config-options-forward-x11-trusted
                       options))
                  (not (eq (getf *options* :x11-forward) :no)))
-        (unsupported "ForwardX11" "X11 forwarding is not implemented"))
+        (unsupported "ForwardX11" "X11 forwarding needs the pure SSH backend"))
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
@@ -605,6 +608,12 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
     (case (getf *options* :forward-agent)
       ((t) (push "ForwardAgent yes" options))
       ((:no) (push "ForwardAgent no" options)))
+    ;; -X, -Y and -x are dedicated flags too, so they outrank the file.
+    (case (getf *options* :x11-forward)
+      ((:yes) (push "ForwardX11 yes" options))
+      ((:trust) (push "ForwardX11 yes" options)
+                (push "ForwardX11Trusted yes" options))
+      ((:no) (push "ForwardX11 no" options)))
     options))
 
 (defun apply-command-line-options ()

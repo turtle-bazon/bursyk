@@ -106,8 +106,8 @@ socket address and has no routing domains.")
 ;;; in a warning, never silently dropped.
 (defparameter +ssh-server-config-ignored-keywords+
   '("printmotd" "printlastlog" "logverbose" "fingerprinthash"
-    "syslogfacility" "protocol" "useprivilegeseparation" "x11displayoffset"
-    "x11uselocalhost" "xauthlocation" "modulifile" "ipqos" "rdomain"
+    "syslogfacility" "protocol" "useprivilegeseparation"
+    "modulifile" "ipqos" "rdomain"
     "usedns" "securitykeyprovider" "gssapicleanupcredentials"
     "gssapistrictacceptorcheck" "kerberosorlocalpasswd"
     "kerberosticketcleanup" "kerberosgetafstoken"
@@ -121,8 +121,7 @@ socket address and has no routing domains.")
 ;;; configuration that asks for that value is fine; asking for anything else
 ;;; would change behaviour this build does not have, so it is refused.
 (defparameter +ssh-server-config-accepted-off-keywords+
-  '(("x11forwarding" . "no")
-    ("permittunnel" . "no")
+  '(("permittunnel" . "no")
     ("passwordauthentication" . "no")
     ("kbdinteractiveauthentication" . "no")
     ("challengeresponseauthentication" . "no")
@@ -205,6 +204,16 @@ socket address and has no routing domains.")
   (allow-tcp-forwarding nil)
   ;; AllowAgentForwarding: :YES or :NO.  NIL is sshd's default of yes.
   (allow-agent-forwarding nil)
+  ;; X11Forwarding: :YES or :NO.  NIL is sshd's default of no.
+  (x11-forwarding nil)
+  ;; X11DisplayOffset: the first display number sshd tries, 10 by default.
+  (x11-display-offset nil)
+  ;; X11UseLocalhost: listen on loopback and spell DISPLAY "localhost" by
+  ;; default; "no" binds the machine's addresses and uses its host name.
+  (x11-use-localhost nil)
+  ;; XAuthLocation: the xauth program.  This server writes Xauthority itself,
+  ;; so the path is kept for configuration parity and never executed.
+  (xauth-location nil)
   ;; AgentSocketPath: "none", "shared:DIRECTORY" or "user:DIRECTORY", where
   ;; the directory may use ~ and %u/%U/%h.  NIL leaves sshd's default of
   ;; user:~/.ssh/agent, which BURSYK-SERVER creates per session.
@@ -718,6 +727,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
     hostbased-authentication hostbased-accepted-algorithms
     hostbased-uses-name-from-packet-only ignore-rhosts
     gateway-ports allow-tcp-forwarding allow-agent-forwarding
+    x11-forwarding x11-display-offset x11-use-localhost
     agent-socket-path allow-streamlocal-forwarding
     streamlocal-bind-mask streamlocal-bind-unlink
     disable-forwarding set-env
@@ -1223,6 +1233,27 @@ cannot apply per connection."
         (if (ssh-server-config-flag
              line (ssh-server-config-one-argument line))
             :yes :no)))
+      ((string= keyword "x11forwarding")
+       (ssh-server-config-set-once
+        config 'x11-forwarding
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "x11displayoffset")
+       (ssh-server-config-set-once
+        config 'x11-display-offset
+        (ssh-server-config-count
+         line (ssh-server-config-one-argument line))))
+      ((string= keyword "x11uselocalhost")
+       (ssh-server-config-set-once
+        config 'x11-use-localhost
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "xauthlocation")
+       (ssh-server-config-set-once
+        config 'xauth-location
+        (ssh-server-config-one-argument line)))
       ((string= keyword "agentsocketpath")
        (let ((argument (ssh-server-config-one-argument line)))
          (when (and (not (string-equal argument "none"))

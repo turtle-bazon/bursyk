@@ -102,6 +102,8 @@ forwarding request is queued for the moment the peer confirms the channel."
     (when (and (ssh-client-forward-agent client)
                (ssh-client-forward-agent-path client))
       (setf (ssh-channel-pending-agent-request channel) t))
+    (when (ssh-client-prepare-x11 client)
+      (setf (ssh-channel-pending-x11-request channel) t))
     channel))
 
 (defun ssh-open-direct-tcpip (client host port
@@ -300,6 +302,9 @@ side is known to accept."
       ((string= type "forwarded-streamlocal@openssh.com")
        (ssh-client-accept-forwarded-streamlocal client reader sender window
                                                 max-packet))
+      ((string= type "x11")
+       (ssh-client-accept-x11-channel client reader sender window
+                                      max-packet))
       ((member type '("auth-agent@openssh.com" "agent-connect")
                :test #'string=)
        (ssh-client-accept-agent-channel client type sender window
@@ -539,15 +544,19 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
   ;; channel_set_xtype does after the request is sent.
   (ssh-client-channel-start-timeout channel)
   (let ((agent (ssh-channel-pending-agent-request channel))
+        (x11 (ssh-channel-pending-x11-request channel))
         (env (ssh-channel-pending-env channel))
         (exec (ssh-channel-pending-exec channel))
         (subsystem (ssh-channel-pending-subsystem channel)))
     (setf (ssh-channel-pending-agent-request channel) nil
+          (ssh-channel-pending-x11-request channel) nil
           (ssh-channel-pending-env channel) nil
           (ssh-channel-pending-exec channel) nil
           (ssh-channel-pending-subsystem channel) nil)
     (when agent
       (ssh-channel-send-agent-request channel))
+    (when x11
+      (ssh-channel-send-x11-request channel))
     (iter (for (name . value) in env)
       (ssh-channel-send-env channel name value))
     (when exec
@@ -653,6 +662,13 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                ;; its bytes straight there; anything else belongs to the
                ;; application, which may bridge it to its own descriptor.
                (cond
+                 ((and (ssh-channel-target-fd-relay channel)
+                       (string= (ssh-channel-type channel) "x11"))
+                  (let ((data (ssh-read-string reader)))
+                    (ssh-client-channel-note-activity channel)
+                    (decf (ssh-channel-local-window channel) (length data))
+                    (ssh-channel-adjust-window channel (length data))
+                    (ssh-client-x11-target-data channel data)))
                  ((ssh-channel-target-fd-relay channel)
                   (let ((data (ssh-read-string reader)))
                     (ssh-client-channel-note-activity channel)
@@ -684,13 +700,24 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                (ssh-channel-handle-close channel))
               (#.+ssh-msg-channel-request+
                (ssh-channel-handle-request channel reader))
-              (#.+ssh-msg-channel-success+ nil)
+              (#.+ssh-msg-channel-success+
+               ;; The first reply is x11-req's: ssh asks for it, while the
+               ;; requests queued around it do not want one.
+               (when (ssh-channel-x11-reply-pending channel)
+                 (setf (ssh-channel-x11-reply-pending channel) nil)))
               (#.+ssh-msg-channel-failure+
-               (when (ssh-channel-on-error channel)
-                 (funcall (ssh-channel-on-error channel) channel
-                          (make-condition 'ssh-channel-error
-                                          :channel channel
-                                          :detail "request refused"))))))))))
+               (if (ssh-channel-x11-reply-pending channel)
+                   ;; ssh logs a refused x11-req and keeps the session, so the
+                   ;; failure is not the channel error an exec refusal is.
+                   (progn
+                     (setf (ssh-channel-x11-reply-pending channel) nil)
+                     (ssh-warn "X11 forwarding request failed on channel ~D"
+                               (ssh-channel-local-id channel)))
+                   (when (ssh-channel-on-error channel)
+                     (funcall (ssh-channel-on-error channel) channel
+                              (make-condition 'ssh-channel-error
+                                              :channel channel
+                                              :detail "request refused")))))))))))
 
 ;;; ---- Client shutdown ----
 

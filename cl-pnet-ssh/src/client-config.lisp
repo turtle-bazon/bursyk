@@ -193,6 +193,10 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-known-hosts-command options)
         :add-keys-to-agent
         (or (ssh-config-options-add-keys-to-agent options) :no)
+        :forward-x11 (ssh-config-options-forward-x11 options)
+        :forward-x11-trusted (ssh-config-options-forward-x11-trusted options)
+        :forward-x11-timeout (ssh-config-options-forward-x11-timeout options)
+        :xauth-location (ssh-config-options-xauth-location options)
         :hostbased-authentication
         (ssh-config-options-hostbased-authentication options)
         :hostbased-accepted-algorithms
@@ -580,6 +584,16 @@ uses whichever of the two it saw first instead of chaining them."
            #-ssh-backend-ffi
            :forward-agent-sock-path
            (getf parameters :forward-agent-sock-path)
+           ;; X11 forwarding is a pure-backend feature too: the libssh client
+           ;; has no x11 channel interface.
+           #-ssh-backend-ffi
+           :forward-x11 (getf parameters :forward-x11)
+           #-ssh-backend-ffi
+           :forward-x11-trusted (getf parameters :forward-x11-trusted)
+           #-ssh-backend-ffi
+           :forward-x11-timeout (getf parameters :forward-x11-timeout)
+           #-ssh-backend-ffi
+           :xauth-location (getf parameters :xauth-location)
            :on-open on-open
            :on-error on-error
            :on-close on-close

@@ -236,6 +236,20 @@ session_auth_agent_req."
          (not (ssh-session-setting
                session #'ssh-server-config-disable-forwarding)))))
 
+(defun ssh-session-permits-x11-p (session)
+  "Whether SESSION may request X11 forwarding.
+
+The key must not carry no-x11-forwarding, X11Forwarding must be yes, and
+DisableForwarding must not be in force, matching sshd's session_x11_req."
+  (let ((options (ssh-session-authorization session)))
+    (and (or (null options)
+             (ssh-authorization-options-permit-x11-forwarding options))
+         (eq (ssh-session-setting
+              session #'ssh-server-config-x11-forwarding)
+             :yes)
+         (not (ssh-session-setting
+               session #'ssh-server-config-disable-forwarding)))))
+
 (defun ssh-authorization-options-permit-address-p (options address)
   "Whether ADDRESS may use the key described by OPTIONS.
 

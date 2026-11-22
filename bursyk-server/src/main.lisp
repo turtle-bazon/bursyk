@@ -1655,6 +1655,19 @@ asked for, when it asked for anything."
 (defun home-file (name)
   (merge-pathnames name (user-homedir-pathname)))
 
+(defun x11-authority-file (session)
+  "The Xauthority file sshd records a forwarded display's cookie in.
+
+The file follows the account's home, as sshd runs xauth as that user; the
+server process's own XAUTHORITY would be the wrong one when it serves more
+than one account."
+  (multiple-value-bind (home uid)
+      (user-home-and-uid (cl-pnet-ssh:ssh-session-user session))
+    (declare (ignore uid))
+    (and home
+         (namestring (merge-pathnames ".Xauthority"
+                                      (uiop:ensure-directory-pathname home))))))
+
 ;;; ---- authorized_keys ----
 ;;;
 ;;; AUTHORIZED-KEYS (-A) names one file for every user.  Without it, sshd's
@@ -2730,6 +2743,18 @@ guess, so only an explicit PidFile is written."
            #-ssh-backend-ffi
            #-win32
            (lambda (session) (start-agent-forward session))
+           #-ssh-backend-ffi
+           #+win32
+           (lambda (session)
+             (declare (ignore session))
+             nil)
+           ;; X11 forwarding: the library binds the display listener and asks
+           ;; where to record the account's fake cookie.
+           #-ssh-backend-ffi
+           :x11-authority-file
+           #-ssh-backend-ffi
+           #-win32
+           #'x11-authority-file
            #-ssh-backend-ffi
            #+win32
            (lambda (session)

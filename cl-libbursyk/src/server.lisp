@@ -179,6 +179,7 @@ presented."
                           on-streamlocal-forward
                           on-cancel-streamlocal-forward
                           on-agent-forward
+                          x11-authority-file
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -258,7 +259,10 @@ before calling it, watches FD, opens an agent channel for every accepted
 connection and relays its bytes.  CLEANUP, when given, removes PATH when the
 session ends; without it the library unlinks PATH itself.  ON-ERROR receives
 (SESSION CONDITION) (SESSION is NIL for listener errors), ON-CLOSE receives
-(SESSION REASON)."
+(SESSION REASON).  X11-AUTHORITY-FILE is a function of (SESSION) returning
+the Xauthority file the fake X11 cookie belongs in, or NIL to forward
+without recording a cookie; the library creates the loopback display
+listener and sets DISPLAY in the session's environment."
   (let* ((version (if server-version
                       (format nil "SSH-2.0-~A"
                               (check-server-version server-version))
@@ -324,6 +328,7 @@ session ends; without it the library unlinks PATH itself.  ON-ERROR receives
                   :on-streamlocal-forward on-streamlocal-forward
                   :on-cancel-streamlocal-forward on-cancel-streamlocal-forward
                   :on-agent-forward on-agent-forward
+                  :x11-authority-file x11-authority-file
                   :on-error on-error
                   :on-close on-close
                   :connections (make-hash-table :test #'eq)))
