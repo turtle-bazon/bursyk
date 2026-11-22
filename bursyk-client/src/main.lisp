@@ -2546,11 +2546,14 @@ peer that connected to it; NIL refuses the channel."
 
 ;;; ---- -G: print the effective configuration ----
 
-(defun synchronous-canonical-resolver (host on-success on-error)
-  "Resolve HOST on this thread, for the synchronous -G path."
+(defun synchronous-canonical-resolver (host on-success on-error &key family)
+  "Resolve HOST on this thread, for the synchronous -G path.
+
+FAMILY, when :INET or :INET6, keeps the canonical name lookup in the family
+AddressFamily selected, as the asynchronous path does."
   (handler-case
       (multiple-value-bind (address canonical)
-          (cl-pnet-sockets:lookup-host-canonical host)
+          (cl-pnet-sockets:lookup-host-canonical host :family family)
         (if canonical
             (funcall on-success address canonical)
             (funcall on-success address)))

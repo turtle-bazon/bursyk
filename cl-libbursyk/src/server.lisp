@@ -167,6 +167,8 @@ presented."
                           (unused-connection-timeout 0)
                           channel-timeouts
                           (tcp-keep-alive t)
+                          v6only
+                          address-family
                           accept-env
                           server-version
                           version-addendum
@@ -236,6 +238,10 @@ CHANNEL-TIMEOUTS is sshd's ChannelTimeout list, as (TYPE-PATTERN . SECONDS)
 pairs or :NONE: an open channel that moves no bytes for the first matching
 type's interval is closed.
 TCP-KEEP-ALIVE (default T) controls SO_KEEPALIVE on accepted sockets.
+V6ONLY, when true, sets IPV6_V6ONLY on an IPv6 listener, so an AddressFamily
+inet6 wildcard does not also accept IPv4-mapped connections.  ADDRESS-FAMILY,
+when :INET or :INET6, restricts a named ADDRESS when the listener resolves it,
+so `localhost' under inet6 binds ::1 rather than the first answer.
 
 SERVER-VERSION is the software version in the SSH identification string,
 the part after \"SSH-2.0-\"; it defaults to the library's own string.  A
@@ -334,6 +340,8 @@ listener and sets DISPLAY in the session's environment."
                   :connections (make-hash-table :test #'eq)))
          (listener (cl-pnet:make-tcp-listener
                     address port
+                    :v6only v6only
+                    :family address-family
                     :read-cb (lambda (connection data)
                                (ssh-server-dispatch-read server connection data))
                     :on-accept (lambda (connection)

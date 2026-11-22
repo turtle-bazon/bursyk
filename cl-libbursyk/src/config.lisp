@@ -2415,8 +2415,10 @@ This is ssh.c's sequence: resolve the first pass, apply resolve_canonicalize(),
 then, when canonicalization ran or a Match final line asked for it, re-read the
 configuration with the canonical name in HOSTNAME and Match canonical/final
 active.  ON-OPTIONS receives (OPTIONS CANONICAL-HOST); the caller builds the
-client from those.  RESOLVER is (HOST ON-SUCCESS ON-ERROR) and may report a
-canonical name as ON-SUCCESS's second argument."
+client from those.  RESOLVER is (HOST ON-SUCCESS ON-ERROR &KEY FAMILY) and
+may report a canonical name as ON-SUCCESS's second argument.  It receives
+the AddressFamily the first pass resolved, so a name is canonicalized in
+the same family the connection will dial."
   (let ((seen (make-hash-table :test #'equal))
         (original (or original-host host)))
     (labels
@@ -2449,7 +2451,14 @@ canonical name as ON-SUCCESS's second argument."
                         (string-downcase input)
                         input)))
              (ssh-config-canonicalize-host
-              effective options direct resolver
+              effective options direct
+              ;; The name is resolved in the family the connection will
+              ;; use, so CanonicalizeHostname cannot follow an address the
+              ;; dialer would reject.
+              (lambda (name on-success on-error)
+                (funcall resolver name on-success on-error
+                         :family (ssh-config-options-address-family
+                                  options)))
               (lambda (canonical) (second-pass options canonical))
               on-error))))
       (ssh-config-resolve

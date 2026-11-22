@@ -1476,7 +1476,18 @@ ListenAddress ::1")))
         (bursyk-server::*server-config*
           (config-from-text "AddressFamily inet6
 ListenAddress 127.0.0.1")))
-    (signals error (bursyk-server::server-address))))
+    (signals error (bursyk-server::server-address)))
+  ;; The listener resolves a named address in this family, and :INET6 also
+  ;; turns on IPV6_V6ONLY so the wildcard refuses IPv4-mapped peers.
+  (let ((bursyk-server::*options* '(:address-family-6 t))
+        (bursyk-server::*server-config* nil))
+    (is (eq :inet6 (bursyk-server::listener-family))))
+  (let ((bursyk-server::*options* '(:address-family-4 t))
+        (bursyk-server::*server-config* nil))
+    (is (eq :inet (bursyk-server::listener-family))))
+  (let ((bursyk-server::*options* nil)
+        (bursyk-server::*server-config* nil))
+    (is (null (bursyk-server::listener-family)))))
 
 (test -f-none-reads-no-config-file
   (let ((bursyk-server::*options* (list :config-file "none")))

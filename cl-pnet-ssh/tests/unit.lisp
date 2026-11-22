@@ -3318,6 +3318,34 @@ newline")))
     (is (fits :inet6 "::1"))
     (is (not (fits :inet6 "127.0.0.1")))))
 
+(def-pure-test resolver-specs-reach-burzay-with-the-family
+  "A BURZAY resolver specification is not a function to call: :DNS must reach
+BURZAY (which now asks for AAAA under :INET6) instead of being funcalled."
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :resolver :dns :address-family :inet6))
+        (result nil)
+        (failure nil))
+    ;; A numeric host short-circuits resolution inside BURZAY, so reaching
+    ;; ON-SUCCESS proves the spec was passed on rather than called.
+    (cl-pnet-ssh::ssh-client-resolve-host
+     client "::1"
+     (lambda (address) (setf result address))
+     (lambda (condition) (setf failure condition)))
+    (is (equal "::1" result))
+    (is (null failure)))
+  ;; A real function resolver keeps its three-argument shape.
+  (let ((client
+          (cl-pnet-ssh::%make-ssh-client
+           :resolver (lambda (host on-success on-error)
+                       (declare (ignore on-error))
+                       (funcall on-success (concatenate 'string host "!")))))
+        (result nil))
+    (cl-pnet-ssh::ssh-client-resolve-host
+     client "name"
+     (lambda (address) (setf result address))
+     #'error)
+    (is (equal "name!" result))))
+
 (test ssh-config-seconds-parses-bare-and-suffixed-times
   ;; A bare number has no suffix, so the final flush runs after the loop; a
   ;; missing flush there leaves the value at zero without diagnosing it.
@@ -4069,7 +4097,8 @@ path that selects the agent socket to forward."
 
 (defun canonicalize-test-resolver (answers)
   "A resolver answering from ANSWERS, a list of (REQUEST . (ADDRESS CNAME))."
-  (lambda (host on-success on-error)
+  (lambda (host on-success on-error &key family)
+    (declare (ignore family))
     (let ((answer (assoc host answers :test #'string=)))
       (if answer
           (destructuring-bind (address canonical) (cdr answer)
@@ -4108,6 +4137,34 @@ path that selects the agent socket to forward."
     (is (equal "short.example" (ssh-config-options-hostname options)))
     (is (= 2200 (ssh-config-options-port options)))))
 
+(test canonicalize-resolves-in-the-configured-address-family
+  "The canonical lookup gets the first pass's AddressFamily, so a name is
+canonicalized in the family the connection will dial."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalizeHostname yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "CanonicalDomains example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "AddressFamily inet6"))))
+         (families '())
+         (canonical nil))
+    (ssh-config-canonicalize
+     config "short"
+     :resolver (lambda (host on-success on-error &key family)
+                 (declare (ignore on-error))
+                 (is (equal "short.example." host))
+                 (push family families)
+                 (funcall on-success "::1" "short.example"))
+     :on-options (lambda (options host)
+                   (declare (ignore options))
+                   (setf canonical host))
+     :on-error #'error)
+    (is (equal '(:inet6) families))
+    (is (equal "short.example" canonical))))
+
 (test canonicalize-follows-permitted-cname
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
@@ -4140,8 +4197,8 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
          (canonical nil))
     (ssh-config-canonicalize
      config "alias"
-     :resolver (lambda (host on-success on-error)
-                 (declare (ignore host on-success on-error))
+     :resolver (lambda (host on-success on-error &key family)
+                 (declare (ignore host on-success on-error family))
                  (error "canonicalization is off, so no lookup may run"))
      :on-options (lambda (options host)
                    (declare (ignore options))
@@ -4184,8 +4241,8 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
     (handler-case
         (ssh-config-canonicalize
          config "short"
-         :resolver (lambda (host on-success on-error)
-                     (declare (ignore host on-success))
+         :resolver (lambda (host on-success on-error &key family)
+                     (declare (ignore host on-success family))
                      (funcall on-error
                               (make-condition 'simple-error
                                               :format-control "no")))
@@ -4208,8 +4265,8 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
          (canonical nil))
     (ssh-config-canonicalize
      config "Host"
-     :resolver (lambda (host on-success on-error)
-                 (declare (ignore host on-success on-error))
+     :resolver (lambda (host on-success on-error &key family)
+                 (declare (ignore host on-success on-error family))
                  (error "a final-only pass must not resolve"))
      :on-options (lambda (value host)
                    (setf options value canonical host))
@@ -4230,8 +4287,8 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
          (canonical nil))
     (ssh-config-canonicalize
      config "short"
-     :resolver (lambda (host on-success on-error)
-                 (declare (ignore host on-success on-error))
+     :resolver (lambda (host on-success on-error &key family)
+                 (declare (ignore host on-success on-error family))
                  (error "a proxied name must not resolve"))
      :on-options (lambda (options host)
                    (declare (ignore options))
@@ -4253,8 +4310,8 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
          (canonical nil))
     (ssh-config-canonicalize
      config "short"
-     :resolver (lambda (host on-success on-error)
-                 (declare (ignore host on-success on-error))
+     :resolver (lambda (host on-success on-error &key family)
+                 (declare (ignore host on-success on-error family))
                  (error "a proxied name must not resolve"))
      :on-options (lambda (options host)
                    (declare (ignore options))

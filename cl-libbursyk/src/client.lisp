@@ -438,20 +438,31 @@ address is known, because it has to be in the same family."
     (:inet6 (cl-pnet-sockets:ipv6-address-p address))
     (t t)))
 
+(defun ssh-client-resolver-function-p (resolver)
+  "Whether RESOLVER is a function rather than a BURZAY resolver spec.
+
+BURZAY's spec is NIL, :SYSTEM, :DNS, (:DNS :ENDPOINT ENDPOINT) or a function.
+A non-keyword symbol may name a function, so it is treated as one."
+  (and resolver
+       (or (functionp resolver)
+           (and (symbolp resolver) (not (keywordp resolver))))))
+
 (defun ssh-client-resolve-host (client host on-success on-error)
   "Resolve HOST for CLIENT, honouring AddressFamily when it can.
 
-The default resolver and :SYSTEM pass the family to BURZAY, which asks the
-operating system for IPv4 or IPv6 alone.  A caller-supplied resolver keeps
-its (HOST ON-SUCCESS ON-ERROR) shape and chooses the family itself; the
-address it returns is still checked against CLIENT's AddressFamily before
-dialling.  HOST is left alone when it is already a numeric address, just as
-BURZAY does."
+BURZAY's resolver specifications - the default, :SYSTEM, :DNS and
+\(:DNS :ENDPOINT ENDPOINT) - all receive the family, so the system resolver
+asks for IPv4 or IPv6 alone and the DNS resolver asks for A or AAAA.  A
+caller-supplied function keeps its (HOST ON-SUCCESS ON-ERROR) shape and
+chooses the family itself; the address it returns is still checked against
+CLIENT's AddressFamily before dialling.  HOST is left alone when it is
+already a numeric address, just as BURZAY does."
   (let ((resolver (ssh-client-resolver client)))
-    (if (or (null resolver) (eq resolver :system))
+    (if (ssh-client-resolver-function-p resolver)
+        (funcall resolver host on-success on-error)
         (burzay:resolve-host host on-success on-error
-                             :family (ssh-client-address-family client))
-        (funcall resolver host on-success on-error))))
+                             :resolver resolver
+                             :family (ssh-client-address-family client)))))
 
 (defun ssh-open-direct-transport (client)
   "Resolve and dial CONNECT-HOST for a connection that is not proxied."
@@ -802,10 +813,12 @@ instead, and BIND-ADDRESS wins when both are set, as in ssh.  A ProxyCommand
 carries the stream itself, so neither applies there.
 
 ADDRESS-FAMILY is NIL for any, or :INET / :INET6 to resolve and dial only
-IPv4 or IPv6, as ssh -4, ssh -6 and AddressFamily do.  The default system
-resolver receives the family; a caller-supplied RESOLVER keeps its
-(HOST ON-SUCCESS ON-ERROR) shape, and its answer is checked against
-ADDRESS-FAMILY before the connection is dialled.
+IPv4 or IPv6, as ssh -4, ssh -6 and AddressFamily do.  BURZAY's resolver
+specifications - the default, :SYSTEM and :DNS - receive the family, so the
+system resolver asks for one family and DNS asks for A or AAAA; a
+caller-supplied resolver function keeps its (HOST ON-SUCCESS ON-ERROR)
+shape, and its answer is checked against ADDRESS-FAMILY before the
+connection is dialled.
 
 FORWARD-AGENT, when true, asks the peer to forward its agent connections,
 as ssh -A and ssh_config's ForwardAgent; FORWARD-AGENT-SOCK-PATH names the

@@ -348,6 +348,17 @@ explicit -f that does not exist is an error, as in sshd."
   "The wildcard address FAMILY listens on."
   (if (string-equal family "inet6") "::" "0.0.0.0"))
 
+(defun listener-family ()
+  "The family to give MAKE-TCP-LISTENER: :INET, :INET6, or NIL for any.
+
+A name in ListenAddress is resolved with this family, and :INET6 also turns
+on IPV6_V6ONLY, so the wildcard does not silently accept IPv4 clients."
+  (let ((family (server-address-family)))
+    (cond
+      ((string-equal family "inet") :inet)
+      ((string-equal family "inet6") :inet6)
+      (t nil))))
+
 (defun address-matches-family-p (address family)
   "Whether an explicit ADDRESS may be used with FAMILY.
 
@@ -2656,6 +2667,8 @@ guess, so only an explicit PidFile is written."
           (cl-pnet-ssh:make-ssh-server
            (server-address)
            (server-port)
+           :address-family (listener-family)
+           :v6only (eq (listener-family) :inet6)
            :host-key host-keys
            :host-key-agent (host-key-agent)
            :host-certificate (host-certificate-files)

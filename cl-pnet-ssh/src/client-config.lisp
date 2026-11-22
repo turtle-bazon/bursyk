@@ -797,8 +797,8 @@ string or a (KEYWORD . VALUE) cons; they are applied before CONFIG, so any
 keyword wins over the file.  EXEC-MATCHER answers Match exec; ON-CLIENT
 receives an asynchronous client; ON-CONFIG-ERROR reports resolution
 failures.  RESOLVER dials addresses for the built clients; CANONICAL-RESOLVER
-performs the CanonicalizeHostname lookup and may report a CNAME as its
-second value."
+performs the CanonicalizeHostname lookup, may report a CNAME as its second
+value, and receives the resolved AddressFamily as its :FAMILY keyword."
   (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
