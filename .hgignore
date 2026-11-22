@@ -1,0 +1,8 @@
+^_build/
+^system-index.txt
+.*\.fasl$
+.*\.so$
+.*\.dx64fsl$
+.*\.lx64fsl$
+.*\.swp$
+.*\.orig$
