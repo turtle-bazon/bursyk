@@ -678,3 +678,31 @@ CLI's decision and at the plist it filled."
   "The version BURS reports must be the version the system file declares."
   (is (equal (asdf:component-version (asdf:find-system "bursyk-client"))
              burs::+burs-version+)))
+
+;;; ---- ObscureKeystrokeTiming ----
+
+(test obscure-keystroke-timing-interval
+  "The obfuscation applies only to the channel that asked for a pty, and only
+while the interval is positive."
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :obscure-keystroke-timing 50))
+        (burs::*client* nil)
+        (burs::*pty-channel* nil))
+    (setf burs::*client* client
+          burs::*pty-channel* :pty)
+    (is (= 50 (burs::keystroke-obfuscation-interval :pty)))
+    (is (null (burs::keystroke-obfuscation-interval :other)))
+    (setf (cl-pnet-ssh:ssh-client-obscure-keystroke-timing client) 0)
+    (is (null (burs::keystroke-obfuscation-interval :pty)))
+    (setf burs::*pty-channel* nil)
+    (is (null (burs::keystroke-obfuscation-interval :pty)))))
+
+(test obscure-keystroke-delay-stays-in-fuzz-range
+  "A quantised interval is the requested one, less up to ten percent, plus
+this session's fixed offset."
+  (dotimes (index 20)
+    (declare (ignore index))
+    (let ((delay (burs::keystroke-delay 20 0.002)))
+      (is (<= 0.0199 delay))
+      (is (< delay 0.022))))
+  (is (= 20 cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)))

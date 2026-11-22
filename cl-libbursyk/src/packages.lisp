@@ -20,6 +20,7 @@
    #:ssh-client-connect-port
    #:ssh-client-host
    #:ssh-client-user
+   #:ssh-client-obscure-keystroke-timing
    #:*ssh-log-function*
    #:*ssh-log-enabled*
    #:ssh-log
@@ -179,6 +180,7 @@
    #:ssh-config-options-check-host-ip
    #:ssh-config-options-batch-mode
    #:ssh-config-options-warn-weak-crypto
+   #:ssh-config-options-obscure-keystroke-timing
    #:ssh-config-options-no-host-authentication-for-localhost
    #:ssh-config-options-verify-host-key-dns
    #:*ssh-dns-server*
@@ -525,4 +527,10 @@
    #:+ssh-host-key-algorithms+
    #:+ssh-ciphers+
    #:+ssh-macs+
-   #:+ssh-compressions+))
+   #:+ssh-compressions+
+   #:+ssh-keystroke-default-interval-ms+))
+
+(in-package #:cl-pnet-ssh)
+
+(defconstant +ssh-keystroke-default-interval-ms+ 20
+  "ssh's default ObscureKeystrokeTiming interval, in milliseconds.")

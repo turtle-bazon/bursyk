@@ -347,6 +347,8 @@ helper is what reaches the server."
                                  host-key-alias
                                  batch-mode
                                  (warn-weak-crypto t)
+                                 (obscure-keystroke-timing
+                                  +ssh-keystroke-default-interval-ms+)
                                  channel-timeouts
                                  version-addendum
                                  hostbased-authentication
@@ -399,6 +401,7 @@ helper is what reaches the server."
                     :host-key-alias host-key-alias
                     :batch-mode batch-mode
                     :warn-weak-crypto warn-weak-crypto
+                    :obscure-keystroke-timing obscure-keystroke-timing
                     :channel-timeouts channel-timeouts
                     :version-addendum
                     (and version-addendum
@@ -535,6 +538,8 @@ is applied here, before any request names a key the configuration forbade."
                              host-key-alias
                              batch-mode
                              (warn-weak-crypto t)
+                             (obscure-keystroke-timing
+                              +ssh-keystroke-default-interval-ms+)
                              channel-timeouts
                              version-addendum
                              hostbased-authentication
@@ -598,6 +603,9 @@ BATCH-MODE, when true, never asks: an unknown host key fails even when a
 confirmation callback was supplied.  WARN-WEAK-CRYPTO, on by default, shows
 OpenSSH 10.6's post-quantum notice after the initial key exchange when it used
 no post-quantum algorithm and KexAlgorithms was left at its default.
+OBSCURE-KEYSTROKE-TIMING is the number of milliseconds between quantised
+keystrokes on a pty, or 0 to send each keystroke as it arrives; the
+application applies it because it owns stdin.
 VERSION-ADDENDUM is appended after a space to the identification string,
 matching sshd's VersionAddendum.
 
@@ -649,6 +657,8 @@ role-neutral."
                            :host-key-alias host-key-alias
                            :batch-mode batch-mode
                            :warn-weak-crypto warn-weak-crypto
+                           :obscure-keystroke-timing
+                           obscure-keystroke-timing
                            :channel-timeouts channel-timeouts
                            :version-addendum version-addendum
                            :hostbased-authentication hostbased-authentication

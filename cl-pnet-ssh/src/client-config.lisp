@@ -244,6 +244,9 @@ MAKE-SSH-CLIENT's own defaults."
         :batch-mode (ssh-config-options-batch-mode options)
         :warn-weak-crypto
         (not (eq (ssh-config-options-warn-weak-crypto options) :no))
+        :obscure-keystroke-timing
+        (or (ssh-config-options-obscure-keystroke-timing options)
+            +ssh-keystroke-default-interval-ms+)
         :channel-timeouts
         (ssh-config-client-channel-timeouts options)
         :connect-timeout
@@ -515,6 +518,9 @@ uses whichever of the two it saw first instead of chaining them."
            :host-key-callback (getf parameters :host-key-callback)
            :batch-mode (getf parameters :batch-mode)
            :warn-weak-crypto (getf parameters :warn-weak-crypto t)
+           :obscure-keystroke-timing
+           (getf parameters :obscure-keystroke-timing
+                 +ssh-keystroke-default-interval-ms+)
            :channel-timeouts (getf parameters :channel-timeouts)
            :kex-algorithms (getf parameters :kex-algorithms)
            :host-key-algorithms (getf parameters :host-key-algorithms)

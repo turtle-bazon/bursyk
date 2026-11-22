@@ -55,6 +55,9 @@
   ;; one notice per connection.
   (warn-weak-crypto t)
   (non-pq-kex-warned nil)
+  ;; ObscureKeystrokeTiming: milliseconds between quantised keystrokes; 0
+  ;; disables it.  The application owns stdin, so it applies this policy.
+  (obscure-keystroke-timing +ssh-keystroke-default-interval-ms+)
   ;; Algorithm offers from ssh_config's Ciphers, MACs, KexAlgorithms and
   ;; HostKeyAlgorithms.  NIL means this build's own list; a list from
   ;; SSH-RESOLVE-ALGORITHM-LIST restricts what KEXINIT offers.

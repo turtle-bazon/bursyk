@@ -266,6 +266,7 @@ bytes the user typed."
               (cl-pnet:call-on-loop
                (lambda ()
                  (unless *stdin-stopped*
+                   (finish-keystrokes channel)
                    (handler-case (cl-pnet-ssh:ssh-channel-eof channel)
                      (error () nil))))))
             (return))
@@ -275,6 +276,7 @@ bytes the user typed."
                 (cl-pnet:call-on-loop
                  (lambda ()
                    (unless *stdin-stopped*
+                     (finish-keystrokes channel)
                      (handler-case (cl-pnet-ssh:ssh-channel-eof channel)
                        (error () nil))))))
               (return))
@@ -284,7 +286,7 @@ bytes the user typed."
                  (lambda ()
                    (unless *stdin-stopped*
                      (handler-case
-                         (cl-pnet-ssh:ssh-channel-write channel octets)
+                         (feed-keystrokes channel octets)
                        (error () nil)))))))))))))
 
 (defun start-stdin (channel)

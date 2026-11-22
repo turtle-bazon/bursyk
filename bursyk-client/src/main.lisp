@@ -1057,6 +1057,7 @@ ordering without adding a request hook to the library."
            (case (cl-pnet-ssh::ssh-channel-state channel)
              (:open
               (stop-pty-timer)
+              (setf *pty-channel* channel)
               (send-pty-request channel)
               (start-winch channel)
               (cond
@@ -1076,6 +1077,154 @@ ordering without adding a request hook to the library."
   (if (stdin-null-p)
       (cl-pnet-ssh:ssh-channel-eof channel)
       (start-stdin channel)))
+
+;;; ---- ObscureKeystrokeTiming ----
+;;;
+;;; ssh hides the timing of interactive typing by sending keystrokes only at
+;;; fixed intervals, so an observer cannot measure pauses between keys.  The
+;;; interval is randomised by ten percent, both per keystroke and for the
+;;; whole session, and hiding continues for one to three seconds after the
+;;; last keystroke.  This application owns stdin, so the policy lives here
+;;; while the library carries the configured interval.
+
+(defun keystroke-now ()
+  "Seconds on CL's internal real-time clock."
+  (/ (float (get-internal-real-time) 1.0d0)
+     (float internal-time-units-per-second 1.0d0)))
+
+(defun keystroke-delay (milliseconds rate-fuzz)
+  "One randomised interval of MILLISECONDS, offset by RATE-FUZZ seconds."
+  (let* ((interval (/ milliseconds 1000.0))
+         (fuzz (* interval 0.10)))
+    (+ (- interval fuzz) (random fuzz) rate-fuzz)))
+
+(defun keystroke-live-p (channel)
+  "Whether CHANNEL can still take input."
+  (and channel
+       *client*
+       (not (cl-pnet-ssh::ssh-client-closed-p *client*))
+       (eq (cl-pnet-ssh::ssh-channel-state channel) :open)))
+
+(defun keystroke-obfuscation-interval (channel)
+  "CHANNEL's quantisation interval in milliseconds, or NIL when it has none."
+  (when (and *client* (eq channel *pty-channel*))
+    (let ((interval (cl-pnet-ssh:ssh-client-obscure-keystroke-timing *client*)))
+      (and interval (plusp interval) interval))))
+
+(defun stop-keystroke-timer ()
+  (when *keystroke-timer*
+    (let ((timer *keystroke-timer*))
+      (setf *keystroke-timer* nil)
+      (ignore-errors (cl-pnet:timer-stop timer)))))
+
+(defun keystroke-schedule (delay milliseconds)
+  "Run one tick after DELAY seconds."
+  (stop-keystroke-timer)
+  (setf *keystroke-timer*
+        (cl-pnet:timer-start
+         (max 0.001 delay) 0.0
+         (lambda () (keystroke-tick milliseconds)))))
+
+(defun keystroke-flush (channel)
+  "Write every held keystroke now."
+  (when (plusp (fill-pointer *keystroke-pending*))
+    (let ((pending (subseq *keystroke-pending* 0
+                           (fill-pointer *keystroke-pending*))))
+      (setf (fill-pointer *keystroke-pending*) 0)
+      (cl-pnet-ssh:ssh-channel-write channel pending))))
+
+(defun keystroke-stop-active ()
+  "Stop hiding timing, dropping anything still held."
+  (when *keystroke-active*
+    (cl-pnet-ssh:ssh-log "stopped obscuring keystroke timing"))
+  (stop-keystroke-timer)
+  (setf *keystroke-active* nil
+        *keystroke-channel* nil
+        *keystroke-rate-fuzz* 0
+        (fill-pointer *keystroke-pending*) 0))
+
+(defun keystroke-start (channel milliseconds)
+  "Release CHANNEL's first keystroke immediately, then begin quantising."
+  (let* ((now (keystroke-now))
+         (interval (/ milliseconds 1000.0))
+         (fuzz (* interval 0.10))
+         (rate-fuzz (random fuzz)))
+    (setf *keystroke-active* t
+          *keystroke-channel* channel
+          *keystroke-rate-fuzz* rate-fuzz
+          ;; ssh keeps hiding for 1024ms plus up to another 2048ms.
+          *keystroke-chaff-until* (+ now 1.024 (random 2.048)))
+    (cl-pnet-ssh:ssh-log "obscuring keystroke timing at ~Dms" milliseconds)
+    (keystroke-schedule (keystroke-delay milliseconds rate-fuzz)
+                        milliseconds)))
+
+(defun keystroke-tick (milliseconds)
+  "Release the keystrokes held for the interval that just ended."
+  ;; A one-shot timer has already fired; clearing the handle keeps
+  ;; STOP-KEYSTROKE-TIMER from stopping a handle the loop has freed.
+  (setf *keystroke-timer* nil)
+  (let ((channel *keystroke-channel*))
+    (cond
+      ((not (keystroke-live-p channel))
+       (keystroke-stop-active))
+      (t
+       (let ((now (keystroke-now)))
+         (when (plusp (fill-pointer *keystroke-pending*))
+           (handler-case
+               (keystroke-flush channel)
+             (error ()
+               (keystroke-stop-active)
+               (return-from keystroke-tick nil)))
+           ;; A keystroke was sent, so the chaff window starts over.
+           (setf *keystroke-chaff-until* (+ now 1.024 (random 2.048))))
+         (cond
+           ;; Rekeying and a closed pty stop the hiding, but only after what
+           ;; was already typed has gone out.
+           ((or (not (eq channel *pty-channel*))
+                (cl-pnet-ssh::ssh-client-kexinit-sent *client*))
+            (keystroke-stop-active))
+           ((and (zerop (fill-pointer *keystroke-pending*))
+                 (>= now *keystroke-chaff-until*))
+            (keystroke-stop-active))
+           (t
+            (keystroke-schedule
+             (keystroke-delay milliseconds *keystroke-rate-fuzz*)
+             milliseconds))))))))
+
+(defun feed-keystrokes (channel octets)
+  "Write OCTETS from stdin to CHANNEL, hiding inter-keystroke timing.
+
+The first keystroke of a burst goes out at once, as ssh's just_started does.
+Later ones wait for the next interval.  A paste of more than a few keystrokes
+turns the hiding off and is written straight through, matching ssh's
+\"output buffer filling\" stop."
+  (let ((milliseconds (keystroke-obfuscation-interval channel)))
+    (cond
+      ((or (null milliseconds) (not (keystroke-live-p channel)))
+       (cl-pnet-ssh:ssh-channel-write channel octets))
+      ((not (and *keystroke-active*
+                 (eq *keystroke-channel* channel)))
+       (cl-pnet-ssh:ssh-channel-write channel octets)
+       (keystroke-start channel milliseconds))
+      (t
+       (loop for octet across octets
+             do (vector-push-extend octet *keystroke-pending*))
+       (when (>= (fill-pointer *keystroke-pending*) 256)
+         (let ((pending (subseq *keystroke-pending* 0
+                                (fill-pointer *keystroke-pending*))))
+           (keystroke-stop-active)
+           (cl-pnet-ssh:ssh-channel-write channel pending)))))))
+
+(defun finish-keystrokes (channel)
+  "Release CHANNEL's held keystrokes before stdin reports EOF."
+  (when (and *keystroke-active* (eq *keystroke-channel* channel))
+    (ignore-errors (keystroke-flush channel)))
+  (keystroke-stop-active))
+
+(defun stop-keystroke-obfuscation ()
+  "Forget the pty channel; the session is over."
+  (keystroke-stop-active)
+  (setf *pty-channel* nil))
 
 (defun quit-now (status)
   "Leave with STATUS without flushing streams again.
@@ -1097,6 +1246,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
     (stop-pty-timer)
     (stop-winch)
     (stop-stdin)
+    (stop-keystroke-obfuscation)
     (stop-forwards)
     ;; Stop listening before the connection goes away, so a client cannot
     ;; connect to a master that is already closing.
@@ -2638,6 +2788,15 @@ peer that connected to it; NIL refuses the channel."
     (format t "requiredrsasize ~D~%"
             (or (cl-pnet-ssh:ssh-config-options-required-rsa-size options)
                 cl-pnet-ssh::+ssh-rsa-minimum-modulus-size+))
+    (format t "obscurekeystroketiming ~A~%"
+            (let ((value
+                    (or (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
+                         options)
+                        cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)))
+              (cond ((zerop value) "no")
+                    ((= value cl-pnet-ssh:+ssh-keystroke-default-interval-ms+)
+                     "yes")
+                    (t (format nil "~D" value)))))
     (format t "casignaturealgorithms ~{~A~^,~}~%"
             (or (cl-pnet-ssh::ssh-config-client-algorithms
                  options

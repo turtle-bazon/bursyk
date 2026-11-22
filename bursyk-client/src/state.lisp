@@ -4,7 +4,7 @@
 ;;;; before either terminal backend, so the POSIX and Windows files can see
 ;;;; the options they consult and the handles they save.
 
-(defparameter +burs-version+ "0.0.2.76")
+(defparameter +burs-version+ "0.0.2.77")
 
 (defvar *background-child* nil
   "True in the re-executed child that will signal authentication success.")
@@ -85,6 +85,25 @@ forwards, disconnect, or open the escape command line."
   "Accepted forwarding connections, keyed by their CL-PNET connection.")
 (defvar *pty-timer* nil
   "The watchdog that sends pty-req once the session channel is open.")
+;;; ObscureKeystrokeTiming.  The application owns stdin, and ssh's interval
+;;; quantisation lives with it: keystrokes on a pty are held to fixed
+;;; intervals instead of being written as they arrive.
+(defvar *pty-channel* nil
+  "The session channel that asked for a pty, or NIL for a plain session.")
+(defvar *keystroke-timer* nil
+  "The one-shot timer that releases the next quantised keystroke.")
+(defvar *keystroke-active* nil
+  "True while keystroke timing is being hidden.")
+(defvar *keystroke-channel* nil
+  "The channel the active quantisation belongs to.")
+(defvar *keystroke-pending*
+  (make-array 0 :element-type '(unsigned-byte 8)
+                :adjustable t :fill-pointer 0)
+  "Keystrokes waiting for the next interval.")
+(defvar *keystroke-chaff-until* 0
+  "When the idle window that keeps timing hidden ends.")
+(defvar *keystroke-rate-fuzz* 0
+  "This session's random share of the interval, as ssh perturbs it.")
 (defvar *terminal-saved* nil
   "The terminal settings STTY -G reported, or NIL when not in raw mode.")
 (defvar *winch* nil

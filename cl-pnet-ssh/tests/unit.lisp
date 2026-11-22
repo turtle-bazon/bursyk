@@ -6481,3 +6481,60 @@ KexAlgorithms was not set, the exchange is classical and the warning is on."
     (is (null (warnings :negotiated '(:kex "mlkem768x25519-sha256"))))
     (is (cl-pnet-ssh::ssh-kex-post-quantum-p "mlkem768x25519-sha256"))
     (is (not (cl-pnet-ssh::ssh-kex-post-quantum-p "curve25519-sha256")))))
+
+(test obscure-keystroke-timing-is-parsed
+  "ObscureKeystrokeTiming takes yes, no or interval:MILLISECONDS, is
+case-sensitive like readconf's strcmp, rejects every other spelling, and keeps
+the first active value."
+  (flet ((options-for (&rest lines)
+           (let ((options nil)
+                 (condition nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (value) (setf condition value)))
+             (values options condition))))
+    (multiple-value-bind (options condition)
+        (options-for "Port 22")
+      (is (null condition))
+      (is (null
+           (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing options))))
+    (dolist (case '(("ObscureKeystrokeTiming yes" . 20)
+                    ("ObscureKeystrokeTiming true" . 20)
+                    ("ObscureKeystrokeTiming no" . 0)
+                    ("ObscureKeystrokeTiming false" . 0)
+                    ("ObscureKeystrokeTiming interval:1" . 1)
+                    ("ObscureKeystrokeTiming interval:100" . 100)
+                    ("ObscureKeystrokeTiming interval:1000" . 1000)))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (is (null condition) (car case))
+        (is (= (cdr case)
+               (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
+                options))
+            (car case))))
+    (multiple-value-bind (options condition)
+        (options-for "ObscureKeystrokeTiming interval:50"
+                     "ObscureKeystrokeTiming no")
+      (is (null condition))
+      (is (= 50
+             (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
+              options))))
+    (dolist (case '(("ObscureKeystrokeTiming" . "missing argument")
+                    ("ObscureKeystrokeTiming yes no" . "invalid arguments")
+                    ("ObscureKeystrokeTiming YES" . "unsupported argument")
+                    ("ObscureKeystrokeTiming maybe" . "unsupported argument")
+                    ("ObscureKeystrokeTiming interval:" . "integer value missing.")
+                    ("ObscureKeystrokeTiming interval:abc" . "integer value invalid.")
+                    ("ObscureKeystrokeTiming interval:0" . "value out of range.")
+                    ("ObscureKeystrokeTiming interval:1001" . "value out of range.")))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (declare (ignore options))
+        (is (typep condition 'ssh-config-error) (car case))
+        (is (search (cdr case)
+                    (cl-pnet-ssh::ssh-error-detail condition))
+            (car case))))))

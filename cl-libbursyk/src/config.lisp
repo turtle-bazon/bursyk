@@ -163,6 +163,10 @@ way ssh refuses it.")
   ;; :YES asks for it, and NIL means ssh's default of yes.  The 10.6
   ;; "no-pq-kex" spelling also selects :NO, as readconf's multistate does.
   (warn-weak-crypto nil)
+  ;; ObscureKeystrokeTiming: the interval in milliseconds between quantised
+  ;; keystrokes, 0 when disabled, or NIL when the file did not say.  ssh's
+  ;; default is 20ms.
+  (obscure-keystroke-timing nil)
   (preferred-authentications nil)
   (pubkey-authentication nil)
   (password-authentication nil)
@@ -725,6 +729,23 @@ does that without a temporary file."
                  (or (null maximum) (<= number maximum)))
       (error (ssh-config-line-error line "invalid number ~S" value)))
     number))
+
+(defun ssh-config-atoi-error (value)
+  "OpenSSH's strtonum diagnostic for VALUE, or NIL when it parses as an int.
+
+readconf's atoi_err gives strtonum the bytes after \"interval:\" and prints
+its error string verbatim, so an empty tail, a non-number and a value that
+does not fit an int each read the way ssh reports them."
+  (cond
+    ((zerop (length value)) "missing")
+    (t
+     (let ((number (handler-case (parse-integer value :junk-allowed nil)
+                     (error () nil))))
+       (cond
+         ((null number) "invalid")
+         ((> number 2147483647) "too large")
+         ((< number 0) "too small")
+         (t nil))))))
 
 (defun ssh-config-seconds (line value)
   "A time argument as seconds, :NONE for unlimited, or an error."
@@ -1466,6 +1487,43 @@ understand them rather than silently match nothing."
                 (lambda (options)
                   (setf (ssh-config-options-channel-timeouts options)
                         (copy-list arguments))))))))
+      ((string= keyword "obscurekeystroketiming")
+       ;; readconf accepts exactly one argument, reassigns only the first
+       ;; active line, but parses every line so a mistake later is still fatal.
+       (let ((arguments (ssh-config-line-args line)))
+         (unless arguments
+           (error (ssh-config-line-error line "missing argument")))
+         (when (rest arguments)
+           (error (ssh-config-line-error line "invalid arguments")))
+         (let* ((argument (first arguments))
+                (value
+                  (cond
+                    ((or (string= argument "yes")
+                         (string= argument "true"))
+                     +ssh-keystroke-default-interval-ms+)
+                    ((or (string= argument "no") (string= argument "false"))
+                     0)
+                    ((and (>= (length argument) 9)
+                          (string= argument "interval:" :end1 9 :end2 9))
+                     (let* ((number (subseq argument 9))
+                            (problem (ssh-config-atoi-error number)))
+                       (when problem
+                         (error (ssh-config-line-error
+                                 line "integer value ~A." problem)))
+                       (let ((milliseconds (parse-integer number)))
+                         (when (or (< milliseconds 1)
+                                   (> milliseconds 1000))
+                           (error (ssh-config-line-error
+                                   line "value out of range.")))
+                         milliseconds)))
+                    (t
+                     (error (ssh-config-line-error
+                             line "unsupported argument ~S" argument))))))
+           (ssh-config-set-once
+            seen options :obscure-keystroke-timing
+            (lambda (options)
+              (setf (ssh-config-options-obscure-keystroke-timing options)
+                    value))))))
       (t
        (ssh-config-set-once
         seen options
@@ -1761,6 +1819,7 @@ block is active, as ssh's parse_token does."
                          "sessiontype" "stdinnull"
                          "forkafterauthentication"
                          "channeltimeout"
+                         "obscurekeystroketiming"
                          "controlmaster" "controlpath" "controlpersist"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"
