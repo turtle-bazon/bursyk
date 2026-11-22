@@ -346,6 +346,7 @@ helper is what reaches the server."
                                  no-host-authentication-for-localhost
                                  host-key-alias
                                  batch-mode
+                                 channel-timeouts
                                  version-addendum
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
@@ -396,6 +397,7 @@ helper is what reaches the server."
                     no-host-authentication-for-localhost
                     :host-key-alias host-key-alias
                     :batch-mode batch-mode
+                    :channel-timeouts channel-timeouts
                     :version-addendum
                     (and version-addendum
                          (not (eq version-addendum :none))
@@ -530,6 +532,7 @@ is applied here, before any request names a key the configuration forbade."
                              no-host-authentication-for-localhost
                              host-key-alias
                              batch-mode
+                             channel-timeouts
                              version-addendum
                              hostbased-authentication
                              hostbased-accepted-algorithms
@@ -592,6 +595,11 @@ BATCH-MODE, when true, never asks: an unknown host key fails even when a
 confirmation callback was supplied.  VERSION-ADDENDUM is appended after a
 space to the identification string, matching sshd's VersionAddendum.
 
+CHANNEL-TIMEOUTS is a list of (PATTERN . SECONDS) pairs, as ssh_config's
+ChannelTimeout: a channel that matches PATTERN and sees no traffic for
+SECONDS is closed, and the pattern \"global\" closes every channel once none
+of them has been used for that long.
+
 VERIFY-HOST-KEY-DNS is :NO, :YES or :ASK.  With :YES, a matching SSHFP record
 whose answer carries the DNSSEC authenticated-data bit trusts the host key
 without known_hosts; :ASK looks the records up but never accepts on its own.
@@ -634,6 +642,7 @@ role-neutral."
                            no-host-authentication-for-localhost
                            :host-key-alias host-key-alias
                            :batch-mode batch-mode
+                           :channel-timeouts channel-timeouts
                            :version-addendum version-addendum
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms

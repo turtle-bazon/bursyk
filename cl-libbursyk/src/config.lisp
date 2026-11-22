@@ -217,6 +217,11 @@ way ssh refuses it.")
   (session-type nil)
   (stdin-null nil)
   (fork-after-authentication nil)
+  ;; ChannelTimeout: the PATTERN=INTERVAL arguments as written, in the order
+  ;; the first active line named them, :NONE for an explicit "none", or NIL
+  ;; when the keyword never appeared.  A "global" pattern bounds the whole
+  ;; connection.  The text is kept for -G; the policy layer parses it.
+  (channel-timeouts nil)
   ;; ControlMaster, ControlPath and ControlPersist: whether this client may
   ;; listen for multiplexed sessions, where the control socket lives, and how
   ;; long a background master outlives its last session.  :YES, :NO, :ASK,
@@ -747,6 +752,22 @@ does that without a temporary file."
 
 (defun ssh-config-split-list (value)
   (remove "" (uiop:split-string value :separator ",") :test #'string=))
+
+(defun ssh-config-channel-timeout-pair (line argument)
+  "VALUES PATTERN SECONDS for one ChannelTimeout PATTERN=INTERVAL argument.
+
+The pattern may contain wildcards, as ssh's match_pattern allows, but must
+not be empty.  INTERVAL uses ssh's time syntax and may be zero, which
+disables that pattern's timeout."
+  (let ((equals (position #\= argument)))
+    (when (or (null equals) (zerop equals))
+      (error (ssh-config-line-error line "invalid channel timeout ~A"
+                                    argument)))
+    (let ((seconds (ssh-parse-time (subseq argument (1+ equals)))))
+      (unless seconds
+        (error (ssh-config-line-error line "invalid channel timeout ~A"
+                                      argument)))
+      (values (subseq argument 0 equals) seconds))))
 
 (defun ssh-config-set-once (seen options key thunk)
   "Apply THUNK unless KEY was already set, as OpenSSH keeps first values."
@@ -1380,6 +1401,32 @@ understand them rather than silently match nothing."
         seen options :tag
         (lambda (options)
           (setf (ssh-config-options-tag options) (ssh-config-arg line)))))
+      ((string= keyword "channeltimeout")
+       ;; ssh keeps the first active ChannelTimeout line as a whole, but parses
+       ;; every argument on every active line, so a typo in a later line is
+       ;; fatal just as it is in ssh.  "none" must stand alone.
+       (let ((arguments (ssh-config-line-args line)))
+         (unless arguments
+           (error (ssh-config-line-error
+                   line "ChannelTimeout needs an argument")))
+         (if (string-equal (first arguments) "none")
+             (progn
+               (when (rest arguments)
+                 (error (ssh-config-line-error
+                         line "ChannelTimeout \"none\" argument must appear alone")))
+               (ssh-config-set-once
+                seen options :channel-timeouts
+                (lambda (options)
+                  (setf (ssh-config-options-channel-timeouts options)
+                        :none))))
+             (progn
+               (dolist (argument arguments)
+                 (ssh-config-channel-timeout-pair line argument))
+               (ssh-config-set-once
+                seen options :channel-timeouts
+                (lambda (options)
+                  (setf (ssh-config-options-channel-timeouts options)
+                        (copy-list arguments))))))))
       (t
        (ssh-config-set-once
         seen options (intern (string-upcase keyword) :keyword)
@@ -1661,6 +1708,7 @@ block is active, as ssh's parse_token does."
                          "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
                          "forkafterauthentication"
+                         "channeltimeout"
                          "controlmaster" "controlpath" "controlpersist"
                          "streamlocalbindmask" "streamlocalbindunlink"
                          "requesttty" "tag"

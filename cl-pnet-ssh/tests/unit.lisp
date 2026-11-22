@@ -6262,3 +6262,111 @@ the KEX from its signature."
       (when receiver (cl-pnet-sockets:close-open-fd receiver))
       (cl-pnet-sockets:close-open-fd listener)
       (ignore-errors (delete-file path))))))
+
+(test channel-timeout-is-parsed
+  "ChannelTimeout keeps the first active line's raw arguments for -G and
+hands the client their resolved seconds; none is exclusive and disables all."
+  (flet ((resolve (&rest lines)
+           (let ((condition nil)
+                 (options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (value) (setf condition value)))
+             (values condition options))))
+    ;; Several patterns on one line, with time units and an explicit zero.
+    (multiple-value-bind (condition options)
+        (resolve "ChannelTimeout session=5m global=1h session:command=0")
+      (is (null condition))
+      (is (equal '("session=5m" "global=1h" "session:command=0")
+                 (cl-pnet-ssh:ssh-config-options-channel-timeouts options)))
+      (is (equal '(("session" . 300) ("global" . 3600)
+                   ("session:command" . 0))
+                 (cl-pnet-ssh::ssh-config-client-channel-timeouts options))))
+    ;; The first active line wins as a whole, but a later line is still read.
+    (multiple-value-bind (condition options)
+        (resolve "ChannelTimeout session=1m" "ChannelTimeout global=2m")
+      (is (null condition))
+      (is (equal '("session=1m")
+                 (cl-pnet-ssh:ssh-config-options-channel-timeouts options))))
+    ;; none must stand alone and turns every timeout off.
+    (multiple-value-bind (condition options)
+        (resolve "ChannelTimeout none")
+      (is (null condition))
+      (is (eq :none
+              (cl-pnet-ssh:ssh-config-options-channel-timeouts options)))
+      (is (null (cl-pnet-ssh::ssh-config-client-channel-timeouts options))))
+    ;; ssh refuses none beside a pattern and any malformed pattern=time.
+    (dolist (lines '(("ChannelTimeout none session=5m")
+                     ("ChannelTimeout session")
+                     ("ChannelTimeout =5m")
+                     ("ChannelTimeout session=")
+                     ("ChannelTimeout session=five")))
+      (multiple-value-bind (condition options)
+          (apply #'resolve lines)
+        (declare (ignore options))
+        (is (typep condition 'ssh-config-error))))))
+
+(test channel-timeout-matches-channel-types
+  "The first ChannelTimeout pattern matching a channel's type wins, and the
+last global entry is the connection-wide one, as ssh applies them in order."
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :channel-timeouts
+                 '(("session:command" . 1) ("session" . 300)
+                   ("session:subsystem:*" . 60)
+                   ("global" . 10) ("global" . 3600)))))
+    (is (= 1 (cl-pnet-ssh::ssh-client-channel-type-timeout
+              client "session:command")))
+    ;; A plain session pattern names the channel type, not its labels.
+    (is (= 300 (cl-pnet-ssh::ssh-client-channel-type-timeout
+                client "session")))
+    (is (null (cl-pnet-ssh::ssh-client-channel-type-timeout
+               client "session:shell")))
+    ;; The label's own pattern is what overrides the plain type.
+    (is (= 60 (cl-pnet-ssh::ssh-client-channel-type-timeout
+               client "session:subsystem:git-upload-pack")))
+    (is (null (cl-pnet-ssh::ssh-client-channel-type-timeout
+               client "direct-tcpip")))
+    (is (= 3600 (cl-pnet-ssh::ssh-client-global-channel-timeout client)))
+    ;; Pattern matching is ssh's: a wildcard must cover the whole name.
+    (is (null (cl-pnet-ssh::ssh-client-channel-type-timeout
+               client "sessionx")))
+    (is (null (cl-pnet-ssh::ssh-client-global-channel-timeout
+               (cl-pnet-ssh::%make-ssh-client
+                :channel-timeouts '(("session" . 5))))))))
+
+(test channel-timeout-closes-idle-channels
+  "The timer closes an idle channel at its own limit and leaves a busy one
+alone; a global limit closes every channel after the connection goes quiet."
+  (flet ((channel (client id last-used limit)
+           (let ((channel (cl-pnet-ssh::%make-ssh-channel
+                           :client client :local-id id :remote-id id
+                           :type "session" :state :open
+                           :last-used last-used
+                           :inactive-timeout limit)))
+             (setf (gethash id (cl-pnet-ssh::ssh-client-channels client))
+                   channel)
+             channel)))
+    (let* ((now (cl-pnet-ssh::ssh-client-now))
+           (client (cl-pnet-ssh::%make-ssh-client
+                    :channel-timeouts '(("session" . 1))))
+           (idle (channel client 0 (- now 10) 1))
+           (busy (channel client 1 now 1)))
+      (cl-pnet-ssh::ssh-client-channel-timeout-tick client)
+      (is (eq :closed (cl-pnet-ssh::ssh-channel-state idle)))
+      (is (eq :open (cl-pnet-ssh::ssh-channel-state busy)))
+      (cl-pnet-ssh::ssh-client-stop-timers client))
+    (let* ((now (cl-pnet-ssh::ssh-client-now))
+           (client (cl-pnet-ssh::%make-ssh-client
+                    :channel-timeouts '(("global" . 1))))
+           (first (channel client 0 (- now 10) 0))
+           (second (channel client 1 (- now 5) 0)))
+      ;; The newest activity on any channel drives the global clock.
+      (setf (cl-pnet-ssh::ssh-client-channel-last-used client) (- now 5))
+      (cl-pnet-ssh::ssh-client-channel-timeout-tick client)
+      (is (eq :closed (cl-pnet-ssh::ssh-channel-state first)))
+      (is (eq :closed (cl-pnet-ssh::ssh-channel-state second)))
+      (cl-pnet-ssh::ssh-client-stop-timers client))))

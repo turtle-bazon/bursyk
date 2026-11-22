@@ -113,6 +113,19 @@ mean the feature is off to MAKE-SSH-CLIENT."
   "VALUE as a non-negative count, or NIL when it was not configured."
   (and (integerp value) value))
 
+(defun ssh-config-client-channel-timeouts (options)
+  "OPTIONS' ChannelTimeout as (PATTERN . SECONDS) pairs, or NIL for none.
+
+The parser kept the arguments as written so -G can reprint them; the client
+wants the resolved seconds and the pattern.  \"none\" is stored apart from a
+list and disables every timeout."
+  (let ((value (ssh-config-options-channel-timeouts options)))
+    (when (consp value)
+      (loop for argument in value
+            for equals = (position #\= argument)
+            collect (cons (subseq argument 0 equals)
+                          (ssh-parse-time (subseq argument (1+ equals))))))))
+
 (defun ssh-config-client-algorithms (options accessor supported option
                                      &key (all supported))
   "OPTIONS' algorithm choice as this build's ordered offer, or NIL for default.
@@ -229,6 +242,8 @@ MAKE-SSH-CLIENT's own defaults."
                                   (ssh-config-client-policy options)))
         :host-key-callback host-key-callback
         :batch-mode (ssh-config-options-batch-mode options)
+        :channel-timeouts
+        (ssh-config-client-channel-timeouts options)
         :connect-timeout
         (ssh-config-client-seconds
          (ssh-config-options-connect-timeout options))
@@ -497,6 +512,7 @@ uses whichever of the two it saw first instead of chaining them."
            :host-key-policy (getf parameters :host-key-policy)
            :host-key-callback (getf parameters :host-key-callback)
            :batch-mode (getf parameters :batch-mode)
+           :channel-timeouts (getf parameters :channel-timeouts)
            :kex-algorithms (getf parameters :kex-algorithms)
            :host-key-algorithms (getf parameters :host-key-algorithms)
            :ciphers (getf parameters :ciphers)

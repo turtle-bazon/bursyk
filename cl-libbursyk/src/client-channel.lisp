@@ -57,6 +57,7 @@ runs once the peer has confirmed the channel, before any of its data."
                    :on-exit on-exit
                    :on-close on-close :on-error on-error)))
     (incf (ssh-client-next-channel-id client))
+    (setf (ssh-client-channel-last-used client) (ssh-client-now))
     (setf (gethash id (ssh-client-channels client)) channel)
     (ssh-client-run-when-ready
      client (lambda () (ssh-channel-send channel (ssh-channel-open-payload channel))))
@@ -104,7 +105,8 @@ runs once the peer has confirmed the channel, before any of its data."
    :fields (lambda (writer)
              (ssh-write-text writer "exec")
              (ssh-write-boolean writer t)
-             (ssh-write-text writer command))))
+             (ssh-write-text writer command)))
+  (ssh-channel-set-x-type channel "session:command"))
 
 (defun ssh-channel-send-subsystem (channel subsystem)
   "Ask the peer to run SUBSYSTEM on CHANNEL's session."
@@ -113,7 +115,9 @@ runs once the peer has confirmed the channel, before any of its data."
    :fields (lambda (writer)
              (ssh-write-text writer "subsystem")
              (ssh-write-boolean writer t)
-             (ssh-write-text writer subsystem))))
+             (ssh-write-text writer subsystem)))
+  (ssh-channel-set-x-type
+   channel (concatenate 'string "session:subsystem:" subsystem)))
 
 (defun ssh-channel-send-env (channel name value)
   "Ask the peer to set NAME=VALUE for commands on CHANNEL's session."
@@ -177,7 +181,8 @@ side is known to accept."
 
 (defun ssh-channel-flush (channel)
   "Send as much queued data as the peer's window and packet size allow."
-  (let ((queue (ssh-channel-write-queue channel)))
+  (let ((queue (ssh-channel-write-queue channel))
+        (sent nil))
     (iter (while (and (eq (ssh-channel-state channel) :open)
                       (plusp (fill-pointer queue))
                       (plusp (ssh-channel-remote-window channel))))
@@ -189,7 +194,10 @@ side is known to accept."
            channel +ssh-msg-channel-data+
            :fields (lambda (writer) (ssh-write-string writer chunk))))
         (decf (ssh-channel-remote-window channel) count)
-        (ssh-channel-drop-queue channel count)))
+        (ssh-channel-drop-queue channel count)
+        (setf sent t)))
+    (when sent
+      (ssh-client-channel-note-activity channel))
     (ssh-channel-after-queue channel)))
 
 (defun ssh-channel-after-queue (channel)
@@ -306,6 +314,7 @@ side is known to accept."
             (incf (ssh-client-next-channel-id client))
             (setf (gethash id (ssh-client-channels client)) channel)
             (ssh-client-confirm-channel channel)
+            (ssh-client-channel-start-timeout channel)
             (ssh-client-connect-forward-target channel host port)
             channel)))))
 
@@ -340,6 +349,7 @@ CHANNEL, or NIL to refuse the request."
           (incf (ssh-client-next-channel-id client))
           (setf (gethash id (ssh-client-channels client)) channel)
           (ssh-client-confirm-channel channel)
+          (ssh-client-channel-start-timeout channel)
           (funcall setup channel)
           channel))))
 
@@ -389,6 +399,7 @@ CHANNEL, or NIL to refuse the request."
   "Move channel data to a forwarded-tcpip CHANNEL's local socket."
   (let ((data (ssh-read-string reader))
         (target (ssh-channel-target channel)))
+    (ssh-client-channel-note-activity channel)
     (decf (ssh-channel-local-window channel) (length data))
     (ssh-channel-adjust-window channel (length data))
     (when target
@@ -423,6 +434,10 @@ CHANNEL, or NIL to refuse the request."
         (ssh-channel-remote-window channel) (ssh-read-u32 reader)
         (ssh-channel-remote-max-packet channel) (ssh-read-u32 reader)
         (ssh-channel-state channel) :open)
+  ;; Start the inactivity clock before the queued session request labels the
+  ;; channel, so the label can override the plain type's timeout, as ssh's
+  ;; channel_set_xtype does after the request is sent.
+  (ssh-client-channel-start-timeout channel)
   (let ((env (ssh-channel-pending-env channel))
         (exec (ssh-channel-pending-exec channel))
         (subsystem (ssh-channel-pending-subsystem channel)))
@@ -459,6 +474,7 @@ CHANNEL, or NIL to refuse the request."
                    (if (= (ssh-read-u32 reader) 1) :stderr :other)
                    :stdout))
          (data (ssh-read-string reader)))
+    (ssh-client-channel-note-activity channel)
     (decf (ssh-channel-local-window channel) (length data))
     (when (eq kind :other)
       (ssh-channel-adjust-window channel (length data))
@@ -498,6 +514,7 @@ CHANNEL, or NIL to refuse the request."
       (setf (ssh-channel-target channel) nil))
     (remhash (ssh-channel-local-id channel)
              (ssh-client-channels (ssh-channel-client channel)))
+    (ssh-client-note-channel-change (ssh-channel-client channel))
     (when (ssh-channel-on-close channel)
       (funcall (ssh-channel-on-close channel) channel
                (ssh-channel-exit-status channel)))))

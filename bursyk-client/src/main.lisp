@@ -2495,6 +2495,14 @@ peer that connected to it; NIL refuses the channel."
                  "info")))
     (dolist (line (cl-pnet-ssh:ssh-config-options-log-verbose options))
       (format t "logverbose ~A~%" line))
+    (format t "channeltimeout")
+    (let ((timeouts
+            (cl-pnet-ssh:ssh-config-options-channel-timeouts options)))
+      (if (consp timeouts)
+          (dolist (argument timeouts)
+            (format t " ~A" argument))
+          (format t " none")))
+    (format t "~%")
     (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
       (when local
         (format t "localcommand ~A~%" local)))

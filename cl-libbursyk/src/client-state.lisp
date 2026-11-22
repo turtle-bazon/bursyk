@@ -144,6 +144,13 @@
   (alive-misses 0)
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
+  ;; ChannelTimeout: (PATTERN . SECONDS) pairs from ssh_config; a "global"
+  ;; pattern bounds the whole connection, and NIL means no timeout at all.
+  (channel-timeouts nil)
+  channel-timeout-timer
+  ;; The connection-wide activity clock for a "global" ChannelTimeout; a new
+  ;; channel resets it, as ssh's channel_register_fds does.
+  (channel-last-used nil)
   (pending-actions nil)
   ;; Global requests sent by us, oldest first; the peer answers in order.
   (pending-global-requests nil)
@@ -169,6 +176,13 @@
   local-id
   (remote-id nil)
   (type "session")
+  ;; ChannelTimeout support: the extended type a session request gives the
+  ;; channel ("session:command", "session:subsystem:git-upload-pack", ...),
+  ;; the resolved inactivity limit in seconds, and when it was last used.
+  ;; A limit of 0, or no LAST-USED, means the channel does not time out.
+  (x-type nil)
+  (inactive-timeout 0)
+  (last-used nil)
   (open-extra (make-array 0 :element-type '(unsigned-byte 8)))
   (state :opening)
   (remote-window 0)
@@ -235,13 +249,15 @@
   nil)
 
 (defun ssh-client-stop-timers (client)
-  "Disarm CLIENT's connect timeout and keepalive timer, once."
+  "Disarm CLIENT's connection timers, once."
   (setf (ssh-client-connect-timer client)
         (ssh-client-cancel-timer (ssh-client-connect-timer client))
         (ssh-client-retry-timer client)
         (ssh-client-cancel-timer (ssh-client-retry-timer client))
         (ssh-client-alive-timer client)
-        (ssh-client-cancel-timer (ssh-client-alive-timer client))))
+        (ssh-client-cancel-timer (ssh-client-alive-timer client))
+        (ssh-client-channel-timeout-timer client)
+        (ssh-client-cancel-timer (ssh-client-channel-timeout-timer client))))
 
 (defun ssh-client-start-connect-timer (client)
   "Fail CLIENT when ConnectTimeout seconds pass before authentication.
@@ -311,6 +327,161 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
                        :detail (format nil "server ~A stopped responding"
                                        (ssh-client-host client))))
                      (ssh-client-send-keepalive client)))))))))
+
+;;; ---- Channel inactivity timeouts ----
+;;;
+;;; OpenSSH's ChannelTimeout closes a channel that has seen no traffic for
+;;; its pattern's interval, and a "global" interval closes every channel once
+;;; none of them has been used for that long.  One timer for the connection is
+;;; enough: activity only moves LAST-USED, so a timer that fires early simply
+;;; recomputes and rearms.
+
+(defun ssh-client-now ()
+  "Monotonic time in seconds, for the channel timers."
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun ssh-client-channel-list (client)
+  "The channels CLIENT currently has, in no particular order."
+  (loop for channel being the hash-values of (ssh-client-channels client)
+        collect channel))
+
+(defun ssh-client-channel-type-timeout (client type)
+  "CLIENT's ChannelTimeout for channel TYPE in seconds, or NIL.
+
+The first pattern matching TYPE wins, as ssh's lookup_timeout returns the
+first match.  Unlike sshd's older session:shell aliases, the client's extended
+types are already specific (session:command, session:subsystem:NAME), and ssh
+matches them literally, so \"session\" alone selects the plain channel type
+and leaves those labels to their own patterns."
+  (let ((timeouts (ssh-client-channel-timeouts client)))
+    (when (consp timeouts)
+      (loop for (pattern . seconds) in timeouts
+            when (and (not (string= pattern "global"))
+                      (ssh-match-pattern pattern type))
+              return seconds))))
+
+(defun ssh-client-global-channel-timeout (client)
+  "CLIENT's global ChannelTimeout in seconds, or NIL when none is set.
+
+ssh's channel_add_timeout assigns the global deadline for every "global"
+entry, so a repeated pattern keeps the last value."
+  (let ((timeouts (ssh-client-channel-timeouts client))
+        (seconds nil))
+    (when (consp timeouts)
+      (loop for (pattern . value) in timeouts
+            when (string= pattern "global")
+              do (setf seconds value))
+      seconds)))
+
+(defun ssh-client-channel-note-activity (channel)
+  "Move CHANNEL's and its connection's inactivity clocks to now."
+  (when (eq (ssh-channel-state channel) :open)
+    (let ((now (ssh-client-now)))
+      (setf (ssh-channel-last-used channel) now
+            (ssh-client-channel-last-used (ssh-channel-client channel))
+            now))))
+
+(defun ssh-client-channel-start-timeout (channel)
+  "Start CHANNEL's inactivity clock from now.
+
+ssh starts it when the channel becomes usable, whether we or the peer opened
+it, and a new channel also resets the connection-wide clock."
+  (when (eq (ssh-channel-state channel) :open)
+    (let ((client (ssh-channel-client channel))
+          (now (ssh-client-now)))
+      (setf (ssh-channel-last-used channel) now
+            (ssh-client-channel-last-used client) now
+            (ssh-channel-inactive-timeout channel)
+            (or (ssh-client-channel-type-timeout
+                 client (ssh-channel-type channel))
+                0))
+      (ssh-client-note-channel-change client))))
+
+(defun ssh-channel-set-x-type (channel type)
+  "Give CHANNEL ssh's extended type and re-resolve its inactivity limit.
+
+Only a specific, non-zero match overrides the limit the channel already had,
+as ssh's channel_set_xtype does; the activity clock keeps running from the
+last byte, so a channel already idle longer than the new limit expires at
+once."
+  (setf (ssh-channel-x-type channel) type)
+  (when (eq (ssh-channel-state channel) :open)
+    (let* ((client (ssh-channel-client channel))
+           (seconds (ssh-client-channel-type-timeout client type)))
+      (when (and seconds (plusp seconds))
+        (setf (ssh-channel-inactive-timeout channel) seconds))
+      (ssh-client-refresh-channel-timeout-timer client))))
+
+(defun ssh-client-stop-channel-timeout-timer (client)
+  "Disarm CLIENT's ChannelTimeout timer."
+  (setf (ssh-client-channel-timeout-timer client)
+        (ssh-client-cancel-timer
+         (ssh-client-channel-timeout-timer client))))
+
+(defun ssh-client-refresh-channel-timeout-timer (client)
+  "Arm CLIENT's timer for the earliest open-channel inactivity deadline."
+  (let ((earliest nil)
+        (now (ssh-client-now))
+        (timeouts (ssh-client-channel-timeouts client)))
+    (when (and (not (ssh-client-closed client)) (consp timeouts))
+      (let ((open nil))
+        (dolist (channel (ssh-client-channel-list client))
+          (let ((used (ssh-channel-last-used channel))
+                (limit (ssh-channel-inactive-timeout channel)))
+            (when (eq (ssh-channel-state channel) :open)
+              (setf open t)
+              (when (and used (plusp limit))
+                (let ((deadline (+ used limit)))
+                  (when (or (null earliest) (< deadline earliest))
+                    (setf earliest deadline)))))))
+        ;; A global timeout runs from the newest activity on any channel,
+        ;; closed ones included, and only matters while one is open.
+        (let ((global (ssh-client-global-channel-timeout client))
+              (last-used (ssh-client-channel-last-used client)))
+          (when (and open global (plusp global) last-used)
+            (let ((deadline (+ last-used global)))
+              (when (or (null earliest) (< deadline earliest))
+                (setf earliest deadline)))))))
+    (ssh-client-stop-channel-timeout-timer client)
+    (when earliest
+      (setf (ssh-client-channel-timeout-timer client)
+            (cl-pnet:timer-start
+             (max 0.05 (- earliest now)) 0
+             (lambda ()
+               (setf (ssh-client-channel-timeout-timer client) nil)
+               (ssh-client-channel-timeout-tick client)))))))
+
+(defun ssh-client-channel-timeout-tick (client)
+  "Close every open channel whose ChannelTimeout has expired.
+
+Per-channel limits are checked first; a global timeout then closes all
+channels that remain, as ssh's channel_handler does with the shorter of the
+channel and global deadlines."
+  (let ((now (ssh-client-now)))
+    (dolist (channel (ssh-client-channel-list client))
+      (let ((used (ssh-channel-last-used channel))
+            (limit (ssh-channel-inactive-timeout channel)))
+        (when (and (eq (ssh-channel-state channel) :open)
+                   used (plusp limit)
+                   (>= now (+ used limit)))
+          (ssh-log "channel ~D: closing after ~A seconds of inactivity"
+                   (ssh-channel-local-id channel) limit)
+          (ssh-channel-handle-close channel))))
+    (let ((global (ssh-client-global-channel-timeout client))
+          (last-used (ssh-client-channel-last-used client)))
+      (when (and global (plusp global) last-used
+                 (>= now (+ last-used global)))
+        (dolist (channel (ssh-client-channel-list client))
+          (when (eq (ssh-channel-state channel) :open)
+            (ssh-log "closing channel ~D: global ChannelTimeout expired"
+                     (ssh-channel-local-id channel))
+            (ssh-channel-handle-close channel))))))
+  (ssh-client-refresh-channel-timeout-timer client))
+
+(defun ssh-client-note-channel-change (client)
+  "React to CLIENT's channels opening or closing."
+  (unless (ssh-client-closed client)
+    (ssh-client-refresh-channel-timeout-timer client)))
 
 (defun ssh-client-finish (client reason kind)
   "Close CLIENT once, reporting REASON through the callback KIND selects."

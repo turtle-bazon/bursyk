@@ -213,6 +213,7 @@
    #:ssh-config-options-session-type
    #:ssh-config-options-stdin-null
    #:ssh-config-options-fork-after-authentication
+   #:ssh-config-options-channel-timeouts
    #:ssh-config-options-control-master
    #:ssh-config-options-control-path
    #:ssh-config-options-control-persist
