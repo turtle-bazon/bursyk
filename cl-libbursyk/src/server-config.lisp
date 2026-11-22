@@ -122,9 +122,6 @@ socket address and has no routing domains.")
 ;;; would change behaviour this build does not have, so it is refused.
 (defparameter +ssh-server-config-accepted-off-keywords+
   '(("permittunnel" . "no")
-    ("passwordauthentication" . "no")
-    ("kbdinteractiveauthentication" . "no")
-    ("challengeresponseauthentication" . "no")
     ("skeyauthentication" . "no")
     ("usepam" . "no")
     ("permitemptypasswords" . "no")
@@ -154,9 +151,15 @@ socket address and has no routing domains.")
   ;; HostKey's public keys; sshd pairs them at startup and drops the rest.
   (host-certificate-files '())
   ;; AuthenticationMethods: NIL when absent, :ANY for the "any" pseudo-method,
-  ;; or a list of comma-separated method-list strings.  Only lists this
-  ;; server can complete (publickey) are usable at connection time.
+  ;; or a list of comma-separated method-list strings.  A list naming a method
+  ;; this server can complete (publickey, hostbased, password,
+  ;; keyboard-interactive) is usable at connection time.
   (authentication-methods nil)
+  ;; PasswordAuthentication and KbdInteractiveAuthentication.  :YES, :NO, or
+  ;; NIL for sshd's default of yes.  They only matter when the application
+  ;; supplied the matching authentication hook.
+  (password-authentication nil)
+  (kbd-interactive-authentication nil)
   ;; NIL means the default; sshd's "none" entries are skipped, so a list of
   ;; only "none" disables public-key authentication.
   (authorized-keys-files nil)
@@ -371,9 +374,10 @@ carrying = or a space cannot be passed to execve safely."
     "gssapi-with-mic")
   "The method names OpenSSH's authmethods table accepts.
 
-Only publickey can actually complete on this server; the others are still
-valid in the file, and a list that needs one is skipped at connection time
-as sshd skips a list naming a disabled method.")
+publickey, hostbased, password and keyboard-interactive can complete on this
+server when the matching hook or key list is configured; gssapi-with-mic and
+none are still valid in the file, and a list that needs one is skipped at
+connection time as sshd skips a list naming a disabled method.")
 
 (defun ssh-server-config-check-authentication-methods (line argument)
   "Refuse ARGUMENT unless it is a comma-separated list of known methods."
@@ -961,6 +965,22 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'authorized-principals-command-user
         (ssh-server-config-one-argument line)))
+      ((string= keyword "passwordauthentication")
+       (ssh-server-config-set-once
+        config 'password-authentication
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((member keyword '("kbdinteractiveauthentication"
+                         "challengeresponseauthentication")
+               :test #'string=)
+       ;; ChallengeResponseAuthentication is the obsolete name sshd maps to
+       ;; KbdInteractiveAuthentication; the first of the two wins.
+       (ssh-server-config-set-once
+        config 'kbd-interactive-authentication
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
       ((string= keyword "hostbasedauthentication")
        (ssh-server-config-set-once
         config 'hostbased-authentication

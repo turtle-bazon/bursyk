@@ -546,6 +546,13 @@ already a numeric address, just as BURZAY does."
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
+                                 (password-authentication t)
+                                 (kbd-interactive-authentication t)
+                                 number-of-password-prompts
+                                 preferred-authentications
+                                 (pubkey-authentication t)
+                                 password-callback
+                                 kbd-interactive-callback
                                  (canonicalize-hostname :no)
                                  (canonical-domains '())
                                  (canonicalize-max-dots 1)
@@ -626,6 +633,14 @@ already a numeric address, just as BURZAY does."
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
                     :hostbased-keys hostbased-keys
+                    :password-authentication password-authentication
+                    :kbd-interactive-authentication
+                    kbd-interactive-authentication
+                    :number-of-password-prompts number-of-password-prompts
+                    :preferred-authentications preferred-authentications
+                    :pubkey-authentication pubkey-authentication
+                    :password-callback password-callback
+                    :kbd-interactive-callback kbd-interactive-callback
                     :canonicalize-hostname canonicalize-hostname
                     :canonical-domains canonical-domains
                     :canonicalize-max-dots canonicalize-max-dots
@@ -717,7 +732,9 @@ is applied here, before any request names a key the configuration forbade."
                      (ssh-client-pubkey-accepted-algorithms client)
                      :minimum-rsa-size (ssh-client-required-rsa-size client))))
        (if (and (null signers)
-                (null (ssh-client-hostbased-key client)))
+                (null (ssh-client-hostbased-key client))
+                (null (ssh-client-password-callback client))
+                (null (ssh-client-kbd-interactive-callback client)))
            (ssh-client-fail
             client
             (make-condition
@@ -727,7 +744,9 @@ is applied here, before any request names a key the configuration forbade."
              (setf (ssh-client-signers client) signers)
              (ssh-open-connection client)))))
    (lambda (condition)
-     (if (ssh-client-hostbased-key client)
+     (if (or (ssh-client-hostbased-key client)
+             (ssh-client-password-callback client)
+             (ssh-client-kbd-interactive-callback client))
          (ssh-open-connection client)
          (ssh-client-fail client condition)))
    :add-keys-to-agent
@@ -771,6 +790,13 @@ is applied here, before any request names a key the configuration forbade."
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
+                             (password-authentication t)
+                             (kbd-interactive-authentication t)
+                             number-of-password-prompts
+                             preferred-authentications
+                             (pubkey-authentication t)
+                             password-callback
+                             kbd-interactive-callback
                              (canonicalize-hostname :no)
                              (canonical-domains '())
                              (canonicalize-max-dots 1)
@@ -838,6 +864,16 @@ it replaced.  This client has no X Security extension, so -X cannot create
 the weaker untrusted cookie sshd's -X would; the forwarded display has the
 same access as the local session.  XAUTH-LOCATION is accepted for ssh_config
 parity; cookies are read from $XAUTHORITY or ~/.Xauthority directly.
+
+PASSWORD-AUTHENTICATION and KBD-INTERACTIVE-AUTHENTICATION default to true,
+as ssh_config does.  PASSWORD-CALLBACK is a function of (CLIENT PROMPT)
+returning the password to send, or NIL to skip the method; the prompt is
+already formatted as ssh's.  KBD-INTERACTIVE-CALLBACK is a function of
+(CLIENT NAME INSTRUCTION PROMPTS), each prompt being (TEXT ECHO-P), returning
+one answer per prompt or NIL to cancel.  NUMBER-OF-PASSWORD-PROMPTS bounds
+the password attempts (default 3), and PREFERRED-AUTHENTICATIONS orders the
+methods the server offers.  BatchMode suppresses both methods without calling
+their callbacks, as ssh does.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY every default identity file that exists
@@ -929,6 +965,17 @@ role-neutral."
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms
                            :hostbased-keys hostbased-keys
+                           :password-authentication password-authentication
+                           :kbd-interactive-authentication
+                           kbd-interactive-authentication
+                           :number-of-password-prompts
+                           number-of-password-prompts
+                           :preferred-authentications
+                           preferred-authentications
+                           :pubkey-authentication pubkey-authentication
+                           :password-callback password-callback
+                           :kbd-interactive-callback
+                           kbd-interactive-callback
                            :canonicalize-hostname canonicalize-hostname
                            :canonical-domains canonical-domains
                            :canonicalize-max-dots canonicalize-max-dots

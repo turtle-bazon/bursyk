@@ -151,6 +151,8 @@ presented."
                           authorize
                           authorize-user
                           hostbased-key-allowed
+                          authorize-password
+                          authorize-keyboard-interactive
                           sshd-config
                           user-groups
                           banner
@@ -202,6 +204,14 @@ AUTHORIZE-USER is a function of (SESSION USER) answering whether the
 account may try to authenticate at all; it runs before any method and its
 answer is cached for that name, which is where AllowUsers, DenyUsers and
 PermitRootLogin belong.
+
+AUTHORIZE-PASSWORD is a function of (SESSION USER PASSWORD) answering whether
+a password request may finish the login; PasswordAuthentication must also not
+be off.  AUTHORIZE-KEYBOARD-INTERACTIVE is a function of (SESSION USER
+REQUEST) returning :SUCCESS, :FAILURE, or a plist (:NAME :INSTRUCTION
+:PROMPTS) for the next challenge, where each prompt is (TEXT ECHO-P) and
+REQUEST's :RESPONSES holds the previous round's answers.  Both are optional;
+a method with no hook is never advertised.
 
 SSHD-CONFIG is the parsed sshd_config whose Match blocks are resolved for
 each connection once its account name is known; USER-GROUPS is a function of
@@ -297,6 +307,9 @@ listener and sets DISPLAY in the session's environment."
                   :authorize authorize
                   :authorize-user authorize-user
                   :hostbased-key-allowed hostbased-key-allowed
+                  :authorize-password authorize-password
+                  :authorize-keyboard-interactive
+                  authorize-keyboard-interactive
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

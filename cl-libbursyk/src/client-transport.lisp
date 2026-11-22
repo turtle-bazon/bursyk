@@ -140,6 +140,8 @@ line, and NIL while the line is still incomplete."
        (ssh-client-handle-service-accept client payload))
       ((= type +ssh-msg-userauth-banner+)
        (ssh-client-handle-banner client payload))
+      ((= type +ssh-msg-userauth-info-request+)
+       (ssh-client-handle-info-request client payload))
       ((= type +ssh-msg-userauth-success+)
        (ssh-client-handle-auth-success client))
       ((= type +ssh-msg-userauth-failure+)
@@ -1057,8 +1059,7 @@ request goes out from the callback rather than from this function's tail."
                      (ssh-write-octets writer unsigned)
                      (ssh-writer-output writer)))
              (signature (ssh-private-key-signature-blob key data)))
-        (setf (ssh-client-hostbased-tried client) t
-              (ssh-client-last-auth-method client) "hostbased")
+        (setf (ssh-client-last-auth-method client) "hostbased")
         (let ((writer (ssh-writer)))
           (ssh-write-octets writer unsigned)
           (ssh-write-string writer signature)
@@ -1066,13 +1067,173 @@ request goes out from the callback rather than from this function's tail."
     (error (condition)
       (ssh-client-fail client condition))))
 
+(defparameter +ssh-client-auth-method-order+
+  '("hostbased" "publickey" "keyboard-interactive" "password")
+  "Methods to try, in OpenSSH's order, when PreferredAuthentications is unset.")
+
+(defun ssh-client-auth-option-on-p (value)
+  "Whether an authentication switch VALUE leaves its method on.
+
+The library accepts T and NIL from programs and ssh_config's :YES and :NO
+from the configuration layer, so neither spelling can turn :NO into truth."
+  (not (or (null value) (eq value :no))))
+
+(defun ssh-client-auth-method-enabled-p (client method)
+  "Whether CLIENT may try METHOD.
+
+BatchMode forbids the two interactive methods entirely, so their callbacks
+are never called when the user asked not to be asked anything."
+  (cond
+    ((string= method "hostbased")
+     (and (ssh-client-auth-option-on-p
+           (ssh-client-hostbased-authentication client))
+          (ssh-client-hostbased-key client)))
+    ((string= method "publickey")
+     (ssh-client-auth-option-on-p (ssh-client-pubkey-authentication client)))
+    ((string= method "keyboard-interactive")
+     (and (ssh-client-auth-option-on-p
+           (ssh-client-kbd-interactive-authentication client))
+          (not (ssh-client-batch-mode client))
+          (ssh-client-kbd-interactive-callback client)))
+    ((string= method "password")
+     (and (ssh-client-auth-option-on-p
+           (ssh-client-password-authentication client))
+          (not (ssh-client-batch-mode client))
+          (ssh-client-password-callback client)))
+    (t nil)))
+
+(defun ssh-client-auth-method-order (client)
+  "The methods CLIENT may try, in the order it should try them."
+  (let ((preferred (ssh-client-preferred-authentications client)))
+    (remove-if-not (lambda (method)
+                     (ssh-client-auth-method-enabled-p client method))
+                   (or preferred +ssh-client-auth-method-order+))))
+
+(defun ssh-client-next-auth-method (client)
+  "Make the next untried method CLIENT may try current, and return it.
+
+A method the last USERAUTH_FAILURE did not name is skipped when the server
+has told us what it accepts, so a PreferredAuthentications list cannot make
+the client prompt for a method the server refused."
+  (let ((offered (ssh-client-auth-offered-methods client)))
+    (loop for method in (ssh-client-auth-method-order client)
+          unless (member method (ssh-client-auth-methods-tried client)
+                         :test #'string=)
+          unless (and offered (not (member method offered :test #'string=)))
+          do (setf (ssh-client-auth-method client) method)
+             (push method (ssh-client-auth-methods-tried client))
+             (return method))))
+
+(defun ssh-client-send-next-auth-method (client)
+  "Give up on the current method and start the next one."
+  (setf (ssh-client-auth-method client) nil)
+  (ssh-client-send-auth-request client))
+
+(defun ssh-client-password-prompt (client)
+  "The prompt ssh shows before reading a password."
+  (format nil "~A@~A's password: "
+          (ssh-client-user client) (ssh-client-host client)))
+
+(defun ssh-client-send-password-request (client)
+  "Ask CLIENT's PASSWORD-CALLBACK for a password and offer it."
+  (let ((password
+          (funcall (ssh-client-password-callback client)
+                   client (ssh-client-password-prompt client))))
+    (if (null password)
+        (ssh-client-send-next-auth-method client)
+        (progn
+          (incf (ssh-client-password-attempts client))
+          (setf (ssh-client-last-auth-method client) "password")
+          (let ((writer (ssh-writer)))
+            (ssh-write-u8 writer +ssh-msg-userauth-request+)
+            (ssh-write-text writer (ssh-client-user client))
+            (ssh-write-text writer "ssh-connection")
+            (ssh-write-text writer "password")
+            ;; FALSE: this client cannot change an expired password.
+            (ssh-write-boolean writer nil)
+            (ssh-write-text writer password)
+            (ssh-client-send-payload client (ssh-writer-output writer)))))))
+
+(defun ssh-client-send-kbd-interactive-request (client)
+  "Start a keyboard-interactive exchange with no preferred submethods."
+  (setf (ssh-client-last-auth-method client) "keyboard-interactive")
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-userauth-request+)
+    (ssh-write-text writer (ssh-client-user client))
+    (ssh-write-text writer "ssh-connection")
+    (ssh-write-text writer "keyboard-interactive")
+    (ssh-write-text writer "")
+    (ssh-write-text writer "")
+    (ssh-client-send-payload client (ssh-writer-output writer))))
+
+(defun ssh-client-handle-info-request (client payload)
+  "Answer a keyboard-interactive INFO_REQUEST through KBD-INTERACTIVE-CALLBACK."
+  (unless (string= (or (ssh-client-last-auth-method client) "")
+                   "keyboard-interactive")
+    (error 'ssh-protocol-error
+           :detail "unexpected USERAUTH_INFO_REQUEST"))
+  (let* ((reader (ssh-make-reader payload))
+         (type (ssh-read-u8 reader))
+         (name (ssh-read-text reader))
+         (instruction (ssh-read-text reader))
+         (language (ssh-read-text reader))
+         (count (ssh-read-u32 reader))
+         (prompts '()))
+    (declare (ignore type language))
+    (when (>= count 1024)
+      (error 'ssh-protocol-error
+             :detail "USERAUTH_INFO_REQUEST has too many prompts"))
+    (dotimes (index count)
+      (declare (ignore index))
+      (push (list (ssh-read-text reader) (ssh-read-boolean reader)) prompts))
+    (setf prompts (nreverse prompts))
+    (let ((answers
+            (funcall (ssh-client-kbd-interactive-callback client)
+                     client name instruction prompts)))
+      (cond
+        ;; A zero-prompt INFO_REQUEST only displays a message; NIL is then an
+        ;; empty answer list, not a cancellation.
+        ((and (null answers) (plusp count))
+         (ssh-client-fail
+          client
+          (make-condition 'ssh-authentication-error
+                          :detail "keyboard-interactive cancelled")))
+        ((/= (length (or answers '())) count)
+         (error 'ssh-protocol-error
+                :detail "keyboard-interactive answer count does not match"))
+        (t
+         (let ((writer (ssh-writer)))
+           (ssh-write-u8 writer +ssh-msg-userauth-info-response+)
+           (ssh-write-u32 writer count)
+           (dolist (answer answers)
+             (ssh-write-text writer answer))
+           (ssh-client-send-payload client (ssh-writer-output writer))))))))
+
 (defun ssh-client-send-auth-request (client)
-  "Try hostbased first when enabled, then publickey."
-  (if (and (ssh-client-hostbased-authentication client)
-           (not (ssh-client-hostbased-tried client))
-           (ssh-client-hostbased-key client))
-      (ssh-client-send-hostbased-request client)
-      (ssh-client-send-publickey-request client)))
+  "Start the next permitted authentication method."
+  (let ((method (or (ssh-client-auth-method client)
+                    (ssh-client-next-auth-method client))))
+    (cond
+      ((null method)
+       (ssh-client-fail
+        client
+        (make-condition
+         'ssh-authentication-error
+         :detail
+         (if (ssh-client-auth-offered-methods client)
+             (format nil "server accepts ~{~A~^, ~}"
+                     (ssh-client-auth-offered-methods client))
+             "server refused every authentication method"))))
+      ((string= method "hostbased")
+       (ssh-client-send-hostbased-request client))
+      ((string= method "publickey")
+       (if (ssh-client-current-signer client)
+           (ssh-client-send-publickey-request client)
+           (ssh-client-send-next-auth-method client)))
+      ((string= method "keyboard-interactive")
+       (ssh-client-send-kbd-interactive-request client))
+      ((string= method "password")
+       (ssh-client-send-password-request client)))))
 
 (defun ssh-client-handle-banner (client payload)
   "Store a USER AUTH BANNER, which the program shows as it likes.
@@ -1109,27 +1270,54 @@ has no use for it either."
       t)))
 
 (defun ssh-client-handle-auth-failure (client payload)
+  "Advance after one refused authentication attempt.
+
+The failure names the methods the server will still consider.  A
+partial-success flag means one method of an AuthenticationMethods list
+finished; the next request must use the method the server now names, which
+may even be the same method with a second key."
   (let* ((reader (ssh-make-reader payload))
          (methods (progn (ssh-read-u8 reader) (ssh-read-name-list reader)))
-         ;; RFC 4252's partial-success flag: one method of an
-         ;; AuthenticationMethods list is done and another must follow.
-         (partial (ssh-read-boolean reader)))
+         (partial (ssh-read-boolean reader))
+         (method (or (ssh-client-auth-method client) "")))
+    (setf (ssh-client-auth-offered-methods client) methods)
     (cond
-      ((string= (or (ssh-client-last-auth-method client) "") "hostbased")
+      ((string= method "hostbased")
        (setf (ssh-client-last-auth-method client) nil)
-       (ssh-log "hostbased rejected~:[~;; partial success~]; trying publickey"
+       (ssh-log "hostbased rejected~:[~;; partial success~]; trying the next method"
                 partial)
-       (ssh-client-send-auth-request client))
-      ((ssh-client-next-signer-p client)
-       (ssh-log "~:[publickey rejected~;partial success~]; trying the next key"
+       (ssh-client-send-next-auth-method client))
+      ((string= method "publickey")
+       (if (and (or (not partial)
+                    (member "publickey" methods :test #'string=))
+                (ssh-client-next-signer-p client))
+           (progn
+             (ssh-log "~:[publickey rejected~;partial success~]; trying the next key"
+                      partial)
+             (ssh-client-send-auth-request client))
+           (progn
+             ;; No key left, or the server now wants a different method.
+             (setf (ssh-client-auth-index client)
+                   (length (ssh-client-signers client)))
+             (ssh-log "publickey exhausted~:[~;; partial success~]"
+                      partial)
+             (ssh-client-send-next-auth-method client))))
+      ((string= method "password")
+       (if (and (< (ssh-client-password-attempts client)
+                   (or (ssh-client-number-of-password-prompts client) 3))
+                (or (null methods)
+                    (member "password" methods :test #'string=)))
+           (progn
+             (ssh-log "password rejected~:[~;; partial success~]; asking again"
+                      partial)
+             (ssh-client-send-auth-request client))
+           (ssh-client-send-next-auth-method client)))
+      ((string= method "keyboard-interactive")
+       (ssh-log "keyboard-interactive rejected~:[~;; partial success~]"
                 partial)
-       (ssh-client-send-auth-request client))
+       (ssh-client-send-next-auth-method client))
       (t
-       (ssh-client-fail
-        client
-        (make-condition 'ssh-authentication-error
-                        :detail (format nil "server accepts ~{~A~^, ~}"
-                                        methods)))))))
+       (ssh-client-send-next-auth-method client)))))
 
 (defun ssh-client-send-global-request (client name &key fields on-success
                                                      on-failure)

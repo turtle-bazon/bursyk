@@ -104,6 +104,9 @@
    #:ssh-session-permit-user-environment-p
    #:ssh-session-env-allowed-p
    #:ssh-server-authorize-user
+   #:ssh-server-authorize-password
+   #:ssh-server-authorize-keyboard-interactive
+   #:ssh-server-enabled-auth-methods
    #:ssh-server-session-channel-count
    #:ssh-server-channel
    #:ssh-server-channel-p
@@ -279,6 +282,8 @@
    #:ssh-server-config-host-key-agent
    #:ssh-server-config-host-certificate-files
    #:ssh-server-config-authentication-methods
+   #:ssh-server-config-password-authentication
+   #:ssh-server-config-kbd-interactive-authentication
    #:ssh-server-config-pubkey-auth-options
    #:ssh-server-config-max-pubkey-ok
    #:ssh-server-config-authorized-keys-files

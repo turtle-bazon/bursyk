@@ -1726,6 +1726,77 @@ than one account."
          (namestring (merge-pathnames ".Xauthority"
                                       (uiop:ensure-directory-pathname home))))))
 
+#-win32
+(cffi:define-foreign-library libcrypt
+  (:unix (:or "libcrypt.so.1" "libcrypt.so"))
+  (t (:default "libcrypt")))
+
+#-win32
+(cffi:defcfun ("crypt" c-crypt) :pointer (key :string) (salt :string))
+
+#-win32
+(defvar *libcrypt-loaded* nil
+  "Whether libcrypt was loaded; a system without one simply refuses passwords.")
+
+#-win32
+(defvar *crypt-lock* (bordeaux-threads:make-lock "crypt")
+  "crypt(3) keeps its result in static storage, so calls are serialised.")
+
+#-win32
+(defun crypt-password (password hash)
+  "PASSWORD encrypted with HASH's setting, or NIL when crypt(3) cannot."
+  (unless *libcrypt-loaded*
+    (setf *libcrypt-loaded*
+          (handler-case
+              (progn (cffi:load-foreign-library 'libcrypt) t)
+            (error () nil))))
+  (when *libcrypt-loaded*
+    (bordeaux-threads:with-lock-held (*crypt-lock*)
+      (let ((pointer (c-crypt password hash)))
+        (unless (cffi:null-pointer-p pointer)
+          (cffi:foreign-string-to-lisp pointer))))))
+
+#-win32
+(defun quick-string-equal-p (a b)
+  "Compare two strings without stopping at the first differing character."
+  (and (= (length a) (length b))
+       (let ((difference 0))
+         (dotimes (index (length a) (zerop difference))
+           (setf difference
+                 (logior difference
+                         (logxor (char-code (char a index))
+                                 (char-code (char b index)))))))))
+
+#-win32
+(defun password-hash-valid-p (password hash)
+  "Whether PASSWORD is the one HASH was made from.
+
+An account with no hash, a locked hash, or an empty password answer is
+refused; this server has no PermitEmptyPasswords backend."
+  (and (stringp password)
+       (plusp (length password))
+       (stringp hash)
+       (plusp (length hash))
+       (not (member (char hash 0) '(#\! #\*) :test #'char=))
+       (let ((computed (crypt-password password hash)))
+         (and computed (quick-string-equal-p computed hash)))))
+
+#-win32
+(defun shadow-password-hash (user)
+  "USER's hash from /etc/shadow, or NIL when unreadable or absent."
+  (when (and user (plusp (length user)))
+    (handler-case
+        (with-open-file (stream "/etc/shadow" :direction :input
+                                :if-does-not-exist nil)
+          (when stream
+            (loop for line = (read-line stream nil nil)
+                  while line
+                  for fields = (uiop:split-string line :separator ":")
+                  when (and (>= (length fields) 2)
+                            (string= (first fields) user))
+                    do (return (second fields)))))
+      (error () nil))))
+
 ;;; ---- authorized_keys ----
 ;;;
 ;;; AUTHORIZED-KEYS (-A) names one file for every user.  Without it, sshd's
@@ -1795,6 +1866,28 @@ user simply has no groups, so an AllowGroups rule then denies the login."
 #+win32
 (defun user-groups (user)
   (declare (ignore user))
+  nil)
+
+#-win32
+(defun user-password-hash (user)
+  "USER's stored password hash, from shadow when it exists.
+
+Older accounts keep the hash in /etc/passwd; a shadow entry that says
+\"x\" or is locked wins over that, as login(1) treats it."
+  (or (shadow-password-hash user)
+      (let ((fields (passwd-fields user)))
+        (and fields (nth 1 fields)))))
+
+#-win32
+(defun verify-user-password (user password)
+  "Whether PASSWORD is USER's account password."
+  (let ((hash (user-password-hash user)))
+    (and hash
+         (password-hash-valid-p password hash))))
+
+#+win32
+(defun verify-user-password (user password)
+  (declare (ignore user password))
   nil)
 
 #-win32
@@ -2131,7 +2224,10 @@ rhosts files are matched against."
          (lookup (if packet-only claimed (or peer "")))
          (host (if packet-only claimed (or peer "")))
          (ip (or peer "")))
-    (and (not (zerop (length lookup)))
+    (and ;; Hostbased has no authorized_keys options, so PermitRootLogin
+         ;; forced-commands-only cannot admit root through it.
+         (root-login-allowed-p session user "hostbased")
+         (not (zerop (length lookup)))
          (hostbased-rhosts-allowed-p
           session user client-user host ip)
          (hostbased-known-host-p session lookup key-blob))))
@@ -2533,13 +2629,16 @@ as the same authorized_keys format."
   "SESSION's peer address as text, or NIL when the backend did not report it."
   (getf (cl-pnet-ssh:ssh-session-remote-address session) :address))
 
-(defun root-login-allowed-p (session user)
-  "Whether PermitRootLogin admits USER at the start of authentication.
+(defun root-login-allowed-p (session user &optional (method "publickey"))
+  "Whether PermitRootLogin admits USER's METHOD at the start of authentication.
 
 A non-root user always passes.  Root under forced-commands-only also passes
-here, because sshd decides that mode once the authenticating key is known:
-only a key carrying command= may log root in, which APPROVED-AUTHORIZED-KEY
-checks after the key matches."
+for publickey, because sshd decides that mode once the authenticating key is
+known: only a key carrying command= may log root in, which
+APPROVED-AUTHORIZED-KEY checks after the key matches.  Password,
+keyboard-interactive and hostbased carry no forced command, so they cannot
+satisfy that mode.  METHOD matters for prohibit-password, which admits
+publickey and hostbased alone."
   (multiple-value-bind (home uid) (user-home-and-uid user)
     (declare (ignore home))
     (or (null uid)
@@ -2547,17 +2646,45 @@ checks after the key matches."
         (let ((mode (session-config-setting
                      session
                      #'cl-pnet-ssh:ssh-server-config-permit-root-login)))
-          (or (eq mode :forced-commands-only)
-              (cl-pnet-ssh:ssh-root-login-allowed-p mode "publickey"))))))
+          (or (and (eq mode :forced-commands-only)
+                   (string= method "publickey"))
+              (cl-pnet-ssh:ssh-root-login-allowed-p mode method))))))
 
-(defun user-allowed-p (session user)
+(defun user-allowed-p (session user &optional (method "publickey"))
   "Whether sshd's account policy admits USER from SESSION's peer."
-  (and (root-login-allowed-p session user)
+  (and (root-login-allowed-p session user method)
        (or (null (session-config session))
            (cl-pnet-ssh:ssh-server-user-allowed-p
             (session-config session) user
             (or (session-remote-ip session) "")
             (user-groups user)))))
+
+(defun password-authentication (session user password)
+  "Accept USER's account password, subject to the same account policy."
+  (and (user-allowed-p session user "password")
+       (verify-user-password user password)))
+
+(defun keyboard-interactive-authentication (session user request)
+  "Ask for the account password through keyboard-interactive, then check it.
+
+The first round names the prompt; the answer round uses the same account
+policy and crypt(3) check as PasswordAuthentication."
+  (let ((responses (getf request :responses))
+        (allowed (user-allowed-p session user "keyboard-interactive")))
+    (cond
+      ((null responses)
+       ;; Check root and AllowUsers/DenyUsers before prompting, so an account
+       ;; the policy refuses is not asked for a password first.
+       (if allowed
+           (list :name "bursyk-server"
+                 :instruction ""
+                 :prompts (list (list "Password: " nil)))
+           :failure))
+      ((not allowed)
+       :failure)
+      ((verify-user-password user (or (first responses) ""))
+       :success)
+      (t :failure))))
 
 ;;; ---- Banner ----
 
@@ -2675,6 +2802,8 @@ guess, so only an explicit PidFile is written."
            :authorize #'authorized-keys-p
            :authorize-user #'user-allowed-p
            :hostbased-key-allowed #'hostbased-key-allowed-p
+           :authorize-password #'password-authentication
+           :authorize-keyboard-interactive #'keyboard-interactive-authentication
            :sshd-config *server-config*
            :user-groups #'user-groups
            :permit-user-environment

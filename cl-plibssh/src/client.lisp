@@ -735,6 +735,13 @@ helper and hands back a socketpair to watch."
                           ciphers
                           macs
                           pubkey-accepted-algorithms
+                          (password-authentication t)
+                          (kbd-interactive-authentication t)
+                          number-of-password-prompts
+                          preferred-authentications
+                          (pubkey-authentication t)
+                          password-callback
+                          kbd-interactive-callback
                           on-open
                           on-error
                           on-close
@@ -771,6 +778,14 @@ stream on its pipes instead of dialling."
                  :ciphers ciphers
                  :macs macs
                  :pubkey-accepted-algorithms pubkey-accepted-algorithms
+                 :password-authentication password-authentication
+                 :kbd-interactive-authentication
+                 kbd-interactive-authentication
+                 :number-of-password-prompts number-of-password-prompts
+                 :preferred-authentications preferred-authentications
+                 :pubkey-authentication pubkey-authentication
+                 :password-callback password-callback
+                 :kbd-interactive-callback kbd-interactive-callback
                  :on-open on-open
                  :on-error on-error
                  :on-close on-close

@@ -66,6 +66,43 @@ must already know that stdin is a terminal."
             (when (and rows columns)
               (values rows columns))))))))
 
+(defun read-prompt-line (prompt &key (echo t))
+  "Write PROMPT to stderr and read one line from stdin.
+
+When ECHO is false and stdin is a terminal, the typed characters are not
+echoed.  NIL is returned at end of input, so a non-interactive caller can
+treat a closed stdin as a cancelled prompt rather than an empty answer."
+  (format *error-output* "~A" prompt)
+  (finish-output *error-output*)
+  (let ((saved (and (not echo) (stdin-terminal-p) (run-stty "-g"))))
+    (unwind-protect
+         (progn
+           (when saved (run-stty "-echo"))
+           (read-line *standard-input* nil nil))
+      (when saved
+        (run-stty saved))
+      (when (not echo)
+        (format *error-output* "~%")
+        (finish-output *error-output*)))))
+
+(defun read-keyboard-interactive-answers (name instruction prompts)
+  "Ask each of PROMPTS, a list of (TEXT ECHO-P), and return the answers.
+
+NAME and INSTRUCTION are shown first when the server supplied them, as ssh
+does.  NIL means the input ended before every prompt was answered."
+  (when (and name (plusp (length name)))
+    (format *error-output* "~A~%" name))
+  (when (and instruction (plusp (length instruction)))
+    (format *error-output* "~A~%" instruction))
+  (finish-output *error-output*)
+  (let ((answers '()))
+    (dolist (prompt prompts (nreverse answers))
+      (let ((answer (read-prompt-line (first prompt)
+                                      :echo (second prompt))))
+        (unless answer
+          (return nil))
+        (push answer answers)))))
+
 (defun terminal-enter-raw ()
   "Save the terminal settings and stop local line editing and signals.
 

@@ -1178,23 +1178,60 @@ certificate is checked both through itself and through its CA key."
     (and config (funcall accessor config))))
 
 (defparameter +ssh-server-enabled-auth-methods+ '("publickey" "hostbased")
-  "Authentication methods this server can complete.
+  "Methods a server with no authentication hooks can complete.
 
-AuthenticationMethods is valid with any OpenSSH method name, but a list that
-needs password, keyboard-interactive, hostbased or GSSAPI can never finish
-here, so sshd's rule of skipping a list that names a disabled method leaves
-only publickey sequences.")
+A server that adds AUTHORIZE-PASSWORD or AUTHORIZE-KEYBOARD-INTERACTIVE
+advertises those too, subject to PasswordAuthentication and
+KbdInteractiveAuthentication; SSH-SERVER-ENABLED-AUTH-METHODS computes the
+per-connection list.")
 
-(defun ssh-server-auth-method-lists (config)
+(defun ssh-server-auth-method-configured-p (config accessor)
+  "Whether a config hook named by ACCESSOR leaves its method on.
+
+NIL is sshd's default of yes, :NO is an explicit refusal, and :YES is an
+explicit request."
+  (let ((value (and config (funcall accessor config))))
+    (not (eq value :no))))
+
+(defun ssh-server-enabled-auth-methods (session &optional config)
+  "The authentication methods SESSION can actually complete.
+
+HOSTBASED, PASSWORD and KEYBOARD-INTERACTIVE need both their application hook
+and their sshd_config switch; PUBLICKEY is always offered because the key
+files themselves are checked when a key arrives."
+  (let ((server (ssh-session-server session))
+        (config (or config (ssh-session-effective-config session))))
+    (remove
+     nil
+     (list "publickey"
+           (and (ssh-server-hostbased-key-allowed server)
+                (not (eq (and config
+                              (ssh-server-config-hostbased-authentication
+                               config))
+                         :no))
+                "hostbased")
+           (and (ssh-server-authorize-password server)
+                (ssh-server-auth-method-configured-p
+                 config #'ssh-server-config-password-authentication)
+                "password")
+           (and (ssh-server-authorize-keyboard-interactive server)
+                (ssh-server-auth-method-configured-p
+                 config
+                 #'ssh-server-config-kbd-interactive-authentication)
+                "keyboard-interactive")))))
+
+(defun ssh-server-auth-method-lists
+    (config &key (methods +ssh-server-enabled-auth-methods+))
   "CONFIG's AuthenticationMethods lists that this server can complete.
 
 NIL means no multi-method requirement, :IMPOSSIBLE means the directive was
 set but no usable list remains, and otherwise the result is a list of
-method lists, each in the order it must be completed."
-  (let ((methods (and config
-                      (ssh-server-config-authentication-methods config))))
+method lists, each in the order it must be completed.  METHODS is the set of
+methods the connection can actually offer; it defaults to the no-hook set."
+  (let ((required (and config
+                       (ssh-server-config-authentication-methods config))))
     (cond
-      ((or (null methods) (eq methods :any))
+      ((or (null required) (eq required :any))
        nil)
       (t
        (let ((lists
@@ -1203,11 +1240,9 @@ method lists, each in the order it must be completed."
                   (let ((parts (uiop:split-string text :separator ",")))
                     (and parts
                          (every (lambda (method)
-                                  (member method
-                                          +ssh-server-enabled-auth-methods+
-                                          :test #'string=))
+                                  (member method methods :test #'string=))
                                 parts))))
-                methods)))
+                required)))
          (if lists
              (mapcar (lambda (text)
                        (uiop:split-string text :separator ","))
@@ -1215,11 +1250,15 @@ method lists, each in the order it must be completed."
              :impossible))))))
 
 (defun ssh-server-auth-info-line (method key-blob)
-  "The ExposeAuthInfo line for METHOD and KEY-BLOB."
-  (multiple-value-bind (type data)
-      (ssh-public-key-parts key-blob)
-    (declare (ignore data))
-    (format nil "~A ~A ~A" method type (ssh-octets-base64 key-blob))))
+  "The ExposeAuthInfo line for METHOD and KEY-BLOB, or NIL for no key.
+
+Password and keyboard-interactive authenticate no key, and OpenSSH does not
+write those credentials to the auth-info file."
+  (when key-blob
+    (multiple-value-bind (type data)
+        (ssh-public-key-parts key-blob)
+      (declare (ignore data))
+      (format nil "~A ~A ~A" method type (ssh-octets-base64 key-blob)))))
 
 (defun ssh-session-log-enabled-p (session)
   "Whether SESSION's effective LogLevel asks for protocol detail.
@@ -1259,7 +1298,8 @@ the session's config NIL so the server-level settings stay in force."
           ;; authentication into another's.
           (setf (ssh-session-auth-method-lists session)
                 (ssh-server-auth-method-lists
-                 (ssh-session-effective-config session))
+                 (ssh-session-effective-config session)
+                 :methods (ssh-server-enabled-auth-methods session))
                 (ssh-session-auth-used-keys session) '()
                 (ssh-session-auth-merged-options session) nil
                 (ssh-session-auth-merged-key-env session) '()

@@ -1666,7 +1666,12 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 host-key-alias batch-mode version-addendum
                                 verify-host-key-dns host-key-dns-resolver
                                 bind-address bind-interface
-                                rekey-limit rekey-interval)
+                                rekey-limit rekey-interval
+                                password kbd-interactive
+                                password-authentication
+                                kbd-interactive-authentication
+                                number-of-password-prompts
+                                preferred-authentications)
   "Start a client against SERVER and return the command's exit status.
 
 HOST is the name dialled and checked in known_hosts; ADDRESS-FAMILY asks the
@@ -1699,6 +1704,19 @@ added on first use."
             :host-key-policy host-key-policy
             :hostbased-authentication (and hostbased-key t)
             :hostbased-keys (and hostbased-key (list hostbased-key))
+            :password-authentication
+            (and password (not (eq password-authentication :no)))
+            :kbd-interactive-authentication
+            (and kbd-interactive
+                 (not (eq kbd-interactive-authentication :no)))
+            :number-of-password-prompts number-of-password-prompts
+            :preferred-authentications preferred-authentications
+            :password-callback
+            (and password
+                 (lambda (client prompt)
+                   (declare (ignore client prompt))
+                   password))
+            :kbd-interactive-callback kbd-interactive
             :canonicalize-hostname (or canonicalize-hostname :no)
             :canonical-domains canonical-domains
             :resolver resolver
@@ -2438,6 +2456,142 @@ records both successful methods."
                  (is (not (null failed)))))
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(defun ssh-test-auth-method-loopback-run
+    (password kbd-interactive authorize-password authorize-keyboard-interactive
+     &key authorized-key sshd-options)
+  "Run one exec through a server refusing keys, authenticating otherwise.
+
+PASSWORD and KBD-INTERACTIVE are the client answers the matching callback
+returns; the server hooks are AUTHORIZE-PASSWORD and
+AUTHORIZE-KEYBOARD-INTERACTIVE.  AUTHORIZED-KEY adds the client's key, for an
+AuthenticationMethods list that starts with publickey.  Returns (VALUES
+STDOUT STDERR STATUS)."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-authmethod-loop"))
+         (host-key (merge-pathnames "host_key" directory))
+         (client-key (merge-pathnames "client_key" directory))
+         (authorized (merge-pathnames "authorized_keys" directory))
+         (known-hosts (merge-pathnames "known_hosts" directory))
+         (stdout (make-string-output-stream))
+         (stderr (make-string-output-stream))
+         (server nil))
+    (ensure-directories-exist host-key)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring host-key)))
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring client-key)))
+           (when authorized-key
+             (ssh-test-write-authorized-keys
+              (merge-pathnames "client_key.pub" directory) authorized))
+           (setf server
+                 (make-ssh-server
+                  "127.0.0.1" 0
+                  :host-key host-key
+                  :authorized-keys (and authorized-key authorized)
+                  :sshd-config (and sshd-options
+                                    (ssh-server-config-load
+                                     nil :options sshd-options))
+                  :authorize-password authorize-password
+                  :authorize-keyboard-interactive
+                  authorize-keyboard-interactive
+                  :on-channel
+                  (lambda (channel)
+                    (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                          (lambda (channel command)
+                            (ssh-test-run-command channel command))))))
+           (let ((status (ssh-test-loopback-run
+                          server client-key known-hosts stdout stderr
+                          :password password
+                          :kbd-interactive kbd-interactive)))
+             (values (get-output-stream-string stdout)
+                     (get-output-stream-string stderr)
+                     status)))
+      (when server (ssh-server-close server))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(def-pure-test server-loopback-password-authentication
+  "A password request completes a login when the application accepts it."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((prompted 0))
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-auth-method-loopback-run
+             "secret" nil
+             (lambda (session user password)
+               (declare (ignore session user))
+               (incf prompted)
+               (string= password "secret"))
+             nil)
+          (is (equal "hello" stdout))
+          (is (equal "oops" stderr))
+          (is (eql 3 status))
+          (is (= 1 prompted)))
+        ;; The same hook refuses a wrong answer, and the client reports the
+        ;; refused method instead of running the command.
+        (let ((refused
+                (handler-case
+                    (progn
+                      (ssh-test-auth-method-loopback-run
+                       "wrong" nil
+                       (lambda (session user password)
+                         (declare (ignore session user))
+                         (string= password "secret"))
+                       nil)
+                      nil)
+                  (error () t))))
+          (is (not (null refused)))))))
+
+(def-pure-test server-loopback-keyboard-interactive-authentication
+  "The server asks one prompt, then accepts the answer round."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((rounds 0)
+            (seen nil))
+        (flet ((hook (session user request)
+                 (declare (ignore session user))
+                 (incf rounds)
+                 (let ((responses (getf request :responses)))
+                   (if responses
+                       (if (equal responses '("secret"))
+                           :success
+                           :failure)
+                       (list :name "Test"
+                             :instruction "Answer the question"
+                             :prompts '(("Password: " nil)))))))
+          (multiple-value-bind (stdout stderr status)
+              (ssh-test-auth-method-loopback-run
+               nil
+               (lambda (client name instruction prompts)
+                 (declare (ignore client))
+                 (push (list name instruction prompts) seen)
+                 (list "secret"))
+               nil #'hook)
+            (is (equal "hello" stdout))
+            (is (equal "oops" stderr))
+            (is (eql 3 status))
+            (is (= 2 rounds))
+            (is (equal '(("Test" "Answer the question"
+                          (("Password: " nil))))
+                       seen)))))))
+
+(def-pure-test server-loopback-authentication-methods-publickey-then-password
+  "AuthenticationMethods publickey,password accepts a key and then a password."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-auth-method-loopback-run
+           "secret" nil
+           (lambda (session user password)
+             (declare (ignore session user))
+             (string= password "secret"))
+           nil
+           :authorized-key t
+           :sshd-options '("AuthenticationMethods publickey,password"))
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))
 
 (def-pure-test host-certificate-known-hosts-policy
   "A @cert-authority line trusts the certificate; a @revoked line for the
@@ -6470,10 +6624,148 @@ cookie in the account's Xauthority; one directive short and it refuses."
   (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1::2::3")))
   (is (= 8 (length (cl-pnet-ssh::ssh-config-ipv6-words "::")))))
 
+(def-pure-test batch-mode-and-switches-suppress-interactive-auth-methods
+  ;; BatchMode means never ask, so even a configured callback is not used.
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :batch-mode t
+                 :password-authentication t
+                 :kbd-interactive-authentication t
+                 :password-callback (lambda (client prompt)
+                                      (declare (ignore client prompt))
+                                      "secret")
+                 :kbd-interactive-callback
+                 (lambda (client name instruction prompts)
+                   (declare (ignore client name instruction prompts))
+                   '("secret")))))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "password")))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "keyboard-interactive"))))
+  ;; The sshd switches turn a method off even when its callback exists.
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :password-authentication nil
+                 :kbd-interactive-authentication nil
+                 :password-callback (lambda (client prompt)
+                                      (declare (ignore client prompt))
+                                      "secret")
+                 :kbd-interactive-callback
+                 (lambda (client name instruction prompts)
+                   (declare (ignore client name instruction prompts))
+                   '("secret")))))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "password")))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "keyboard-interactive"))))
+  ;; :NO is the configuration layer's spelling of an explicit no.
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :password-authentication :no
+                 :kbd-interactive-authentication :no
+                 :password-callback (lambda (client prompt)
+                                      (declare (ignore client prompt))
+                                      "secret")
+                 :kbd-interactive-callback
+                 (lambda (client name instruction prompts)
+                   (declare (ignore client name instruction prompts))
+                   '("secret")))))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "password")))
+    (is (not (cl-pnet-ssh::ssh-client-auth-method-enabled-p
+              client "keyboard-interactive")))))
+
+(def-pure-test keyboard-interactive-info-request-carries-prompts-and-answers
+  (flet ((request (name instruction prompts)
+           (let ((writer (ssh-writer)))
+             (ssh-write-u8 writer
+                           cl-pnet-ssh::+ssh-msg-userauth-info-request+)
+             (ssh-write-text writer name)
+             (ssh-write-text writer instruction)
+             (ssh-write-text writer "")
+             (ssh-write-u32 writer (length prompts))
+             (dolist (prompt prompts)
+               (ssh-write-text writer (first prompt))
+               (ssh-write-boolean writer (second prompt)))
+             (ssh-writer-output writer))))
+    (let* ((seen nil)
+           (client (cl-pnet-ssh::%make-ssh-client
+                    :kbd-interactive-callback
+                    (lambda (client name instruction prompts)
+                      (declare (ignore client))
+                      (push (list name instruction prompts) seen)
+                      (mapcar (lambda (prompt)
+                                (format nil "answer to ~A" (first prompt)))
+                              prompts))))
+           (sent '()))
+      (setf (cl-pnet-ssh::ssh-client-last-auth-method client)
+            "keyboard-interactive")
+      (let ((original
+              (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                     (lambda (client payload)
+                       (declare (ignore client))
+                       (push payload sent)
+                       t))
+               ;; A message with prompts asks for one answer each, and the
+               ;; echo flag reaches the callback so a password can be hidden.
+               (cl-pnet-ssh::ssh-client-handle-info-request
+                client
+                (request "Fixture" "Instruction"
+                         '(("Password: " nil) ("Code: " t))))
+               ;; A zero-prompt message only displays text; its empty answer
+               ;; list is not a cancellation.
+               (cl-pnet-ssh::ssh-client-handle-info-request
+                client (request "Notice" "" '())))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                original)))
+      (is (equal '(("Fixture" "Instruction"
+                    (("Password: " nil) ("Code: " t)))
+                   ("Notice" "" nil))
+                 (nreverse seen)))
+      (let ((reader (ssh-make-reader (second sent))))
+        (is (= cl-pnet-ssh::+ssh-msg-userauth-info-response+
+               (ssh-read-u8 reader)))
+        (is (= 2 (ssh-read-u32 reader)))
+        (is (equal "answer to Password: " (ssh-read-text reader)))
+        (is (equal "answer to Code: " (ssh-read-text reader))))
+      (let ((reader (ssh-make-reader (first sent))))
+        (is (= cl-pnet-ssh::+ssh-msg-userauth-info-response+
+               (ssh-read-u8 reader)))
+        (is (zerop (ssh-read-u32 reader)))))))
+
+(def-pure-test authentication-methods-follow-the-configured-order
+  (flet ((client (&rest arguments)
+           (apply #'cl-pnet-ssh::%make-ssh-client
+                  :password-callback
+                  (lambda (client prompt)
+                    (declare (ignore client prompt))
+                    "secret")
+                  :kbd-interactive-callback
+                  (lambda (client name instruction prompts)
+                    (declare (ignore client name instruction prompts))
+                    '("secret"))
+                  arguments)))
+    ;; ssh's default order, with the methods this client can finish.
+    (is (equal '("publickey" "keyboard-interactive" "password")
+               (cl-pnet-ssh::ssh-client-auth-method-order (client))))
+    ;; PreferredAuthentications reorders and narrows the list.
+    (is (equal '("password" "publickey")
+               (cl-pnet-ssh::ssh-client-auth-method-order
+                (client :preferred-authentications
+                        '("password" "publickey")))))
+    ;; A method the server's last failure did not name is skipped, so a
+    ;; configured method the server refuses never prompts.
+    (let ((client (client)))
+      (setf (cl-pnet-ssh::ssh-client-auth-offered-methods client)
+            '("publickey"))
+      (is (equal "publickey"
+                 (cl-pnet-ssh::ssh-client-next-auth-method client)))
+      (is (null (cl-pnet-ssh::ssh-client-next-auth-method client))))))
+
 (test authentication-methods-are-filtered-to-what-this-server-can-complete
-  ;; Password and the other methods are valid names, but this server cannot
-  ;; complete them, so a list that needs one is skipped as sshd skips a list
-  ;; naming a disabled method.
+  ;; A method with no application hook cannot complete, so a list that needs
+  ;; one is skipped as sshd skips a list naming a disabled method.  Once the
+  ;; hook and PasswordAuthentication make password usable, the list stays.
   (let ((two (ssh-server-config-load
               nil :options '("AuthenticationMethods publickey,publickey")))
         (mixed (ssh-server-config-load
@@ -6484,6 +6776,10 @@ cookie in the account's Xauthority; one directive short and it refuses."
                (cl-pnet-ssh::ssh-server-auth-method-lists two)))
     (is (eq :impossible
             (cl-pnet-ssh::ssh-server-auth-method-lists mixed)))
+    (is (equal '(("publickey" "password"))
+               (cl-pnet-ssh::ssh-server-auth-method-lists
+                mixed :methods '("publickey" "password"
+                                 "keyboard-interactive"))))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists any)))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists nil)))))
 

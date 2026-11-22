@@ -30,6 +30,16 @@
   ;; (SESSION USER CLIENT-USER CLIENT-HOST KEY-BLOB) answering whether the
   ;; client host and its rhosts/known_hosts entry admit USER.
   (hostbased-key-allowed nil)
+  ;; Password authentication: a function of (SESSION USER PASSWORD) answering
+  ;; whether the credential is correct.  The application owns the account
+  ;; database; this library never reads /etc/shadow itself.
+  (authorize-password nil)
+  ;; Keyboard-interactive authentication: a function of (SESSION USER REQUEST)
+  ;; returning :SUCCESS, :FAILURE, or a plist describing the next round:
+  ;; (:name NAME :instruction TEXT :prompts ((TEXT ECHO-P) ...)).  REQUEST
+  ;; carries the previous round's answers as its :RESPONSES list, empty on the
+  ;; first call.
+  (authorize-keyboard-interactive nil)
   ;; The sshd_config the connection-scoped Match blocks are resolved from.
   ;; NIL means the program configured the server directly and there is
   ;; nothing to re-read per connection.
@@ -167,6 +177,10 @@ present after RequiredRSASize, for callers that only want to describe it."
   (auth-used-keys '())
   (auth-merged-options nil)
   (auth-merged-key-env '())
+  ;; A keyboard-interactive exchange in progress: the user, and whether an
+  ;; INFO_REQUEST is waiting for its INFO_RESPONSE.
+  (kbd-interactive-user nil)
+  (kbd-interactive-pending nil)
   ;; ExposeAuthInfo lines, one per successful method, in completion order.
   (auth-info-lines '())
   ;; The environment= options of the authorized_keys line that authenticated

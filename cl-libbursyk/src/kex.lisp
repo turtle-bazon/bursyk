@@ -21,6 +21,10 @@
 (defconstant +ssh-msg-userauth-success+ 52)
 (defconstant +ssh-msg-userauth-banner+ 53)
 (defconstant +ssh-msg-userauth-pk-ok+ 60)
+;; RFC 4256's keyboard-interactive messages share 60 with PK_OK: 60 answers an
+;; unsigned publickey offer, and is an info request during a kbdint exchange.
+(defconstant +ssh-msg-userauth-info-request+ 60)
+(defconstant +ssh-msg-userauth-info-response+ 61)
 (defconstant +ssh-msg-global-request+ 80)
 (defconstant +ssh-msg-request-success+ 81)
 (defconstant +ssh-msg-request-failure+ 82)

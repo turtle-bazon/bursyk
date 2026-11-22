@@ -52,6 +52,16 @@ beside the readable one on every backend."
   server-version
   ;; The server's authentication banner, once it has sent one.
   banner
+  ;; Password and keyboard-interactive options are accepted for the same
+  ;; interface as the pure backend, but this backend has no libssh binding
+  ;; for either method yet, so they do not affect its authentication.
+  (password-authentication t)
+  (kbd-interactive-authentication t)
+  number-of-password-prompts
+  preferred-authentications
+  (pubkey-authentication t)
+  password-callback
+  kbd-interactive-callback
   ;; ObscureKeystrokeTiming is owned by the application, which reads and
   ;; writes it through the same accessor in either backend.  libssh itself
   ;; does not act on it.
@@ -140,6 +150,11 @@ beside the readable one on every backend."
   authorize
   authorize-user
   (hostbased-key-allowed nil)
+  ;; Accepted for the same interface as the pure backend.  libssh's
+  ;; message API can read a password but sends no keyboard-interactive
+  ;; request, so neither hook can complete a login here yet.
+  authorize-password
+  authorize-keyboard-interactive
   ;; The sshd_config the connection-scoped Match blocks are resolved from,
   ;; and a function of USER returning group names for Match Group.
   sshd-config

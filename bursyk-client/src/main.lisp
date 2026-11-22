@@ -497,10 +497,16 @@ still disables X11 and therefore silences the refusal."
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
           (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
+      ;; The pure backend also implements password and keyboard-interactive,
+      ;; so PubkeyAuthentication no and a PreferredAuthentications list
+      ;; without publickey are real requests there.  libssh still offers
+      ;; publickey alone.
+      #+ssh-backend-ffi
       (when (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)
                 :no)
         (unsupported "PubkeyAuthentication no"
                      "public-key authentication is the only method implemented"))
+      #+ssh-backend-ffi
       (let ((methods
               (cl-pnet-ssh:ssh-config-options-preferred-authentications
                options)))
@@ -509,6 +515,21 @@ still disables X11 and therefore silences the refusal."
           (unsupported
            "PreferredAuthentications"
            (format nil "~{~A~^,~} excludes publickey, the only method implemented"
+                   methods))))
+      #-ssh-backend-ffi
+      (let ((methods
+              (cl-pnet-ssh:ssh-config-options-preferred-authentications
+               options)))
+        (when (and methods
+                   (notany (lambda (method)
+                             (member method
+                                     '("publickey" "hostbased"
+                                       "keyboard-interactive" "password")
+                                     :test #'string-equal))
+                           methods))
+          (unsupported
+           "PreferredAuthentications"
+           (format nil "~{~A~^,~} names no authentication method implemented"
                    methods))))
       #+ssh-backend-ffi
       (when (member (cl-pnet-ssh:ssh-config-options-address-family options)
@@ -3177,6 +3198,17 @@ of calling back in the middle of authentication."
       (format *error-output* "~A" banner)
       (finish-output *error-output*))))
 
+(defun password-authentication-prompt (client prompt)
+  "Ask for a password the way ssh's password method does."
+  (declare (ignore client))
+  (read-prompt-line prompt))
+
+(defun keyboard-interactive-authentication-prompt
+    (client name instruction prompts)
+  "Answer the server's keyboard-interactive prompts."
+  (declare (ignore client))
+  (read-keyboard-interactive-answers name instruction prompts))
+
 (defun start-client (host command command-given-p)
   "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
   (cl-pnet-ssh:make-ssh-client-from-config
@@ -3206,6 +3238,13 @@ of calling back in the middle of authentication."
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-forwarded-streamlocal #'forwarded-streamlocal-target
+   ;; The libssh backend has no password or keyboard-interactive binding yet,
+   ;; so it gets no callbacks and keeps failing early when no key is usable.
+   #-ssh-backend-ffi
+   :password-callback #'password-authentication-prompt
+   #-ssh-backend-ffi
+   :kbd-interactive-callback
+   #'keyboard-interactive-authentication-prompt
    :on-open
    (lambda (client)
      (if *mux-daemon*

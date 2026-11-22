@@ -148,6 +148,8 @@ and NIL while the line is still incomplete."
        (ssh-server-handle-service-request session payload))
       ((= type +ssh-msg-userauth-request+)
        (ssh-server-handle-userauth-request session payload))
+      ((= type +ssh-msg-userauth-info-response+)
+       (ssh-server-handle-info-response session payload))
       ((= type +ssh-msg-global-request+)
        (ssh-server-handle-global-request session payload))
       ((<= +ssh-msg-channel-open+ type +ssh-msg-channel-failure+)
@@ -609,7 +611,7 @@ every attempt fail rather than quietly falling back to publickey."
   (let ((lists (ssh-session-auth-method-lists session)))
     (cond
       ((eq lists :impossible) '())
-      ((null lists) +ssh-server-enabled-auth-methods+)
+      ((null lists) (ssh-server-enabled-auth-methods session))
       (t (remove-duplicates (mapcar #'first lists) :test #'string=)))))
 
 (defun ssh-server-auth-key-used-p (session key-blob)
@@ -619,12 +621,16 @@ every attempt fail rather than quietly falling back to publickey."
         (ssh-session-auth-used-keys session)))
 
 (defun ssh-server-record-auth-success (session method key-blob)
-  "Record METHOD with KEY-BLOB and add its ExposeAuthInfo line."
-  (setf (ssh-session-auth-used-keys session)
-        (cons key-blob (ssh-session-auth-used-keys session))
-        (ssh-session-auth-info-lines session)
-        (append (ssh-session-auth-info-lines session)
-                (list (ssh-server-auth-info-line method key-blob)))))
+  "Record METHOD with KEY-BLOB and add its ExposeAuthInfo line.
+
+Password and keyboard-interactive carry no key, so they neither consume a key
+nor contribute an auth-info line."
+  (when key-blob
+    (push key-blob (ssh-session-auth-used-keys session)))
+  (let ((line (ssh-server-auth-info-line method key-blob)))
+    (when line
+      (setf (ssh-session-auth-info-lines session)
+            (append (ssh-session-auth-info-lines session) (list line))))))
 
 (defun ssh-server-send-auth-failure (session &key (count t) partial)
   "Refuse the current attempt and name the methods that may continue.
@@ -900,6 +906,102 @@ can test keys without burning its authentication budget; later ones do."
          session "hostbased" user key-blob nil nil)
         (ssh-server-send-auth-failure session :count count))))
 
+(defun ssh-server-handle-password (session user reader &key (count t))
+  "Handle one password authentication attempt.
+
+The change-password flag is refused: this server has no password-change
+backend, and silently treating it as a login would be worse than a failure."
+  (let ((change (ssh-read-boolean reader))
+        (password (ssh-read-text reader))
+        (hook (ssh-server-authorize-password (ssh-session-server session))))
+    (if (and hook
+             (not change)
+             (funcall hook session user password))
+        (ssh-server-auth-method-succeeded
+         session "password" user nil nil nil)
+        (ssh-server-send-auth-failure session :count count))))
+
+(defun ssh-server-send-info-request (session name instruction prompts)
+  "Send one keyboard-interactive INFO_REQUEST.
+
+PROMPTS is a list of (TEXT ECHO-P); each prompt's echo flag travels in the
+request so the client's terminal can hide a password."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-userauth-info-request+)
+    (ssh-write-text writer (or name ""))
+    (ssh-write-text writer (or instruction ""))
+    (ssh-write-text writer "")
+    (ssh-write-u32 writer (length prompts))
+    (dolist (prompt prompts)
+      (ssh-write-text writer (first prompt))
+      (ssh-write-boolean writer (second prompt)))
+    (ssh-session-send-payload session (ssh-writer-output writer))))
+
+(defun ssh-server-keyboard-interactive-step (session responses)
+  "Call the keyboard-interactive hook with RESPONSES and act on its answer."
+  (let* ((server (ssh-session-server session))
+         (hook (ssh-server-authorize-keyboard-interactive server))
+         (user (ssh-session-kbd-interactive-user session))
+         (request (list :responses responses)))
+    (setf (ssh-session-kbd-interactive-pending session) nil)
+    (cond
+      ((null hook)
+       (ssh-server-send-auth-failure session))
+      (t
+       (let ((result (funcall hook session user request)))
+         (cond
+           ((eq result :success)
+            (ssh-server-auth-method-succeeded
+             session "keyboard-interactive" user nil nil nil))
+           ((or (null result) (eq result :failure))
+            (ssh-server-send-auth-failure session))
+           ((eq result t)
+            (ssh-server-auth-method-succeeded
+             session "keyboard-interactive" user nil nil nil))
+           (t
+            (let ((prompts (getf result :prompts)))
+              (unless prompts
+                (error 'ssh-protocol-error
+                       :detail "keyboard-interactive hook returned no prompts"))
+              (setf (ssh-session-kbd-interactive-pending session) t)
+              (ssh-server-send-info-request
+               session (getf result :name) (getf result :instruction)
+               prompts)))))))))
+
+(defun ssh-server-handle-keyboard-interactive
+    (session user reader &key (count t))
+  "Start a keyboard-interactive exchange, or refuse it when no hook exists."
+  (let ((language (ssh-read-text reader))
+        (submethods (ssh-read-text reader))
+        (hook (ssh-server-authorize-keyboard-interactive
+               (ssh-session-server session))))
+    (declare (ignore language submethods))
+    (cond
+      ((null hook)
+       (ssh-server-send-auth-failure session :count count))
+      (t
+       (setf (ssh-session-kbd-interactive-user session) user
+             (ssh-session-kbd-interactive-pending session) t)
+       (ssh-server-keyboard-interactive-step session '())))))
+
+(defun ssh-server-handle-info-response (session payload)
+  "Feed one keyboard-interactive INFO_RESPONSE back to the hook."
+  (unless (ssh-session-kbd-interactive-pending session)
+    (error 'ssh-protocol-error
+           :detail "USERAUTH_INFO_RESPONSE without an INFO_REQUEST"))
+  (let* ((reader (ssh-make-reader payload))
+         (type (ssh-read-u8 reader))
+         (count (ssh-read-u32 reader))
+         (responses '()))
+    (declare (ignore type))
+    (when (>= count 1024)
+      (error 'ssh-protocol-error
+             :detail "USERAUTH_INFO_RESPONSE has too many answers"))
+    (dotimes (index count)
+      (declare (ignore index))
+      (push (ssh-read-text reader) responses))
+    (ssh-server-keyboard-interactive-step session (nreverse responses))))
+
 (defun ssh-server-user-permitted-p (session user)
   "Whether the application admits USER on SESSION.
 
@@ -956,12 +1058,19 @@ allowed methods; everything after it counts."
        :refused)
       (return-from ssh-server-handle-userauth-request nil))
     (incf (ssh-session-auth-attempts session))
+    ;; A new USER AUTH REQUEST abandons any half-finished kbdint exchange.
+    (setf (ssh-session-kbd-interactive-pending session) nil)
     (let ((count (ssh-server-auth-failure-counts-p
                   (ssh-session-auth-attempts session) method)))
       (cond
         ((not (string= service "ssh-connection"))
          (ssh-server-send-auth-failure session :count count))
         ((not (ssh-server-user-permitted-p session user))
+         (ssh-server-send-auth-failure session :count count))
+        ((and (member method '("password" "keyboard-interactive")
+                      :test #'string=)
+              (not (member method (ssh-server-allowed-auth-methods session)
+                           :test #'string=)))
          (ssh-server-send-auth-failure session :count count))
         ((string= method "publickey")
          (let ((has-signature (ssh-read-boolean reader))
@@ -971,6 +1080,11 @@ allowed methods; everything after it counts."
                                         has-signature :count count)))
         ((string= method "hostbased")
          (ssh-server-handle-hostbased session user reader :count count))
+        ((string= method "password")
+         (ssh-server-handle-password session user reader :count count))
+        ((string= method "keyboard-interactive")
+         (ssh-server-handle-keyboard-interactive session user reader
+                                                 :count count))
         (t (ssh-server-send-auth-failure session :count count))))))
 
 (defun ssh-server-send-global-reply (session success-p &optional fields)

@@ -154,8 +154,29 @@
   (hostbased-accepted-algorithms nil)
   (hostbased-keys '())
   (hostbased-key nil)
-  (hostbased-tried nil)
   (last-auth-method nil)
+  ;; PasswordAuthentication, KbdInteractiveAuthentication and
+  ;; NumberOfPasswordPrompts, with ssh's defaults.  A method a
+  ;; PreferredAuthentications list does not name is still offered only if it
+  ;; is enabled here.
+  (password-authentication t)
+  (kbd-interactive-authentication t)
+  (number-of-password-prompts nil)
+  (preferred-authentications nil)
+  (pubkey-authentication t)
+  ;; A function of (CLIENT PROMPT) returning a password, or NIL to skip the
+  ;; method.  BatchMode suppresses every prompt before this is called.
+  (password-callback nil)
+  ;; A function of (CLIENT NAME INSTRUCTION PROMPTS), where each prompt is
+  ;; (TEXT ECHO-P), returning a list of answer strings or NIL to cancel.
+  (kbd-interactive-callback nil)
+  ;; The method currently being attempted, the methods already tried, the
+  ;; methods the last USERAUTH_FAILURE named, and how many password prompts
+  ;; this connection has used.
+  (auth-method nil)
+  (auth-methods-tried '())
+  (auth-offered-methods '())
+  (password-attempts 0)
   ;; UpdateHostKeys: whether a proven host key may be added to known_hosts.
   (update-host-keys :yes)
   (host-keys-seen nil)

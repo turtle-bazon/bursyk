@@ -141,7 +141,9 @@ may name when that differs from the default offer."
                                      &key user port private-key agent passphrase
                                        known-hosts host-key-policy
                                        host-key-callback proxy-command
-                                       resolver canonicalized)
+                                       resolver canonicalized
+                                       password-callback
+                                       kbd-interactive-callback)
   "MAKE-SSH-CLIENT's arguments for HOST, given resolved OPTIONS.
 
 USER and PORT win over the file; the remaining keywords are explicit
@@ -205,6 +207,18 @@ MAKE-SSH-CLIENT's own defaults."
          +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms")
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
+        :password-authentication
+        (ssh-config-options-password-authentication options)
+        :kbd-interactive-authentication
+        (ssh-config-options-kbd-interactive-authentication options)
+        :number-of-password-prompts
+        (ssh-config-options-number-of-password-prompts options)
+        :preferred-authentications
+        (ssh-config-options-preferred-authentications options)
+        :pubkey-authentication
+        (not (eq (ssh-config-options-pubkey-authentication options) :no))
+        :password-callback password-callback
+        :kbd-interactive-callback kbd-interactive-callback
         :canonicalize-hostname
         (if canonicalized
             ;; The config layer already canonicalized this name, with
@@ -554,6 +568,18 @@ uses whichever of the two it saw first instead of chaining them."
            :hostbased-accepted-algorithms
            (getf parameters :hostbased-accepted-algorithms)
            :hostbased-keys (getf parameters :hostbased-keys)
+           :password-authentication
+           (getf parameters :password-authentication)
+           :kbd-interactive-authentication
+           (getf parameters :kbd-interactive-authentication)
+           :number-of-password-prompts
+           (getf parameters :number-of-password-prompts)
+           :preferred-authentications
+           (getf parameters :preferred-authentications)
+           :pubkey-authentication (getf parameters :pubkey-authentication)
+           :password-callback (getf parameters :password-callback)
+           :kbd-interactive-callback
+           (getf parameters :kbd-interactive-callback)
            :canonicalize-hostname (getf parameters :canonicalize-hostname)
            :canonical-domains (getf parameters :canonical-domains)
            :canonicalize-max-dots (getf parameters :canonicalize-max-dots)
@@ -623,7 +649,10 @@ the destination's user and port do not apply to it."
            :known-hosts (getf overrides :known-hosts)
            :host-key-policy (getf overrides :host-key-policy)
            :host-key-callback (getf overrides :host-key-callback)
-           :resolver (getf overrides :resolver))))
+           :resolver (getf overrides :resolver)
+           :password-callback (getf overrides :password-callback)
+           :kbd-interactive-callback
+           (getf overrides :kbd-interactive-callback))))
     (when (getf descriptor :user)
       (setf (getf parameters :user) (getf descriptor :user)))
     (when (getf descriptor :port)
@@ -714,6 +743,9 @@ in the tunnel's buffers."
                  :host-key-policy (getf overrides :host-key-policy)
                  :host-key-callback (getf overrides :host-key-callback)
                  :resolver (getf overrides :resolver)
+                 :password-callback (getf overrides :password-callback)
+                 :kbd-interactive-callback
+                 (getf overrides :kbd-interactive-callback)
                  :canonicalized t
                  :proxy-command proxy-command)))
     (cond
@@ -746,7 +778,9 @@ in the tunnel's buffers."
 
 (defun ssh-config-client-overrides (user port private-key agent passphrase
                                     known-hosts host-key-policy
-                                    host-key-callback resolver)
+                                    host-key-callback resolver
+                                    password-callback
+                                    kbd-interactive-callback)
   "The explicit command-line answers, as a plist for the chain builder."
   (list :user user :port port
         :private-key private-key :agent agent
@@ -754,7 +788,9 @@ in the tunnel's buffers."
         :known-hosts known-hosts
         :host-key-policy host-key-policy
         :host-key-callback host-key-callback
-        :resolver resolver))
+        :resolver resolver
+        :password-callback password-callback
+        :kbd-interactive-callback kbd-interactive-callback))
 
 (defun ssh-config-build-client (source host options proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error
@@ -786,7 +822,8 @@ in the tunnel's buffers."
               known-hosts host-key-policy host-key-callback proxy-jump
               proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close on-forwarded-tcpip
-              on-forwarded-streamlocal resolver canonical-resolver)
+              on-forwarded-streamlocal resolver canonical-resolver
+              password-callback kbd-interactive-callback)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -798,11 +835,14 @@ keyword wins over the file.  EXEC-MATCHER answers Match exec; ON-CLIENT
 receives an asynchronous client; ON-CONFIG-ERROR reports resolution
 failures.  RESOLVER dials addresses for the built clients; CANONICAL-RESOLVER
 performs the CanonicalizeHostname lookup, may report a CNAME as its second
-value, and receives the resolved AddressFamily as its :FAMILY keyword."
+value, and receives the resolved AddressFamily as its :FAMILY keyword.
+PASSWORD-CALLBACK and KBD-INTERACTIVE-CALLBACK reach the built client and
+every ProxyJump hop, as they would in ssh."
   (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
-                     known-hosts host-key-policy host-key-callback resolver))
+                     known-hosts host-key-policy host-key-callback resolver
+                     password-callback kbd-interactive-callback))
          (finished nil)
          (client nil)
          (on-built (lambda (value)

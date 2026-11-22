@@ -423,14 +423,35 @@ ForceCommand two")))
 
 (test sshd-config-refuses-what-this-server-cannot-honour
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "PasswordAuthentication yes"))
-  (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "NotAKeyword yes"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Port 1
 Port 2"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "AddressFamily ipv7")))
+
+(test sshd-config-reads-password-and-keyboard-interactive-switches
+  (let ((config (config-from-text "PasswordAuthentication no
+KbdInteractiveAuthentication no")))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-password-authentication config)))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-kbd-interactive-authentication
+                 config))))
+  ;;
+  ;; ChallengeResponseAuthentication is the obsolete spelling of
+  ;; KbdInteractiveAuthentication; the first of the two wins.
+  (let ((config (config-from-text "ChallengeResponseAuthentication no
+KbdInteractiveAuthentication yes")))
+    (is (eq :no (cl-pnet-ssh:ssh-server-config-kbd-interactive-authentication
+                 config))))
+  (let ((password (config-from-text "PasswordAuthentication yes")))
+    (is (null (cl-pnet-ssh:ssh-server-config-warnings password)))
+    (is (eq :yes
+            (cl-pnet-ssh:ssh-server-config-password-authentication password))))
+  (let ((kbd (config-from-text "KbdInteractiveAuthentication yes")))
+    (is (null (cl-pnet-ssh:ssh-server-config-warnings kbd)))
+    (is (eq :yes
+            (cl-pnet-ssh:ssh-server-config-kbd-interactive-authentication
+             kbd)))))
 
 (test sshd-config-accepts-what-describes-this-server
   (is (null (cl-pnet-ssh:ssh-server-config-warnings
@@ -1820,6 +1841,29 @@ DenyGroups banned")))
   (is (cl-pnet-ssh:ssh-root-login-allowed-p
        :forced-commands-only "publickey" :force-command "id")))
 
+(test password-hashes-are-checked-with-crypt
+  ;; The DES hash of "secret"; crypt(3) accepts the traditional setting too.
+  (is (bursyk-server::password-hash-valid-p "secret" "abNANd1rDfiNc"))
+  (is (not (bursyk-server::password-hash-valid-p "wrong" "abNANd1rDfiNc")))
+  ;; A locked or empty account, and an empty answer, never authenticate.
+  (is (not (bursyk-server::password-hash-valid-p "secret" "!locked")))
+  (is (not (bursyk-server::password-hash-valid-p "secret" "*")))
+  (is (not (bursyk-server::password-hash-valid-p "" "abNANd1rDfiNc")))
+  (is (not (bursyk-server::password-hash-valid-p "secret" ""))))
+
+(test keyboard-interactive-asks-once-and-checks-the-answer
+  (let ((request (list :responses '())))
+    (let ((step (bursyk-server::keyboard-interactive-authentication
+                 nil "tester" request)))
+      (is (getf step :prompts))
+      (is (equal "Password: " (first (first (getf step :prompts)))))
+      (is (not (second (first (getf step :prompts)))))))
+  ;; Only the account policy and crypt(3) decide the answer round, so an
+  ;; unknown user fails without pretending a prompt is still due.
+  (is (eq :failure
+          (bursyk-server::keyboard-interactive-authentication
+           nil "these-accounts-do-not-exist" (list :responses '("x"))))))
+
 (test forced-commands-only-root-needs-a-forced-command
   ;; PermitRootLogin forced-commands-only is decided when the key matches:
   ;; a key carrying command= admits root, one without it does not.
@@ -1874,6 +1918,30 @@ DenyGroups banned")))
                  (is (null (bursyk-server::authorized-keys-p
                             "root" key nil session)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test forced-commands-only-root-admits-only-a-public-key
+  ;; Password, keyboard-interactive and hostbased cannot carry command=, so
+  ;; they must not satisfy PermitRootLogin forced-commands-only.
+  (if (null (nth-value 1 (bursyk-server::user-home-and-uid "root")))
+      (skip "no local root account")
+      (let ((bursyk-server::*server-config*
+              (config-from-text "PermitRootLogin forced-commands-only")))
+        (is (bursyk-server::root-login-allowed-p nil "root" "publickey"))
+        (dolist (method '("password" "keyboard-interactive" "hostbased"))
+          (is (not (bursyk-server::root-login-allowed-p
+                    nil "root" method))
+              method)))))
+
+(test prohibit-password-root-refuses-interactive-methods
+  (if (null (nth-value 1 (bursyk-server::user-home-and-uid "root")))
+      (skip "no local root account")
+      (let ((bursyk-server::*server-config*
+              (config-from-text "PermitRootLogin prohibit-password")))
+        (is (bursyk-server::root-login-allowed-p nil "root" "publickey"))
+        (is (bursyk-server::root-login-allowed-p nil "root" "hostbased"))
+        (is (not (bursyk-server::root-login-allowed-p nil "root" "password")))
+        (is (not (bursyk-server::root-login-allowed-p
+                  nil "root" "keyboard-interactive"))))))
 
 (test max-auth-tries-counts-failures-and-has-sshd-defaults
   ;; The limit is stored per server; the counter is per connection.

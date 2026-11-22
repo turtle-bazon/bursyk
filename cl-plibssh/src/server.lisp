@@ -1093,6 +1093,8 @@ this program's error, because a configured list is meant exactly as written."
                           authorize
                           authorize-user
                           hostbased-key-allowed
+                          authorize-password
+                          authorize-keyboard-interactive
                           sshd-config
                           user-groups
                           banner
@@ -1177,6 +1179,9 @@ list, applied by the same inactivity accounting as the pure backend."
                   :authorize authorize
                   :authorize-user authorize-user
                   :hostbased-key-allowed hostbased-key-allowed
+                  :authorize-password authorize-password
+                  :authorize-keyboard-interactive
+                  authorize-keyboard-interactive
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

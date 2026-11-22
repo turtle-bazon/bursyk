@@ -769,6 +769,33 @@ other dedicated flags use; neither flag leaves the config alone."
                   (with-output-to-string (*standard-output*)
                     (burs::print-config-options "agent.example" options nil)))))))
 
+(test password-prompts-read-a-line-and-report-end-of-input
+  ;; A closed stdin means the user cancelled: NIL, not an empty password.
+  (let ((*standard-input* (make-string-input-stream (format nil "secret~%")))
+        (*error-output* (make-string-output-stream)))
+    (is (equal "secret" (burs::read-prompt-line "Password: ")))
+    (is (equal "Password: " (get-output-stream-string *error-output*))))
+  (let ((*standard-input* (make-string-input-stream ""))
+        (*error-output* (make-string-output-stream)))
+    (is (null (burs::read-prompt-line "Password: ")))))
+
+(test keyboard-interactive-prompts-show-the-server-text-and-read-answers
+  (let ((*standard-input* (make-string-input-stream
+                           (format nil "one~%two~%")))
+        (*error-output* (make-string-output-stream)))
+    (is (equal '("one" "two")
+               (burs::read-keyboard-interactive-answers
+                "Fixture" "Answer carefully"
+                '(("First: " t) ("Second: " t)))))
+    (let ((text (get-output-stream-string *error-output*)))
+      (dolist (expected '("Fixture" "Answer carefully" "First: " "Second: "))
+        (is (search expected text) expected))))
+  ;; Input that ends before the last prompt cancels the exchange.
+  (let ((*standard-input* (make-string-input-stream (format nil "one~%")))
+        (*error-output* (make-string-output-stream)))
+    (is (null (burs::read-keyboard-interactive-answers
+               nil nil '(("First: " t) ("Second: " t)))))))
+
 (test print-config-reports-openssh-defaults
   "The lines ssh -G always prints appear even when nothing configured them,
 and ProxyJump/ProxyCommand stay off the output when unset."
