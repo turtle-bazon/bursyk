@@ -477,6 +477,27 @@ still disables the feature and therefore silences the refusal."
       (when (cl-pnet-ssh:ssh-config-options-bind-address options)
         (unsupported "BindAddress"
                      "binding the source address is not implemented"))
+      (when (cl-pnet-ssh:ssh-config-options-bind-interface options)
+        (unsupported "BindInterface"
+                     "binding the source interface is not implemented"))
+      (when (cl-pnet-ssh:ssh-config-options-gssapi-authentication options)
+        (unsupported "GSSAPIAuthentication"
+                     "GSSAPI authentication is not implemented"))
+      (let ((provider
+              (cl-pnet-ssh:ssh-config-options-pkcs11-provider options)))
+        (when (and provider (not (eq provider :none)))
+          (unsupported "PKCS11Provider"
+                       "PKCS#11 keys are not implemented")))
+      ;; ssh only consults ProxyUseFdpass when a ProxyCommand carries the
+      ;; stream; with a direct connection or a ProxyJump it changes nothing.
+      (when (and (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)
+                 (or (cl-pnet-ssh:ssh-config-options-proxy-command options)
+                     (getf *options* :proxy-command)))
+        (unsupported "ProxyUseFdpass"
+                     "passing a descriptor back from the proxy is not implemented"))
+      (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
+        (when (and tunnel (not (eq tunnel :no)))
+          (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
       (when (cl-pnet-ssh:ssh-config-options-rekey-limit options)
         (unsupported "RekeyLimit" "rekeying is not implemented"))
       (when (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)
@@ -2633,6 +2654,31 @@ peer that connected to it; NIL refuses the channel."
             (if (cl-pnet-ssh:ssh-config-options-batch-mode options)
                 "yes"
                 "no"))
+    (format t "gssapiauthentication ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-gssapi-authentication
+                 options)
+                "yes"
+                "no"))
+    (format t "gssapidelegatecredentials ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
+                 options)
+                "yes"
+                "no"))
+    (format t "proxyusefdpass ~A~%"
+            (if (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)
+                "yes"
+                "no"))
+    ;; ssh prints Tunnel's multistate name: ethernet, point-to-point,
+    ;; true for the default device, or false when disabled.
+    (format t "tunnel ~A~%"
+            (case (cl-pnet-ssh:ssh-config-options-tunnel options)
+              (:ethernet "ethernet")
+              (:point-to-point "point-to-point")
+              ((:yes) "true")
+              (t "false")))
+    (format t "forwardx11timeout ~D~%"
+            (or (cl-pnet-ssh:ssh-config-options-forward-x11-timeout options)
+                1200))
     (format t "requesttty ~A~%"
             (or (tty-setting-name (getf *options* :request-tty))
                 (cl-pnet-ssh:ssh-config-options-request-tty options)
@@ -2648,6 +2694,38 @@ peer that connected to it; NIL refuses the channel."
                (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
               (ip-qos-name
                (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
+    (let ((bind (cl-pnet-ssh:ssh-config-options-bind-interface options)))
+      (when bind
+        (format t "bindinterface ~A~%" bind)))
+    (let ((devices
+            (cl-pnet-ssh:ssh-config-options-kbd-interactive-devices options)))
+      (when devices
+        (format t "kbdinteractivedevices ~A~%" devices)))
+    (let ((provider
+            (cl-pnet-ssh:ssh-config-options-pkcs11-provider options)))
+      (when (and provider (not (eq provider :none)))
+        (format t "pkcs11provider ~A~%" provider)))
+    (let ((provider
+            (cl-pnet-ssh:ssh-config-options-security-key-provider options)))
+      ;; ssh clears "none" after parsing, so no line appears; otherwise
+      ;; the default provider is internal.
+      (unless (eq provider :none)
+        (format t "securitykeyprovider ~A~%"
+                (or provider "internal"))))
+    (format t "syslogfacility ~A~%"
+            (or (cl-pnet-ssh:ssh-config-options-syslog-facility options)
+                "USER"))
+    (let ((device (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
+      (format t "tunneldevice ~A:~A~%"
+              (if device
+                  (if (eq (car device) :any) "any" (car device))
+                  "any")
+              (if (and device (not (eq (cdr device) :any)))
+                  (cdr device)
+                  "any")))
+    (format t "xauthlocation ~A~%"
+            (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
+                "/usr/bin/xauth"))
     (format t "checkhostip ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-check-host-ip options)
                 "yes"

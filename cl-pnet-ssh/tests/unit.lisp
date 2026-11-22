@@ -6543,6 +6543,120 @@ the first active value."
                     (cl-pnet-ssh::ssh-error-detail condition))
             (car case))))))
 
+(test remaining-client-keywords-are-parsed
+  "The ssh_config keywords this build cannot act on are still parsed and
+validated, so -G reports what ssh would and a bad line fails the same way."
+  (labels ((options-for (&rest lines)
+             (let ((options nil)
+                   (condition nil))
+               (ssh-config-resolve
+                (cl-pnet-ssh::%make-ssh-config
+                 :directives
+                 (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+                "alias"
+                :on-options (lambda (value) (setf options value))
+                :on-error (lambda (value) (setf condition value)))
+               (values options condition))))
+    (multiple-value-bind (options condition)
+        (options-for "Port 22")
+      (is (null condition))
+      (is (null (cl-pnet-ssh:ssh-config-options-gssapi-authentication
+                 options)))
+      (is (null (cl-pnet-ssh:ssh-config-options-bind-interface options)))
+      (is (null (cl-pnet-ssh:ssh-config-options-tunnel options)))
+      (is (null (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
+      (is (null (cl-pnet-ssh:ssh-config-options-xauth-location options)))
+      (is (null (cl-pnet-ssh:ssh-config-options-forward-x11-timeout
+                 options))))
+    (multiple-value-bind (options condition)
+        (options-for "ForwardX11Timeout 10m")
+      (is (null condition))
+      (is (= 600 (cl-pnet-ssh:ssh-config-options-forward-x11-timeout
+                  options))))
+    (multiple-value-bind (options condition)
+        (options-for "ForwardX11Timeout none")
+      (is (null condition))
+      (is (null (cl-pnet-ssh:ssh-config-options-forward-x11-timeout
+                 options))))
+    (multiple-value-bind (options condition)
+        (options-for "GSSAPIAuthentication yes"
+                     "GSSAPIDelegateCredentials yes"
+                     "ProxyUseFdpass yes")
+      (is (null condition))
+      (is (cl-pnet-ssh:ssh-config-options-gssapi-authentication options))
+      (is (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
+           options))
+      (is (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)))
+    (multiple-value-bind (options condition)
+        (options-for "BindInterface eth0"
+                     "KbdInteractiveDevices bsdauth,pgp,skey"
+                     "XAuthLocation /opt/xauth")
+      (is (null condition))
+      (is (string= "eth0"
+                   (cl-pnet-ssh:ssh-config-options-bind-interface options)))
+      (is (string= "bsdauth,pgp,skey"
+                   (cl-pnet-ssh:ssh-config-options-kbd-interactive-devices
+                    options)))
+      (is (string= "/opt/xauth"
+                   (cl-pnet-ssh:ssh-config-options-xauth-location
+                    options))))
+    (multiple-value-bind (options condition)
+        (options-for "PKCS11Provider /usr/lib/one.so"
+                     "SmartcardDevice /usr/lib/two.so")
+      (is (null condition))
+      (is (string= "/usr/lib/one.so"
+                   (cl-pnet-ssh:ssh-config-options-pkcs11-provider
+                    options))))
+    (multiple-value-bind (options condition)
+        (options-for "PKCS11Provider none")
+      (is (null condition))
+      (is (eq :none (cl-pnet-ssh:ssh-config-options-pkcs11-provider
+                     options))))
+    (multiple-value-bind (options condition)
+        (options-for "SecurityKeyProvider internal")
+      (is (null condition))
+      (is (string= "internal"
+                   (cl-pnet-ssh:ssh-config-options-security-key-provider
+                    options))))
+    (multiple-value-bind (options condition)
+        (options-for "SyslogFacility local7")
+      (is (null condition))
+      (is (string= "LOCAL7"
+                   (cl-pnet-ssh:ssh-config-options-syslog-facility options))))
+    (dolist (case '(("Tunnel yes" . :yes)
+                    ("Tunnel true" . :yes)
+                    ("Tunnel no" . :no)
+                    ("Tunnel false" . :no)
+                    ("Tunnel ethernet" . :ethernet)
+                    ("Tunnel point-to-point" . :point-to-point)))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (is (null condition) (car case))
+        (is (eq (cdr case)
+                (cl-pnet-ssh:ssh-config-options-tunnel options))
+            (car case))))
+    (dolist (case '(("TunnelDevice 5:6" . (5 . 6))
+                    ("TunnelDevice 7" . (7 . :any))
+                    ("TunnelDevice any:any" . (:any . :any))
+                    ("TunnelDevice any:3" . (:any . 3))))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (is (null condition) (car case))
+        (is (equal (cdr case)
+                   (cl-pnet-ssh:ssh-config-options-tunnel-device options))
+            (car case))))
+    (dolist (case '(("SyslogFacility nonsense"
+                     . "unsupported log facility 'nonsense'")
+                    ("Tunnel maybe" . "unsupported option \"maybe\".")
+                    ("TunnelDevice 5:x" . "Bad tun device.")))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (declare (ignore options))
+        (is (typep condition 'ssh-config-error) (car case))
+        (is (search (cdr case)
+                    (cl-pnet-ssh::ssh-error-detail condition))
+            (car case))))))
+
 ;;; ---- ping@openssh.com and keystroke chaff ----
 
 (test ext-info-records-the-ping-extension

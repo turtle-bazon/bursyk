@@ -228,6 +228,18 @@
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files
    #:ssh-config-options-bind-address
+   #:ssh-config-options-bind-interface
+   #:ssh-config-options-forward-x11-timeout
+   #:ssh-config-options-gssapi-authentication
+   #:ssh-config-options-gssapi-delegate-credentials
+   #:ssh-config-options-kbd-interactive-devices
+   #:ssh-config-options-pkcs11-provider
+   #:ssh-config-options-security-key-provider
+   #:ssh-config-options-proxy-use-fdpass
+   #:ssh-config-options-syslog-facility
+   #:ssh-config-options-tunnel
+   #:ssh-config-options-tunnel-device
+   #:ssh-config-options-xauth-location
    #:ssh-config-options-rekey-limit
    #:ssh-config-options-preferred-authentications
    #:ssh-config-options-pubkey-authentication

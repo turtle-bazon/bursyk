@@ -182,7 +182,34 @@ way ssh refuses it.")
   (forward-agent nil)
   (forward-x11 nil)
   (forward-x11-trusted nil)
+  ;; ForwardX11Timeout: how long ssh waits for an untrusted X11 channel.
+  ;; This build has no X11 forwarding, but the value is still parsed and
+  ;; printed so a shared ssh_config resolves the same way.
+  (forward-x11-timeout nil)
   (gateway-ports nil)
+  ;; GSSAPIAuthentication and GSSAPIDelegateCredentials have no
+  ;; implementation here; they are parsed so an ssh_config that turns them
+  ;; off (the usual default) is not refused, and -G can print the value.
+  (gssapi-authentication nil)
+  (gssapi-delegate-credentials nil)
+  ;; BindInterface names the local interface whose address ssh binds the
+  ;; source to.  Parsed for diagnosis; the dialer has no interface support.
+  (bind-interface nil)
+  ;; KbdInteractiveDevices, PKCS11Provider, SecurityKeyProvider, SyslogFacility
+  ;; and XAuthLocation are inert here but are part of ssh's effective
+  ;; configuration, so -G can report them.
+  (kbd-interactive-devices nil)
+  (pkcs11-provider nil)
+  (security-key-provider nil)
+  (syslog-facility nil)
+  (xauth-location nil)
+  ;; ProxyUseFdpass asks the ProxyCommand helper to pass back a connected
+  ;; descriptor; this build reads the helper's stdout instead.
+  (proxy-use-fdpass nil)
+  ;; Tunnel and TunnelDevice: :NO, :YES, :ETHERNET or :POINT-TO-POINT, and a
+  ;; (LOCAL . REMOTE) pair where each side is an integer or :ANY.
+  (tunnel nil)
+  (tunnel-device nil)
   ;; IPQoS: the DSCP value for interactive and bulk sessions; :NONE means
   ;; the operating system default.  ssh's defaults are ef and none.
   (ip-qos-interactive #xb8)
@@ -813,6 +840,9 @@ KbdInteractiveAuthentication from winning, exactly as ssh does."
      "kbdinteractiveauthentication")
     ((string= keyword "dsaauthentication") "pubkeyauthentication")
     ((string= keyword "identityfile2") "identityfile")
+    ;; SmartcardDevice is PKCS11Provider's old name; one opcode, one
+    ;; first-value-wins key.
+    ((string= keyword "smartcarddevice") "pkcs11provider")
     (t keyword)))
 
 (defun ssh-config-permitted-cnames-value (line)
@@ -1569,6 +1599,36 @@ understand them rather than silently match nothing."
     ((= 1 (length value)) (char value 0))
     (t nil)))
 
+(defun ssh-config-tunnel-id (line value)
+  "One end of a TunnelDevice as an interface number or :ANY.
+
+misc.c's a2tun accepts \"any\" or 0..SSH_TUNID_MAX and reports anything else
+as \"Bad tun device.\"; the bound keeps the maximum clear of the two
+sentinels OpenSSH reserves."
+  (if (string-equal value "any")
+      :any
+      (let ((number
+              (handler-case
+                  (ssh-config-integer line value
+                                      :minimum 0 :maximum 2147483645)
+                (ssh-config-error () nil))))
+        (unless number
+          (error (ssh-config-line-error line "Bad tun device.")))
+        number)))
+
+(defun ssh-config-tunnel-device (line value)
+  "LINE's TunnelDevice VALUE as (LOCAL . REMOTE).
+
+A single value leaves the remote side any, as a2tun does when no colon is
+present."
+  (let* ((colon (position #\: value))
+         (local (ssh-config-tunnel-id
+                 line (if colon (subseq value 0 colon) value)))
+         (remote (if colon
+                     (ssh-config-tunnel-id line (subseq value (1+ colon)))
+                     :any)))
+    (cons local remote)))
+
 (defun ssh-config-apply-session-value (line options keyword)
   (let ((value (ssh-config-arg line)))
     (flet ((boolean () (ssh-config-boolean line value))
@@ -1596,6 +1656,61 @@ understand them rather than silently match nothing."
          (setf (ssh-config-options-forward-x11 options) (boolean)))
         ((string= keyword "forwardx11trusted")
          (setf (ssh-config-options-forward-x11-trusted options) (boolean)))
+        ((string= keyword "forwardx11timeout")
+         ;; parse_time accepts "none", but fill_default_options turns the
+         ;; resulting -1 back into 1200, so NONE means the default here too.
+         (setf (ssh-config-options-forward-x11-timeout options)
+               (let ((seconds (ssh-config-seconds line value)))
+                 (if (eq seconds :none) nil seconds))))
+        ((string= keyword "gssapiauthentication")
+         (setf (ssh-config-options-gssapi-authentication options) (boolean)))
+        ((string= keyword "gssapidelegatecredentials")
+         (setf (ssh-config-options-gssapi-delegate-credentials options)
+               (boolean)))
+        ((string= keyword "bindinterface")
+         (setf (ssh-config-options-bind-interface options) value))
+        ((string= keyword "kbdinteractivedevices")
+         (setf (ssh-config-options-kbd-interactive-devices options) value))
+        ((member keyword '("pkcs11provider" "smartcarddevice")
+                 :test #'string=)
+         ;; CLEAR_ON_NONE drops the provider after parsing, so -G prints
+         ;; nothing for "none"; :NONE records that decision.
+         (setf (ssh-config-options-pkcs11-provider options)
+               (if (string-equal value "none") :none value)))
+        ((string= keyword "securitykeyprovider")
+         (setf (ssh-config-options-security-key-provider options)
+               (if (string-equal value "none") :none value)))
+        ((string= keyword "proxyusefdpass")
+         (setf (ssh-config-options-proxy-use-fdpass options) (boolean)))
+        ((string= keyword "syslogfacility")
+         (let ((facility (string-upcase value)))
+           (unless (member facility
+                           '("DAEMON" "USER" "AUTH" "AUTHPRIV"
+                             "LOCAL0" "LOCAL1" "LOCAL2" "LOCAL3"
+                             "LOCAL4" "LOCAL5" "LOCAL6" "LOCAL7")
+                           :test #'string=)
+             (error (ssh-config-line-error
+                     line "unsupported log facility '~A'" value)))
+           (setf (ssh-config-options-syslog-facility options) facility)))
+        ((string= keyword "tunnel")
+         (let ((setting (string-downcase value)))
+           (unless (member setting
+                           '("ethernet" "point-to-point" "true" "yes"
+                             "false" "no")
+                           :test #'string=)
+             (error (ssh-config-line-error line
+                                           "unsupported option \"~A\"."
+                                           value)))
+           (setf (ssh-config-options-tunnel options)
+                 (cond ((string= setting "ethernet") :ethernet)
+                       ((string= setting "point-to-point") :point-to-point)
+                       ((member setting '("true" "yes") :test #'string=) :yes)
+                       (t :no)))))
+        ((string= keyword "tunneldevice")
+         (setf (ssh-config-options-tunnel-device options)
+               (ssh-config-tunnel-device line value)))
+        ((string= keyword "xauthlocation")
+         (setf (ssh-config-options-xauth-location options) value))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
         ((string= keyword "exitonforwardfailure")
@@ -1807,6 +1922,12 @@ block is active, as ssh's parse_token does."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
+                         "forwardx11timeout" "gssapiauthentication"
+                         "gssapidelegatecredentials" "bindinterface"
+                         "kbdinteractivedevices" "pkcs11provider"
+                         "smartcarddevice" "securitykeyprovider"
+                         "proxyusefdpass" "syslogfacility" "tunnel"
+                         "tunneldevice" "xauthlocation"
                          "gatewayports" "ipqos" "exitonforwardfailure"
                          "permitremoteopen" "clearallforwardings"
                          "tcpkeepalive" "keepalive"
