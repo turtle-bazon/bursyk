@@ -41,6 +41,11 @@
 (defconstant +ssh-msg-ping+ 192)
 (defconstant +ssh-msg-pong+ 193)
 
+;; RFC 4250's transport layer numbering, which OpenSSH's packet layer uses
+;; to decide what may travel while a key exchange is in progress.
+(defconstant +ssh-kex-message-min+ 1)
+(defconstant +ssh-kex-message-max+ 49)
+
 (defparameter +ssh-chaff-ping-data+ (ssh-string-octets "PING!")
   "The payload PING carries when it stands in for a keystroke.
 

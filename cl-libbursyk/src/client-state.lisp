@@ -41,6 +41,27 @@
   (ignore-next-kex-packet nil)
   (keys-sent nil)
   (keys-received nil)
+  ;; RekeyLimit: the configured byte volume (0 selects the cipher's default)
+  ;; and interval in seconds (0 disables time-based rekeying).  A rekey's
+  ;; KEXINIT was sent but our NEWKEYS has not gone out yet.
+  (rekey-limit 0)
+  (rekey-interval 0)
+  (rekeying nil)
+  ;; OpenSSH starts no rekey before authentication completes (packet.c's
+  ;; after_authentication), including for very small RekeyLimits.
+  (after-authentication nil)
+  ;; Packet and block counters since the last NEWKEYS in each direction.
+  ;; OpenSSH resets both counters at every NEWKEYS, so the limits apply per
+  ;; set of keys, not to the whole connection.
+  (sent-packets 0)
+  (received-packets 0)
+  (sent-blocks 0)
+  (received-blocks 0)
+  ;; Payloads held back while a rekey is in progress, oldest first.  They are
+  ;; encoded only after NEWKEYS so they use the new keys.
+  (outgoing-queue '())
+  (rekey-time nil)
+  (rekey-timer nil)
   (signers nil)
   (auth-index 0)
   (known-hosts nil)
@@ -307,7 +328,9 @@ with ProxyUseFdpass) is a socket stored without a CL-PNET connection."
         (ssh-client-alive-timer client)
         (ssh-client-cancel-timer (ssh-client-alive-timer client))
         (ssh-client-channel-timeout-timer client)
-        (ssh-client-cancel-timer (ssh-client-channel-timeout-timer client))))
+        (ssh-client-cancel-timer (ssh-client-channel-timeout-timer client))
+        (ssh-client-rekey-timer client)
+        (ssh-client-cancel-timer (ssh-client-rekey-timer client))))
 
 (defun ssh-client-start-connect-timer (client)
   "Fail CLIENT when ConnectTimeout seconds pass before authentication.
@@ -570,10 +593,37 @@ channel and global deadlines."
               (error (condition) (ssh-client-fail client condition)))))))
   (not (ssh-client-closed client)))
 
+(defun ssh-client-transmit-payload (client payload)
+  "Frame and send PAYLOAD now, counting it against the rekey limits."
+  (let* ((cipher (ssh-client-cipher client))
+         (octets (ssh-encode-packet payload cipher))
+         (counted (ssh-packet-counted-length (length octets) cipher :send)))
+    (when (ssh-client-send-bytes client octets)
+      (incf (ssh-client-sent-packets client))
+      (incf (ssh-client-sent-blocks client)
+            (floor counted (ssh-cipher-state-block-size cipher))))))
+
 (defun ssh-client-send-payload (client payload)
-  "Frame and send one protocol PAYLOAD."
-  (ssh-client-send-bytes client
-                         (ssh-encode-packet payload (ssh-client-cipher client))))
+  "Frame and send one protocol PAYLOAD, deferring it during a rekey.
+
+OpenSSH queues every non-key-exchange packet while a rekey is under way and
+starts a rekey before sending a packet that would exceed RekeyLimit.  The
+queue holds payloads, not wire octets, so each is encrypted with the keys in
+force when it finally goes out."
+  (cond
+    ((and (not (ssh-client-kex-message-p (aref payload 0)))
+          (ssh-client-rekeying client))
+     (setf (ssh-client-outgoing-queue client)
+           (nconc (ssh-client-outgoing-queue client) (list payload)))
+     nil)
+    ((and (not (ssh-client-kex-message-p (aref payload 0)))
+          (ssh-client-need-rekey-p client (length payload)))
+     (setf (ssh-client-outgoing-queue client)
+           (nconc (ssh-client-outgoing-queue client) (list payload)))
+     (ssh-client-start-rekey client)
+     nil)
+    (t
+     (ssh-client-transmit-payload client payload))))
 
 (defun ssh-client-send-disconnect (client &optional (description "client closed"))
   "Tell the peer CLIENT is going away, so it can close the session.

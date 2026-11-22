@@ -485,8 +485,6 @@ therefore silences the refusal."
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
           (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
-      (when (cl-pnet-ssh:ssh-config-options-rekey-limit options)
-        (unsupported "RekeyLimit" "rekeying is not implemented"))
       (when (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)
                 :no)
         (unsupported "PubkeyAuthentication no"
@@ -3078,12 +3076,9 @@ and known-hosts files) are printed as this client will actually use them."
                  (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
                 (ip-qos-name
                  (cl-pnet-ssh:ssh-config-options-ip-qos-bulk options))))
-      (format t "rekeylimit ~A~%"
-              (let ((arguments
-                      (cl-pnet-ssh:ssh-config-options-rekey-limit options)))
-                (if arguments
-                    (format nil "~{~A~^ ~}" arguments)
-                    "0 0")))
+      (format t "rekeylimit ~D ~D~%"
+              (or (cl-pnet-ssh:ssh-config-options-rekey-limit options) 0)
+              (or (cl-pnet-ssh:ssh-config-options-rekey-interval options) 0))
       (format t "streamlocalbindmask 0~O~%"
               (or (cl-pnet-ssh:ssh-config-options-streamlocal-bind-mask
                    options)

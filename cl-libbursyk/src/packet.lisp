@@ -97,6 +97,30 @@ length field travels outside the encrypted body."
           (ssh-hmac-length (ssh-cipher-state-encrypt-mac state))
           0)))
 
+(defun ssh-packet-authentication-length (state direction)
+  "The tag or MAC octets a DIRECTION packet carries.
+
+chacha20-poly1305 hides its tag inside the AEAD construction, so its
+negotiated MAC is unused; every other cipher appends its hmac.  Before the
+first NEWKEYS there is no cipher state at all, and an unencrypted packet
+carries no authentication."
+  (if (null state)
+      0
+      (if (eq direction :receive)
+          (if (ssh-cipher-state-decrypt state)
+              16
+              (ssh-packet-mac-length state direction))
+          (if (ssh-cipher-state-encrypt state)
+              16
+              (ssh-packet-mac-length state direction)))))
+
+(defun ssh-packet-counted-length (wire-length state direction)
+  "WIRE-LENGTH less the MAC a DIRECTION packet carries.
+
+OpenSSH counts this length, the length field plus padding length, payload
+and padding, against a cipher's block limits.  The tag is not part of it."
+  (- wire-length (ssh-packet-authentication-length state direction)))
+
 (defun ssh-strip-padding (body payload-length)
   "Payload octets from the decrypted BODY, or signal on bad padding."
   (unless (plusp (length body))

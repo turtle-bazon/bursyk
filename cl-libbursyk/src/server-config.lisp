@@ -252,6 +252,12 @@ socket address and has no routing domains.")
   (login-grace-time nil)
   (client-alive-interval nil)
   (client-alive-count-max nil)
+  ;; RekeyLimit: the byte volume before rekeying (0 is OpenSSH's "default",
+  ;; the cipher's own limit) and the optional time interval in seconds
+  ;; (0 disables time-based rekeying).  Each is first-value-wins separately,
+  ;; as sshd's readconf tracks rekey_limit and rekey_interval independently.
+  (rekey-limit nil)
+  (rekey-interval nil)
   ;; MaxStartups: BEGIN:RATE:FULL, the sshd defaults when NIL.  Only global
   ;; directives set these, and sshd's parser lets a later line replace them.
   (max-startups-begin nil)
@@ -704,6 +710,7 @@ error, never an accidental no-match: sshd fatals in the same situation."
 (defparameter +ssh-server-config-match-slots+
   '(permit-root-login max-auth-tries max-sessions
     client-alive-interval client-alive-count-max
+    rekey-limit rekey-interval
     force-command chroot-directory banner authorized-keys-files accept-env permit-open
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
@@ -1309,6 +1316,27 @@ cannot apply per connection."
         config 'client-alive-count-max
         (ssh-server-config-count
          line (ssh-server-config-one-argument line))))
+      ((string= keyword "rekeylimit")
+       (let ((arguments (ssh-config-line-args line)))
+         (unless (<= 1 (length arguments) 2)
+           (ssh-server-config-line-error
+            line "RekeyLimit takes a size and an optional time"))
+         (let* ((size-argument (first arguments))
+                (bytes (if (string= size-argument "default")
+                           0
+                           (or (ssh-parse-scaled size-argument)
+                               (ssh-server-config-line-error
+                                line "Bad RekeyLimit number ~A"
+                                size-argument)))))
+           (when (and (plusp bytes) (< bytes 16))
+             (ssh-server-config-line-error line "RekeyLimit too small"))
+           (ssh-server-config-set-once config 'rekey-limit bytes)
+           (when (second arguments)
+             (let ((interval-argument (second arguments)))
+               (unless (string= interval-argument "none")
+                 (ssh-server-config-set-once
+                  config 'rekey-interval
+                  (ssh-server-config-time-value line interval-argument))))))))
       ;; ---- startup and idle limits ----
       ((string= keyword "maxstartups")
        ;; sshd takes BEGIN:RATE:FULL, or one number that is both the begin

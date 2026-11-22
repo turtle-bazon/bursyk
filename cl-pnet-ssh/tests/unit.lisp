@@ -1603,7 +1603,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 no-host-authentication-for-localhost
                                 host-key-alias batch-mode version-addendum
                                 verify-host-key-dns host-key-dns-resolver
-                                bind-address bind-interface)
+                                bind-address bind-interface
+                                rekey-limit rekey-interval)
   "Start a client against SERVER and return the command's exit status.
 
 HOST-KEY-POLICY is passed to MAKE-SSH-CLIENT; :STRICT proves a host
@@ -1640,6 +1641,8 @@ certificate was trusted rather than added on first use."
             :host-key-dns-resolver host-key-dns-resolver
             :bind-address bind-address
             :bind-interface bind-interface
+            :rekey-limit rekey-limit
+            :rekey-interval rekey-interval
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -1666,12 +1669,15 @@ certificate was trusted rather than added on first use."
       (when timeout (cl-pnet:timer-stop timeout)))))
 
 (defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
-                                      bind-address bind-interface)
+                                      bind-address bind-interface
+                                      sshd-options rekey-limit rekey-interval)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
 prove an RSA or ECDSA host key is negotiated and its signature verified.
 BIND-ADDRESS and BIND-INTERFACE are passed to the client's source binding.
+SSHD-OPTIONS are -o style directives for the server's sshd_config, while
+REKEY-LIMIT and REKEY-INTERVAL configure the client's own RekeyLimit.
 Returns (VALUES STDOUT STDERR STATUS)."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop"))
          (server-key (merge-pathnames "host_key" directory))
@@ -1696,6 +1702,9 @@ Returns (VALUES STDOUT STDERR STATUS)."
                   "127.0.0.1" 0
                   :host-key server-key
                   :authorized-keys authorized
+                  :sshd-config (and sshd-options
+                                    (ssh-server-config-load
+                                     nil :options sshd-options))
                   :on-channel
                   (lambda (channel)
                     (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
@@ -1704,7 +1713,9 @@ Returns (VALUES STDOUT STDERR STATUS)."
            (let ((status (ssh-test-loopback-run
                           server client-key known-hosts stdout stderr
                           :bind-address bind-address
-                          :bind-interface bind-interface)))
+                          :bind-interface bind-interface
+                          :rekey-limit rekey-limit
+                          :rekey-interval rekey-interval)))
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
                      status)))
@@ -7209,3 +7220,191 @@ ignored and an unsupported version leaves chaff off."
     (setf (cl-pnet-ssh:ssh-client-ping-supported client) t
           (cl-pnet-ssh::ssh-client-phase client) :ready)
     (is (cl-pnet-ssh:ssh-client-send-chaff client))))
+
+;;; ---- RekeyLimit ----
+
+(test client-rekeylimit-parses
+  "RekeyLimit takes scan_scaled bytes and an optional convtime interval."
+  (flet ((value (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (values (cl-pnet-ssh:ssh-config-options-rekey-limit options)
+                     (cl-pnet-ssh:ssh-config-options-rekey-interval options)))))
+    (multiple-value-bind (bytes seconds) (value "RekeyLimit default")
+      (is (= 0 bytes))
+      (is (null seconds)))
+    (multiple-value-bind (bytes seconds) (value "RekeyLimit 1M 1h")
+      (is (= (* 1024 1024) bytes))
+      (is (= 3600 seconds)))
+    (multiple-value-bind (bytes seconds) (value "RekeyLimit 1.5K 90")
+      (is (= 1536 bytes))
+      (is (= 90 seconds)))
+    (multiple-value-bind (bytes seconds) (value "RekeyLimit 16 none")
+      (is (= 16 bytes))
+      (is (null seconds)))
+    (multiple-value-bind (bytes seconds) (value "Port 22")
+      (is (null bytes))
+      (is (null seconds))))
+  (dolist (line '("RekeyLimit 15" "RekeyLimit 15 1h" "RekeyLimit nope"
+                  "RekeyLimit 1M nope" "RekeyLimit 1M 2x"
+                  "RekeyLimit"))
+    (let* ((config
+             (cl-pnet-ssh::%make-ssh-config
+              :directives
+              (list (cl-pnet-ssh::ssh-config-option-line line))))
+           (failure nil))
+      (ssh-config-resolve config "alias"
+                          :on-error (lambda (condition)
+                                      (setf failure condition)))
+      (is (typep failure 'ssh-config-error) line))))
+
+(test server-rekeylimit-parses
+  "sshd's RekeyLimit uses the same syntax and rejects tiny volumes."
+  (let ((config (ssh-server-config-load
+                 nil :options '("RekeyLimit 2M 5m"))))
+    (is (= (* 2 1024 1024)
+           (cl-pnet-ssh:ssh-server-config-rekey-limit config)))
+    (is (= 300 (cl-pnet-ssh:ssh-server-config-rekey-interval config))))
+  (let ((config (ssh-server-config-load
+                 nil :options '("RekeyLimit default none"))))
+    (is (= 0 (cl-pnet-ssh:ssh-server-config-rekey-limit config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-rekey-interval config))))
+  (let ((config (ssh-server-config-load nil)))
+    (is (null (cl-pnet-ssh:ssh-server-config-rekey-limit config)))
+    (is (null (cl-pnet-ssh:ssh-server-config-rekey-interval config))))
+  ;; RekeyLimit is in sshd's SSHCFG_ALL set, so Match may override it.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-rekeymatch"))
+         (path (merge-pathnames "sshd_config" directory)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist path)
+           (with-open-file (output path :direction :output
+                                        :if-exists :supersede
+                                        :if-does-not-exist :create)
+             (format output "RekeyLimit 1M~%Match User alice~%  RekeyLimit 2M 1h~%"))
+           (let* ((config (ssh-server-config-load path))
+                  (alice (ssh-server-config-for-connection
+                          config :user "alice"))
+                  (bob (ssh-server-config-for-connection
+                        config :user "bob")))
+             (is (= (* 2 1024 1024)
+                    (cl-pnet-ssh:ssh-server-config-rekey-limit alice)))
+             (is (= 3600
+                    (cl-pnet-ssh:ssh-server-config-rekey-interval alice)))
+             (is (= (* 1024 1024)
+                    (cl-pnet-ssh:ssh-server-config-rekey-limit bob)))
+             (is (null
+                  (cl-pnet-ssh:ssh-server-config-rekey-interval bob)))))
+      (ignore-errors
+       (uiop:delete-directory-tree directory :validate t))))
+  (dolist (option '("RekeyLimit 15" "RekeyLimit nope"
+                    "RekeyLimit 1M nope" "RekeyLimit 1M 2x"))
+    (let ((failure nil))
+      (handler-case (ssh-server-config-load nil :options (list option))
+        (error (condition) (setf failure condition)))
+      (is (typep failure 'ssh-server-config-error) option))))
+
+#-ssh-backend-ffi
+(test rekey-limit-triggers-on-volume-or-time
+  "The client rekeys only after auth, and only once a packet has crossed."
+  (let ((client (cl-pnet-ssh::%make-ssh-client)))
+    ;; Before authentication no limit applies, as OpenSSH's
+    ;; after_authentication gate requires.
+    (setf (cl-pnet-ssh::ssh-client-phase client) :ready
+          (cl-pnet-ssh::ssh-client-rekey-limit client) 16
+          (cl-pnet-ssh::ssh-client-sent-packets client) 1
+          (cl-pnet-ssh::ssh-client-sent-blocks client) 3)
+    (is (not (cl-pnet-ssh::ssh-client-need-rekey-p client)))
+    (setf (cl-pnet-ssh::ssh-client-after-authentication client) t)
+    ;; A 16-byte limit on this build's 8-byte cipher blocks is two blocks.
+    (is (cl-pnet-ssh::ssh-client-need-rekey-p client))
+    ;; OpenSSH's one-packet-in-or-out rule keeps an idle connection idle.
+    (setf (cl-pnet-ssh::ssh-client-sent-packets client) 0
+          (cl-pnet-ssh::ssh-client-sent-blocks client) 0)
+    (is (not (cl-pnet-ssh::ssh-client-need-rekey-p client)))
+    ;; Time-based rekeying needs the same traffic.
+    (setf (cl-pnet-ssh::ssh-client-rekey-limit client) 0
+          (cl-pnet-ssh::ssh-client-rekey-interval client) 10
+          (cl-pnet-ssh::ssh-client-rekey-time client)
+          (- (cl-pnet-ssh::ssh-client-now) 20)
+          (cl-pnet-ssh::ssh-client-received-packets client) 1)
+    (is (cl-pnet-ssh::ssh-client-need-rekey-p client))))
+
+#-ssh-backend-ffi
+(test rekey-queues-application-packets
+  "While a rekey is in progress, only key-exchange messages go out directly."
+  (let ((client (cl-pnet-ssh::%make-ssh-client))
+        (payload (cl-pnet-ssh::ssh-writer-output
+                  (let ((writer (cl-pnet-ssh::ssh-writer)))
+                    (cl-pnet-ssh::ssh-write-u8 writer 90)
+                    (cl-pnet-ssh::ssh-write-string writer
+                                                   (cl-pnet-ssh::ssh-string-octets "x"))
+                    writer))))
+    (setf (cl-pnet-ssh::ssh-client-rekeying client) t)
+    (is (null (cl-pnet-ssh::ssh-client-send-payload client payload)))
+    (is (= 1 (length (cl-pnet-ssh::ssh-client-outgoing-queue client))))
+    (is (eq payload
+            (first (cl-pnet-ssh::ssh-client-outgoing-queue client))))
+    ;; A KEXINIT is transport traffic and bypasses the queue.
+    (let ((kexinit (cl-pnet-ssh::ssh-make-kexinit-payload)))
+      (setf (cl-pnet-ssh::ssh-client-outgoing-queue client) nil)
+      (cl-pnet-ssh::ssh-client-send-payload client kexinit)
+      (is (null (cl-pnet-ssh::ssh-client-outgoing-queue client))))))
+
+#-ssh-backend-ffi
+(test client-rekeys-after-rekeylimit-volume
+  "A small client RekeyLimit makes the client start its own exchange and then
+finish the session normally."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((count 0)
+            (original (symbol-function
+                       'cl-pnet-ssh::ssh-client-start-rekey)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function
+                      'cl-pnet-ssh::ssh-client-start-rekey)
+                     (lambda (client)
+                       (let ((started (funcall original client)))
+                         (when started (incf count))
+                         started)))
+               (multiple-value-bind (stdout stderr status)
+                   (ssh-test-loopback-result :rekey-limit 16)
+                 (is (= 3 status))
+                 (is (string= "hello" stdout))
+                 (is (string= "oops" stderr))
+                 (is (plusp count))))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-client-start-rekey)
+                original)))))
+
+#-ssh-backend-ffi
+(test server-rekeys-after-rekeylimit-volume
+  "A small sshd RekeyLimit makes the server start its own exchange, which the
+client answers before the session continues."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let ((count 0)
+            (original (symbol-function
+                       'cl-pnet-ssh::ssh-session-start-rekey)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function
+                      'cl-pnet-ssh::ssh-session-start-rekey)
+                     (lambda (session)
+                       (let ((started (funcall original session)))
+                         (when started (incf count))
+                         started)))
+               (multiple-value-bind (stdout stderr status)
+                   (ssh-test-loopback-result :sshd-options '("RekeyLimit 16"))
+                 (is (= 3 status))
+                 (is (string= "hello" stdout))
+                 (is (string= "oops" stderr))
+                 (is (plusp count))))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-session-start-rekey)
+                original)))))

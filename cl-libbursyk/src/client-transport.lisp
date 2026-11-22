@@ -87,7 +87,15 @@ line, and NIL while the line is still incomplete."
                                    (ssh-client-cipher client))
               (when (eq payload :incomplete) (leave))
               (ssh-client-buffer-consume client consumed)
-              (ssh-client-handle-payload client payload))))
+              (let ((cipher (ssh-client-cipher client)))
+                (when cipher
+                  (incf (ssh-client-received-packets client))
+                  (incf (ssh-client-received-blocks client)
+                        (floor (ssh-packet-counted-length
+                                consumed cipher :receive)
+                               (ssh-cipher-state-block-size cipher)))))
+              (ssh-client-handle-payload client payload)
+              (ssh-client-maybe-rekey client))))
     (error (condition)
       (ssh-client-fail client condition))))
 
@@ -242,6 +250,12 @@ its KEXINIT when the connection came up."
       (setf (ssh-client-client-kexinit client) kexinit
             (ssh-client-kexinit-sent client) t)
       (ssh-client-send-payload client kexinit)))
+  ;; A KEXINIT that arrives once channels are running is a rekey; hold
+  ;; application packets until our NEWKEYS has crossed.
+  (when (eq (ssh-client-phase client) :ready)
+    (setf (ssh-client-rekeying client) t
+          (ssh-client-keys-sent client) nil
+          (ssh-client-keys-received client) nil))
   (let ((offers (ssh-parse-kexinit-payload payload)))
     (setf (ssh-client-server-kexinit client) payload
           (ssh-client-negotiated client)
@@ -316,7 +330,18 @@ its KEXINIT when the connection came up."
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
                       :encrypt-mac (getf keys :encrypt-mac)
                       :aead (getf keys :aead))
-    (setf (ssh-client-keys-sent client) t)
+    (setf (ssh-client-keys-sent client) t
+          ;; OpenSSH resets its send counters when the new keys are
+          ;; installed, so a rekeyed session starts a fresh volume budget.
+          (ssh-client-sent-packets client) 0
+          (ssh-client-sent-blocks client) 0
+          (ssh-client-rekey-time client) (ssh-client-now))
+    (let ((rekey (eq (ssh-client-phase client) :ready)))
+      (setf (ssh-client-rekeying client) nil)
+      (when rekey
+        (ssh-log "rekey complete; resuming queued packets")
+        (ssh-client-flush-outgoing client)
+        (ssh-client-schedule-rekey-timer client)))
     (ssh-client-maybe-finish-kex client)))
 
 (defun ssh-client-handle-newkeys (client)
@@ -330,7 +355,9 @@ its KEXINIT when the connection came up."
                       :decrypt-mac (getf keys :decrypt-mac)
                       :aead (getf keys :aead))
     (setf (ssh-client-keys-received client) t
-          (ssh-client-kexinit-sent client) nil)
+          (ssh-client-kexinit-sent client) nil
+          (ssh-client-received-packets client) 0
+          (ssh-client-received-blocks client) 0)
     (ssh-client-maybe-finish-kex client)))
 
 (defun ssh-client-check-weak-crypto (client)
@@ -357,12 +384,145 @@ as ssh sets non_pq_kex_warned after showing it."
   (when (and (ssh-client-keys-sent client)
              (ssh-client-keys-received client)
              (eq (ssh-client-phase client) :kex))
-    (setf (ssh-client-phase client) :auth)
+    (setf (ssh-client-phase client) :auth
+          (ssh-client-keys-sent client) nil
+          (ssh-client-keys-received client) nil)
     (ssh-client-check-weak-crypto client)
     ;; ConnectTimeout keeps running through authentication, as it does in
     ;; OpenSSH: a server that completes the key exchange and then stalls
     ;; must not hang the caller forever.
     (ssh-client-send-service-request client)))
+
+;;; ---- Rekeying ----
+;;;
+;;; OpenSSH rekeys after a cipher-dependent volume, after RekeyLimit bytes
+;;; or seconds, or after 2^31 packets.  The client starts the exchange with
+;;; KEXINIT and holds non-key-exchange packets until its NEWKEYS is sent.
+
+(defun ssh-client-kex-message-p (type)
+  "Whether packet TYPE may travel during a key exchange, as OpenSSH decides.
+
+OpenSSH excludes SERVICE_REQUEST, SERVICE_ACCEPT and EXT_INFO from the
+transport range, so those wait for the new keys even though their numbers
+lie between DISCONNECT and the last key-exchange message."
+  (and (<= +ssh-kex-message-min+ type +ssh-kex-message-max+)
+       (not (member type (list +ssh-msg-service-request+
+                               +ssh-msg-service-accept+
+                               +ssh-msg-ext-info+)))))
+
+(defun ssh-client-rekey-hard-max-blocks (block-size)
+  "The cipher's absolute block limit from RFC 4344 and OpenSSH's packet.c."
+  (if (>= block-size 16)
+      (ash 1 (* block-size 2))
+      (floor (ash 1 30) block-size)))
+
+(defun ssh-client-rekey-max-blocks (client)
+  "CLIENT's block budget for the current keys."
+  (let* ((block-size (ssh-cipher-state-block-size (ssh-client-cipher client)))
+         (hard (ssh-client-rekey-hard-max-blocks block-size))
+         (limit (ssh-client-rekey-limit client)))
+    (if (and (integerp limit) (plusp limit))
+        (min hard (floor limit block-size))
+        hard)))
+
+(defun ssh-client-need-rekey-p (client &optional (outbound-payload-length 0))
+  "Whether CLIENT must start a rekey before sending an outbound packet.
+
+OUTBOUND-PAYLOAD-LENGTH is the payload about to go out, or zero when the
+check follows a received packet.  OpenSSH permits one packet in or out
+after every rekey, so an otherwise idle connection does not rekey."
+  (and (eq (ssh-client-phase client) :ready)
+       (ssh-client-after-authentication client)
+       (not (ssh-client-rekeying client))
+       ;; Our NEWKEYS has gone out but the peer's has not arrived: the
+       ;; exchange is still open, so its old receive counters must not start
+       ;; another one.  OpenSSH's kex state covers this window.
+       (not (and (ssh-client-keys-sent client)
+                 (not (ssh-client-keys-received client))))
+       (not (ssh-client-closed-p client))
+       (not (and (zerop (ssh-client-sent-packets client))
+                 (zerop (ssh-client-received-packets client))))
+       (let ((interval (ssh-client-rekey-interval client))
+             (time (ssh-client-rekey-time client)))
+         (or (and (integerp interval) (plusp interval) time
+                  (<= (+ time interval) (ssh-client-now)))
+             (let* ((cipher (ssh-client-cipher client))
+                    (block-size (ssh-cipher-state-block-size cipher))
+                    (max-blocks (ssh-client-rekey-max-blocks client))
+                    (out-blocks (if (plusp outbound-payload-length)
+                                    (* block-size
+                                       (ceiling (+ 5 outbound-payload-length)
+                                                block-size))
+                                    0)))
+               (or (> (ssh-client-sent-packets client) (ash 1 31))
+                   (> (ssh-client-received-packets client) (ash 1 31))
+                   (and (plusp max-blocks)
+                        (or (> (+ (ssh-client-sent-blocks client) out-blocks)
+                               max-blocks)
+                            (> (ssh-client-received-blocks client)
+                               max-blocks)))))))))
+
+(defun ssh-client-start-rekey (client)
+  "Begin a client-initiated key exchange, as OpenSSH's kex_start_rekex."
+  (when (and (eq (ssh-client-phase client) :ready)
+             (not (ssh-client-rekeying client))
+             (not (ssh-client-closed-p client)))
+    (let ((kexinit (ssh-make-kexinit-payload
+                    :kex (ssh-client-kex-algorithms client)
+                    :host-keys (ssh-client-host-key-algorithms client)
+                    :ciphers (ssh-client-ciphers client)
+                    :macs (ssh-client-macs client))))
+      (setf (ssh-client-rekeying client) t
+            (ssh-client-client-kexinit client) kexinit
+            (ssh-client-kexinit-sent client) t
+            (ssh-client-keys-sent client) nil
+            (ssh-client-keys-received client) nil)
+      (ssh-log "rekeying after ~D blocks, ~D received"
+               (ssh-client-sent-blocks client)
+               (ssh-client-received-blocks client))
+      (ssh-client-transmit-payload client kexinit))
+    t))
+
+(defun ssh-client-flush-outgoing (client)
+  "Send the payloads held back during a rekey, in their original order.
+
+A payload that would itself exceed the fresh limit queues again and starts
+another exchange, exactly as OpenSSH's queue drain does."
+  (let ((queue (ssh-client-outgoing-queue client)))
+    (setf (ssh-client-outgoing-queue client) nil)
+    (dolist (payload queue)
+      (unless (ssh-client-closed-p client)
+        (ssh-client-send-payload client payload)))))
+
+(defun ssh-client-maybe-rekey (client)
+  "Start a rekey now when the volume or time limit has been reached."
+  (when (ssh-client-need-rekey-p client)
+    (ssh-client-start-rekey client)))
+
+(defun ssh-client-schedule-rekey-timer (client)
+  "Arm the timer for RekeyLimit's time value, if it is set."
+  (setf (ssh-client-rekey-timer client)
+        (ssh-client-cancel-timer (ssh-client-rekey-timer client)))
+  (let ((interval (ssh-client-rekey-interval client)))
+    (when (and (integerp interval) (plusp interval)
+               (eq (ssh-client-phase client) :ready)
+               (not (ssh-client-closed-p client)))
+      (let* ((now (ssh-client-now))
+             (base (or (ssh-client-rekey-time client) now))
+             (delay (- (+ base interval) now)))
+        (setf (ssh-client-rekey-timer client)
+              (cl-pnet:timer-start
+               (max 1 delay) 0
+               (lambda ()
+                 (setf (ssh-client-rekey-timer client) nil)
+                 (when (and (not (ssh-client-closed-p client))
+                            (eq (ssh-client-phase client) :ready))
+                   (when (ssh-client-need-rekey-p client)
+                     (ssh-client-start-rekey client))))))))))
+
+(defun ssh-client-start-rekey-timer (client)
+  "Start time-based rekeying once authentication has completed."
+  (ssh-client-schedule-rekey-timer client))
 
 ;;; ---- Host key policy ----
 
@@ -929,9 +1089,11 @@ has no use for it either."
 (defun ssh-client-handle-auth-success (client)
   "Authenticated: let the queued channel work start."
   (ssh-log "authenticated as ~A" (ssh-client-user client))
-  (setf (ssh-client-phase client) :ready)
+  (setf (ssh-client-phase client) :ready
+        (ssh-client-after-authentication client) t)
   (ssh-client-cancel-connect-timer client)
   (ssh-client-start-alive-timer client)
+  (ssh-client-start-rekey-timer client)
   (let ((actions (nreverse (ssh-client-pending-actions client))))
     (setf (ssh-client-pending-actions client) nil)
     (when (ssh-client-on-open client)

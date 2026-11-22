@@ -249,6 +249,8 @@ MAKE-SSH-CLIENT's own defaults."
             +ssh-keystroke-default-interval-ms+)
         :channel-timeouts
         (ssh-config-client-channel-timeouts options)
+        :rekey-limit (or (ssh-config-options-rekey-limit options) 0)
+        :rekey-interval (or (ssh-config-options-rekey-interval options) 0)
         :connect-timeout
         (ssh-config-client-seconds
          (ssh-config-options-connect-timeout options))
@@ -529,6 +531,8 @@ uses whichever of the two it saw first instead of chaining them."
            (getf parameters :obscure-keystroke-timing
                  +ssh-keystroke-default-interval-ms+)
            :channel-timeouts (getf parameters :channel-timeouts)
+           :rekey-limit (getf parameters :rekey-limit)
+           :rekey-interval (getf parameters :rekey-interval)
            :kex-algorithms (getf parameters :kex-algorithms)
            :host-key-algorithms (getf parameters :host-key-algorithms)
            :ciphers (getf parameters :ciphers)

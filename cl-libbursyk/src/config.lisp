@@ -180,7 +180,12 @@ way ssh refuses it.")
   (set-env nil)
   (proxy-jump nil)
   (proxy-command nil)
+  ;; RekeyLimit: the byte volume before rekeying and the optional time
+  ;; interval, each NIL until an active line sets it.  0 is OpenSSH's
+  ;; "default" volume, meaning the cipher's own limit, and a 0 interval
+  ;; disables time-based rekeying.
   (rekey-limit nil)
+  (rekey-interval nil)
   ;; ForwardAgent: T enables it, NIL leaves it off.  A path instead of yes
   ;; selects the agent socket to forward, as ssh 10.6 allows.
   (forward-agent nil)
@@ -761,6 +766,73 @@ does that without a temporary file."
                  (or (null maximum) (<= number maximum)))
       (error (ssh-config-line-error line "invalid number ~S" value)))
     number))
+
+(defun ssh-parse-scaled (value)
+  "VALUE as scan_scaled reads a size in bytes, or NIL when it is invalid.
+
+The syntax is digits with an optional decimal fraction and an optional
+B/K/M/G/T/P/E suffix, as OpenSSH's RekeyLimit accepts.  The suffix is a
+power of 1024, case-insensitively, and anything after it is invalid.  A
+negative size is refused: OpenSSH's scan_scaled accepts it, but every
+directive that uses it rejects the result."
+  (when (and (stringp value) (plusp (length value)))
+    (let ((position 0)
+          (length (length value)))
+      (loop while (and (< position length)
+                       (member (char value position)
+                               '(#\Space #\Tab #\Return #\Linefeed)))
+            do (incf position))
+      (when (and (< position length)
+                 (char= (char value position) #\+))
+        (incf position))
+      (when (and (< position length)
+                 (char= (char value position) #\-))
+        (return-from ssh-parse-scaled nil))
+      (let ((whole 0)
+            (fraction 0)
+            (fraction-digits 0)
+            (digits 0))
+        (loop while (and (< position length)
+                         (digit-char-p (char value position)))
+              do (setf whole (+ (* whole 10)
+                                (digit-char-p (char value position))))
+                 (incf digits)
+                 (incf position))
+        (when (and (< position length) (char= (char value position) #\.))
+          (incf position)
+          (loop while (and (< position length)
+                           (digit-char-p (char value position)))
+                do (setf fraction (+ (* fraction 10)
+                                     (digit-char-p (char value position))))
+                   (incf digits)
+                   (incf fraction-digits)
+                   (incf position)))
+        (unless (plusp digits)
+          (return-from ssh-parse-scaled nil))
+        (let ((multiplier 1))
+          (when (< position length)
+            (setf multiplier
+                  (case (char-upcase (char value position))
+                    (#\B 1)
+                    (#\K (expt 1024 1))
+                    (#\M (expt 1024 2))
+                    (#\G (expt 1024 3))
+                    (#\T (expt 1024 4))
+                    (#\P (expt 1024 5))
+                    (#\E (expt 1024 6))
+                    (t (return-from ssh-parse-scaled nil))))
+            (incf position))
+          (when (< position length)
+            (return-from ssh-parse-scaled nil))
+          (let ((result
+                  (+ (* whole multiplier)
+                     (if (plusp fraction-digits)
+                         (floor (* fraction multiplier)
+                                (expt 10 fraction-digits))
+                         0))))
+            (if (> result (1- (expt 2 63)))
+                nil
+                result)))))))
 
 (defun ssh-config-atoi-error (value)
   "OpenSSH's strtonum diagnostic for VALUE, or NIL when it parses as an int.
@@ -1407,11 +1479,34 @@ understand them rather than silently match nothing."
             (setf (ssh-config-options-compression options)
                   (string= value "yes"))))))
       ((string= keyword "rekeylimit")
-       (ssh-config-set-once
-        seen options :rekey-limit
-        (lambda (options)
-          (setf (ssh-config-options-rekey-limit options)
-                (ssh-config-line-args line))))))))
+       (let ((arguments (ssh-config-line-args line)))
+         (unless (<= 1 (length arguments) 2)
+           (error (ssh-config-line-error
+                   line "RekeyLimit takes a size and an optional time")))
+         (let* ((size-argument (first arguments))
+                (bytes (if (string= size-argument "default")
+                           0
+                           (or (ssh-parse-scaled size-argument)
+                               (error (ssh-config-line-error
+                                       line "Bad number ~S" size-argument))))))
+           (when (and (plusp bytes) (< bytes 16))
+             (error (ssh-config-line-error line "RekeyLimit too small")))
+           (ssh-config-set-once
+            seen options :rekey-limit
+            (lambda (options)
+              (setf (ssh-config-options-rekey-limit options) bytes)))
+           (when (second arguments)
+             (let ((interval-argument (second arguments)))
+               (unless (string= interval-argument "none")
+                 (let ((seconds (or (ssh-parse-time interval-argument)
+                                    (error (ssh-config-line-error
+                                            line "invalid time value ~S"
+                                            interval-argument)))))
+                   (ssh-config-set-once
+                    seen options :rekey-interval
+                    (lambda (options)
+                      (setf (ssh-config-options-rekey-interval options)
+                            seconds)))))))))))))
 
 (defparameter +ssh-config-ip-qos-names+
   '(("af11" . #x28) ("af12" . #x30) ("af13" . #x38)

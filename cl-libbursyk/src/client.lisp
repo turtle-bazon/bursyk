@@ -491,6 +491,7 @@ address is known, because it has to be in the same family."
                                  (obscure-keystroke-timing
                                   +ssh-keystroke-default-interval-ms+)
                                  channel-timeouts
+                                 rekey-limit rekey-interval
                                  version-addendum
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
@@ -554,6 +555,8 @@ address is known, because it has to be in the same family."
                     :warn-weak-crypto warn-weak-crypto
                     :obscure-keystroke-timing obscure-keystroke-timing
                     :channel-timeouts channel-timeouts
+                    :rekey-limit (or rekey-limit 0)
+                    :rekey-interval (or rekey-interval 0)
                     :version-addendum
                     (and version-addendum
                          (not (eq version-addendum :none))
@@ -697,6 +700,7 @@ is applied here, before any request names a key the configuration forbade."
                              (obscure-keystroke-timing
                               +ssh-keystroke-default-interval-ms+)
                              channel-timeouts
+                             rekey-limit rekey-interval
                              version-addendum
                              hostbased-authentication
                              hostbased-accepted-algorithms
@@ -832,6 +836,8 @@ role-neutral."
                            :obscure-keystroke-timing
                            obscure-keystroke-timing
                            :channel-timeouts channel-timeouts
+                           :rekey-limit rekey-limit
+                           :rekey-interval rekey-interval
                            :version-addendum version-addendum
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms

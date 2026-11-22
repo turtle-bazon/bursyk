@@ -97,7 +97,15 @@ and NIL while the line is still incomplete."
                                    (ssh-session-cipher session))
               (when (eq payload :incomplete) (leave))
               (ssh-session-buffer-consume session consumed)
-              (ssh-server-handle-payload session payload))))
+              (let ((cipher (ssh-session-cipher session)))
+                (when cipher
+                  (incf (ssh-session-received-packets session))
+                  (incf (ssh-session-received-blocks session)
+                        (floor (ssh-packet-counted-length
+                                consumed cipher :receive)
+                               (ssh-cipher-state-block-size cipher)))))
+              (ssh-server-handle-payload session payload)
+              (ssh-session-maybe-rekey session))))
     (error (condition) (ssh-session-fail session condition))))
 
 (defun ssh-server-receive (session data)
@@ -380,7 +388,12 @@ and refuse the key without ever asking."
                       :encrypt-mac (getf keys :encrypt-mac)
                       :aead (getf keys :aead))
     (setf (ssh-session-keys-sent session) t
-          (ssh-session-kexinit-sent session) nil)
+          (ssh-session-kexinit-sent session) nil
+          ;; OpenSSH resets its send counters when the new keys are
+          ;; installed, so a rekeyed session starts a fresh volume budget.
+          (ssh-session-sent-packets session) 0
+          (ssh-session-sent-blocks session) 0
+          (ssh-session-rekey-time session) (ssh-session-now))
     (ssh-session-send-bytes
      session
      (if ext-info
@@ -388,6 +401,9 @@ and refuse the key without ever asking."
                      (ssh-encode-packet
                       (ssh-server-ext-info-payload) cipher))
          newkeys))
+    (when (ssh-session-rekey session)
+      (ssh-log "rekey complete; resuming queued packets")
+      (ssh-session-flush-outgoing session))
     (ssh-server-maybe-finish-kex session)))
 
 (defun ssh-server-handle-newkeys (session)
@@ -401,7 +417,9 @@ and refuse the key without ever asking."
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
                       :decrypt-mac (getf keys :decrypt-mac)
                       :aead (getf keys :aead))
-    (setf (ssh-session-keys-received session) t)
+    (setf (ssh-session-keys-received session) t
+          (ssh-session-received-packets session) 0
+          (ssh-session-received-blocks session) 0)
     (ssh-server-maybe-finish-kex session)))
 
 (defun ssh-server-maybe-finish-kex (session)
@@ -409,11 +427,141 @@ and refuse the key without ever asking."
   (when (and (ssh-session-keys-sent session)
              (ssh-session-keys-received session)
              (eq (ssh-session-phase session) :kex))
-    (setf (ssh-session-phase session)
-          (if (ssh-session-rekey session) :ready :auth)
-          (ssh-session-rekey session) nil
-          (ssh-session-keys-sent session) nil
-          (ssh-session-keys-received session) nil)))
+    (let ((rekey (ssh-session-rekey session)))
+      (setf (ssh-session-phase session)
+            (if rekey :ready :auth)
+            (ssh-session-rekey session) nil
+            (ssh-session-keys-sent session) nil
+            (ssh-session-keys-received session) nil)
+      (when rekey
+        (ssh-session-schedule-rekey-timer session)))))
+
+;;; ---- Rekeying ----
+;;;
+;;; The server enforces its own RekeyLimit and may start the exchange, as
+;;; sshd's packet layer does.  It holds non-key-exchange packets until its
+;;; NEWKEYS has been sent.
+
+(defun ssh-session-kex-message-p (type)
+  "Whether packet TYPE may travel during a key exchange, as OpenSSH decides."
+  (and (<= +ssh-kex-message-min+ type +ssh-kex-message-max+)
+       (not (member type (list +ssh-msg-service-request+
+                               +ssh-msg-service-accept+
+                               +ssh-msg-ext-info+)))))
+
+(defun ssh-session-rekeying-p (session)
+  "Whether SESSION must hold application packets for the keys being installed."
+  (and (ssh-session-rekey session)
+       (eq (ssh-session-phase session) :kex)
+       (not (ssh-session-keys-sent session))))
+
+(defun ssh-session-rekey-limits (session)
+  "SESSION's RekeyLimit volume and interval, defaulting both to zero."
+  (let ((config (ssh-session-effective-config session)))
+    (values (or (and config (ssh-server-config-rekey-limit config)) 0)
+            (or (and config (ssh-server-config-rekey-interval config)) 0))))
+
+(defun ssh-session-rekey-hard-max-blocks (block-size)
+  "The cipher's absolute block limit from RFC 4344 and OpenSSH's packet.c."
+  (if (>= block-size 16)
+      (ash 1 (* block-size 2))
+      (floor (ash 1 30) block-size)))
+
+(defun ssh-session-rekey-max-blocks (session)
+  "SESSION's block budget for the current keys."
+  (multiple-value-bind (limit interval)
+      (ssh-session-rekey-limits session)
+    (declare (ignore interval))
+    (let* ((block-size (ssh-cipher-state-block-size (ssh-session-cipher session)))
+           (hard (ssh-session-rekey-hard-max-blocks block-size)))
+      (if (and (integerp limit) (plusp limit))
+          (min hard (floor limit block-size))
+          hard))))
+
+(defun ssh-session-rekey-interval (session)
+  "SESSION's RekeyLimit time value in seconds, or zero."
+  (nth-value 1 (ssh-session-rekey-limits session)))
+
+(defun ssh-session-need-rekey-p (session &optional (outbound-payload-length 0))
+  "Whether SESSION must start a rekey before sending an outbound packet."
+  (and (eq (ssh-session-phase session) :ready)
+       (ssh-session-after-authentication session)
+       ;; Our NEWKEYS has gone out but the peer's has not arrived: wait for
+       ;; the open exchange before starting another one.
+       (not (and (ssh-session-keys-sent session)
+                 (not (ssh-session-keys-received session))))
+       (not (ssh-session-closed-p session))
+       (not (and (zerop (ssh-session-sent-packets session))
+                 (zerop (ssh-session-received-packets session))))
+       (let ((interval (ssh-session-rekey-interval session))
+             (time (ssh-session-rekey-time session)))
+         (or (and (integerp interval) (plusp interval) time
+                  (<= (+ time interval) (ssh-session-now)))
+             (let* ((cipher (ssh-session-cipher session))
+                    (block-size (ssh-cipher-state-block-size cipher))
+                    (max-blocks (ssh-session-rekey-max-blocks session))
+                    (out-blocks (if (plusp outbound-payload-length)
+                                    (* block-size
+                                       (ceiling (+ 5 outbound-payload-length)
+                                                block-size))
+                                    0)))
+               (or (> (ssh-session-sent-packets session) (ash 1 31))
+                   (> (ssh-session-received-packets session) (ash 1 31))
+                   (and (plusp max-blocks)
+                        (or (> (+ (ssh-session-sent-blocks session) out-blocks)
+                               max-blocks)
+                            (> (ssh-session-received-blocks session)
+                               max-blocks)))))))))
+
+(defun ssh-session-start-rekey (session)
+  "Begin a server-initiated key exchange, as OpenSSH's kex_start_rekex."
+  (when (and (eq (ssh-session-phase session) :ready)
+             (not (ssh-session-closed-p session)))
+    (setf (ssh-session-rekey session) t
+          (ssh-session-phase session) :kex)
+    (ssh-log "rekeying after ~D blocks, ~D received"
+             (ssh-session-sent-blocks session)
+             (ssh-session-received-blocks session))
+    (ssh-server-send-kexinit session)
+    t))
+
+(defun ssh-session-flush-outgoing (session)
+  "Send the payloads held during a rekey, in their original order."
+  (let ((queue (ssh-session-outgoing-queue session)))
+    (setf (ssh-session-outgoing-queue session) nil)
+    (dolist (payload queue)
+      (unless (ssh-session-closed-p session)
+        (ssh-session-send-payload session payload)))))
+
+(defun ssh-session-maybe-rekey (session)
+  "Start a rekey now when SESSION's volume or time limit has been reached."
+  (when (ssh-session-need-rekey-p session)
+    (ssh-session-start-rekey session)))
+
+(defun ssh-session-schedule-rekey-timer (session)
+  "Arm the timer for RekeyLimit's time value, if it is set."
+  (setf (ssh-session-rekey-timer session)
+        (ssh-session-cancel-timer (ssh-session-rekey-timer session)))
+  (let ((interval (ssh-session-rekey-interval session)))
+    (when (and (integerp interval) (plusp interval)
+               (eq (ssh-session-phase session) :ready)
+               (not (ssh-session-closed-p session)))
+      (let* ((now (ssh-session-now))
+             (base (or (ssh-session-rekey-time session) now))
+             (delay (- (+ base interval) now)))
+        (setf (ssh-session-rekey-timer session)
+              (cl-pnet:timer-start
+               (max 1 delay) 0
+               (lambda ()
+                 (setf (ssh-session-rekey-timer session) nil)
+                 (when (and (not (ssh-session-closed-p session))
+                            (eq (ssh-session-phase session) :ready))
+                   (when (ssh-session-need-rekey-p session)
+                     (ssh-session-start-rekey session))))))))))
+
+(defun ssh-session-start-rekey-timer (session)
+  "Start time-based rekeying once authentication has completed."
+  (ssh-session-schedule-rekey-timer session))
 
 ;;; ---- Service and authentication ----
 
@@ -621,7 +769,9 @@ which the transport enforces for pty and forwarding requests."
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session)))
   (ssh-server-send-auth-success session)
+  (setf (ssh-session-after-authentication session) t)
   (ssh-session-start-client-alive-timer session)
+  (ssh-session-start-rekey-timer session)
   (when (ssh-server-on-session (ssh-session-server session))
     (funcall (ssh-server-on-session (ssh-session-server session)) session))
   ;; sshd starts UnusedConnectionTimeout when authentication finishes, before

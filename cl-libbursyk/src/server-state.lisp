@@ -140,6 +140,18 @@ present after RequiredRSASize, for callers that only want to describe it."
   (rekey nil)
   (keys-sent nil)
   (keys-received nil)
+  ;; OpenSSH's packet.c starts no rekey before the server has sent its
+  ;; USERAUTH_SUCCESS, even when RekeyLimit is very small.
+  (after-authentication nil)
+  ;; RekeyLimit and counters, the same bookkeeping the client keeps.  A
+  ;; rekey's KEXINIT has been sent and our NEWKEYS has not.
+  (sent-packets 0)
+  (received-packets 0)
+  (sent-blocks 0)
+  (received-blocks 0)
+  (outgoing-queue '())
+  (rekey-time nil)
+  (rekey-timer nil)
   (authenticated nil)
   (user nil)
   (authorized-key nil)
@@ -355,7 +367,10 @@ present after RequiredRSASize, for callers that only want to describe it."
          (ssh-session-unused-connection-timer session))
         (ssh-session-channel-timeout-timer session)
         (ssh-session-cancel-timer
-         (ssh-session-channel-timeout-timer session))))
+         (ssh-session-channel-timeout-timer session))
+        (ssh-session-rekey-timer session)
+        (ssh-session-cancel-timer
+         (ssh-session-rekey-timer session))))
 
 (defun ssh-session-start-login-grace-timer (session)
   "Close SESSION if it has not authenticated in LoginGraceTime seconds.
@@ -487,10 +502,32 @@ server was built without a value."
           (error (condition) (ssh-session-fail session condition))))))
   (not (ssh-session-closed session)))
 
+(defun ssh-session-transmit-payload (session payload)
+  "Frame and send PAYLOAD now, counting it against the rekey limits."
+  (let* ((cipher (ssh-session-cipher session))
+         (octets (ssh-encode-packet payload cipher))
+         (counted (ssh-packet-counted-length (length octets) cipher :send)))
+    (when (ssh-session-send-bytes session octets)
+      (incf (ssh-session-sent-packets session))
+      (incf (ssh-session-sent-blocks session)
+            (floor counted (ssh-cipher-state-block-size cipher))))))
+
 (defun ssh-session-send-payload (session payload)
-  "Frame and send one protocol PAYLOAD."
-  (ssh-session-send-bytes session
-                          (ssh-encode-packet payload (ssh-session-cipher session))))
+  "Frame and send one protocol PAYLOAD, deferring it during a rekey."
+  (cond
+    ((and (not (ssh-session-kex-message-p (aref payload 0)))
+          (ssh-session-rekeying-p session))
+     (setf (ssh-session-outgoing-queue session)
+           (nconc (ssh-session-outgoing-queue session) (list payload)))
+     nil)
+    ((and (not (ssh-session-kex-message-p (aref payload 0)))
+          (ssh-session-need-rekey-p session (length payload)))
+     (setf (ssh-session-outgoing-queue session)
+           (nconc (ssh-session-outgoing-queue session) (list payload)))
+     (ssh-session-start-rekey session)
+     nil)
+    (t
+     (ssh-session-transmit-payload session payload))))
 
 (defun ssh-session-send-payload-and-close (session payload reason)
   "Send PAYLOAD, then close SESSION with REASON once it is on the wire.

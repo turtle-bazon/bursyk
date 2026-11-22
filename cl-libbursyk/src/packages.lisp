@@ -250,6 +250,8 @@
    #:ssh-config-options-tunnel-device
    #:ssh-config-options-xauth-location
    #:ssh-config-options-rekey-limit
+   #:ssh-config-options-rekey-interval
+   #:ssh-parse-scaled
    #:ssh-config-options-preferred-authentications
    #:ssh-config-options-pubkey-authentication
    #:ssh-config-options-password-authentication
@@ -322,6 +324,8 @@
    #:ssh-server-config-max-sessions
    #:ssh-server-config-login-grace-time
    #:ssh-server-config-client-alive-interval
+   #:ssh-server-config-rekey-limit
+   #:ssh-server-config-rekey-interval
    #:ssh-server-config-client-alive-count-max
    #:ssh-server-config-max-startups-begin
    #:ssh-server-config-max-startups-rate
