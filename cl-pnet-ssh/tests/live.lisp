@@ -14,9 +14,17 @@
 ;;;;   SSH_TEST_STATUS       expected exit status, default 7
 ;;;;   SSH_TEST_STDOUT       expected stdout, default "hello"
 ;;;;   SSH_TEST_STDERR       expected stderr, default "oops"
+;;;;
+;;;; When this file runs outside the pesekey monorepo there is no sibling
+;;;; cl-pnet test selector, so the caller must push the backend feature
+;;;; itself (:pnet-backend-puma, :pnet-backend-libev or :pnet-backend-libuv)
+;;;; plus :ssh-backend-ffi for the libssh backend.  The Makefile targets do.
 
-(load (merge-pathnames "../../cl-pnet/tests/pnet-backend.lisp"
-                       (make-pathname :name nil :type nil :defaults *load-truename*)))
+(let ((selector (merge-pathnames "../../cl-pnet/tests/pnet-backend.lisp"
+                                 (make-pathname :name nil :type nil
+                                                :defaults *load-truename*))))
+  (when (probe-file selector)
+    (load selector)))
 (require :asdf)
 (asdf:load-system :cl-pnet-ssh)
 
