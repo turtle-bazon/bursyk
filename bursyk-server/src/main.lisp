@@ -1782,12 +1782,20 @@ refused; this server has no PermitEmptyPasswords backend."
          (and computed (quick-string-equal-p computed hash)))))
 
 #-win32
+(defvar *shadow-file* "/etc/shadow"
+  "The shadow file password checks read; rebindable for tests.")
+
+#-win32
+(defvar *passwd-file* "/etc/passwd"
+  "The passwd file account lookups read; rebindable for tests.")
+
+#-win32
 (defun shadow-password-hash (user)
-  "USER's hash from /etc/shadow, or NIL when unreadable or absent."
+  "USER's hash from *SHADOW-FILE*, or NIL when unreadable or absent."
   (when (and user (plusp (length user)))
     (handler-case
-        (with-open-file (stream "/etc/shadow" :direction :input
-                                :if-does-not-exist nil)
+        (with-open-file (stream *shadow-file* :direction :input
+                                              :if-does-not-exist nil)
           (when stream
             (loop for line = (read-line stream nil nil)
                   while line
@@ -1805,10 +1813,10 @@ refused; this server has no PermitEmptyPasswords backend."
 
 #-win32
 (defun passwd-fields (user)
-  "The colon-separated fields for USER in /etc/passwd, or NIL."
+  "The colon-separated fields for USER in *PASSWD-FILE*, or NIL."
   (when (and user (plusp (length user)))
-    (with-open-file (stream "/etc/passwd" :direction :input
-                            :if-does-not-exist nil)
+    (with-open-file (stream *passwd-file* :direction :input
+                                          :if-does-not-exist nil)
       (when stream
         (loop for line = (read-line stream nil nil)
               while line

@@ -1851,6 +1851,65 @@ DenyGroups banned")))
   (is (not (bursyk-server::password-hash-valid-p "" "abNANd1rDfiNc")))
   (is (not (bursyk-server::password-hash-valid-p "secret" ""))))
 
+(test shadow-and-passwd-password-files-are-read-in-order
+  ;; The real /etc/shadow is not readable in the test environment, so use
+  ;; fixture files through the rebindable paths.
+  (let* ((directory (merge-pathnames
+                     (format nil "bursyk-server-shadow-~D/"
+                             (random 1000000))
+                     (uiop:temporary-directory)))
+         (shadow (merge-pathnames "shadow" directory))
+         (passwd (merge-pathnames "passwd" directory))
+         (hash "abNANd1rDfiNc"))
+    (ensure-directories-exist shadow)
+    (flet ((write-lines (path &rest lines)
+             (with-open-file (out path :direction :output
+                                       :if-exists :supersede
+                                       :if-does-not-exist :create)
+               (dolist (line lines)
+                 (format out "~A~%" line)))))
+      (unwind-protect
+           (progn
+             ;; The modern layout: the hash is in shadow and passwd says "x".
+             (write-lines shadow (format nil "tester:~A:19000:0:99999:7:::"
+                                         hash))
+             (write-lines passwd
+                          "tester:x:1001:1001:Test User:/home/tester:/bin/sh")
+             (let ((bursyk-server::*shadow-file* shadow)
+                   (bursyk-server::*passwd-file* passwd))
+               (is (equal hash
+                          (bursyk-server::shadow-password-hash "tester")))
+               (is (bursyk-server::verify-user-password "tester" "secret"))
+               (is (not (bursyk-server::verify-user-password
+                         "tester" "wrong")))
+               (is (null (bursyk-server::verify-user-password
+                          "nobody-here" "secret"))))
+             ;; Without a shadow file the passwd field is the hash, as on an
+             ;; account that never moved to shadow.
+             (write-lines passwd
+                          (format nil "tester:~A:1001:1001:Test User:/home/tester:/bin/sh"
+                                  hash))
+             (let ((bursyk-server::*shadow-file*
+                     (merge-pathnames "absent-shadow" directory))
+                   (bursyk-server::*passwd-file* passwd))
+               (is (bursyk-server::verify-user-password "tester" "secret"))
+               (is (not (bursyk-server::verify-user-password
+                         "tester" "wrong"))))
+             ;; A locked shadow entry wins over the passwd field.
+             (write-lines shadow (format nil "tester:!~A:19000:0:99999:7:::"
+                                         hash))
+             (let ((bursyk-server::*shadow-file* shadow)
+                   (bursyk-server::*passwd-file* passwd))
+               (is (not (bursyk-server::verify-user-password
+                         "tester" "secret"))))
+             ;; An empty shadow hash is refused and does not fall back.
+             (write-lines shadow "tester::19000:0:99999:7:::")
+             (let ((bursyk-server::*shadow-file* shadow)
+                   (bursyk-server::*passwd-file* passwd))
+               (is (not (bursyk-server::verify-user-password
+                         "tester" "secret")))))
+        (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test keyboard-interactive-asks-once-and-checks-the-answer
   (let ((request (list :responses '())))
     (let ((step (bursyk-server::keyboard-interactive-authentication
