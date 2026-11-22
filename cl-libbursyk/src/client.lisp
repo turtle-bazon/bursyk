@@ -4,13 +4,6 @@
 ;;;; driven, like cl-pnet-tls: MAKE-SSH-CLIENT returns at once and ON-OPEN
 ;;;; runs when the session is authenticated and ready for channels.
 
-(defparameter +ssh-default-identity-names+
-  '("id_ed25519" "id_ecdsa" "id_rsa")
-  "Identity files OpenSSH would try, in the order offered here.
-
-ed25519 comes first because it is what OpenSSH generates by default; ECDSA
-and RSA follow because many existing accounts still have only one of those.")
-
 (defun ssh-default-private-keys ()
   "The default identity files that exist, or NIL."
   (iter (for name in +ssh-default-identity-names+)

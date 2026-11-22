@@ -284,6 +284,15 @@ way ssh refuses it.")
   (log-verbose nil)
   (extra nil))
 
+(defparameter +ssh-default-identity-names+
+  '("id_ed25519" "id_ecdsa" "id_rsa")
+  "Identity files OpenSSH would try, in the order offered here.
+
+ed25519 comes first because it is what OpenSSH generates by default; ECDSA
+and RSA follow because many existing accounts still have only one of those.
+This is a config default rather than backend state, so the libssh build
+reports the same identityfile lines as the pure one.")
+
 (defun ssh-default-user ()
   "The local user name, or ROOT when the environment does not say."
   (or (uiop:getenv "USER")
