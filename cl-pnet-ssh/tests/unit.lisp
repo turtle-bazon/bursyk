@@ -5370,11 +5370,15 @@ option the server cannot honour refuses the line rather than being lost."
                    (is (= cl-pnet-ssh::+ssh-msg-ext-info+ (aref ext 0)))
                    (let ((reader (ssh-make-reader ext)))
                      (ssh-read-u8 reader)
-                     (is (= 1 (ssh-read-u32 reader)))
+                     (is (= 2 (ssh-read-u32 reader)))
                      (is (string= "server-sig-algs" (ssh-read-text reader)))
                      (is (member "rsa-sha2-512"
                                  (ssh-read-name-list reader)
-                                 :test #'string=)))))))
+                                 :test #'string=))
+                     (is (string= "ping@openssh.com"
+                                  (ssh-read-text reader)))
+                     (is (equalp (cl-pnet-ssh::ssh-string-octets "0")
+                                 (ssh-read-string reader))))))))
            ;; Without a client that asked for extensions, only NEWKEYS.
            (multiple-value-bind (plain-count plain-wire)
                (funcall capture '(:ext-info nil))
@@ -6538,3 +6542,71 @@ the first active value."
         (is (search (cdr case)
                     (cl-pnet-ssh::ssh-error-detail condition))
             (car case))))))
+
+;;; ---- ping@openssh.com and keystroke chaff ----
+
+(test ext-info-records-the-ping-extension
+  "EXT_INFO enables chaff only for ping@openssh.com version 0; other names are
+ignored and an unsupported version leaves chaff off."
+  (flet ((payload (&rest extensions)
+           (let ((writer (cl-pnet-ssh::ssh-writer)))
+             (cl-pnet-ssh::ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-ext-info+)
+             (cl-pnet-ssh::ssh-write-u32 writer (length extensions))
+             (dolist (extension extensions)
+               (cl-pnet-ssh::ssh-write-text writer (car extension))
+               (cl-pnet-ssh::ssh-write-text writer (cdr extension)))
+             (cl-pnet-ssh::ssh-writer-output writer)))
+         (supports-p (client)
+           (cl-pnet-ssh:ssh-client-ping-supported client)))
+    (let ((client (cl-pnet-ssh::%make-ssh-client)))
+      (cl-pnet-ssh::ssh-client-handle-ext-info
+       client (payload (cons "server-sig-algs" "ssh-ed25519")
+                       (cons "ping@openssh.com" "0")))
+      (is (supports-p client)))
+    (let ((client (cl-pnet-ssh::%make-ssh-client)))
+      (cl-pnet-ssh::ssh-client-handle-ext-info
+       client (payload (cons "ping@openssh.com" "1")))
+      (is (not (supports-p client))))
+    (let ((client (cl-pnet-ssh::%make-ssh-client)))
+      (cl-pnet-ssh::ssh-client-handle-ext-info
+       client (payload (cons "unknown@example.com" "0")))
+      (is (not (supports-p client))))))
+
+(test server-advertises-ping-version-zero
+  "The server EXT_INFO names server-sig-algs and ping@openssh.com version 0."
+  (let* ((payload (cl-pnet-ssh::ssh-server-ext-info-payload))
+         (reader (cl-pnet-ssh::ssh-make-reader payload))
+         (extensions nil))
+    (is (= 7 (cl-pnet-ssh::ssh-read-u8 reader)))
+    (let ((count (cl-pnet-ssh::ssh-read-u32 reader)))
+      (is (= 2 count))
+      (dotimes (index count)
+        (declare (ignore index))
+        (push (cons (cl-pnet-ssh::ssh-read-text reader)
+                    (cl-pnet-ssh::ssh-read-string reader))
+              extensions)))
+    (is (plusp (length (cdr (assoc "server-sig-algs" extensions
+                                    :test #'string=)))))
+    (is (equalp (cl-pnet-ssh::ssh-string-octets "0")
+                (cdr (assoc "ping@openssh.com" extensions
+                            :test #'string=))))))
+
+(test ping-and-pong-payloads-echo-data
+  "A PING carries a string and the PONG repeats it, as OpenSSH's chaff needs."
+  (let* ((payload (cl-pnet-ssh::ssh-make-ping-payload))
+         (reader (cl-pnet-ssh::ssh-make-reader payload)))
+    (is (= 192 (cl-pnet-ssh::ssh-read-u8 reader)))
+    (let ((data (cl-pnet-ssh::ssh-read-string reader)))
+      (is (equalp (cl-pnet-ssh::ssh-string-octets "PING!") data))
+      (let* ((pong (cl-pnet-ssh::ssh-make-pong-payload data))
+             (pong-reader (cl-pnet-ssh::ssh-make-reader pong)))
+        (is (= 193 (cl-pnet-ssh::ssh-read-u8 pong-reader)))
+        (is (equalp data (cl-pnet-ssh::ssh-read-string pong-reader)))))))
+
+(test chaff-needs-the-ping-extension
+  "No PING goes out until EXT_INFO allowed it, and a ready client accepts one."
+  (let ((client (cl-pnet-ssh::%make-ssh-client)))
+    (is (null (cl-pnet-ssh:ssh-client-send-chaff client)))
+    (setf (cl-pnet-ssh:ssh-client-ping-supported client) t
+          (cl-pnet-ssh::ssh-client-phase client) :ready)
+    (is (cl-pnet-ssh:ssh-client-send-chaff client))))

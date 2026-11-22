@@ -35,6 +35,31 @@
 (defconstant +ssh-msg-channel-request+ 98)
 (defconstant +ssh-msg-channel-success+ 99)
 (defconstant +ssh-msg-channel-failure+ 100)
+;; RFC 4253 section 11.3 transport-level keepalives.  OpenSSH also uses PING
+;; as chaff for ObscureKeystrokeTiming once the server advertises
+;; ping@openssh.com.
+(defconstant +ssh-msg-ping+ 192)
+(defconstant +ssh-msg-pong+ 193)
+
+(defparameter +ssh-chaff-ping-data+ (ssh-string-octets "PING!")
+  "The payload PING carries when it stands in for a keystroke.
+
+OpenSSH sends this exact text so a PING packet is as large as the
+CHANNEL_DATA packet a single keystroke would have produced.")
+
+(defun ssh-make-ping-payload (&optional (data +ssh-chaff-ping-data+))
+  "A PING payload carrying DATA, which defaults to chaff text."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-ping+)
+    (ssh-write-string writer data)
+    (ssh-writer-output writer)))
+
+(defun ssh-make-pong-payload (data)
+  "A PONG payload repeating the PING DATA it answers."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-pong+)
+    (ssh-write-string writer data)
+    (ssh-writer-output writer)))
 
 ;; Disconnect reason codes (RFC 4250 section 4.2.2).
 (defconstant +ssh-disconnect-protocol-error+ 2

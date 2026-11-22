@@ -124,6 +124,12 @@ and NIL while the line is still incomplete."
        (ssh-server-handle-disconnect session payload))
       ((member type '(+ssh-msg-ignore+ +ssh-msg-debug+ +ssh-msg-unimplemented+))
        nil)
+      ((= type +ssh-msg-ping+)
+       (ssh-server-handle-ping session payload))
+      ((= type +ssh-msg-pong+)
+       ;; A PONG answers a probe this server did not send; accepting it keeps
+       ;; the transport code tolerant of the other side's chaff.
+       (ssh-server-read-pong payload))
       ((= type +ssh-msg-kexinit+)
        (ssh-server-handle-kexinit session payload))
       ((= type +ssh-msg-kex-ecdh-init+)
@@ -147,6 +153,26 @@ and NIL while the line is still incomplete."
     (declare (ignore reason))
     (ssh-session-finish
      session (format nil "disconnected by peer: ~A" description) :close)))
+
+(defun ssh-server-handle-ping (session payload)
+  "Answer a PING with a PONG carrying the same data.
+
+As in OpenSSH's transport code, a PING is ignored before authentication and
+while key exchange is in progress, so it can never answer for KEX traffic."
+  (let* ((reader (ssh-make-reader payload))
+         (type (ssh-read-u8 reader))
+         (data (ssh-read-string reader)))
+    (declare (ignore type))
+    (when (and (ssh-session-authenticated session)
+               (not (eq (ssh-session-phase session) :kex)))
+      (ssh-session-send-payload session (ssh-make-pong-payload data)))))
+
+(defun ssh-server-read-pong (payload)
+  "Read a peer PONG's echoed data and discard it."
+  (let ((reader (ssh-make-reader payload)))
+    (ssh-read-u8 reader)
+    (ssh-read-string reader)
+    nil))
 
 ;;; ---- Key exchange ----
 
@@ -305,17 +331,21 @@ and returns; the agent's callback finishes the KEX."
     (ssh-session-send-payload session (ssh-writer-output writer))))
 
 (defun ssh-server-ext-info-payload ()
-  "The EXT_INFO payload naming the public-key signatures this server accepts.
+  "The EXT_INFO payload naming the extensions this server supports.
 
 RFC 8308 sends EXT_INFO right after the first NEWKEYS, when the client
 asked for it with ext-info-c.  Without server-sig-algs an OpenSSH client
 refuses to try an RSA key (\"no mutual signature algorithm\"), because it
-cannot know that rsa-sha2-512 is acceptable."
+cannot know that rsa-sha2-512 is acceptable.  ping@openssh.com version 0
+tells a 10.6 client it may send PING as chaff for ObscureKeystrokeTiming;
+the server answers those PINGs with PONG."
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-ext-info+)
-    (ssh-write-u32 writer 1)
+    (ssh-write-u32 writer 2)
     (ssh-write-text writer "server-sig-algs")
     (ssh-write-name-list writer +ssh-server-user-key-algorithms+)
+    (ssh-write-text writer "ping@openssh.com")
+    (ssh-write-text writer "0")
     (ssh-writer-output writer)))
 
 (defun ssh-server-send-ext-info (session)

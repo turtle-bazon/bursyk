@@ -123,9 +123,13 @@ line, and NIL while the line is still incomplete."
       ((= type +ssh-msg-newkeys+)
        (ssh-client-handle-newkeys client))
       ((= type +ssh-msg-ext-info+)
-       ;; RFC 8308 server-sig-algs and friends.  This client already knows
-       ;; which signatures it can offer, so the announcement adds nothing.
-       nil)
+       (ssh-client-handle-ext-info client payload))
+      ((= type +ssh-msg-ping+)
+       (ssh-client-handle-ping client payload))
+      ((= type +ssh-msg-pong+)
+       ;; A reply to one of our chaff packets.  Its size proves only that the
+       ;; server answered; chaff needs no accounting beyond that.
+       (ssh-client-read-pong payload))
       ((= type +ssh-msg-service-accept+)
        (ssh-client-handle-service-accept client payload))
       ((= type +ssh-msg-userauth-banner+)
@@ -153,6 +157,70 @@ line, and NIL while the line is still incomplete."
      client
      (make-condition 'ssh-connection-error
                      :detail (format nil "disconnected by peer: ~A" description)))))
+
+(defun ssh-client-handle-ext-info (client payload)
+  "Read RFC 8308 extensions and remember the ones this client can use.
+
+Only ping@openssh.com matters here: version 0 lets the client send PING as
+chaff while it hides keystroke timing.  A malformed announcement is a protocol
+error rather than something to guess past, as OpenSSH treats it."
+  (let ((reader (ssh-make-reader payload)))
+    (ssh-read-u8 reader)
+    (let ((count (ssh-read-u32 reader)))
+      (when (>= count 1024)
+        (error 'ssh-protocol-error
+               :detail "EXT_INFO has too many extensions"))
+      (dotimes (index count)
+        (declare (ignore index))
+        (let ((name (ssh-read-text reader))
+              (value (ssh-read-string reader)))
+          (cond
+            ((string= name "ping@openssh.com")
+             ;; Only version 0 is defined; a different value leaves the
+             ;; extension unusable, as OpenSSH's version check does.
+             (when (and (= (length value) 1) (= (aref value 0) 48))
+               (setf (ssh-client-ping-supported client) t)
+               (ssh-log "server supports ping@openssh.com")))
+            (t
+             (ssh-log "server extension ~A ignored" name))))))
+    (unless (zerop (ssh-reader-remaining reader))
+      (error 'ssh-protocol-error
+             :detail "trailing bytes in EXT_INFO"))))
+
+(defun ssh-client-handle-ping (client payload)
+  "Answer a peer PING with a PONG once the session is past key exchange.
+
+OpenSSH's transport code refuses to answer before authentication and while
+rekeying, when a PING could be mistaken for key-exchange traffic."
+  (let* ((reader (ssh-make-reader payload))
+         (type (ssh-read-u8 reader))
+         (data (ssh-read-string reader)))
+    (declare (ignore type))
+    (when (and (eq (ssh-client-phase client) :ready)
+               (not (ssh-client-kexinit-sent client)))
+      (ssh-client-send-payload client (ssh-make-pong-payload data)))))
+
+(defun ssh-client-read-pong (payload)
+  "Read a PONG's echoed data; chaff needs no further accounting."
+  (let ((reader (ssh-make-reader payload)))
+    (ssh-read-u8 reader)
+    (ssh-read-string reader)
+    (ssh-log "received chaff PONG")
+    nil))
+
+(defun ssh-client-send-chaff (client)
+  "Send a PING decoy when the server advertised ping@openssh.com.
+
+Returns true when a packet went out.  The payload has the size of a one-byte
+CHANNEL_DATA, so an observer watching an idle session cannot tell that the
+user stopped typing."
+  (when (and (ssh-client-ping-supported client)
+             (eq (ssh-client-phase client) :ready)
+             (not (ssh-client-kexinit-sent client))
+             (not (ssh-client-closed-p client)))
+    (ssh-client-send-payload client (ssh-make-ping-payload))
+    (ssh-log "sent chaff keystroke packet")
+    t))
 
 ;;; ---- Key exchange ----
 

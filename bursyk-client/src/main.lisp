@@ -1168,10 +1168,13 @@ ordering without adding a request hook to the library."
       ((not (keystroke-live-p channel))
        (keystroke-stop-active))
       (t
-       (let ((now (keystroke-now)))
+       (let ((now (keystroke-now))
+             (flushed nil))
          (when (plusp (fill-pointer *keystroke-pending*))
            (handler-case
-               (keystroke-flush channel)
+               (progn
+                 (keystroke-flush channel)
+                 (setf flushed t))
              (error ()
                (keystroke-stop-active)
                (return-from keystroke-tick nil)))
@@ -1183,10 +1186,20 @@ ordering without adding a request hook to the library."
            ((or (not (eq channel *pty-channel*))
                 (cl-pnet-ssh::ssh-client-kexinit-sent *client*))
             (keystroke-stop-active))
-           ((and (zerop (fill-pointer *keystroke-pending*))
+           ((and (not flushed)
+                 (zerop (fill-pointer *keystroke-pending*))
                  (>= now *keystroke-chaff-until*))
             (keystroke-stop-active))
            (t
+            ;; With no keystroke due, a PING the size of one keystroke keeps
+            ;; the idle pattern indistinguishable when the server allows it.
+            (when (and (not flushed)
+                       (zerop (fill-pointer *keystroke-pending*)))
+              (handler-case
+                  (cl-pnet-ssh:ssh-client-send-chaff *client*)
+                (error ()
+                  (keystroke-stop-active)
+                  (return-from keystroke-tick nil))))
             (keystroke-schedule
              (keystroke-delay milliseconds *keystroke-rate-fuzz*)
              milliseconds))))))))

@@ -21,6 +21,8 @@
    #:ssh-client-host
    #:ssh-client-user
    #:ssh-client-obscure-keystroke-timing
+   #:ssh-client-ping-supported
+   #:ssh-client-send-chaff
    #:*ssh-log-function*
    #:*ssh-log-enabled*
    #:ssh-log

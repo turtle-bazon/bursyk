@@ -55,6 +55,10 @@
   ;; one notice per connection.
   (warn-weak-crypto t)
   (non-pq-kex-warned nil)
+  ;; EXT_INFO's ping@openssh.com extension.  When the server advertises
+  ;; version 0 the client may use PING packets as chaff while hiding
+  ;; keystroke timing.
+  (ping-supported nil)
   ;; ObscureKeystrokeTiming: milliseconds between quantised keystrokes; 0
   ;; disables it.  The application owns stdin, so it applies this policy.
   (obscure-keystroke-timing +ssh-keystroke-default-interval-ms+)
