@@ -852,6 +852,123 @@ callback; without it the same callback trusts the key."
                         :on-options (lambda (value) (setf options value)))
     (is (null (cl-pnet-ssh:ssh-config-options-batch-mode options)))))
 
+(test client-version-addendum
+  "VersionAddendum parses as the rest of the line, expands its % tokens, and
+leaves the greeting alone for none."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HostName real.example")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostKeyAlias alias-key")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "VersionAddendum v-%h-%n-%p-%r-%%-%k"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :user "tester" :port 2222
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "v-%h-%n-%p-%r-%%-%k"
+               (cl-pnet-ssh:ssh-config-options-version-addendum options)))
+    (is (equal "v-real.example-alias-2222-tester-%-alias-key"
+               (cl-pnet-ssh::ssh-config-client-version-addendum
+                options "alias" :user "tester" :port 2222))))
+  ;; # cuts the comment, as it does in ssh's readconf.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::%make-ssh-config-line
+                   :keyword "versionaddendum"
+                   :args '("keep" "me")
+                   :raw "keep me # drop me"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal "keep me"
+               (cl-pnet-ssh:ssh-config-options-version-addendum options))))
+  ;; none is an explicit empty value, not an absent one.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "VersionAddendum none"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (equal ""
+               (cl-pnet-ssh:ssh-config-options-version-addendum options)))
+    (is (null (cl-pnet-ssh::ssh-config-client-version-addendum
+               options "alias"))))
+  ;; An unknown token is fatal, not literal.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "VersionAddendum bad-%q"))))
+         (options nil)
+         (error nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (handler-case
+        (cl-pnet-ssh::ssh-config-client-version-addendum options "alias")
+      (ssh-config-error (condition) (setf error condition)))
+    (is (not (null error))))
+  ;; The greeting and the exchange hash use the same string.
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :client-version "SSH-2.0-test" :version-addendum "hello")))
+    (is (equal "SSH-2.0-test hello"
+               (cl-pnet-ssh::ssh-client-version-string client)))
+    (setf (cl-pnet-ssh::ssh-client-version-addendum client) nil)
+    (is (equal "SSH-2.0-test"
+               (cl-pnet-ssh::ssh-client-version-string client)))))
+
+(test client-version-addendum-reaches-the-server
+  "A login still verifies when the addendum is part of the greeting, and the
+server records the full string."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-addendum"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (stdout (make-string-output-stream))
+             (seen nil)
+             (server nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      :authorized-keys authorized
+                      :on-session
+                      (lambda (session)
+                        (setf seen (cl-pnet-ssh:ssh-session-client-version
+                                    session)))
+                      :on-channel
+                      (lambda (channel)
+                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (ssh-test-run-command channel command))))))
+               (is (= 3
+                      (ssh-test-loopback-run
+                       server client-key known-hosts stdout
+                       (make-string-output-stream)
+                       :version-addendum "cl-pnet-test")))
+               (is (string= "hello"
+                            (get-output-stream-string stdout)))
+               (is (not (null (search "cl-pnet-test" (or seen ""))))))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test certificate-option-merge-follows-sshd
   "Permission flags are ANDed, restrictive values are combined, and two
 different force-command clauses cannot be merged."
@@ -1425,7 +1542,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 hostbased-key canonicalize-hostname
                                 canonical-domains resolver certificate-files
                                 no-host-authentication-for-localhost
-                                host-key-alias batch-mode
+                                host-key-alias batch-mode version-addendum
                                 verify-host-key-dns host-key-dns-resolver)
   "Start a client against SERVER and return the command's exit status.
 
@@ -1451,6 +1568,7 @@ certificate was trusted rather than added on first use."
             no-host-authentication-for-localhost
             :host-key-alias host-key-alias
             :batch-mode batch-mode
+            :version-addendum version-addendum
             :known-hosts known-hosts
             :host-key-policy host-key-policy
             :hostbased-authentication (and hostbased-key t)

@@ -17,6 +17,17 @@
            fd cl-pnet-sockets:+ipproto-ip+
            cl-pnet-sockets:+ip-tos+ value))))))
 
+(defun ssh-client-version-string (client)
+  "CLIENT's identification string, with VersionAddendum when configured.
+
+Both the greeting and the key-exchange hash use this exact string, as
+RFC 4253 requires."
+  (let ((addendum (ssh-client-version-addendum client)))
+    (if (and addendum (plusp (length addendum)))
+        (concatenate 'string (ssh-client-client-version client)
+                     " " addendum)
+        (ssh-client-client-version client))))
+
 (defun ssh-client-connected (client connection)
   "CLIENT's TCP connection is up: greet and offer our KEXINIT."
   (setf (ssh-client-connection client) connection
@@ -33,7 +44,7 @@
   (ssh-client-send-bytes
    client
    (ssh-string-octets (concatenate 'string
-                                   (ssh-client-client-version client)
+                                   (ssh-client-version-string client)
                                    (string #\Return)
                                    (string #\Newline))))
   (let ((kexinit (ssh-make-kexinit-payload
@@ -203,7 +214,7 @@ its KEXINIT when the connection came up."
          (shared (ssh-curve25519-shared
                   (ssh-client-ephemeral-private client) server-public))
          (hash (ssh-exchange-hash
-                (ssh-client-client-version client)
+                (ssh-client-version-string client)
                 (ssh-client-server-version client)
                 (ssh-client-client-kexinit client)
                 (ssh-client-server-kexinit client)

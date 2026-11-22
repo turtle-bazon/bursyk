@@ -346,6 +346,7 @@ helper is what reaches the server."
                                  no-host-authentication-for-localhost
                                  host-key-alias
                                  batch-mode
+                                 version-addendum
                                  hostbased-authentication
                                  hostbased-accepted-algorithms
                                  (hostbased-keys '())
@@ -395,6 +396,10 @@ helper is what reaches the server."
                     no-host-authentication-for-localhost
                     :host-key-alias host-key-alias
                     :batch-mode batch-mode
+                    :version-addendum
+                    (and version-addendum
+                         (not (eq version-addendum :none))
+                         (check-version-addendum version-addendum))
                     :hostbased-authentication hostbased-authentication
                     :hostbased-accepted-algorithms
                     hostbased-accepted-algorithms
@@ -525,6 +530,7 @@ is applied here, before any request names a key the configuration forbade."
                              no-host-authentication-for-localhost
                              host-key-alias
                              batch-mode
+                             version-addendum
                              hostbased-authentication
                              hostbased-accepted-algorithms
                              (hostbased-keys '())
@@ -583,7 +589,8 @@ HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of
 (CLIENT FINGERPRINT KEY-BLOB) that returns true to trust and record an
 unknown key; HOST-KEY-CALLBACK is the same function under a clearer name.
 BATCH-MODE, when true, never asks: an unknown host key fails even when a
-confirmation callback was supplied.
+confirmation callback was supplied.  VERSION-ADDENDUM is appended after a
+space to the identification string, matching sshd's VersionAddendum.
 
 VERIFY-HOST-KEY-DNS is :NO, :YES or :ASK.  With :YES, a matching SSHFP record
 whose answer carries the DNSSEC authenticated-data bit trusts the host key
@@ -627,6 +634,7 @@ role-neutral."
                            no-host-authentication-for-localhost
                            :host-key-alias host-key-alias
                            :batch-mode batch-mode
+                           :version-addendum version-addendum
                            :hostbased-authentication hostbased-authentication
                            :hostbased-accepted-algorithms
                            hostbased-accepted-algorithms

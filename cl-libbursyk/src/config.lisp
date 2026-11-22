@@ -155,6 +155,9 @@ relative Include is anchored here.")
   ;; RemoteCommand: the command ssh runs on the peer when the command line
   ;; names none.  Stored as written; the caller expands its % tokens.
   (remote-command nil)
+  ;; VersionAddendum: text appended to our identification string, "" for an
+  ;; explicit "none", or NIL when the keyword never appeared.
+  (version-addendum nil)
   ;; SessionType and StdinNull: whether to open a session at all, whether the
   ;; command names a subsystem, and whether stdin is /dev/null.
   (session-type nil)
@@ -378,16 +381,41 @@ the caller can treat the '[' literally."
                        (write-char character out)))
                  (write-char character out)))))
 
-(defun ssh-config-expand-tokens (value options context)
-  "Expand the OpenSSH % tokens VALUE may contain."
-  (let* ((context-host (ssh-config-context-original-host context))
+(defun ssh-config-connection-hash (local-host host port user jump-host)
+  "The %C value: SHA-1 over the connection's identity, as lowercase hex."
+  (format nil "~{~2,'0x~}"
+          (coerce
+           (ssh-hash :sha1
+                     (ssh-string-octets
+                      (format nil "~A~A~A~A~A"
+                              local-host host port user jump-host)))
+           'list)))
+
+(defun ssh-config-expand-tokens (value options context &key strict jump-host)
+  "Expand the OpenSSH % tokens VALUE may contain.
+
+%h is the configured HostName, %n the host as written, and the rest follow
+ssh: %p port, %r remote user, %u local user, %d home, %i uid, %k
+HostKeyAlias, %j jump host, %l and %L the local name, %C the connection
+hash.  An unknown token is copied literally unless STRICT is set, in which
+case it is an error as it is for VersionAddendum."
+  (let* ((context-host (or (ssh-config-context-original-host context) ""))
          (host (or (ssh-config-options-hostname options) context-host))
          (user (or (ssh-config-options-user options)
-                   (ssh-config-context-user context)))
+                   (ssh-config-context-user context)
+                   (ssh-default-user)))
          (port (or (ssh-config-options-port options)
                    (ssh-config-context-port context)
                    22))
-         (local-user (ssh-default-user)))
+         (local-user (ssh-default-user))
+         (local-host (or (uiop:getenv "HOSTNAME")
+                         (machine-instance)
+                         "localhost"))
+         (short-host (subseq local-host 0
+                             (or (position #\. local-host)
+                                 (length local-host))))
+         (key-alias (or (ssh-config-options-host-key-alias options) ""))
+         (jump (or jump-host "")))
     (with-output-to-string (out)
       (loop with length = (length value)
             for index from 0 below length
@@ -402,10 +430,26 @@ the caller can treat the '[' literally."
                        (#\p (princ port out) (incf index))
                        (#\r (princ user out) (incf index))
                        (#\u (princ local-user out) (incf index))
-                       (#\d (princ (namestring (user-homedir-pathname)) out)
+                       (#\d (princ (string-right-trim
+                                    "/" (namestring (user-homedir-pathname)))
+                                   out)
                             (incf index))
                        (#\i (princ (or (uiop:getenv "UID") "") out) (incf index))
-                       (t (write-char character out))))
+                       (#\k (princ key-alias out) (incf index))
+                       (#\j (princ jump out) (incf index))
+                       (#\l (princ local-host out) (incf index))
+                       (#\L (princ short-host out) (incf index))
+                       (#\C (princ (ssh-config-connection-hash
+                                    local-host host port user jump)
+                                   out)
+                            (incf index))
+                       (t (if strict
+                              (error 'ssh-config-error
+                                     :detail
+                                     (format nil
+                                             "unknown percent token %~A in ~S"
+                                             token value))
+                              (write-char character out)))))
                    (write-char character out))))))
 
 (defun ssh-config-path-argument (value options context)
@@ -1396,6 +1440,21 @@ understand them rather than silently match nothing."
            (setf (ssh-config-options-remote-command options)
                  (let ((raw (ssh-config-line-raw line)))
                    (if (and raw (plusp (length raw))) raw value)))))
+        ((string= keyword "versionaddendum")
+         ;; The whole rest of the line is the comment, spaces included, up to
+         ;; a '#' as in ssh.  "none" is an explicit empty value, distinct from
+         ;; the keyword never appearing.
+         (unless (ssh-config-options-version-addendum options)
+           (let* ((raw (ssh-config-line-raw line))
+                  (text (if (and raw (plusp (length raw))) raw value))
+                  (hash (position #\# text)))
+             (when hash (setf text (subseq text 0 hash)))
+             (setf text (string-trim '(#\Space #\Tab #\Return) text))
+             (when (zerop (length text))
+               (error (ssh-config-line-error
+                       line "VersionAddendum missing argument")))
+             (setf (ssh-config-options-version-addendum options)
+                   (if (string-equal text "none") "" text)))))
         ((string= keyword "loglevel")
          (let ((level (string-downcase value)))
            (unless (member level '("quiet" "fatal" "error" "info" "verbose"
@@ -1508,6 +1567,7 @@ understand them rather than silently match nothing."
                          "remotecommand" "localcommand"
                          "permitlocalcommand" "escapechar"
                          "enableescapecommandline"
+                         "versionaddendum"
                          "loglevel" "logverbose"
                          "sessiontype" "stdinnull"
                          "forkafterauthentication"

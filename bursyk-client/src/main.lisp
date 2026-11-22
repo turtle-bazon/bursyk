@@ -2377,6 +2377,13 @@ peer that connected to it; NIL refuses the channel."
                       host)))
     (format t "host ~A~%" host)
     (format t "hostname ~A~%" hostname)
+    (when (cl-pnet-ssh:ssh-config-options-version-addendum options)
+      (format t "versionaddendum ~A~%"
+              (or (cl-pnet-ssh::ssh-config-client-version-addendum
+                   options host
+                   :user (getf *options* :user)
+                   :port (client-port))
+                  "")))
     (format t "canonicalizehostname ~A~%"
             (case (cl-pnet-ssh:ssh-config-options-canonicalize-hostname
                    options)

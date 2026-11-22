@@ -54,6 +54,21 @@ itself orders them."
           ((string= value "accept-new") :accept-new)
           (t :strict))))
 
+(defun ssh-config-client-version-addendum (options host &key user port)
+  "VersionAddendum for HOST with its % tokens expanded, or NIL for none."
+  (let ((value (ssh-config-options-version-addendum options)))
+    (cond
+      ((null value) nil)
+      ((string= value "") nil)
+      (t
+       (ssh-config-expand-tokens
+        value options
+        (%make-ssh-config-context
+         :original-host host
+         :user (or user (ssh-config-options-user options))
+         :port (or port (ssh-config-options-port options) 22))
+        :strict t)))))
+
 (defun ssh-config-client-agent (options explicit)
   "The agent to use: EXPLICIT, or the one the config and environment select.
 
@@ -129,6 +144,8 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-no-host-authentication-for-localhost options)
         :port (or port (ssh-config-options-port options) 22)
         :user (or user (ssh-config-options-user options) (ssh-default-user))
+        :version-addendum
+        (ssh-config-client-version-addendum options host :user user :port port)
         :private-key (ssh-config-client-identities options private-key)
         :certificate-files
         (reverse (ssh-config-options-certificate-files options))
@@ -472,6 +489,7 @@ uses whichever of the two it saw first instead of chaining them."
            :connect-port (or connect-port (getf parameters :port))
            :port (getf parameters :port)
            :user (getf parameters :user)
+           :version-addendum (getf parameters :version-addendum)
            :private-key (getf parameters :private-key)
            :agent (getf parameters :agent)
            :passphrase (getf parameters :passphrase)
