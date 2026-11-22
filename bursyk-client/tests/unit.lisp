@@ -719,6 +719,41 @@ see the source that will actually be used."
       (is (member "BindAddress 127.0.0.2" lines :test #'equal))
       (is (member "BindInterface eth0" lines :test #'equal)))))
 
+(test command-line-agent-forwarding-reaches-config
+  "-A and -a outrank the file and -o through the same first-value rule the
+other dedicated flags use; neither flag leaves the config alone."
+  (flet ((lines (option)
+           (let ((burs::*options* (empty-options)))
+             (setf (getf burs::*options* :forward-agent) option)
+             (burs::resolver-option-list))))
+    (is (member "ForwardAgent yes" (lines t) :test #'equal))
+    (is (member "ForwardAgent no" (lines :no) :test #'equal))
+    (is (notany (lambda (line)
+                  (search "ForwardAgent" line :test #'char-equal))
+                (lines nil)))))
+
+(test print-config-reports-a-forward-agent-socket-path
+  "ForwardAgent's path form is printed as the path, as ssh -G does, while
+-a still reports no even when the file named a socket."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "ForwardAgent /run/user/1000/agent.sock"))))
+         (options nil))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "agent.example"
+     :on-options (lambda (value) (setf options value)))
+    (let ((burs::*options* (empty-options)))
+      (is (search "forwardagent /run/user/1000/agent.sock"
+                  (with-output-to-string (*standard-output*)
+                    (burs::print-config-options "agent.example" options nil)))))
+    (let ((burs::*options* (empty-options)))
+      (setf (getf burs::*options* :forward-agent) :no)
+      (is (search "forwardagent no"
+                  (with-output-to-string (*standard-output*)
+                    (burs::print-config-options "agent.example" options nil)))))))
+
 (test print-config-reports-openssh-defaults
   "The lines ssh -G always prints appear even when nothing configured them,
 and ProxyJump/ProxyCommand stay off the output when unset."

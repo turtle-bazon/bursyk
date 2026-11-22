@@ -181,7 +181,10 @@ way ssh refuses it.")
   (proxy-jump nil)
   (proxy-command nil)
   (rekey-limit nil)
+  ;; ForwardAgent: T enables it, NIL leaves it off.  A path instead of yes
+  ;; selects the agent socket to forward, as ssh 10.6 allows.
   (forward-agent nil)
+  (forward-agent-sock-path nil)
   (forward-x11 nil)
   (forward-x11-trusted nil)
   ;; ForwardX11Timeout: how long ssh waits for an untrusted X11 channel.
@@ -1660,7 +1663,19 @@ present."
          (setf (ssh-config-options-server-alive-count-max options)
                (integer :minimum 0)))
         ((string= keyword "forwardagent")
-         (setf (ssh-config-options-forward-agent options) (boolean)))
+         ;; readconf accepts yes/no/true/false, and treats anything else as
+         ;; the path of the agent socket to forward.
+         (cond
+           ((member value '("yes" "true") :test #'string-equal)
+            (setf (ssh-config-options-forward-agent options) t))
+           ((member value '("no" "false") :test #'string-equal)
+            (setf (ssh-config-options-forward-agent options) nil))
+           ((plusp (length value))
+            (setf (ssh-config-options-forward-agent options) t
+                  (ssh-config-options-forward-agent-sock-path options) value))
+           (t
+            (error (ssh-config-line-error line
+                                          "missing ForwardAgent argument")))))
         ((string= keyword "forwardx11")
          (setf (ssh-config-options-forward-x11 options) (boolean)))
         ((string= keyword "forwardx11trusted")

@@ -338,13 +338,17 @@ asked for it with ext-info-c.  Without server-sig-algs an OpenSSH client
 refuses to try an RSA key (\"no mutual signature algorithm\"), because it
 cannot know that rsa-sha2-512 is acceptable.  ping@openssh.com version 0
 tells a 10.6 client it may send PING as chaff for ObscureKeystrokeTiming;
-the server answers those PINGs with PONG."
+the server answers those PINGs with PONG.  agent-forward version 0 says the
+server understands RFC 9987's agent-req and agent-connect names as well as
+OpenSSH's auth-agent@openssh.com."
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-ext-info+)
-    (ssh-write-u32 writer 2)
+    (ssh-write-u32 writer 3)
     (ssh-write-text writer "server-sig-algs")
     (ssh-write-name-list writer +ssh-server-user-key-algorithms+)
     (ssh-write-text writer "ping@openssh.com")
+    (ssh-write-text writer "0")
+    (ssh-write-text writer "agent-forward")
     (ssh-write-text writer "0")
     (ssh-writer-output writer)))
 

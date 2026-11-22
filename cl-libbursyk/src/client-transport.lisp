@@ -179,6 +179,11 @@ error rather than something to guess past, as OpenSSH treats it."
              (when (and (= (length value) 1) (= (aref value 0) 48))
                (setf (ssh-client-ping-supported client) t)
                (ssh-log "server supports ping@openssh.com")))
+            ((string= name "agent-forward")
+             ;; Version 0 selects RFC 9987's agent-req and agent-connect.
+             (when (and (= (length value) 1) (= (aref value 0) 48))
+               (setf (ssh-client-agent-forward-supported client) t)
+               (ssh-log "server supports agent-forward")))
             (t
              (ssh-log "server extension ~A ignored" name))))))
     (unless (zerop (ssh-reader-remaining reader))

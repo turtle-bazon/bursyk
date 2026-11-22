@@ -68,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.83"
+(defparameter +bursyk-server-version+ "0.0.2.84"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -587,6 +587,184 @@ client should not make by itself."
                 (delete forward *streamlocal-forwards*))
           t)
         nil)))
+
+;;; ---- Agent forwarding ----
+;;;
+;;; sshd creates a Unix listener for a session that asks for agent
+;;; forwarding, puts its path in SSH_AUTH_SOCK, and relays each accepted
+;;; connection to the client.  AgentSocketPath names where that listener
+;;; lives; "user:" keeps it under a directory the user owns, "shared:" makes
+;;; a temporary directory below a shared one.  The library applies the
+;;; AllowAgentForwarding, DisableForwarding and no-agent-forwarding policy and
+;;; does the relaying; this code only chooses and creates the socket.
+
+#-win32
+(defun agent-random-suffix (length)
+  "LENGTH characters from the class ssh uses for temporary socket names."
+  (let ((alphabet
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        (text (make-string length)))
+    (dotimes (index length text)
+      (setf (char text index) (char alphabet (random (length alphabet)))))))
+
+#-win32
+(cffi:defcfun ("mkdir" c-mkdir) :int
+  (path :string) (mode :unsigned-int))
+
+#-win32
+(cffi:defcfun ("rmdir" c-rmdir) :int
+  (path :string))
+
+#-win32
+(defun ensure-private-directory (path)
+  "Create PATH, and any missing parents, with sshd's 0700 mode."
+  (let ((directory (uiop:ensure-directory-pathname path)))
+    (unless (uiop:directory-exists-p directory)
+      (let ((old-mask (c-umask #o077)))
+        (unwind-protect
+             (ignore-errors (ensure-directories-exist directory))
+          (c-umask old-mask))))
+    (uiop:directory-exists-p directory)))
+
+#-win32
+(defun agent-percent-expand (text user home uid)
+  "Expand AgentSocketPath's %u, %U and %h tokens; NIL on an unknown one."
+  (let ((output (make-string-output-stream)))
+    (loop with index = 0
+          while (< index (length text))
+          do (let ((character (char text index)))
+               (cond
+                 ((and (char= character #\%)
+                       (< (1+ index) (length text)))
+                  (let ((token (char text (1+ index))))
+                    (case token
+                      ((#\u) (write-string user output))
+                      ((#\U) (write-string (or uid "") output))
+                      ((#\h) (write-string home output))
+                      ((#\%) (write-char #\% output))
+                      (t (return-from agent-percent-expand nil)))
+                    (incf index 2)))
+                 (t
+                  (write-char character output)
+                  (incf index)))))
+    (get-output-stream-string output)))
+
+#-win32
+(defun expand-agent-directory (directory user home uid)
+  "DIRECTORY with sshd's tokens and ~ expansion, absolute, or NIL."
+  (let ((text (agent-percent-expand directory user home uid)))
+    (when text
+      (cond
+        ((string= text "")
+         nil)
+        ((and (> (length text) 1)
+              (string= (subseq text 0 2) "~/"))
+         (namestring (merge-pathnames (subseq text 2)
+                                      (uiop:ensure-directory-pathname home))))
+        ((string= text "~")
+         (namestring (uiop:ensure-directory-pathname home)))
+        ((char= (char text 0) #\~)
+         ;; ~otheruser needs another passwd lookup and sshd's path helpers;
+         ;; refusing is safer than guessing whose directory was meant.
+         nil)
+        ((char= (char text 0) #\/)
+         text)
+        (t
+         (format nil "~A/~A"
+                 (string-right-trim "/" home) text))))))
+
+#-win32
+(defun agent-socket-directory (pathspec session)
+  "The directory PATHSPEC names for SESSION, and whether it is shared."
+  (multiple-value-bind (home uid)
+      (user-home-and-uid (cl-pnet-ssh:ssh-session-user session))
+    (when home
+      (cond
+        ((and (> (length pathspec) 7)
+              (string-equal (subseq pathspec 0 7) "shared:"))
+         (values (expand-agent-directory
+                  (subseq pathspec 7)
+                  (cl-pnet-ssh:ssh-session-user session) home uid)
+                 t))
+        ((and (> (length pathspec) 5)
+              (string-equal (subseq pathspec 0 5) "user:"))
+         (values (expand-agent-directory
+                  (subseq pathspec 5)
+                  (cl-pnet-ssh:ssh-session-user session) home uid)
+                 nil))
+        (t nil)))))
+
+#-win32
+(defun start-agent-forward (session)
+  "Create the Unix listener SESSION's forwarded agent will accept on.
+
+Returns (VALUES FD PATH CLEANUP) for the library, or NIL when
+AgentSocketPath is none or the socket cannot be created."
+  (let* ((pathspec
+           (or (session-config-setting
+                session
+                #'cl-pnet-ssh:ssh-server-config-agent-socket-path)
+               "user:~/.ssh/agent")))
+    (when (string-equal pathspec "none")
+      (return-from start-agent-forward nil))
+    (multiple-value-bind (directory shared)
+        (agent-socket-directory pathspec session)
+      (unless directory
+        (log-at-session session :error
+                        "cannot expand AgentSocketPath ~A" pathspec)
+        (return-from start-agent-forward nil))
+      (flet ((open-listener (socket-path)
+               (handler-case
+                   (cl-pnet-sockets:listen-unix socket-path :mask #o177)
+                 (error (condition)
+                   (declare (ignore condition))
+                   (log-at-session session :error
+                                   "cannot listen on agent socket ~A"
+                                   socket-path)
+                   nil))))
+        (if shared
+            ;; A shared parent needs a private directory per session, which
+            ;; is what sshd's mkdtemp step creates and removes.
+            (let* ((temporary
+                     (format nil "~A/ssh-~A"
+                             (string-right-trim "/" directory)
+                             (agent-random-suffix 12)))
+                   (socket-path (format nil "~A/agent.~D"
+                                        temporary (c-getpid))))
+              (unless (ensure-private-directory temporary)
+                (log-at-session session :error
+                                "cannot create agent socket directory ~A"
+                                temporary)
+                (return-from start-agent-forward nil))
+              (let ((fd (open-listener socket-path)))
+                (unless fd
+                  (ignore-errors (c-rmdir temporary))
+                  (return-from start-agent-forward nil))
+                (log-at-session session :verbose
+                                "agent forwarding listening on ~A" socket-path)
+                (values fd socket-path
+                        (lambda ()
+                          (ignore-errors (delete-file socket-path))
+                          (ignore-errors (c-rmdir temporary))))))
+            (let* ((socket-path
+                     (format nil "~A/s.~A.~D.~A"
+                             (string-right-trim "/" directory)
+                             (agent-random-suffix 10)
+                             (c-getpid)
+                             (agent-random-suffix 10)))
+                   (fd (progn
+                         (unless (ensure-private-directory directory)
+                           (log-at-session session :error
+                                           "cannot create agent socket directory ~A"
+                                           directory)
+                           (return-from start-agent-forward nil))
+                         (open-listener socket-path))))
+              (unless fd
+                (return-from start-agent-forward nil))
+              (log-at-session session :verbose
+                              "agent forwarding listening on ~A" socket-path)
+              (values fd socket-path
+                      (lambda () (ignore-errors (delete-file socket-path))))))))))
 )
 
 #+win32
@@ -2544,6 +2722,19 @@ guess, so only an explicit PidFile is written."
            #-(or win32 ssh-backend-ffi)
            (lambda (session path)
              (cancel-streamlocal-remote-forward session path))
+           ;; Agent forwarding: the library applies AllowAgentForwarding,
+           ;; DisableForwarding and the key's no-agent-forwarding, then asks
+           ;; this hook for the Unix socket the session's SSH_AUTH_SOCK names.
+           #-ssh-backend-ffi
+           :on-agent-forward
+           #-ssh-backend-ffi
+           #-win32
+           (lambda (session) (start-agent-forward session))
+           #-ssh-backend-ffi
+           #+win32
+           (lambda (session)
+             (declare (ignore session))
+             nil)
            :on-close (lambda (session reason)
                        (log-at-session
                         session :info "closed session for ~A: ~A"

@@ -217,6 +217,25 @@ the permissive defaults of an authorized_keys line."
   "Whether OPTIONS allow forwarding at all; NIL options allow it."
   (or (null options) (ssh-authorization-options-permit-port-forwarding options)))
 
+(defun ssh-authorization-options-permit-agent-forwarding-p (options)
+  "Whether OPTIONS allow agent forwarding; NIL options allow it."
+  (or (null options)
+      (ssh-authorization-options-permit-agent-forwarding options)))
+
+(defun ssh-session-permits-agent-forwarding-p (session)
+  "Whether SESSION may request authentication-agent forwarding.
+
+The key must not carry no-agent-forwarding, AllowAgentForwarding must not be
+no, and DisableForwarding must not be in force, matching sshd's
+session_auth_agent_req."
+  (let ((options (ssh-session-authorization session)))
+    (and (ssh-authorization-options-permit-agent-forwarding-p options)
+         (not (eq (ssh-session-setting
+                   session #'ssh-server-config-allow-agent-forwarding)
+                  :no))
+         (not (ssh-session-setting
+               session #'ssh-server-config-disable-forwarding)))))
+
 (defun ssh-authorization-options-permit-address-p (options address)
   "Whether ADDRESS may use the key described by OPTIONS.
 

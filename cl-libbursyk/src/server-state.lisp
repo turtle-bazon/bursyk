@@ -93,6 +93,12 @@
   ;; Stream-local remote forwarding, as (SESSION PATH) functions.
   (on-streamlocal-forward nil)
   (on-cancel-streamlocal-forward nil)
+  ;; Agent forwarding: the application creates the listening Unix socket,
+  ;; because it knows the user's home and AgentSocketPath, and returns
+  ;; (VALUES FD PATH CLEANUP).  The library watches FD, opens the channel to
+  ;; the client and relays bytes; CLEANUP, when given, removes PATH and its
+  ;; directory after the session ends.
+  (on-agent-forward nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))
@@ -172,6 +178,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   (allowed-users '())
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
+  ;; The SSH_AUTH_SOCK listener this session forwards to the client, once a
+  ;; session channel asks for agent forwarding.
+  (agent-forward nil)
   ;; Connection timers.  LAST-INPUT-TIME is monotonic seconds and is moved
   ;; whenever bytes arrive or a probe is sent, as sshd's last_client_time is.
   login-grace-timer
@@ -188,6 +197,15 @@ present after RequiredRSASize, for callers that only want to describe it."
   (close-reason nil)
   (window 2097152)
   (max-packet 32768))
+
+(defstruct (ssh-agent-forward (:constructor %make-ssh-agent-forward))
+  session
+  fd
+  path
+  cleanup
+  watcher
+  ;; RFC 9987's agent-connect instead of auth-agent@openssh.com.
+  (new-style nil))
 
 (defstruct (ssh-server-channel (:constructor %make-ssh-server-channel))
   session
@@ -216,6 +234,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   (subsystem nil)
   ;; The Unix-domain path a direct-streamlocal channel targets.
   (streamlocal-path nil)
+  ;; An agent-forwarding channel's raw local socket.
+  (target-fd-relay nil)
+  (target-fd-eof nil)
   ;; PTY-REQ stores the peer's terminal here, so the application that starts
   ;; the shell or command can size it before the first output.
   (pty-p nil)
@@ -274,6 +295,22 @@ present after RequiredRSASize, for callers that only want to describe it."
                 (funcall (ssh-server-on-error server) session value)))
       (:close (when (ssh-server-on-close server)
                 (funcall (ssh-server-on-close server) session value))))))
+
+(defun ssh-session-close-agent-forward (session)
+  "Remove SESSION's agent-forwarding listener and its socket, once."
+  (let ((agent (ssh-session-agent-forward session)))
+    (when agent
+      (setf (ssh-session-agent-forward session) nil)
+      (when (ssh-agent-forward-watcher agent)
+        (ignore-errors
+         (cl-pnet:fd-unwatch (ssh-agent-forward-watcher agent))))
+      (let ((fd (ssh-agent-forward-fd agent)))
+        (when (and fd (>= fd 0))
+          (ignore-errors (cl-pnet-sockets:close-open-fd fd))))
+      (if (ssh-agent-forward-cleanup agent)
+          (ignore-errors (funcall (ssh-agent-forward-cleanup agent)))
+          (let ((path (ssh-agent-forward-path agent)))
+            (when path (ignore-errors (delete-file path))))))))
 
 (defun ssh-session-terminate-channels (session reason kind)
   "Report SESSION's end to every channel not yet closed."
@@ -418,6 +455,7 @@ server was built without a value."
           (ssh-session-kex-signature-pending session) nil)
     (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
+    (ssh-session-close-agent-forward session)
     (ssh-session-terminate-channels session reason kind)
     (ssh-session-close-connection session)
     (let ((server (ssh-session-server session)))

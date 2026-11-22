@@ -515,7 +515,9 @@ address is known, because it has to be in the same family."
                                   +ssh-rsa-minimum-modulus-size+)
                                  proxy-use-fdpass
                                  bind-address
-                                 bind-interface)
+                                 bind-interface
+                                 forward-agent
+                                 forward-agent-sock-path)
   "The CLIENT structure, before any connection exists."
   (%make-ssh-client :host host
                     :connect-host connect-host
@@ -532,6 +534,8 @@ address is known, because it has to be in the same family."
                     :proxy-use-fdpass proxy-use-fdpass
                     :bind-address bind-address
                     :bind-interface bind-interface
+                    :forward-agent forward-agent
+                    :forward-agent-sock-path forward-agent-sock-path
                     :kex-algorithms kex-algorithms
                     :host-key-algorithms host-key-algorithms
                     :ciphers ciphers
@@ -676,6 +680,8 @@ is applied here, before any request names a key the configuration forbade."
                              proxy-use-fdpass
                              bind-address
                              bind-interface
+                             forward-agent
+                             forward-agent-sock-path
                              kex-algorithms host-key-algorithms
                              ciphers macs pubkey-accepted-algorithms
                              ca-signature-algorithms
@@ -735,6 +741,13 @@ BIND-ADDRESS is a local address a direct connection is made from, as
 ssh_config's BindAddress and ssh -b; BIND-INTERFACE names an interface
 instead, and BIND-ADDRESS wins when both are set, as in ssh.  A ProxyCommand
 carries the stream itself, so neither applies there.
+
+FORWARD-AGENT, when true, asks the peer to forward its agent connections,
+as ssh -A and ssh_config's ForwardAgent; FORWARD-AGENT-SOCK-PATH names the
+agent socket to use instead of SSH_AUTH_SOCK, matching ForwardAgent's path
+form.  Each server-initiated agent channel is dialled to that socket and
+relayed.  With no usable agent socket the request is skipped, as ssh's
+check_agent_present clears it.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
 protected file.  With no PRIVATE-KEY every default identity file that exists
@@ -844,7 +857,9 @@ role-neutral."
                            :required-rsa-size required-rsa-size
                            :proxy-use-fdpass proxy-use-fdpass
                            :bind-address bind-address
-                           :bind-interface bind-interface)
+                           :bind-interface bind-interface
+                           :forward-agent forward-agent
+                           :forward-agent-sock-path forward-agent-sock-path)
    private-key agent passphrase))
 
 (defun ssh-client-close (client)

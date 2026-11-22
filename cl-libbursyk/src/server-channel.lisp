@@ -118,12 +118,16 @@ goes out once the client confirms."
     channel))
 
 (defun ssh-server-channel-handle-open-confirmation (channel reader)
-  "The client accepted a forwarded-tcpip CHANNEL we opened."
+  "The client accepted a channel we opened."
   (setf (ssh-server-channel-remote-id channel) (ssh-read-u32 reader)
         (ssh-server-channel-remote-window channel) (ssh-read-u32 reader)
         (ssh-server-channel-remote-max-packet channel) (ssh-read-u32 reader)
         (ssh-server-channel-state channel) :open)
   (ssh-server-channel-start-inactivity-timeout channel)
+  ;; An agent channel's local socket waited for the client to accept before
+  ;; it could carry anything, as sshd starts its relay on confirmation.
+  (when (ssh-server-channel-target-fd-relay channel)
+    (ssh-fd-relay-start (ssh-server-channel-target-fd-relay channel)))
   (ssh-server-channel-flush channel))
 
 (defun ssh-server-channel-handle-open-failure (channel reader)
@@ -368,6 +372,113 @@ returns NIL and is refused rather than accepted and abandoned."
     (when handler
       (funcall handler channel command))))
 
+;;; ---- Agent forwarding ----
+;;;
+;;; sshd answers auth-agent-req@openssh.com by creating a Unix listener,
+;;; putting its path in SSH_AUTH_SOCK and turning each accepted connection
+;;; into an agent channel back to the client.  The application supplies the
+;;; listener (it knows the user's home), so this server never guesses where
+;;; an agent socket belongs.
+
+(defun ssh-server-channel-add-env (channel name value)
+  "Set NAME=VALUE in CHANNEL's environment, replacing an earlier value."
+  (setf (ssh-server-channel-env channel)
+        (cons (cons name value)
+              (remove name (ssh-server-channel-env channel)
+                      :key #'car :test #'string=))))
+
+(defun ssh-server-open-agent-channel (session new-style)
+  "Ask SESSION's client for an agent-connection channel."
+  (let* ((id (ssh-session-next-channel-id session))
+         (window (ssh-session-window session))
+         (max-packet (ssh-session-max-packet session))
+         (type (if new-style "agent-connect" "auth-agent@openssh.com"))
+         (channel (%make-ssh-server-channel
+                   :session session
+                   :local-id id
+                   :type type
+                   :state :opening
+                   :local-window window
+                   :local-max-packet max-packet)))
+    (incf (ssh-session-next-channel-id session))
+    (setf (gethash id (ssh-session-channels session)) channel)
+    (ssh-session-note-channel-change session)
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-channel-open+)
+      (ssh-write-text writer type)
+      (ssh-write-u32 writer id)
+      (ssh-write-u32 writer window)
+      (ssh-write-u32 writer max-packet)
+      (ssh-session-send-payload session (ssh-writer-output writer)))
+    channel))
+
+(defun ssh-server-agent-accept (agent)
+  "Turn every pending connection on AGENT's listener into a channel."
+  (loop for fd = (cl-pnet-sockets:accept-socket (ssh-agent-forward-fd agent))
+        while fd
+        do (if (minusp (cl-pnet-sockets:set-nonblocking fd))
+               (ignore-errors (cl-pnet-sockets:close-open-fd fd))
+               (let* ((session (ssh-agent-forward-session agent))
+                      (channel (ssh-server-open-agent-channel
+                                session (ssh-agent-forward-new-style agent)))
+                      (relay (%make-ssh-fd-relay
+                              :fd fd
+                              :on-data
+                              (lambda (relay octets)
+                                (declare (ignore relay))
+                                (ssh-server-channel-write channel octets))
+                              :on-eof
+                              (lambda (relay)
+                                (declare (ignore relay))
+                                (setf (ssh-server-channel-target-fd-eof channel) t)
+                                (ssh-server-channel-eof channel)
+                                (when (ssh-server-channel-eof-received channel)
+                                  (ssh-server-channel-close channel)))
+                              :on-error
+                              (lambda (relay condition)
+                                (declare (ignore relay))
+                                (ssh-server-channel-fail channel condition)))))
+                 (setf (ssh-server-channel-target-fd-relay channel) relay)))))
+
+(defun ssh-server-handle-agent-request (session channel want-reply new-style)
+  "Answer an agent forwarding request, creating the session's listener.
+
+A second request, a key with no-agent-forwarding, AllowAgentForwarding no or
+DisableForwarding all answer failure, as sshd's session_auth_agent_req does."
+  (let ((ok nil))
+    (cond
+      ((ssh-session-agent-forward session)
+       (ssh-log "agent forwarding requested twice"))
+      ((not (ssh-session-permits-agent-forwarding-p session))
+       (ssh-log "agent forwarding disabled")
+       nil)
+      (t
+       (let ((hook (ssh-server-on-agent-forward
+                    (ssh-session-server session))))
+         (when hook
+           (multiple-value-bind (fd path cleanup)
+               (funcall hook session)
+             (when (and fd path)
+               (let ((agent (%make-ssh-agent-forward
+                             :session session
+                             :fd fd
+                             :path path
+                             :cleanup cleanup
+                             :new-style new-style)))
+                 (setf (ssh-session-agent-forward session) agent)
+                 ;; sshd puts the listener path in the session environment;
+                 ;; the application copies the channel's environment, so the
+                 ;; same place reaches the command it starts.
+                 (ssh-server-channel-add-env channel "SSH_AUTH_SOCK" path)
+                 (setf (ssh-agent-forward-watcher agent)
+                       (cl-pnet:fd-watch
+                        fd :on-readable
+                        (lambda (watcher)
+                          (declare (ignore watcher))
+                          (ssh-server-agent-accept agent))))
+                 (setf ok t))))))))
+    (ssh-server-channel-reply channel (not (null ok)) want-reply)))
+
 (defun ssh-server-handle-channel-request (session channel reader)
   "Dispatch one request addressed to CHANNEL."
   (let ((request (ssh-read-text reader))
@@ -385,8 +496,11 @@ returns NIL and is refused rather than accepted and abandoned."
        (ssh-server-handle-subsystem-request channel reader want-reply))
       ((string= request "window-change")
        (ssh-server-handle-window-change channel reader want-reply))
-      ((member request '("auth-agent-req@openssh.com" "x11-req")
+      ((member request '("auth-agent-req@openssh.com" "agent-req")
                :test #'string=)
+       (ssh-server-handle-agent-request
+        session channel want-reply (string= request "agent-req")))
+      ((string= request "x11-req")
        (ssh-server-channel-reply channel nil want-reply))
       (t (ssh-server-channel-reply channel nil want-reply)))))
 
@@ -500,6 +614,8 @@ returns NIL and is refused rather than accepted and abandoned."
     (cond
       ((string= (ssh-server-channel-type channel) "direct-tcpip")
        (ssh-server-channel-write-target channel data))
+      ((ssh-server-channel-target-fd-relay channel)
+       (ssh-fd-relay-queue (ssh-server-channel-target-fd-relay channel) data))
       ((and (not (eq kind :other)) (ssh-server-channel-on-data channel))
        (funcall (ssh-server-channel-on-data channel) channel data kind)))))
 
@@ -515,6 +631,9 @@ returns NIL and is refused rather than accepted and abandoned."
       ;; idempotent, so call it plainly rather than hiding other errors.
       (cl-pnet:close-connection (ssh-server-channel-target channel))
       (setf (ssh-server-channel-target channel) nil))
+    (when (ssh-server-channel-target-fd-relay channel)
+      (ssh-fd-relay-close (ssh-server-channel-target-fd-relay channel))
+      (setf (ssh-server-channel-target-fd-relay channel) nil))
     (when (ssh-server-channel-on-close channel)
       (funcall (ssh-server-channel-on-close channel) channel))))
 
@@ -574,12 +693,18 @@ reader."
      (ssh-server-channel-handle-data channel reader t))
     (#.+ssh-msg-channel-eof+
      (setf (ssh-server-channel-eof-received channel) t)
-     (when (string= (ssh-server-channel-type channel) "direct-tcpip")
-       (ssh-server-channel-half-close-target channel)
-       (when (ssh-server-channel-target-eof channel)
-         (ssh-server-channel-close channel)))
-     (when (ssh-server-channel-on-eof channel)
-       (funcall (ssh-server-channel-on-eof channel) channel)))
+     (cond
+       ((ssh-server-channel-target-fd-relay channel)
+        (ssh-fd-relay-shutdown-write
+         (ssh-server-channel-target-fd-relay channel))
+        (when (ssh-server-channel-target-fd-eof channel)
+          (ssh-server-channel-close channel)))
+       ((string= (ssh-server-channel-type channel) "direct-tcpip")
+        (ssh-server-channel-half-close-target channel)
+        (when (ssh-server-channel-target-eof channel)
+          (ssh-server-channel-close channel)))
+       ((ssh-server-channel-on-eof channel)
+        (funcall (ssh-server-channel-on-eof channel) channel))))
     (#.+ssh-msg-channel-close+
      (ssh-server-channel-handle-close channel))
     (#.+ssh-msg-channel-request+

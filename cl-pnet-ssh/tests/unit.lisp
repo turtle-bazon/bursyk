@@ -1855,6 +1855,281 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
 
+;;; ---- Agent forwarding ----
+
+#-ssh-backend-ffi
+(defun ssh-test-agent-echo-listener (path)
+  "Listen on PATH and echo every octet back, as a minimal ssh-agent.
+
+Returns a thunk that stops the listener and closes its connections."
+  (let* ((listener (cl-pnet-sockets:listen-unix path))
+         (watcher nil)
+         (clients (make-hash-table :test #'eql)))
+    (labels ((drop (client)
+               (let ((client-watcher (gethash client clients)))
+                 (when client-watcher
+                   (remhash client clients)
+                   (ignore-errors (cl-pnet:fd-unwatch client-watcher))))
+               (ignore-errors (cl-pnet-sockets:close-open-fd client)))
+             (serve (client)
+               (multiple-value-bind (octets count errno)
+                   (cl-pnet-sockets:receive-octets client 4096)
+                 (cond
+                   ((plusp count)
+                    (cl-pnet-sockets:send-octets client octets))
+                   ((member errno '(11 35)))
+                   (t
+                    ;; Zero is EOF; any other errno is equally the end of a
+                    ;; test agent that only echoes.
+                    (drop client))))))
+      (setf watcher
+            (cl-pnet:fd-watch
+             listener :on-readable
+             (lambda (watcher)
+               (declare (ignore watcher))
+               (loop for accepted = (cl-pnet-sockets:accept-socket listener)
+                     while accepted
+                     do (let ((client accepted))
+                          (cl-pnet-sockets:set-nonblocking client)
+                          (setf (gethash client clients)
+                                (cl-pnet:fd-watch
+                                 client :on-readable
+                                 (lambda (watcher)
+                                   (declare (ignore watcher))
+                                   (serve client))))))))))
+    (lambda ()
+      (when watcher
+        (ignore-errors (cl-pnet:fd-unwatch watcher)))
+      (maphash (lambda (client client-watcher)
+                 (declare (ignore client-watcher))
+                 (ignore-errors (cl-pnet-sockets:close-open-fd client)))
+               clients)
+      (clrhash clients)
+      (ignore-errors (cl-pnet-sockets:close-open-fd listener)))))
+
+#-ssh-backend-ffi
+(defun ssh-test-agent-roundtrip (channel path)
+  "Connect to PATH, send PING, and report the echo on CHANNEL.
+
+This stands in for a remote program that uses $SSH_AUTH_SOCK: it is the
+server-side half of agent forwarding, so the test needs no external tools."
+  (multiple-value-bind (fd status)
+      (cl-pnet-sockets:connect-unix path)
+    (if (null fd)
+        (progn
+          (ssh-server-channel-write channel "no agent socket")
+          (ssh-server-channel-exit channel 1)
+          (ssh-server-channel-close channel))
+        (let ((message (make-array 4 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(80 73 78 71)))
+              (sent 0)
+              (reply (make-array 0 :element-type '(unsigned-byte 8)
+                                   :adjustable t :fill-pointer 0))
+              (read-watcher nil)
+              (write-watcher nil))
+          (labels
+              ((close-socket ()
+                 (when read-watcher
+                   (ignore-errors (cl-pnet:fd-unwatch read-watcher))
+                   (setf read-watcher nil))
+                 (when write-watcher
+                   (ignore-errors (cl-pnet:fd-unwatch write-watcher))
+                   (setf write-watcher nil))
+                 (when fd
+                   (ignore-errors (cl-pnet-sockets:close-open-fd fd))
+                   (setf fd nil)))
+               (abort-roundtrip ()
+                 (close-socket)
+                 (ssh-server-channel-write channel "agent roundtrip failed")
+                 (ssh-server-channel-exit channel 1)
+                 (ssh-server-channel-close channel))
+               (finish ()
+                 (close-socket)
+                 (ssh-server-channel-write
+                  channel (map 'string #'code-char reply))
+                 (ssh-server-channel-exit channel 0)
+                 (ssh-server-channel-close channel))
+               (read-reply ()
+                 (unless read-watcher
+                   (setf read-watcher
+                         (cl-pnet:fd-watch
+                          fd :on-readable
+                          (lambda (watcher)
+                            (declare (ignore watcher))
+                            (multiple-value-bind (octets count errno)
+                                (cl-pnet-sockets:receive-octets fd 4096)
+                              (cond
+                                ((plusp count)
+                                 (loop for octet across octets
+                                       do (vector-push-extend octet reply))
+                                 (when (>= (fill-pointer reply) (length message))
+                                   (finish)))
+                                ((member errno '(11 35)))
+                                (t (abort-roundtrip)))))))))
+               (flush ()
+                 (loop while (< sent (length message))
+                       do (multiple-value-bind (count errno)
+                              (cl-pnet-sockets:send-octets
+                               fd message :start sent)
+                            (cond
+                              ((plusp count)
+                               (incf sent count))
+                              ((member errno '(11 35))
+                               (unless write-watcher
+                                 (setf write-watcher
+                                       (cl-pnet:fd-watch
+                                        fd :on-writable
+                                        (lambda (watcher)
+                                          (declare (ignore watcher))
+                                          (ignore-errors
+                                           (cl-pnet:fd-unwatch write-watcher))
+                                          (setf write-watcher nil)
+                                          (flush)))))
+                               (return))
+                              (t
+                               (abort-roundtrip)
+                               (return)))))
+                 (when (and (= sent (length message))
+                            (null write-watcher))
+                   (read-reply))))
+            (if (eq status :connected)
+                (flush)
+                ;; A non-blocking Unix connect reports completion through
+                ;; writability, exactly as the relay handles it.
+                (setf write-watcher
+                      (cl-pnet:fd-watch
+                       fd :on-writable
+                       (lambda (watcher)
+                         (declare (ignore watcher))
+                         (multiple-value-bind (errno answered)
+                             (cl-pnet-sockets:socket-error fd)
+                           (ignore-errors (cl-pnet:fd-unwatch write-watcher))
+                           (setf write-watcher nil)
+                           (if (and answered (zerop errno))
+                               (flush)
+                               (abort-roundtrip)))))))
+            channel)))))
+
+#-ssh-backend-ffi
+(test server-loopback-agent-forwarding
+  "A session that asks for agent forwarding gets a working SSH_AUTH_SOCK,
+and an agent channel reaches the client's own agent socket."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent"))
+             (server-key (merge-pathnames "host_key" directory))
+             (client-key (merge-pathnames "client_key" directory))
+             (authorized (merge-pathnames "authorized_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory))
+             (client-agent (namestring
+                            (merge-pathnames "client-agent.sock" directory)))
+             (server-agent (namestring
+                            (merge-pathnames "server-agent.sock" directory)))
+             (stdout (make-string-output-stream))
+             (state (list :none nil))
+             (server nil)
+             (stop-agent nil)
+             (timeout nil))
+        (ensure-directories-exist server-key)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring server-key)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring client-key)))
+               (ssh-test-write-authorized-keys
+                (merge-pathnames "client_key.pub" directory) authorized)
+               (setf stop-agent (ssh-test-agent-echo-listener client-agent)
+                     server
+                     (make-ssh-server
+                      "127.0.0.1" 0
+                      :host-key server-key
+                      :authorized-keys authorized
+                      :on-channel
+                      (lambda (channel)
+                        (setf (ssh-server-channel-on-exec channel)
+                              (lambda (channel command)
+                                (if (string= command "agent")
+                                    (let ((path
+                                            (cdr (assoc
+                                                  "SSH_AUTH_SOCK"
+                                                  (ssh-server-channel-env channel)
+                                                  :test #'string=))))
+                                      (if path
+                                          (ssh-test-agent-roundtrip channel path)
+                                          (progn
+                                            (ssh-server-channel-write
+                                             channel "no SSH_AUTH_SOCK")
+                                            (ssh-server-channel-exit channel 1)
+                                            (ssh-server-channel-close channel))))
+                                    (ssh-test-run-command channel command)))))
+                      ;; The application owns the listener path, as
+                      ;; bursyk-server does; the library relays it.
+                      :on-agent-forward
+                      (lambda (session)
+                        (declare (ignore session))
+                        (values (cl-pnet-sockets:listen-unix server-agent)
+                                server-agent
+                                (lambda ()
+                                  (ignore-errors
+                                   (delete-file server-agent)))))))
+               (setf timeout
+                     (cl-pnet:timer-start
+                      10 0
+                      (lambda ()
+                        (setf (second state) :timed-out)
+                        (cl-pnet:event-loop-stop))))
+               (let ((client
+                       (make-ssh-client
+                        "127.0.0.1"
+                        :port (ssh-server-port server)
+                        :user "tester"
+                        :private-key client-key
+                        :known-hosts known-hosts
+                        :host-key-policy :accept-new
+                        :forward-agent t
+                        :forward-agent-sock-path client-agent
+                        :on-open
+                        (lambda (client)
+                          (let ((channel
+                                  (ssh-open-session
+                                   client
+                                   :on-data
+                                   (ssh-test-loopback-handle-data stdout nil)
+                                   :on-exit
+                                   (lambda (channel value)
+                                     (declare (ignore channel))
+                                     (setf (first state) value))
+                                   :on-close
+                                   (lambda (channel value)
+                                     (declare (ignore channel value))
+                                     (ssh-client-close client)
+                                     (cl-pnet:event-loop-stop))
+                                   :on-error
+                                   (lambda (channel condition)
+                                     (declare (ignore channel))
+                                     (setf (second state) condition)
+                                     (cl-pnet:event-loop-stop)))))
+                            (ssh-channel-exec channel "agent")))
+                        :on-error
+                        (lambda (client condition)
+                          (declare (ignore client))
+                          (setf (second state) condition)
+                          (cl-pnet:event-loop-stop)))))
+                 (declare (ignore client))
+                 (when (fboundp '(setf cl-pnet::ev-stop-requested-p))
+                   (setf (cl-pnet::ev-stop-requested-p) nil)
+                   (cl-pnet:event-loop-run-once))
+                 (cl-pnet:event-loop-run)
+                 (when (second state)
+                   (error "agent loopback: ~A" (second state)))
+                 (is (equal "PING" (get-output-stream-string stdout)))
+                 (is (eql 0 (first state)))))
+          (when timeout (cl-pnet:timer-stop timeout))
+          (when stop-agent (funcall stop-agent))
+          (when server (ssh-server-close server))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test client-binds-a-direct-connection
   "BindAddress and BindInterface change where a direct connection comes
 from, and a source the kernel cannot assign fails the connection."
@@ -3065,6 +3340,45 @@ newline")))
            :user "cli-user" :port 2222)))
     (is (equal "cli-user" (getf parameters :user)))
     (is (= 2222 (getf parameters :port)))))
+
+(test forward-agent-parses-flags-and-socket-paths
+  "ForwardAgent takes ssh's yes/no/true/false flag forms and, as in 10.6, a
+path that selects the agent socket to forward."
+  (flet ((resolve (value)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line
+                            (format nil "ForwardAgent ~A" value)))))
+                  (options nil))
+             (cl-pnet-ssh:ssh-config-resolve
+              config "agent.example"
+              :on-options (lambda (resolved) (setf options resolved)))
+             options)))
+    (dolist (value '("yes" "true"))
+      (let ((options (resolve value)))
+        (is (eq t (cl-pnet-ssh:ssh-config-options-forward-agent options)))
+        (is (null (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                   options)))))
+    (dolist (value '("no" "false"))
+      (let ((options (resolve value)))
+        (is (null (cl-pnet-ssh:ssh-config-options-forward-agent options)))
+        (is (null (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                   options)))))
+    (let ((options (resolve "/run/user/1000/agent.sock")))
+      (is (eq t (cl-pnet-ssh:ssh-config-options-forward-agent options)))
+      (is (equal "/run/user/1000/agent.sock"
+                 (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                  options)))))
+  ;; The facade hands both values to the client constructor.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options '(:forward-agent t
+                             :forward-agent-sock-path "/tmp/agent.sock")))))
+    (is (eq t (getf parameters :forward-agent)))
+    (is (equal "/tmp/agent.sock"
+               (getf parameters :forward-agent-sock-path)))))
 
 (test algorithm-selection-follows-ssh-prefixes
   ;; ssh_config's +, - and ^ prefixes edit this build's list; a name it does
@@ -5375,6 +5689,33 @@ option the server cannot honour refuses the line rather than being lost."
     (is (not (cl-pnet-ssh:ssh-session-permits-tcpip-forward-p session "127.0.0.1" 8081)))
     (is (cl-pnet-ssh:ssh-session-permits-direct-tcpip-p session "host" 22))))
 
+(test agent-forwarding-policy-follows-config-and-key-options
+  "AllowAgentForwarding, DisableForwarding and no-agent-forwarding each
+refuse a session's agent request, and the defaults allow it."
+  (flet ((session (&rest options)
+           (let* ((config (ssh-server-config-load nil :options options))
+                  (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+             (cl-pnet-ssh::%make-ssh-session :server server))))
+    (let ((session (session)))
+      (is (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session)))
+    (let ((session (session "AllowAgentForwarding no")))
+      (is (not (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session))))
+    (let ((session (session "DisableForwarding yes")))
+      (is (not (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session))))
+    (let ((session (session)))
+      (setf (ssh-session-authorization session)
+            (nth-value 0
+                       (cl-pnet-ssh:ssh-authorized-key-options-parse
+                        "no-agent-forwarding")))
+      (is (not (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session))))
+    ;; A key that only restricts something else keeps agent forwarding.
+    (let ((session (session)))
+      (setf (ssh-session-authorization session)
+            (nth-value 0
+                       (cl-pnet-ssh:ssh-authorized-key-options-parse
+                        "no-pty,no-x11-forwarding")))
+      (is (cl-pnet-ssh:ssh-session-permits-agent-forwarding-p session)))))
+
 (test ssh-config-carries-the-features-the-caller-must-refuse
   ;; Agent, X11 and compression wishes can come from the file.  The parser
   ;; records them so a client can refuse a feature it lacks instead of
@@ -5511,7 +5852,7 @@ option the server cannot honour refuses the line rather than being lost."
                    (is (= cl-pnet-ssh::+ssh-msg-ext-info+ (aref ext 0)))
                    (let ((reader (ssh-make-reader ext)))
                      (ssh-read-u8 reader)
-                     (is (= 2 (ssh-read-u32 reader)))
+                     (is (= 3 (ssh-read-u32 reader)))
                      (is (string= "server-sig-algs" (ssh-read-text reader)))
                      (is (member "rsa-sha2-512"
                                  (ssh-read-name-list reader)
@@ -6834,7 +7175,7 @@ ignored and an unsupported version leaves chaff off."
          (extensions nil))
     (is (= 7 (cl-pnet-ssh::ssh-read-u8 reader)))
     (let ((count (cl-pnet-ssh::ssh-read-u32 reader)))
-      (is (= 2 count))
+      (is (= 3 count))
       (dotimes (index count)
         (declare (ignore index))
         (push (cons (cl-pnet-ssh::ssh-read-text reader)
@@ -6844,6 +7185,9 @@ ignored and an unsupported version leaves chaff off."
                                     :test #'string=)))))
     (is (equalp (cl-pnet-ssh::ssh-string-octets "0")
                 (cdr (assoc "ping@openssh.com" extensions
+                            :test #'string=))))
+    (is (equalp (cl-pnet-ssh::ssh-string-octets "0")
+                (cdr (assoc "agent-forward" extensions
                             :test #'string=))))))
 
 (test ping-and-pong-payloads-echo-data

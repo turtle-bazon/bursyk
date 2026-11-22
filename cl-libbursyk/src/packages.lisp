@@ -233,6 +233,7 @@
    #:ssh-config-options-control-path
    #:ssh-config-options-control-persist
    #:ssh-config-options-forward-agent
+   #:ssh-config-options-forward-agent-sock-path
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files
    #:ssh-config-options-bind-address
@@ -298,6 +299,8 @@
    #:ssh-server-config-required-rsa-size
    #:ssh-server-config-gateway-ports
    #:ssh-server-config-allow-tcp-forwarding
+   #:ssh-server-config-allow-agent-forwarding
+   #:ssh-server-config-agent-socket-path
    #:ssh-server-config-allow-streamlocal-forwarding
    #:ssh-server-config-streamlocal-bind-mask
    #:ssh-server-config-hostbased-authentication
@@ -383,6 +386,8 @@
    #:ssh-authorization-options-permit-x11-forwarding
    #:ssh-authorization-options-permit-pty-p
    #:ssh-authorization-options-permit-port-forwarding-p
+   #:ssh-authorization-options-permit-agent-forwarding-p
+   #:ssh-session-permits-agent-forwarding-p
    #:ssh-authorization-options-permit-address-p
    #:ssh-authorization-options-permit-now-p
    #:ssh-authorization-options-permit-open-p

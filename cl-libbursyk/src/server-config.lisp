@@ -113,16 +113,15 @@ socket address and has no routing domains.")
     "kerberosticketcleanup" "kerberosgetafstoken"
     "authorizedkeysfile2"
     ;; 10.6 directives that describe OpenSSH's privsep helpers or features
-    ;; this server refuses outright (PAM, GSSAPI, agent forwarding).
+    ;; this server refuses outright (PAM and GSSAPI).
     "sshdauthpath" "sshdsessionpath" "pamservicename"
-    "gssapidelegatecredentials" "agentsocketpath" "warnweakcrypto"))
+    "gssapidelegatecredentials" "warnweakcrypto"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
 ;;; configuration that asks for that value is fine; asking for anything else
 ;;; would change behaviour this build does not have, so it is refused.
 (defparameter +ssh-server-config-accepted-off-keywords+
-  '(("allowagentforwarding" . "no")
-    ("x11forwarding" . "no")
+  '(("x11forwarding" . "no")
     ("permittunnel" . "no")
     ("passwordauthentication" . "no")
     ("kbdinteractiveauthentication" . "no")
@@ -204,6 +203,12 @@ socket address and has no routing domains.")
   (required-rsa-size nil)
   (gateway-ports nil)
   (allow-tcp-forwarding nil)
+  ;; AllowAgentForwarding: :YES or :NO.  NIL is sshd's default of yes.
+  (allow-agent-forwarding nil)
+  ;; AgentSocketPath: "none", "shared:DIRECTORY" or "user:DIRECTORY", where
+  ;; the directory may use ~ and %u/%U/%h.  NIL leaves sshd's default of
+  ;; user:~/.ssh/agent, which BURSYK-SERVER creates per session.
+  (agent-socket-path nil)
   ;; AllowStreamLocalForwarding: :YES, :NO, :LOCAL or :REMOTE.  NIL leaves
   ;; this server's own default, which refuses stream-local forwarding.
   (allow-streamlocal-forwarding nil)
@@ -705,7 +710,8 @@ error, never an accidental no-match: sshd fatals in the same situation."
     authentication-methods subsystems log-level
     hostbased-authentication hostbased-accepted-algorithms
     hostbased-uses-name-from-packet-only ignore-rhosts
-    gateway-ports allow-tcp-forwarding allow-streamlocal-forwarding
+    gateway-ports allow-tcp-forwarding allow-agent-forwarding
+    agent-socket-path allow-streamlocal-forwarding
     streamlocal-bind-mask streamlocal-bind-unlink
     disable-forwarding set-env
     expose-auth-info refuse-connection
@@ -1204,6 +1210,24 @@ cannot apply per connection."
         (ssh-server-config-multistate
          line (ssh-server-config-one-argument line)
          +ssh-server-config-tcp-forwarding-values+ "AllowTcpForwarding")))
+      ((string= keyword "allowagentforwarding")
+       (ssh-server-config-set-once
+        config 'allow-agent-forwarding
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "agentsocketpath")
+       (let ((argument (ssh-server-config-one-argument line)))
+         (when (and (not (string-equal argument "none"))
+                    (not (and (> (length argument) 7)
+                              (string-equal (subseq argument 0 7) "shared:")
+                              (char= (char argument 7) #\/)))
+                    (not (and (> (length argument) 5)
+                              (string-equal (subseq argument 0 5) "user:"))))
+           (ssh-server-config-line-error
+            line "Invalid AgentSocketPath ~A" argument))
+         (ssh-server-config-set-once
+          config 'agent-socket-path argument)))
       ((string= keyword "allowstreamlocalforwarding")
        (ssh-server-config-set-once
         config 'allow-streamlocal-forwarding

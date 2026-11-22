@@ -2919,7 +2919,6 @@ with a warning rather than becoming unknown keywords."
 SshdAuthPath /usr/libexec/sshd-auth
 PAMServiceName sshd
 GSSAPIDelegateCredentials no
-AgentSocketPath /run/agent.sock
 WarnWeakCrypto no")))
     (is (plusp (length (cl-pnet-ssh:ssh-server-config-warnings config)))))
   ;; HostKeyAgent is implemented, not ignored.
@@ -2927,6 +2926,104 @@ WarnWeakCrypto no")))
              (config-value
               #'cl-pnet-ssh:ssh-server-config-host-key-agent
               "HostKeyAgent /run/agent.sock"))))
+
+(test sshd-config-reads-agent-forwarding
+  "AllowAgentForwarding is a flag and AgentSocketPath accepts sshd's three
+forms; a bare path is refused, as 10.6 does."
+  (is (eq :yes (config-value
+                #'cl-pnet-ssh:ssh-server-config-allow-agent-forwarding
+                "AllowAgentForwarding yes")))
+  (is (eq :no (config-value
+               #'cl-pnet-ssh:ssh-server-config-allow-agent-forwarding
+               "AllowAgentForwarding no")))
+  (dolist (path '("none" "user:~/.ssh/agent" "shared:/run/agent"))
+    (is (equal path
+               (config-value
+                #'cl-pnet-ssh:ssh-server-config-agent-socket-path
+                (format nil "AgentSocketPath ~A" path)))))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AgentSocketPath /run/agent.sock"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AgentSocketPath shared:relative"))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "AgentSocketPath user:")))
+
+#-win32
+(test agent-socket-path-tokens-expand
+  "AgentSocketPath's ~ and % tokens expand to the connecting account's
+directory and identity, and an unknown token or another account is refused
+rather than guessed."
+  (let ((home "/home/turtle/"))
+    (flet ((expand (text &optional (uid "1000"))
+             (bursyk-server::expand-agent-directory text "turtle" home uid)))
+      (is (equal "/home/turtle/agent" (expand "~/agent")))
+      (is (equal "/home/turtle/agent" (expand "agent")))
+      (is (equal "/home/turtle/turtle" (expand "%u")))
+      (is (equal "/home/turtle/1000" (expand "%U")))
+      (is (equal home (expand "%h")))
+      (is (equal "/home/turtle/100%" (expand "100%%")))
+      (is (null (expand "~other/agent")))
+      (is (null (expand "%q")))
+      (is (null (expand ""))))))
+
+#-win32
+(defun agent-forward-test-session (pathspec
+                                   &optional (user (bursyk-server::current-user-name)))
+  "A session whose sshd_config names PATHSPEC for agent forwarding."
+  (let* ((config
+           (config-from-text
+            (format nil "AllowAgentForwarding yes~%AgentSocketPath ~A"
+                    pathspec)))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (cl-pnet-ssh::%make-ssh-session :server server :user user)))
+
+#-win32
+(test agent-forward-listener-is-created-and-removed
+  "start-agent-forward follows AgentSocketPath: shared: gets a private
+temporary directory per session, user: listens directly in the named
+directory, and cleanup removes the socket it made."
+  (let ((root (merge-pathnames
+               (format nil "bursyk-agent-~D/" (random 1000000))
+               (uiop:temporary-directory))))
+    (unwind-protect
+         (flet ((check (pathspec expected-directory)
+                  (let* ((session (agent-forward-test-session pathspec))
+                         (fd nil)
+                         (path nil)
+                         (cleanup nil))
+                    (unwind-protect
+                         (progn
+                           (multiple-value-setq (fd path cleanup)
+                             (bursyk-server::start-agent-forward session))
+                           (is (integerp fd))
+                           (is (stringp path))
+                           (is (uiop:subpathp (pathname path)
+                                              expected-directory))
+                           ;; A leftover file would not accept a connection,
+                           ;; so connecting proves the listener is live.
+                           (multiple-value-bind (client status)
+                               (cl-pnet-sockets:connect-unix path)
+                             (declare (ignore status))
+                             (is (integerp client))
+                             (when client
+                               (cl-pnet-sockets:close-open-fd client)))
+                           (funcall cleanup)
+                           (setf cleanup nil)
+                           (is (not (probe-file path))))
+                      (when cleanup (funcall cleanup))
+                      (when fd (cl-pnet-sockets:close-open-fd fd))))))
+           (let ((shared (merge-pathnames "shared/" root))
+                 (user-directory (merge-pathnames "user/" root)))
+             (check (format nil "shared:~A" (namestring shared)) shared)
+             ;; shared: removes the per-session directory as well.
+             (is (or (not (uiop:directory-exists-p shared))
+                     (null (uiop:subdirectories shared))))
+             (check (format nil "user:~A" (namestring user-directory))
+                    user-directory)
+             ;; none creates nothing at all.
+             (is (null (bursyk-server::start-agent-forward
+                        (agent-forward-test-session "none"))))))
+      (ignore-errors (uiop:delete-directory-tree root :validate t)))))
 
 (test sshd-config-reads-pubkey-auth-options
   "PubkeyAuthOptions keeps the first line's flags and probe budget."

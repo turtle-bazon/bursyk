@@ -59,6 +59,15 @@
   ;; version 0 the client may use PING packets as chaff while hiding
   ;; keystroke timing.
   (ping-supported nil)
+  ;; EXT_INFO's agent-forward extension.  Version 0 selects RFC 9987's
+  ;; agent-req request and agent-connect channel instead of OpenSSH's
+  ;; auth-agent-req@openssh.com names.
+  (agent-forward-supported nil)
+  ;; ForwardAgent: T asks the server to forward its agent connections, and
+  ;; FORWARD-AGENT-SOCK-PATH, when set, names the agent socket to use instead
+  ;; of SSH_AUTH_SOCK.
+  (forward-agent nil)
+  (forward-agent-sock-path nil)
   ;; ObscureKeystrokeTiming: milliseconds between quantised keystrokes; 0
   ;; disables it.  The application owns stdin, so it applies this policy.
   (obscure-keystroke-timing +ssh-keystroke-default-interval-ms+)
@@ -216,6 +225,9 @@
   (pending-exec nil)
   (pending-subsystem nil)
   (pending-env nil)
+  ;; ForwardAgent: the request goes out after the peer confirms the session,
+  ;; before the pty, env and exec requests, as ssh orders it.
+  (pending-agent-request nil)
   (want-eof nil)
   (sent-eof nil)
   (want-close nil)
@@ -226,6 +238,9 @@
   ;; A forwarded-tcpip channel's local socket, once it is dialled.
   (target nil)
   (target-eof nil)
+  ;; An agent-forwarding channel's raw local socket.
+  (target-fd-relay nil)
+  (target-fd-eof nil)
   (on-data nil)
   (on-open nil)
   (on-eof nil)

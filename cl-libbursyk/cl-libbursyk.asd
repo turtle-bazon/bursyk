@@ -2,7 +2,7 @@
   :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.84"
+  :version "0.0.1.85"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
@@ -42,6 +42,9 @@
                              ;; reach an agent, and the FFI backend exposes the
                              ;; same helpers as the pure one.
                              (:file "agent")
+                             ;; Bridging a raw descriptor to a channel, shared
+                             ;; by agent forwarding on the client and server.
+                             (:file "channel-fd" :if-feature (:not :ssh-backend-ffi))
                              ;; Both ends of the protocol.  A build with
                              ;; :ssh-backend-ffi gets these from CL-PLIBSSH
                              ;; instead, so the pure roles are not compiled.

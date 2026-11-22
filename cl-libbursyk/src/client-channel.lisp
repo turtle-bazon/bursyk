@@ -63,11 +63,46 @@ runs once the peer has confirmed the channel, before any of its data."
      client (lambda () (ssh-channel-send channel (ssh-channel-open-payload channel))))
     channel))
 
+(defun ssh-client-forward-agent-path (client)
+  "The Unix socket CLIENT forwards when ForwardAgent is on, or NIL.
+
+ForwardAgent's path form wins over SSH_AUTH_SOCK.  A path that does not
+exist is treated as no agent at all, as ssh's check_agent_present disables
+forwarding rather than asking the server and failing every channel."
+  (let ((path (or (ssh-client-forward-agent-sock-path client)
+                  (uiop:getenv "SSH_AUTH_SOCK"))))
+    (and path (plusp (length path)) (probe-file path) path)))
+
+(defun ssh-channel-send-agent-request (channel)
+  "Ask the peer to forward authentication-agent connections on CHANNEL.
+
+RFC 9987's agent-req is used once the server advertised EXT_INFO's
+agent-forward extension; otherwise the OpenSSH auth-agent-req name is the
+one every server understands.  Neither wants a reply."
+  (let ((request
+          (if (ssh-client-agent-forward-supported
+               (ssh-channel-client channel))
+              "agent-req"
+              "auth-agent-req@openssh.com")))
+    (ssh-channel-send-message
+     channel +ssh-msg-channel-request+
+     :fields (lambda (writer)
+               (ssh-write-text writer request)
+               (ssh-write-boolean writer nil)))))
+
 (defun ssh-open-session (client &key on-data on-eof on-exit on-close on-error)
-  "Open a session channel; commands run on it with SSH-CHANNEL-EXEC."
-  (ssh-open-channel client "session"
-                    :on-data on-data :on-eof on-eof :on-exit on-exit
-                    :on-close on-close :on-error on-error))
+  "Open a session channel; commands run on it with SSH-CHANNEL-EXEC.
+
+When CLIENT's ForwardAgent is on and an agent socket exists, the agent
+forwarding request is queued for the moment the peer confirms the channel."
+  (let ((channel
+          (ssh-open-channel client "session"
+                            :on-data on-data :on-eof on-eof :on-exit on-exit
+                            :on-close on-close :on-error on-error)))
+    (when (and (ssh-client-forward-agent client)
+               (ssh-client-forward-agent-path client))
+      (setf (ssh-channel-pending-agent-request channel) t))
+    channel))
 
 (defun ssh-open-direct-tcpip (client host port
                               &key (origin-address "0.0.0.0") (origin-port 0)
@@ -265,6 +300,10 @@ side is known to accept."
       ((string= type "forwarded-streamlocal@openssh.com")
        (ssh-client-accept-forwarded-streamlocal client reader sender window
                                                 max-packet))
+      ((member type '("auth-agent@openssh.com" "agent-connect")
+               :test #'string=)
+       (ssh-client-accept-agent-channel client type sender window
+                                        max-packet))
       (t
        (ssh-client-send-channel-open-failure
         client sender (format nil "unsupported channel type ~A" type))))))
@@ -353,6 +392,67 @@ CHANNEL, or NIL to refuse the request."
           (funcall setup channel)
           channel))))
 
+(defun ssh-client-accept-agent-channel (client type sender window max-packet)
+  "Accept a server-initiated agent channel and dial the local agent.
+
+The socket is the one ForwardAgent names, or SSH_AUTH_SOCK.  A server that
+opens an agent channel when forwarding was not requested is refused, which
+is the check OpenSSH's client_request_agent makes before touching an agent."
+  (let ((path (and (ssh-client-forward-agent client)
+                   (ssh-client-forward-agent-path client))))
+    (if (null path)
+        (progn
+          (ssh-log "refusing ~A: agent forwarding was not enabled" type)
+          (ssh-client-send-channel-open-failure
+           client sender
+           "agent forwarding was not requested"))
+        (multiple-value-bind (fd status)
+            (cl-pnet-sockets:connect-unix path)
+          (if (null fd)
+              (progn
+                (ssh-log "cannot connect to the agent at ~A: ~A"
+                         path (cl-pnet-sockets:c-strerror status))
+                (ssh-client-send-channel-open-failure
+                 client sender
+                 (format nil "cannot connect to the agent at ~A" path)))
+              (let* ((id (ssh-client-next-channel-id client))
+                     (channel (%make-ssh-channel
+                               :client client
+                               :local-id id
+                               :remote-id sender
+                               :type type
+                               :state :open
+                               :remote-window window
+                               :remote-max-packet max-packet
+                               :local-window (ssh-client-window client)
+                               :local-max-packet (ssh-client-max-packet client)))
+                     (relay (%make-ssh-fd-relay
+                             :fd fd
+                             :phase (if (eq status :connected)
+                                        :connected :connecting)
+                             :on-data
+                             (lambda (relay octets)
+                               (declare (ignore relay))
+                               (ssh-channel-write channel octets))
+                             :on-eof
+                             (lambda (relay)
+                               (declare (ignore relay))
+                               (setf (ssh-channel-target-fd-eof channel) t)
+                               (ssh-channel-eof channel)
+                               (when (ssh-channel-eof-received channel)
+                                 (ssh-channel-close channel)))
+                             :on-error
+                             (lambda (relay condition)
+                               (declare (ignore relay))
+                               (ssh-client-forward-fail channel condition)))))
+                (incf (ssh-client-next-channel-id client))
+                (setf (gethash id (ssh-client-channels client)) channel
+                      (ssh-channel-target-fd-relay channel) relay)
+                (ssh-client-confirm-channel channel)
+                (ssh-client-channel-start-timeout channel)
+                (ssh-fd-relay-start relay)
+                channel))))))
+
 (defun ssh-client-connect-forward-target (channel host port)
   "Connect a forwarded CHANNEL to HOST:PORT without blocking."
   (handler-case
@@ -438,12 +538,16 @@ CHANNEL, or NIL to refuse the request."
   ;; channel, so the label can override the plain type's timeout, as ssh's
   ;; channel_set_xtype does after the request is sent.
   (ssh-client-channel-start-timeout channel)
-  (let ((env (ssh-channel-pending-env channel))
+  (let ((agent (ssh-channel-pending-agent-request channel))
+        (env (ssh-channel-pending-env channel))
         (exec (ssh-channel-pending-exec channel))
         (subsystem (ssh-channel-pending-subsystem channel)))
-    (setf (ssh-channel-pending-env channel) nil
+    (setf (ssh-channel-pending-agent-request channel) nil
+          (ssh-channel-pending-env channel) nil
           (ssh-channel-pending-exec channel) nil
           (ssh-channel-pending-subsystem channel) nil)
+    (when agent
+      (ssh-channel-send-agent-request channel))
     (iter (for (name . value) in env)
       (ssh-channel-send-env channel name value))
     (when exec
@@ -512,6 +616,9 @@ CHANNEL, or NIL to refuse the request."
     (when (ssh-channel-target channel)
       (ignore-errors (cl-pnet:close-connection (ssh-channel-target channel)))
       (setf (ssh-channel-target channel) nil))
+    (when (ssh-channel-target-fd-relay channel)
+      (ssh-fd-relay-close (ssh-channel-target-fd-relay channel))
+      (setf (ssh-channel-target-fd-relay channel) nil))
     (remhash (ssh-channel-local-id channel)
              (ssh-client-channels (ssh-channel-client channel)))
     (ssh-client-note-channel-change (ssh-channel-client channel))
@@ -545,20 +652,34 @@ CHANNEL, or NIL to refuse the request."
                ;; A channel whose local target the library dialled carries
                ;; its bytes straight there; anything else belongs to the
                ;; application, which may bridge it to its own descriptor.
-               (if (ssh-channel-target channel)
-                   (ssh-client-channel-write-target channel reader)
-                   (ssh-channel-handle-data channel reader nil)))
+               (cond
+                 ((ssh-channel-target-fd-relay channel)
+                  (let ((data (ssh-read-string reader)))
+                    (ssh-client-channel-note-activity channel)
+                    (decf (ssh-channel-local-window channel) (length data))
+                    (ssh-channel-adjust-window channel (length data))
+                    (ssh-fd-relay-queue
+                     (ssh-channel-target-fd-relay channel) data)))
+                 ((ssh-channel-target channel)
+                  (ssh-client-channel-write-target channel reader))
+                 (t
+                  (ssh-channel-handle-data channel reader nil))))
               (#.+ssh-msg-channel-extended-data+
                (ssh-channel-handle-data channel reader t))
               (#.+ssh-msg-channel-eof+
                (setf (ssh-channel-eof-received channel) t)
-               (if (ssh-channel-target channel)
-                   (ssh-client-channel-half-close-target channel)
-                   (when (ssh-channel-on-eof channel)
-                     (funcall (ssh-channel-on-eof channel) channel)))
-               (when (and (ssh-channel-target channel)
-                          (ssh-channel-target-eof channel))
-                 (ssh-channel-close channel)))
+               (cond
+                 ((ssh-channel-target-fd-relay channel)
+                  (ssh-fd-relay-shutdown-write
+                   (ssh-channel-target-fd-relay channel))
+                  (when (ssh-channel-target-fd-eof channel)
+                    (ssh-channel-close channel)))
+                 ((ssh-channel-target channel)
+                  (ssh-client-channel-half-close-target channel)
+                  (when (ssh-channel-target-eof channel)
+                    (ssh-channel-close channel)))
+                 ((ssh-channel-on-eof channel)
+                  (funcall (ssh-channel-on-eof channel) channel))))
               (#.+ssh-msg-channel-close+
                (ssh-channel-handle-close channel))
               (#.+ssh-msg-channel-request+

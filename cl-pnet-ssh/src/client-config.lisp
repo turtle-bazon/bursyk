@@ -265,6 +265,9 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-options-proxy-use-fdpass options)
         :bind-address (ssh-config-options-bind-address options)
         :bind-interface (ssh-config-options-bind-interface options)
+        :forward-agent (ssh-config-options-forward-agent options)
+        :forward-agent-sock-path
+        (ssh-config-options-forward-agent-sock-path options)
         :resolver resolver))
 
 ;;; ---- ProxyJump descriptors ----
@@ -565,6 +568,14 @@ uses whichever of the two it saw first instead of chaining them."
            :proxy-use-fdpass (getf parameters :proxy-use-fdpass)
            :bind-address (getf parameters :bind-address)
            :bind-interface (getf parameters :bind-interface)
+           ;; Agent forwarding is a pure-backend feature; the libssh client
+           ;; has no channel interface for a local agent socket, so asking
+           ;; for it there would silently do nothing.
+           #-ssh-backend-ffi
+           :forward-agent (getf parameters :forward-agent)
+           #-ssh-backend-ffi
+           :forward-agent-sock-path
+           (getf parameters :forward-agent-sock-path)
            :on-open on-open
            :on-error on-error
            :on-close on-close

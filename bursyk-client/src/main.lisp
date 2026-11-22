@@ -414,8 +414,9 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-X" "X11 forwarding is not implemented"))
   (when (eq (getf *options* :x11-forward) :trust)
     (unsupported "-Y" "X11 forwarding is not implemented"))
-  (when (eq (getf *options* :forward-agent) t)
-    (unsupported "-A" "agent forwarding is not implemented"))
+  #+ssh-backend-ffi
+  (when (getf *options* :forward-agent)
+    (unsupported "-A" "agent forwarding needs the pure SSH backend"))
   (when (getf *options* :compression)
     (unsupported "-C" "only uncompressed streams are implemented"))
   (when (getf *options* :ciphers)
@@ -450,16 +451,16 @@ a name this build lacks is an error instead of a silently widened offer."
 (defun check-config-supported (client)
   "Fail when CLIENT's resolved config asks for a feature this build lacks.
 
-The command line is checked before connecting, but ForwardAgent,
-Compression and X11 forwarding can arrive from ~/.ssh/config too.  Dropping
-them silently would leave the user believing they are on, so they are
-refused with the same message the matching flag gets.  An explicit -a or -x
-still disables the feature and therefore silences the refusal."
+The command line is checked before connecting, but Compression and X11
+forwarding can arrive from ~/.ssh/config too.  Dropping them silently would
+leave the user believing they are on, so they are refused with the same
+message the matching flag gets.  An explicit -x still disables X11 and
+therefore silences the refusal."
   (let ((options (and client (cl-pnet-ssh:ssh-client-config-options client))))
     (when options
-      (when (and (cl-pnet-ssh:ssh-config-options-forward-agent options)
-                 (not (eq (getf *options* :forward-agent) :no)))
-        (unsupported "ForwardAgent" "agent forwarding is not implemented"))
+      #+ssh-backend-ffi
+      (when (cl-pnet-ssh:ssh-config-options-forward-agent options)
+        (unsupported "ForwardAgent" "agent forwarding needs the pure SSH backend"))
       (when (cl-pnet-ssh:ssh-config-options-compression options)
         (unsupported "Compression" "only uncompressed streams are implemented"))
       (when (and (or (cl-pnet-ssh:ssh-config-options-forward-x11 options)
@@ -600,6 +601,12 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
     (when (getf *options* :bind-interface)
       (push (format nil "BindInterface ~A" (getf *options* :bind-interface))
             options))
+    ;; -A and -a are dedicated flags, so they outrank an -o or the file.
+    ;; OpenSSH applies them after reading the file; prepending the same
+    ;; keyword gives the first value the same effect.
+    (case (getf *options* :forward-agent)
+      ((t) (push "ForwardAgent yes" options))
+      ((:no) (push "ForwardAgent no" options)))
     options))
 
 (defun apply-command-line-options ()
@@ -3010,10 +3017,19 @@ and known-hosts files) are printed as this client will actually use them."
                 (:confirm "confirm")
                 (t "false")))
       (format t "forwardagent ~A~%"
-              (let ((value (or (getf *options* :forward-agent)
-                               (cl-pnet-ssh:ssh-config-options-forward-agent
-                                options))))
-                (cond ((eq value :no) "no")
+              (let* ((cli (getf *options* :forward-agent))
+                     (path
+                       (and (not (eq cli :no))
+                            (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                             options)))
+                     (value
+                       (or cli
+                           (cl-pnet-ssh:ssh-config-options-forward-agent
+                            options))))
+                ;; A path form is what ssh prints when ForwardAgent names a
+                ;; socket; yes/no is the flag form.
+                (cond (path path)
+                      ((eq value :no) "no")
                       (value "yes")
                       (t "no"))))
       (format t "connecttimeout ~A~%"

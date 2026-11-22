@@ -178,6 +178,7 @@ presented."
                           on-cancel-tcpip-forward
                           on-streamlocal-forward
                           on-cancel-streamlocal-forward
+                          on-agent-forward
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -249,7 +250,13 @@ authenticated.  ON-DIRECT-TCPIP is a function of
 forwarded connection.  ON-TCPIP-FORWARD is a function of
 (SESSION BIND-ADDRESS BIND-PORT) returning the port actually bound, or NIL to
 refuse a remote forwarding request; ON-CANCEL-TCPIP-FORWARD takes the same
-arguments and returns true once the listener is gone.  ON-ERROR receives
+arguments and returns true once the listener is gone.  ON-AGENT-FORWARD is a
+function of (SESSION) that creates the Unix socket a forwarded agent listens
+on and returns (VALUES FD PATH CLEANUP); the library applies
+AllowAgentForwarding, DisableForwarding and the key's no-agent-forwarding
+before calling it, watches FD, opens an agent channel for every accepted
+connection and relays its bytes.  CLEANUP, when given, removes PATH when the
+session ends; without it the library unlinks PATH itself.  ON-ERROR receives
 (SESSION CONDITION) (SESSION is NIL for listener errors), ON-CLOSE receives
 (SESSION REASON)."
   (let* ((version (if server-version
@@ -316,6 +323,7 @@ arguments and returns true once the listener is gone.  ON-ERROR receives
                   :on-cancel-tcpip-forward on-cancel-tcpip-forward
                   :on-streamlocal-forward on-streamlocal-forward
                   :on-cancel-streamlocal-forward on-cancel-streamlocal-forward
+                  :on-agent-forward on-agent-forward
                   :on-error on-error
                   :on-close on-close
                   :connections (make-hash-table :test #'eq)))
