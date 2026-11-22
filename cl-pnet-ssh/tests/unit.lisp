@@ -6370,3 +6370,51 @@ alone; a global limit closes every channel after the connection goes quiet."
       (is (eq :closed (cl-pnet-ssh::ssh-channel-state first)))
       (is (eq :closed (cl-pnet-ssh::ssh-channel-state second)))
       (cl-pnet-ssh::ssh-client-stop-timers client))))
+
+(test obsolete-client-keywords-are-aliases
+  "IdentityFile2, DSAAuthentication and the three keyboard-interactive
+spellings behave as the keywords ssh maps them to, including first-value-wins
+across an alias and its canonical name."
+  (flet ((resolve (&rest lines)
+           (let ((condition nil)
+                 (options nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (value) (setf condition value)))
+             (values condition options))))
+    (multiple-value-bind (condition options)
+        (resolve "DSAAuthentication no" "SkeyAuthentication yes"
+                 "TISAuthentication no" "IdentityFile /a"
+                 "IdentityFile2 /b")
+      (is (null condition))
+      (is (eq :no
+              (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)))
+      (is (eq t
+              (cl-pnet-ssh::ssh-config-options-kbd-interactive-authentication
+               options)))
+      (is (equal (list #p"/b" #p"/a")
+                 (cl-pnet-ssh:ssh-config-options-identity-files options))))
+    ;; The first of an alias family wins, whichever spelling comes first.
+    (multiple-value-bind (condition options)
+        (resolve "ChallengeResponseAuthentication no"
+                 "KbdInteractiveAuthentication yes")
+      (is (null condition))
+      (is (null
+           (cl-pnet-ssh::ssh-config-options-kbd-interactive-authentication
+            options))))
+    (multiple-value-bind (condition options)
+        (resolve "KbdInteractiveAuthentication yes"
+                 "ChallengeResponseAuthentication no")
+      (is (null condition))
+      (is (eq t
+              (cl-pnet-ssh::ssh-config-options-kbd-interactive-authentication
+               options))))
+    (multiple-value-bind (condition options)
+        (resolve "PubkeyAuthentication yes" "DSAAuthentication no")
+      (is (null condition))
+      (is (eq :yes
+              (cl-pnet-ssh:ssh-config-options-pubkey-authentication options))))))

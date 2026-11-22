@@ -775,6 +775,21 @@ disables that pattern's timeout."
     (setf (gethash key seen) t)
     (funcall thunk options)))
 
+(defun ssh-config-canonical-client-keyword (keyword)
+  "KEYWORD itself, or the name ssh's opcode table gives an obsolete alias.
+
+Aliases share one opcode, so their first-value-wins bookkeeping must share
+one key too: an earlier ChallengeResponseAuthentication keeps a later
+KbdInteractiveAuthentication from winning, exactly as ssh does."
+  (cond
+    ((member keyword '("challengeresponseauthentication"
+                       "skeyauthentication" "tisauthentication")
+             :test #'string=)
+     "kbdinteractiveauthentication")
+    ((string= keyword "dsaauthentication") "pubkeyauthentication")
+    ((string= keyword "identityfile2") "identityfile")
+    (t keyword)))
+
 (defun ssh-config-permitted-cnames-value (line)
   "LINE's CanonicalizePermittedCNAMEs rules, as (SOURCE . TARGET) pairs.
 
@@ -1023,7 +1038,9 @@ understand them rather than silently match nothing."
 (defun ssh-config-apply-identity (line options seen context)
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
-      ((string= keyword "identityfile")
+      ((member keyword '("identityfile" "identityfile2") :test #'string=)
+       ;; IdentityFile2 is OpenSSH's obsolete spelling of IdentityFile; it
+       ;; still names an identity and joins the same ordered list.
        (push (ssh-config-path-value line options context)
              (ssh-config-options-identity-files options)))
       ((string= keyword "certificatefile")
@@ -1429,7 +1446,10 @@ understand them rather than silently match nothing."
                         (copy-list arguments))))))))
       (t
        (ssh-config-set-once
-        seen options (intern (string-upcase keyword) :keyword)
+        seen options
+        (intern (string-upcase
+                 (ssh-config-canonical-client-keyword keyword))
+                :keyword)
         (lambda (options)
           (ssh-config-apply-session-value line options keyword)))))))
 
@@ -1624,13 +1644,21 @@ understand them rather than silently match nothing."
         ((string= keyword "preferredauthentications")
          (setf (ssh-config-options-preferred-authentications options)
                (ssh-config-split-list value)))
-        ((string= keyword "pubkeyauthentication")
+        ((member keyword '("pubkeyauthentication" "dsaauthentication")
+                 :test #'string=)
+         ;; DSAAuthentication is the obsolete name ssh still maps to the
+         ;; public-key switch.
          (setf (ssh-config-options-pubkey-authentication options)
                (if (boolean) :yes :no)))
         ((string= keyword "passwordauthentication")
          (setf (ssh-config-options-password-authentication options)
                (boolean)))
-        ((string= keyword "kbdinteractiveauthentication")
+        ((member keyword '("kbdinteractiveauthentication"
+                           "challengeresponseauthentication"
+                           "skeyauthentication" "tisauthentication")
+                 :test #'string=)
+         ;; Three obsolete names that ssh maps to the keyboard-interactive
+         ;; switch.
          (setf (ssh-config-options-kbd-interactive-authentication options)
                (boolean)))
         ((string= keyword "numberofpasswordprompts")
@@ -1670,7 +1698,8 @@ block is active, as ssh's parse_token does."
                          "canonicalizepermittedcnames")
                :test #'string=)
        (ssh-config-apply-address line options seen context))
-      ((member keyword '("identityfile" "certificatefile" "identityagent"
+      ((member keyword '("identityfile" "identityfile2" "certificatefile"
+                         "identityagent"
                          "identitiesonly" "addkeystoagent"
                          "hostbasedauthentication" "hostbasedacceptedalgorithms"
                          "hostbasedkeytypes" "hostbasedkey"
@@ -1717,6 +1746,9 @@ block is active, as ssh's parse_token does."
                          "preferredauthentications" "pubkeyauthentication"
                          "passwordauthentication"
                          "kbdinteractiveauthentication"
+                         "dsaauthentication"
+                         "challengeresponseauthentication"
+                         "skeyauthentication" "tisauthentication"
                          "numberofpasswordprompts")
                :test #'string=)
        (ssh-config-apply-session line options seen))
