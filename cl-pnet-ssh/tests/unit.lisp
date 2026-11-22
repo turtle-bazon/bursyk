@@ -6418,3 +6418,66 @@ across an alias and its canonical name."
       (is (null condition))
       (is (eq :yes
               (cl-pnet-ssh:ssh-config-options-pubkey-authentication options))))))
+
+(test warn-weak-crypto-is-parsed
+  "WarnWeakCrypto accepts the multistate spellings ssh's table knows, maps
+no-pq-kex to off as readconf does, rejects anything else, and keeps the first
+active value."
+  (flet ((options-for (&rest lines)
+           (let ((options nil)
+                 (condition nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+              "alias"
+              :on-options (lambda (value) (setf options value))
+              :on-error (lambda (value) (setf condition value)))
+             (values options condition))))
+    (multiple-value-bind (options condition)
+        (options-for "Port 22")
+      (is (null condition))
+      (is (null (cl-pnet-ssh:ssh-config-options-warn-weak-crypto options))))
+    (dolist (case '(("WarnWeakCrypto yes" . :yes)
+                    ("WarnWeakCrypto TRUE" . :yes)
+                    ("WarnWeakCrypto no" . :no)
+                    ("WarnWeakCrypto false" . :no)
+                    ("WarnWeakCrypto no-pq-kex" . :no)))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (is (null condition))
+        (is (eq (cdr case)
+                (cl-pnet-ssh:ssh-config-options-warn-weak-crypto options))
+            (car case))))
+    (multiple-value-bind (options condition)
+        (options-for "WarnWeakCrypto yes" "WarnWeakCrypto no")
+      (is (null condition))
+      (is (eq :yes
+              (cl-pnet-ssh:ssh-config-options-warn-weak-crypto options))))
+    (multiple-value-bind (options condition)
+        (options-for "WarnWeakCrypto maybe")
+      (declare (ignore options))
+      (is (typep condition 'ssh-config-error))
+      (is (search "unsupported option"
+                  (cl-pnet-ssh::ssh-error-detail condition))))))
+
+(test warn-weak-crypto-fires-once-without-pq
+  "The post-quantum notice appears after the initial exchange only when
+KexAlgorithms was not set, the exchange is classical and the warning is on."
+  (flet ((warnings (&rest client-arguments)
+           (let ((lines '())
+                 (client (apply #'cl-pnet-ssh::%make-ssh-client
+                                client-arguments)))
+             (let ((cl-pnet-ssh:*ssh-warning-function*
+                     (lambda (line) (push line lines))))
+               (cl-pnet-ssh::ssh-client-check-weak-crypto client)
+               (cl-pnet-ssh::ssh-client-check-weak-crypto client))
+             (nreverse lines))))
+    (is (= 3 (length (warnings :negotiated '(:kex "curve25519-sha256")))))
+    (is (null (warnings :negotiated '(:kex "curve25519-sha256")
+                        :kex-algorithms '("curve25519-sha256"))))
+    (is (null (warnings :negotiated '(:kex "curve25519-sha256")
+                        :warn-weak-crypto nil)))
+    (is (null (warnings :negotiated '(:kex "mlkem768x25519-sha256"))))
+    (is (cl-pnet-ssh::ssh-kex-post-quantum-p "mlkem768x25519-sha256"))
+    (is (not (cl-pnet-ssh::ssh-kex-post-quantum-p "curve25519-sha256")))))

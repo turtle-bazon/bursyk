@@ -18,3 +18,19 @@ Match LogLevel can suppress protocol detail without changing the reporter.")
   (when (and *ssh-log-enabled* *ssh-log-function*)
     (ignore-errors
       (funcall *ssh-log-function* (apply #'format nil format-string arguments)))))
+
+(defvar *ssh-warning-function* nil
+  "A function of one string for warnings shown at ssh's default log level.
+
+SSH-LOG's reporter is only bound when a command line asks for -v or a log
+file, but OpenSSH prints warnings such as WarnWeakCrypto's notice without
+being asked.  A command line binds this reporter for those, and SSH-WARN
+falls back to SSH-LOG when a library user only bound the logger.")
+
+(defun ssh-warn (format-string &rest arguments)
+  "Report a warning through *SSH-WARNING-FUNCTION*, else through SSH-LOG."
+  (let ((message (apply #'format nil format-string arguments)))
+    (cond
+      (*ssh-warning-function*
+       (ignore-errors (funcall *ssh-warning-function* message)))
+      (t (ssh-log "~A" message)))))

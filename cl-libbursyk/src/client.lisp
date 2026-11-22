@@ -346,6 +346,7 @@ helper is what reaches the server."
                                  no-host-authentication-for-localhost
                                  host-key-alias
                                  batch-mode
+                                 (warn-weak-crypto t)
                                  channel-timeouts
                                  version-addendum
                                  hostbased-authentication
@@ -397,6 +398,7 @@ helper is what reaches the server."
                     no-host-authentication-for-localhost
                     :host-key-alias host-key-alias
                     :batch-mode batch-mode
+                    :warn-weak-crypto warn-weak-crypto
                     :channel-timeouts channel-timeouts
                     :version-addendum
                     (and version-addendum
@@ -532,6 +534,7 @@ is applied here, before any request names a key the configuration forbade."
                              no-host-authentication-for-localhost
                              host-key-alias
                              batch-mode
+                             (warn-weak-crypto t)
                              channel-timeouts
                              version-addendum
                              hostbased-authentication
@@ -592,8 +595,11 @@ HOST-KEY-POLICY is :STRICT, :ACCEPT-NEW, :INSECURE, or a function of
 (CLIENT FINGERPRINT KEY-BLOB) that returns true to trust and record an
 unknown key; HOST-KEY-CALLBACK is the same function under a clearer name.
 BATCH-MODE, when true, never asks: an unknown host key fails even when a
-confirmation callback was supplied.  VERSION-ADDENDUM is appended after a
-space to the identification string, matching sshd's VersionAddendum.
+confirmation callback was supplied.  WARN-WEAK-CRYPTO, on by default, shows
+OpenSSH 10.6's post-quantum notice after the initial key exchange when it used
+no post-quantum algorithm and KexAlgorithms was left at its default.
+VERSION-ADDENDUM is appended after a space to the identification string,
+matching sshd's VersionAddendum.
 
 CHANNEL-TIMEOUTS is a list of (PATTERN . SECONDS) pairs, as ssh_config's
 ChannelTimeout: a channel that matches PATTERN and sees no traffic for
@@ -642,6 +648,7 @@ role-neutral."
                            no-host-authentication-for-localhost
                            :host-key-alias host-key-alias
                            :batch-mode batch-mode
+                           :warn-weak-crypto warn-weak-crypto
                            :channel-timeouts channel-timeouts
                            :version-addendum version-addendum
                            :hostbased-authentication hostbased-authentication

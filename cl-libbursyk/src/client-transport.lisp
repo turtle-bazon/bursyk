@@ -262,12 +262,32 @@ its KEXINIT when the connection came up."
           (ssh-client-kexinit-sent client) nil)
     (ssh-client-maybe-finish-kex client)))
 
+(defun ssh-client-check-weak-crypto (client)
+  "Print OpenSSH 10.6's post-quantum warning after the initial key exchange.
+
+ssh warns when the selected exchange is not post-quantum and the user did not
+set KexAlgorithms; setting it means the choice was deliberate.  This build
+offers only classical exchanges, so a default connection warns every time,
+exactly as an ssh built without PQ support does.  The notice is printed once,
+as ssh sets non_pq_kex_warned after showing it."
+  (let ((kex (getf (ssh-client-negotiated client) :kex)))
+    (when (and kex
+               (ssh-client-warn-weak-crypto client)
+               (null (ssh-client-kex-algorithms client))
+               (not (ssh-kex-post-quantum-p kex))
+               (not (ssh-client-non-pq-kex-warned client)))
+      (setf (ssh-client-non-pq-kex-warned client) t)
+      (ssh-warn "** WARNING: connection is not using a post-quantum key exchange algorithm.")
+      (ssh-warn "** This session may be vulnerable to \"store now, decrypt later\" attacks.")
+      (ssh-warn "** The server may need to be upgraded. See https://openssh.com/pq.html"))))
+
 (defun ssh-client-maybe-finish-kex (client)
   "Once both NEWKEYS have crossed, ask for the userauth service."
   (when (and (ssh-client-keys-sent client)
              (ssh-client-keys-received client)
              (eq (ssh-client-phase client) :kex))
     (setf (ssh-client-phase client) :auth)
+    (ssh-client-check-weak-crypto client)
     ;; ConnectTimeout keeps running through authentication, as it does in
     ;; OpenSSH: a server that completes the key exchange and then stalls
     ;; must not hang the caller forever.

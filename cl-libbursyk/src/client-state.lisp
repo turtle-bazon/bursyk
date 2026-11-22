@@ -49,6 +49,12 @@
   ;; BatchMode: never ask the user anything, so an unknown host key fails
   ;; even when a confirmation callback was supplied.
   (batch-mode nil)
+  ;; WarnWeakCrypto: OpenSSH 10.6 warns after the initial key exchange when
+  ;; it did not use a post-quantum algorithm and KexAlgorithms was left at
+  ;; its default.  NIL turns the notice off; NON-PQ-KEX-WARNED keeps it to
+  ;; one notice per connection.
+  (warn-weak-crypto t)
+  (non-pq-kex-warned nil)
   ;; Algorithm offers from ssh_config's Ciphers, MACs, KexAlgorithms and
   ;; HostKeyAlgorithms.  NIL means this build's own list; a list from
   ;; SSH-RESOLVE-ALGORITHM-LIST restricts what KEXINIT offers.

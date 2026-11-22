@@ -20,6 +20,23 @@
           '("ext-info-c"
             "kex-strict-c-v00@openssh.com")))
 
+(defparameter +ssh-post-quantum-kex-algorithms+
+  '("mlkem768x25519-sha256"
+    "mlkem768nistp256-sha256"
+    "sntrup761x25519-sha512"
+    "sntrup761x25519-sha512@openssh.com")
+  "OpenSSH's post-quantum key exchanges, none offered by this build yet.
+
+WarnWeakCrypto asks whether the chosen exchange is post-quantum.  Keeping
+the names here lets that answer follow ssh before the algorithms themselves
+are implemented, and a build that adds one needs only to add it to the offer.")
+
+(defun ssh-kex-post-quantum-p (name)
+  "Whether NAME is one of OpenSSH's post-quantum key exchanges."
+  (and name
+       (member name +ssh-post-quantum-kex-algorithms+ :test #'string=)
+       t))
+
 (defparameter +ssh-host-key-algorithms+
   '("ssh-ed25519-cert-v01@openssh.com"
     "ecdsa-sha2-nistp256-cert-v01@openssh.com"

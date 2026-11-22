@@ -23,6 +23,8 @@
    #:*ssh-log-function*
    #:*ssh-log-enabled*
    #:ssh-log
+   #:*ssh-warning-function*
+   #:ssh-warn
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
@@ -176,6 +178,7 @@
    #:ssh-config-options-visual-host-key
    #:ssh-config-options-check-host-ip
    #:ssh-config-options-batch-mode
+   #:ssh-config-options-warn-weak-crypto
    #:ssh-config-options-no-host-authentication-for-localhost
    #:ssh-config-options-verify-host-key-dns
    #:*ssh-dns-server*

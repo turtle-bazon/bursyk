@@ -651,7 +651,21 @@ session down."
                     (finish-output stream))
                 (error ()
                   (setf *log-stream* nil
-                        cl-pnet-ssh:*ssh-log-function* nil))))))))
+                        cl-pnet-ssh:*ssh-log-function* nil)))))))
+  ;; Warnings such as WarnWeakCrypto's post-quantum notice appear at ssh's
+  ;; default log level, so they need neither -v nor a log file.  -q still
+  ;; silences them, and -E sends them to the same file as the other lines.
+  (setf cl-pnet-ssh:*ssh-warning-function*
+        (if (getf *options* :quiet)
+            (lambda (line) (declare (ignore line)) nil)
+            (lambda (line)
+              (let ((stream (or *log-stream* *error-output*)))
+                (handler-case
+                    (progn
+                      (format stream "~A~%" line)
+                      (finish-output stream))
+                  (error ()
+                    (setf *log-stream* nil))))))))
 
 ;;; ---- -Q: algorithm queries ----
 
@@ -2569,6 +2583,11 @@ peer that connected to it; NIL refuses the channel."
                  options)
                 "yes"
                 "no"))
+    (format t "warnweakcrypto ~A~%"
+            (if (eq (cl-pnet-ssh:ssh-config-options-warn-weak-crypto options)
+                    :no)
+                "no"
+                "yes"))
     (format t "hostbasedauthentication ~A~%"
             (if (cl-pnet-ssh:ssh-config-options-hostbased-authentication
                  options)

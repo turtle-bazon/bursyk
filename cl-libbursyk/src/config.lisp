@@ -159,6 +159,10 @@ way ssh refuses it.")
   (bind-address nil)
   (address-family nil)
   (batch-mode nil)
+  ;; WarnWeakCrypto: :NO suppresses the post-quantum key-exchange warning,
+  ;; :YES asks for it, and NIL means ssh's default of yes.  The 10.6
+  ;; "no-pq-kex" spelling also selects :NO, as readconf's multistate does.
+  (warn-weak-crypto nil)
   (preferred-authentications nil)
   (pubkey-authentication nil)
   (password-authentication nil)
@@ -1269,7 +1273,25 @@ understand them rather than silently match nothing."
         seen options :batch-mode
         (lambda (options)
           (setf (ssh-config-options-batch-mode options)
-                (ssh-config-boolean line (ssh-config-arg line)))))))))
+                (ssh-config-boolean line (ssh-config-arg line))))))
+      ((string= keyword "warnweakcrypto")
+       ;; A multistate, not a boolean: readconf also accepts no-pq-kex, which
+       ;; its table maps to the same false value as no, and rejects anything
+       ;; else with "unsupported option".
+       (ssh-config-set-once
+        seen options :warn-weak-crypto
+        (lambda (options)
+          (let ((value (ssh-config-arg line)))
+            (setf (ssh-config-options-warn-weak-crypto options)
+                  (cond
+                    ((member value '("yes" "true") :test #'string-equal)
+                     :yes)
+                    ((member value '("no" "false" "no-pq-kex")
+                             :test #'string-equal)
+                     :no)
+                    (t
+                     (error (ssh-config-line-error
+                             line "unsupported option ~S" value))))))))))))
 
 (defun ssh-config-apply-algorithms (line options seen)
   (let ((keyword (ssh-config-line-keyword line)))
@@ -1715,7 +1737,8 @@ block is active, as ssh's parse_token does."
                          "revokedhostkeys"
                          "stricthostkeychecking"
                          "connecttimeout" "connectionattempts"
-                         "addressfamily" "batchmode" "ignoreunknown")
+                         "addressfamily" "batchmode" "ignoreunknown"
+                         "warnweakcrypto")
                :test #'string=)
        (ssh-config-apply-policy line options seen context))
       ((member keyword '("ciphers" "macs" "kexalgorithms" "hostkeyalgorithms"
