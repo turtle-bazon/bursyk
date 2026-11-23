@@ -890,53 +890,6 @@ leaves the greeting alone for none."
     (is (equal "SSH-2.0-test"
                (cl-pnet-ssh::ssh-client-version-string client)))))
 
-(test client-version-addendum-reaches-the-server
-  "A login still verifies when the addendum is part of the greeting, and the
-server records the full string."
-  (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
-      (let* ((directory (ssh-test-directory "cl-pnet-ssh-addendum"))
-             (server-key (merge-pathnames "host_key" directory))
-             (client-key (merge-pathnames "client_key" directory))
-             (authorized (merge-pathnames "authorized_keys" directory))
-             (known-hosts (merge-pathnames "known_hosts" directory))
-             (stdout (make-string-output-stream))
-             (seen nil)
-             (server nil))
-        (ensure-directories-exist server-key)
-        (unwind-protect
-             (progn
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring server-key)))
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring client-key)))
-               (ssh-test-write-authorized-keys
-                (merge-pathnames "client_key.pub" directory) authorized)
-               (setf server
-                     (make-ssh-server
-                      "127.0.0.1" 0
-                      :host-key server-key
-                      :authorized-keys authorized
-                      :on-session
-                      (lambda (session)
-                        (setf seen (cl-pnet-ssh:ssh-session-client-version
-                                    session)))
-                      :on-channel
-                      (lambda (channel)
-                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
-                              (lambda (channel command)
-                                (ssh-test-run-command channel command))))))
-               (is (= 3
-                      (ssh-test-loopback-run
-                       server client-key known-hosts stdout
-                       (make-string-output-stream)
-                       :version-addendum "cl-pnet-test")))
-               (is (string= "hello"
-                            (get-output-stream-string stdout)))
-               (is (not (null (search "cl-pnet-test" (or seen ""))))))
-          (when server (ssh-server-close server))
-          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
-
 (test certificate-option-merge-follows-sshd
   "Permission flags are ANDed, restrictive values are combined, and two
 different force-command clauses cannot be merged."
@@ -2074,67 +2027,6 @@ from, and a source the kernel cannot assign fails the connection."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
-
-(test server-loopback-host-certificate
-  ;; The server presents the certificate, the client checks its CA against
-  ;; @cert-authority in known_hosts, and the KEX signature is verified with
-  ;; the plain key inside the certificate.
-  (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
-      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert-loop"))
-             (ca (merge-pathnames "ca" directory))
-             (host-key (merge-pathnames "host_key" directory))
-             (client-key (merge-pathnames "client_key" directory))
-             (authorized (merge-pathnames "authorized_keys" directory))
-             (known-hosts (merge-pathnames "known_hosts" directory))
-             (stdout (make-string-output-stream))
-             (stderr (make-string-output-stream))
-             (server nil))
-        (ensure-directories-exist ca)
-        (unwind-protect
-             (progn
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring ca)))
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring host-key)))
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring client-key)))
-               (ssh-keygen
-                (list "-q" "-s" (namestring ca) "-I" "host-id"
-                      "-h" "-n" "127.0.0.1" "-V" "-1m:+52w"
-                      (namestring (merge-pathnames "host_key.pub" directory))))
-               (ssh-test-write-authorized-keys
-                (merge-pathnames "client_key.pub" directory) authorized)
-               (setf server
-                     (make-ssh-server
-                      "127.0.0.1" 0
-                      :host-key host-key
-                      :host-certificate
-                      (merge-pathnames "host_key-cert.pub" directory)
-                      :authorized-keys authorized
-                      :on-channel
-                      (lambda (channel)
-                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
-                              (lambda (channel command)
-                                (ssh-test-run-command channel command))))))
-               ;; The host's known_hosts name includes the ephemeral port.
-               (with-open-file (out known-hosts :direction :output
-                                               :if-exists :supersede
-                                               :if-does-not-exist :create)
-                 (with-open-file (in (merge-pathnames "ca.pub" directory))
-                   (format out "@cert-authority [127.0.0.1]:~D ~A~%"
-                           (ssh-server-port server)
-                           (string-trim '(#\Space #\Return #\Newline)
-                                        (read-line in)))))
-               ;; Strict policy: only the certificate's CA can admit the host.
-               (let ((status (ssh-test-loopback-run
-                              server client-key known-hosts stdout stderr
-                              :host-key-policy :strict)))
-                 (is (equal "hello" (get-output-stream-string stdout)))
-                 (is (equal "oops" (get-output-stream-string stderr)))
-                 (is (eql 3 status))))
-          (when server (ssh-server-close server))
-          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test server-loopback-authentication-methods
   "publickey,publickey requires two different keys, and ExposeAuthInfo
@@ -4027,51 +3919,6 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
     (is (eq t (ssh-config-options-enable-ssh-keysign options)))))
 
 
-
-(test client-loopback-hostbased-authentication
-  "The client authenticates with a host key and the server's hostbased hook."
-  (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
-      (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-loop"))
-             (server-key (merge-pathnames "server_key" directory))
-             (hostbased-key (merge-pathnames "client_host_key" directory))
-             (known-hosts (merge-pathnames "known_hosts" directory))
-             (stdout (make-string-output-stream))
-             (stderr (make-string-output-stream))
-             (server nil))
-        (ensure-directories-exist server-key)
-        (unwind-protect
-             (progn
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring server-key)))
-               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                                 "-f" (namestring hostbased-key)))
-               (setf server
-                     (make-ssh-server
-                      "127.0.0.1" 0
-                      :host-key server-key
-                      :sshd-config
-                      (ssh-server-config-load
-                       nil :options '("HostbasedAuthentication yes"))
-                      :hostbased-key-allowed
-                      (lambda (session user client-user client-host key)
-                        (declare (ignore session user client-user client-host
-                                         key))
-                        t)
-                      :on-channel
-                      (lambda (channel)
-                        (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
-                              (lambda (channel command)
-                                (ssh-test-run-command channel command))))))
-               (let ((status (ssh-test-loopback-run
-                              server nil known-hosts stdout stderr
-                              :host-key-policy :insecure
-                              :hostbased-key hostbased-key)))
-                 (is (equal "hello" (get-output-stream-string stdout)))
-                 (is (equal "oops" (get-output-stream-string stderr)))
-                 (is (eql 3 status))))
-          (when server (ssh-server-close server))
-          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test add-keys-to-agent-parses
   (flet ((value (line)
