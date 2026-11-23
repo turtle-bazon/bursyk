@@ -3030,6 +3030,11 @@ guess, so only an explicit PidFile is written."
                        (close-remote-forwards session))
            :on-error (lambda (session condition)
                        (when session
+                         ;; A failure after PAM authenticated the user -- a
+                         ;; pam_setcred failure, for example -- still owns a
+                         ;; transaction; end it as sshd's cleanup list would.
+                         #-win32
+                         (pam-close-session session)
                          (delete-auth-info-file session)
                          (close-remote-forwards session))
                        (if session

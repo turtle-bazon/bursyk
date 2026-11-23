@@ -575,12 +575,13 @@ session required pam_permit.so
 ;;; skips these tests rather than failing them.
 
 #-win32
-(defun compile-pam-test-module (directory)
-  "Compile tests/pam-expired.c into DIRECTORY and return the module path.
+(defun compile-pam-test-module (directory &optional (name "pam-expired"))
+  "Compile tests/NAME.c into DIRECTORY and return the module path.
 NIL means no compiler could build it, so the caller can skip."
   (let ((source (asdf:system-relative-pathname
-                 "bursyk-server" "tests/pam-expired.c"))
-        (output (merge-pathnames "pam-expired.so" directory)))
+                 "bursyk-server"
+                 (format nil "tests/~A.c" name)))
+        (output (merge-pathnames (format nil "~A.so" name) directory)))
     (handler-case
         (progn
           (uiop:run-program
@@ -620,6 +621,64 @@ session required pam_permit.so
 #-win32
 (defmacro with-pam-expired-fixture ((variable) &body body)
   `(let ((,variable (pam-expired-fixture-directory)))
+     (if (null ,variable)
+         (skip "no C compiler for the PAM test module")
+         (unwind-protect
+              (progn ,@body)
+           (ignore-errors
+             (uiop:delete-directory-tree ,variable :validate t
+                                         :if-does-not-exist :ignore))))))
+
+;;; The system modules cannot fail pam_setcred or pam_open_session on
+;;; demand either, so tests/pam-session.c makes each stage fail when the
+;;; service asks it to.  This lets the session hooks be tested without root
+;;; and without changing any real account.
+
+#-win32
+(defun pam-session-fixture-directory ()
+  "A fixture whose services fail one PAM session stage each."
+  (let ((directory (pam-fixture-directory)))
+    (if (null (compile-pam-test-module directory "pam-session"))
+        (progn
+          (ignore-errors
+            (uiop:delete-directory-tree
+             directory :validate t :if-does-not-exist :ignore))
+          nil)
+        (let ((module (namestring
+                       (merge-pathnames "pam-session.so" directory))))
+          (flet ((service (name text)
+                   (with-open-file (out (merge-pathnames name directory)
+                                        :direction :output
+                                        :if-exists :supersede
+                                        :external-format :utf-8)
+                     (write-string text out))))
+            ;; PAM authenticates the user, but pam_setcred then fails.  sshd
+            ;; treats this as fatal because the credentials belong to the
+            ;; login PAM just granted.
+            (service "bursyk-setcred-fail"
+                     (format nil "auth required ~A setcred-fail
+account required pam_permit.so
+session required pam_permit.so
+" module))
+            ;; A key login: PAM never authenticated the user, so the same
+            ;; setcred failure is only a debug message.
+            (service "bursyk-setcred-fail-key"
+                     (format nil "auth required ~A setcred-fail
+account required pam_permit.so
+session required pam_permit.so
+" module))
+            ;; pam_open_session fails after a successful login.  sshd
+            ;; restricts the session to a pty but does not refuse it.
+            (service "bursyk-open-session-fail"
+                     (format nil "auth required ~A
+account required pam_permit.so
+session required ~A open-session-fail
+" module module)))
+          directory))))
+
+#-win32
+(defmacro with-pam-session-fixture ((variable) &body body)
+  `(let ((,variable (pam-session-fixture-directory)))
      (if (null ,variable)
          (skip "no C compiler for the PAM test module")
          (unwind-protect
@@ -766,6 +825,80 @@ PAMServiceName bursyk-expired"))
                        authorization)))
                  (is (equal '(("KEPT" . "yes"))
                             (cl-pnet-ssh:ssh-session-key-env session)))))
+          (bursyk-server::pam-close-session session))))))
+
+#-win32
+(defun pam-session-test-session (service)
+  "A server session whose PAM service is SERVICE."
+  (let* ((config (config-from-text
+                  (format nil "UsePAM yes~%PAMServiceName ~A" service)))
+         (server (cl-pnet-ssh::%make-ssh-server :sshd-config config)))
+    (cl-pnet-ssh::%make-ssh-session :server server :user "tester")))
+
+#-win32
+(test pam-setcred-failure-ends-a-pam-login
+  "sshd fatals when pam_setcred fails for a login PAM authenticated."
+  (with-pam
+    (with-pam-session-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (session (pam-session-test-session "bursyk-setcred-fail")))
+        (unwind-protect
+             (progn
+               (is (bursyk-server::pam-password-check
+                    session "tester" "secret"))
+               ;; The credentials belong to the login PAM just granted, so the
+               ;; failure terminates it instead of continuing unprivileged.
+               (signals cl-pnet-ssh:ssh-connection-error
+                 (bursyk-server::pam-open-session session)))
+          (bursyk-server::pam-close-session session))))))
+
+#-win32
+(test pam-setcred-failure-does-not-end-a-key-login
+  "When another method authenticated, sshd only logs a pam_setcred failure."
+  (with-pam
+    (with-pam-session-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (session (pam-session-test-session "bursyk-setcred-fail-key"))
+             (state (bursyk-server::pam-session-for session "tester")))
+        (unwind-protect
+             (progn
+               ;; A key login reaches the session hooks without a PAM
+               ;; authentication, but the transaction still exists so a
+               ;; session module can run.
+               (bursyk-server::pam-ensure-handle state session)
+               (bursyk-server::pam-open-session session)
+               (is (not (bursyk-server::pam-session-credentials state)))
+               ;; The session itself opened; only the credentials are absent.
+               (is (bursyk-server::pam-session-session-open state)))
+          (bursyk-server::pam-close-session session))))))
+
+#-win32
+(test pam-open-session-failure-restricts-the-session
+  "A failed pam_open_session keeps the login but leaves only a pty."
+  (with-pam
+    (with-pam-session-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (session (pam-session-test-session
+                       "bursyk-open-session-fail"))
+             (state (bursyk-server::pam-session-for session "tester")))
+        (unwind-protect
+             (progn
+               (is (bursyk-server::pam-password-check
+                    session "tester" "secret"))
+               ;; OpenSSH records the failure, restricts the session and keeps
+               ;; the login; it does not refuse the connection.
+               (bursyk-server::pam-open-session session)
+               (is (not (bursyk-server::pam-session-session-open state)))
+               (let ((authorization
+                       (cl-pnet-ssh:ssh-session-authorization session)))
+                 (is (not (null authorization)))
+                 (is (cl-pnet-ssh:ssh-authorization-options-restricted
+                      authorization))
+                 (is (cl-pnet-ssh:ssh-authorization-options-permit-pty-p
+                      authorization))
+                 (is (not
+                      (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
+                       authorization)))))
           (bursyk-server::pam-close-session session))))))
 
 #-win32

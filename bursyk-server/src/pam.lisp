@@ -848,31 +848,40 @@ exchange and clears the requirement before it returns."
   (let ((state (gethash session *pam-sessions*)))
     (and state (pam-session-force-change state))))
 
-(defun pam-restrict-session (session state)
-  "Take away every session feature but a pty when STATE needs a password change.
+(defun pam-restrict-session (session)
+  "Take away every session feature but a pty, as sshd's auth_restrict_session.
 
-This is sshd's auth_restrict_session.  It activates a blank record through
-auth_activate_options, which merges it with whatever admitted the login, so
-the permission flags are logical-AND: the passwd prompt keeps the terminal
-only if the key allowed one, and port, agent, X11 and stream-local forwarding
-are refused.  The key's environment= entries survive the merge, as they do in
-sshd."
-  (when (pam-session-force-change state)
-    (let* ((restricted
-             (cl-pnet-ssh:ssh-authorization-options-restricted-session))
-           (current (cl-pnet-ssh:ssh-session-authorization session))
-           (merged (and current
-                        (cl-pnet-ssh:ssh-authorization-options-merge
-                         current restricted))))
-      (setf (cl-pnet-ssh:ssh-session-authorization session)
-            (or merged restricted)))))
+It activates a blank record through auth_activate_options, which merges it
+with whatever admitted the login, so the permission flags are logical-AND:
+the restricted session keeps the terminal only if the key allowed one, and
+port, agent, X11 and stream-local forwarding are refused.  The key's
+environment= entries survive the merge, as they do in sshd.
+
+Used both for an expired password (pam_acct_mgmt answered
+PAM_NEW_AUTHTOK_REQD) and when pam_open_session fails."
+  (let* ((restricted
+           (cl-pnet-ssh:ssh-authorization-options-restricted-session))
+         (current (cl-pnet-ssh:ssh-session-authorization session))
+         (merged (and current
+                      (cl-pnet-ssh:ssh-authorization-options-merge
+                       current restricted))))
+    (setf (cl-pnet-ssh:ssh-session-authorization session)
+          (or merged restricted))))
 
 (defun pam-open-session (session)
-  "Establish credentials and open SESSION's PAM session."
+  "Establish credentials and open SESSION's PAM session.
+
+This is sshd's do_pam_setcred followed by do_pam_session, after
+USERAUTH_SUCCESS.  A pam_setcred failure ends the login when PAM authenticated
+the user (the credentials are part of the login it granted); when another
+method authenticated, sshd only logs it.  A failed pam_open_session does not
+end the login: it restricts the session to a pty and logs the error, exactly
+as sshd's auth_restrict_session does."
   (when (pam-enabled-p session)
     (let ((state (gethash session *pam-sessions*)))
       (when (and state (pam-session-handle state))
-        (pam-restrict-session session state)
+        (when (pam-session-force-change state)
+          (pam-restrict-session session))
         (let ((handle (pam-session-handle state)))
           ;; Now that every method has succeeded, refresh the authentication
           ;; information sshd exposes to session modules.
@@ -883,14 +892,35 @@ sshd."
             (error () nil))
           (multiple-value-bind (status messages)
               (pam-establish-credentials handle)
-            (when (= status +pam-success+)
-              (setf (pam-session-credentials state) t))
-            (pam-record-messages session messages))
+            (pam-record-messages session messages)
+            (cond
+              ((= status +pam-success+)
+               (setf (pam-session-credentials state) t))
+              ((pam-session-authenticated state)
+               ;; sshd's do_pam_setcred: fatal once PAM has authenticated
+               ;; the user, because the credentials it establishes are part
+               ;; of the login it just granted.
+               (error 'cl-pnet-ssh:ssh-connection-error
+                      :detail (format nil "PAM: pam_setcred(): ~A"
+                                      (pam-status-text handle status))))
+              (t
+               ;; The user authenticated by another method (a key, for
+               ;; example); sshd logs this at debug level and continues.
+               (log-at-session session :debug
+                               "PAM: pam_setcred(): ~A"
+                               (pam-status-text handle status)))))
           (multiple-value-bind (status messages)
               (pam-store-call handle (lambda (h) (%pam-open-session h 0)))
-            (when (= status +pam-success+)
-              (setf (pam-session-session-open state) t))
-            (pam-record-messages session messages))
+            (pam-record-messages session messages)
+            (if (= status +pam-success+)
+                (setf (pam-session-session-open state) t)
+                (progn
+                  ;; sshd's do_pam_session: a pty-only session and an error
+                  ;; in the log, but the login itself is not refused.
+                  (pam-restrict-session session)
+                  (log-at-session session :error
+                                  "PAM: pam_open_session(): ~A"
+                                  (pam-status-text handle status)))))
           (handler-case
               (setf (pam-session-environment state) (pam-environment handle))
             (error () nil)))))))
