@@ -15,5 +15,6 @@
   :serial t
   :components ((:module "src"
                 :serial t
-                :components ((:file "client-config"))))
+                :components ((:file "backend")
+                             (:file "client-config"))))
   :in-order-to ((test-op (test-op #:cl-pnet-ssh-tests))))

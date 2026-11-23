@@ -52,8 +52,10 @@ BACKEND_TAG = $(SSH_BACKEND_NAME)-$(PNET_BACKEND_NAME)
 FASL_ROOT  ?= _build/fasl/$(BACKEND_TAG)
 FASL_ROOT_ABS = $(abspath $(FASL_ROOT))
 
+# Exactly one SSH backend feature is pushed.  CL-PNET-SSH refuses a build
+# that has both or neither, so this is also what keeps the matrix honest.
 FEATURE_EVAL = --eval '(pushnew :pnet-backend-$(PNET_BACKEND_NAME) *features*)' \
-               $(if $(filter libssh,$(SSH_BACKEND_NAME)),--eval '(pushnew :ssh-backend-ffi *features*)')
+               $(if $(filter libssh,$(SSH_BACKEND_NAME)),--eval '(pushnew :ssh-backend-ffi *features*)',--eval '(pushnew :ssh-backend-lisp *features*)')
 
 # Redirect every system this process compiles, including the pesekey
 # dependencies, below _build.  Ignoring inherited configuration means the
