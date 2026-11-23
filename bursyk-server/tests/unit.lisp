@@ -1006,7 +1006,8 @@ PermitListen 8080 127.0.0.1:9000")))
     ;; "-name" removes from the build's list and leaves the rest in order.
     (is (equal '("hmac-sha2-512")
                (cl-pnet-ssh:ssh-server-config-macs config)))
-    (is (equal '("curve25519-sha256" "curve25519-sha256@libssh.org")
+    (is (equal '("mlkem768x25519-sha256" "curve25519-sha256"
+                 "curve25519-sha256@libssh.org")
                (cl-pnet-ssh:ssh-server-config-kex-algorithms config)))
     ;; A plain list replaces the default outright.
     (is (equal '("ssh-ed25519")

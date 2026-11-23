@@ -898,7 +898,7 @@ was built, so the same client code runs unchanged against either transport."
   (not (null (member feature '(:remote-forward :streamlocal-forward
                                :x11-forward :hostbased-authentication
                                :version-addendum :agent-forward
-                               :compression)))))
+                               :compression :post-quantum-kex)))))
 
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the pure transport implements."

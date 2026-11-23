@@ -52,6 +52,86 @@
         (public-key (ironclad-unsafe:make-public-key :curve25519 :y peer-public)))
     (ironclad-unsafe:diffie-hellman private-key public-key)))
 
+;;; ---- ML-KEM-768 hybrid (mlkem768x25519-sha256) ----
+;;;
+;;; OpenSSH's post-quantum key exchange concatenates an ML-KEM-768
+;;; encapsulation key with an X25519 public key.  The server answers with the
+;;; ML-KEM ciphertext followed by its X25519 public key.  The two secrets are
+;;; concatenated and SHA-256 hashed, and that digest is the shared secret the
+;;; exchange hash and key derivation both use.  ironclad-unsafe provides the
+;;; FIPS 203 primitive; this file only lays the two halves out the way the SSH
+;;; method does.
+
+(defconstant +ssh-mlkem768-public-bytes+ 1184)
+(defconstant +ssh-mlkem768-ciphertext-bytes+ 1088)
+
+(defstruct (ssh-mlkem768x25519-state (:constructor %make-ssh-mlkem768x25519-state))
+  "A client's ML-KEM and X25519 private halves plus the public blob to send."
+  (mlkem-private nil)
+  (x25519-private nil)
+  (public nil))
+
+(defun ssh-mlkem768x25519-client-keypair ()
+  "A fresh client keypair for mlkem768x25519-sha256.
+
+Returns an SSH-MLKEM768X25519-STATE whose PUBLIC is the encapsulation key
+followed by the X25519 public key."
+  (multiple-value-bind (mlkem-private mlkem-public)
+      (ironclad-unsafe:generate-key-pair :ml-kem-768)
+    (multiple-value-bind (x25519-private x25519-public)
+        (ssh-curve25519-keypair)
+      (%make-ssh-mlkem768x25519-state
+       :mlkem-private mlkem-private
+       :x25519-private x25519-private
+       :public (ssh-concat
+                (ironclad-unsafe:ml-kem-key-bytes mlkem-public)
+                x25519-public)))))
+
+(defun ssh-mlkem768x25519-client-shared (state server-blob)
+  "The hybrid shared secret of STATE with the server's SERVER-BLOB."
+  (unless (= (length server-blob)
+             (+ +ssh-mlkem768-ciphertext-bytes+ 32))
+    (error 'ssh-protocol-error
+           :detail "malformed mlkem768x25519 server key exchange"))
+  (let ((mlkem-shared
+          (ironclad-unsafe:decapsulate-key
+           (ssh-mlkem768x25519-state-mlkem-private state)
+           (subseq server-blob 0 +ssh-mlkem768-ciphertext-bytes+)))
+        (x25519-shared
+          (ssh-curve25519-shared
+           (ssh-mlkem768x25519-state-x25519-private state)
+           (subseq server-blob +ssh-mlkem768-ciphertext-bytes+))))
+    ;; OpenSSH hashes the concatenation and uses that digest as the shared
+    ;; secret, so both the exchange hash and the key derivation see 32 octets
+    ;; rather than the 64-octet concatenation.
+    (ssh-hash :sha256 (ssh-concat mlkem-shared x25519-shared))))
+
+(defun ssh-mlkem768x25519-server-shared (client-blob)
+  "Answer CLIENT-BLOB with (VALUES SERVER-BLOB SHARED-SECRET)."
+  (unless (= (length client-blob)
+             (+ +ssh-mlkem768-public-bytes+ 32))
+    (error 'ssh-protocol-error
+           :detail "malformed mlkem768x25519 client key exchange"))
+  (let* ((mlkem-public
+           (ironclad-unsafe:make-public-key
+            :ml-kem-768
+            :bytes (subseq client-blob 0 +ssh-mlkem768-public-bytes+)))
+         (x25519-peer (subseq client-blob +ssh-mlkem768-public-bytes+)))
+    (multiple-value-bind (ciphertext mlkem-shared)
+        (ironclad-unsafe:encapsulate-key mlkem-public)
+      (multiple-value-bind (x25519-private x25519-public)
+          (ssh-curve25519-keypair)
+        (values (ssh-concat ciphertext x25519-public)
+                (ssh-hash :sha256
+                          (ssh-concat
+                           mlkem-shared
+                           (ssh-curve25519-shared
+                            x25519-private x25519-peer))))))))
+
+(defun ssh-mlkem768x25519-p (name)
+  "Whether NAME is the mlkem768x25519-sha256 key exchange."
+  (and (stringp name) (string= name "mlkem768x25519-sha256")))
+
 (defun ssh-ed25519-verify (signature message public-key)
   "Verify SIGNATURE (64 octets) over MESSAGE under PUBLIC-KEY (32 octets)."
   (and (= (length signature) 64)

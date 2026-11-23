@@ -8,9 +8,14 @@
 ;;;; be validated while it is read instead of when the first peer arrives.
 
 (defparameter +ssh-kex-real-algorithms+
-  '("curve25519-sha256"
+  '("mlkem768x25519-sha256"
+    "curve25519-sha256"
     "curve25519-sha256@libssh.org")
-  "The key-exchange methods themselves, without the protocol markers.")
+  "The key-exchange methods themselves, without the protocol markers.
+
+mlkem768x25519-sha256 is OpenSSH's default post-quantum hybrid.  It needs
+ML-KEM-768 and X25519, both of which this build has, so it is offered first
+and a peer that does not know it falls back to curve25519.")
 
 (defparameter +ssh-kex-algorithms+
   (append +ssh-kex-real-algorithms+
@@ -25,11 +30,12 @@
     "mlkem768nistp256-sha256"
     "sntrup761x25519-sha512"
     "sntrup761x25519-sha512@openssh.com")
-  "OpenSSH's post-quantum key exchanges, none offered by this build yet.
+  "OpenSSH's post-quantum key exchanges.
 
-WarnWeakCrypto asks whether the chosen exchange is post-quantum.  Keeping
-the names here lets that answer follow ssh before the algorithms themselves
-are implemented, and a build that adds one needs only to add it to the offer.")
+mlkem768x25519-sha256 is offered by the pure transport; the others are
+listed so WarnWeakCrypto recognises them and so a later implementation needs
+only to add the method to the offer.  A transport without one leaves it out
+of the list it resolves KexAlgorithms against.")
 
 (defun ssh-kex-post-quantum-p (name)
   "Whether NAME is one of OpenSSH's post-quantum key exchanges."

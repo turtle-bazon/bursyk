@@ -372,9 +372,14 @@ Compression is chosen separately for each direction, as RFC 4253 requires."
 
 (defun ssh-exchange-hash (client-version server-version
                           client-kexinit server-kexinit
-                          host-key-blob client-public server-public shared)
-  "RFC 8731's H, binding both versions, both KEXINITs, the host key, both
-ephemeral public keys and the X25519 shared secret."
+                          host-key-blob client-public server-public shared
+                          &key string-shared)
+  "The key-exchange hash H, binding both versions, both KEXINITs, the host
+key, both ephemeral public keys and the shared secret.
+
+A plain curve25519 secret is written as an mpint.  OpenSSH's hybrid methods
+put a digest of the concatenated secret in the hash and the KDF as an SSH
+string instead, so STRING-SHARED selects that layout."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer client-version)
     (ssh-write-text writer server-version)
@@ -383,17 +388,26 @@ ephemeral public keys and the X25519 shared secret."
     (ssh-write-string writer host-key-blob)
     (ssh-write-string writer client-public)
     (ssh-write-string writer server-public)
-    (ssh-write-mpint writer (ssh-mpint-integer shared))
+    (if string-shared
+        (ssh-write-string writer shared)
+        (ssh-write-mpint writer (ssh-mpint-integer shared)))
     (ssh-hash :sha256 (ssh-writer-output writer))))
 
-(defun ssh-derive-key (shared exchange-hash session-id letter length)
+(defun ssh-derive-key (shared exchange-hash session-id letter length
+                       &key string-shared)
   "One key from RFC 4253 section 7.2, LENGTH octets long.
 
-SHARED is the X25519 secret as octets; it and H are hashed as the spec
-writes them, with the secret's mpint encoding carrying its length prefix."
-  (let* ((k (let ((writer (ssh-writer)))
-              (ssh-write-mpint writer (ssh-mpint-integer shared))
-              (ssh-writer-output writer)))
+SHARED is the key exchange secret as octets; it and H are hashed as the spec
+writes them, with the secret's mpint encoding carrying its length prefix.
+STRING-SHARED writes the secret as an SSH string, as OpenSSH's hybrid methods
+do."
+  (let* ((k (if string-shared
+                (let ((writer (ssh-writer)))
+                  (ssh-write-string writer shared)
+                  (ssh-writer-output writer))
+                (let ((writer (ssh-writer)))
+                  (ssh-write-mpint writer (ssh-mpint-integer shared))
+                  (ssh-writer-output writer))))
          (material (ssh-hash :sha256 k exchange-hash
                              (make-array 1 :element-type '(unsigned-byte 8)
                                            :initial-element (char-code letter))
@@ -427,7 +441,8 @@ writes them, with the secret's mpint encoding carrying its length prefix."
   (let ((name (ssh-mac-name-keyword mac)))
     (and name (ssh-hmac-length name))))
 
-(defun ssh-session-keys (negotiated shared exchange-hash session-id &key server)
+(defun ssh-session-keys (negotiated shared exchange-hash session-id
+                         &key server string-shared)
   "All six derived keys, as a plist keyed by direction and purpose.
 
 SERVER selects the server half: the letters swap, because C/D and E/F name
@@ -441,17 +456,21 @@ the client-to-server and server-to-client directions, not the two ends."
     (list :encrypt (ssh-derive-key shared exchange-hash session-id
                                    (if server #\D #\C)
                                    (ssh-cipher-key-length
-                                    (if server cipher-s2c cipher-c2s)))
+                                    (if server cipher-s2c cipher-c2s))
+                                   :string-shared string-shared)
           :decrypt (ssh-derive-key shared exchange-hash session-id
                                    (if server #\C #\D)
                                    (ssh-cipher-key-length
-                                    (if server cipher-c2s cipher-s2c)))
+                                    (if server cipher-c2s cipher-s2c))
+                                   :string-shared string-shared)
           :encrypt-mac-key (ssh-derive-key shared exchange-hash session-id
                                            (if server #\F #\E)
-                                           (if server mac-s2c mac-c2s))
+                                           (if server mac-s2c mac-c2s)
+                                           :string-shared string-shared)
           :decrypt-mac-key (ssh-derive-key shared exchange-hash session-id
                                            (if server #\E #\F)
-                                           (if server mac-c2s mac-s2c))
+                                           (if server mac-c2s mac-s2c)
+                                           :string-shared string-shared)
           :encrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-c2s))
           :decrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-s2c))
           :aead t)))

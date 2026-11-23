@@ -1820,3 +1820,54 @@ server records the full string."
                  (is (eql 3 status))))
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+;;; ---- Post-quantum key exchange ----
+
+(test mlkem768x25519-hybrid-agrees
+  "The two halves of mlkem768x25519-sha256 derive one shared secret."
+  (let* ((state (cl-pnet-ssh::ssh-mlkem768x25519-client-keypair))
+         (client-public
+           (cl-pnet-ssh::ssh-mlkem768x25519-state-public state)))
+    ;; ML-KEM-768 encapsulation key (1184) then X25519 (32).
+    (is (= 1216 (length client-public)))
+    (multiple-value-bind (server-public shared)
+        (cl-pnet-ssh::ssh-mlkem768x25519-server-shared client-public)
+      ;; ML-KEM-768 ciphertext (1088) then X25519 (32).
+      (is (= 1120 (length server-public)))
+      ;; OpenSSH hashes the ML-KEM and X25519 secrets together, so the
+      ;; shared secret both sides use is one SHA-256 digest.
+      (is (= 32 (length shared)))
+      (is (equalp shared
+                  (cl-pnet-ssh::ssh-mlkem768x25519-client-shared
+                   state server-public)))))
+  (signals cl-pnet-ssh:ssh-protocol-error
+    (cl-pnet-ssh::ssh-mlkem768x25519-server-shared
+     (make-array 10 :element-type '(unsigned-byte 8)))))
+
+(test post-quantum-kex-is-offered-and-selected
+  "mlkem768x25519-sha256 leads the offer and wins when the peer has it."
+  (is (string= "mlkem768x25519-sha256"
+               (first cl-pnet-ssh:+ssh-kex-real-algorithms+)))
+  (is (cl-pnet-ssh::ssh-kex-post-quantum-p "mlkem768x25519-sha256"))
+  (let ((offers (cl-pnet-ssh::ssh-parse-kexinit-payload
+                 (cl-pnet-ssh::ssh-make-kexinit-payload
+                  :kex '("mlkem768x25519-sha256")))))
+    (is (member "mlkem768x25519-sha256"
+                (getf offers :kex) :test #'string=)))
+  ;; A peer that offers only the new method is matched.
+  (let ((negotiated
+          (cl-pnet-ssh::ssh-negotiate
+           (list :kex '("mlkem768x25519-sha256")
+                 :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
+                 :ciphers-c2s cl-pnet-ssh:+ssh-ciphers+
+                 :ciphers-s2c cl-pnet-ssh:+ssh-ciphers+
+                 :macs-c2s cl-pnet-ssh:+ssh-macs+
+                 :macs-s2c cl-pnet-ssh:+ssh-macs+
+                 :compressions-c2s '("none")
+                 :compressions-s2c '("none"))
+           :kex-algorithms cl-pnet-ssh:+ssh-kex-real-algorithms+
+           :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
+           :ciphers cl-pnet-ssh:+ssh-ciphers+
+           :macs cl-pnet-ssh:+ssh-macs+
+           :compressions '("none"))))
+    (is (string= "mlkem768x25519-sha256" (getf negotiated :kex)))))

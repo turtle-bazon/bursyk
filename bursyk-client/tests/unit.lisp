@@ -94,6 +94,20 @@ CLI's decision and at the plist it filled."
   (is (every #'burs::certificate-algorithm-name-p
              (burs::query-answer "key-cert"))))
 
+(test kex-queries-follow-the-transport
+  "A transport without ML-KEM neither lists nor accepts the hybrid."
+  (let ((kex (burs::query-answer "kex"))
+        (supported (cl-pnet-ssh:ssh-client-feature-supported-p
+                    :post-quantum-kex)))
+    (is (eq supported
+            (not (null (member "mlkem768x25519-sha256" kex
+                               :test #'string=)))))
+    (is (member "curve25519-sha256" kex :test #'string=))
+    (is (eq supported
+            (not (null (member "mlkem768x25519-sha256"
+                               (burs::supported-kex-algorithms)
+                               :test #'string=)))))))
+
 (test double-dash-ends-option-parsing
   (multiple-value-bind (destination command options)
       (parse '("--" "host.example" "-p" "not-a-port"))

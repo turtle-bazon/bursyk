@@ -5,7 +5,8 @@
 ;;;; with the client; only the order of messages and the signing side differ.
 
 (defparameter +ssh-server-kex-algorithms+
-  '("curve25519-sha256"
+  '("mlkem768x25519-sha256"
+    "curve25519-sha256"
     "curve25519-sha256@libssh.org"
     ;; Markers, never selected: strict KEX and RFC 8308 extensions.
     "kex-strict-s-v00@openssh.com"
@@ -281,7 +282,10 @@ came up."
           (hash (ssh-session-kex-hash session)))
       (setf (ssh-session-derived-keys session)
             (ssh-session-keys (ssh-session-negotiated session) shared hash
-                              (ssh-session-session-id session) :server t)
+                              (ssh-session-session-id session) :server t
+                              :string-shared
+                              (ssh-mlkem768x25519-p
+                               (getf (ssh-session-negotiated session) :kex)))
             (ssh-session-kex-shared session) nil
             (ssh-session-kex-hash session) nil
             (ssh-session-kex-signature-pending session) nil)
@@ -291,7 +295,7 @@ came up."
       (ssh-server-send-newkeys session))))
 
 (defun ssh-server-handle-kex-init (session payload)
-  "Answer the client's curve25519 offer: host key, ephemeral key, signature.
+  "Answer the client's key-exchange offer: host key, ephemeral key, signature.
 
 A private host key signs now.  An agent-backed key sends the sign request
 and returns; the agent's callback finishes the KEX."
@@ -315,15 +319,23 @@ and returns; the agent's callback finishes the KEX."
     (unless host-key
       (error 'ssh-protocol-error
              :detail (format nil "no key for host key algorithm ~A" algorithm)))
-    (multiple-value-setq (private server-public) (ssh-curve25519-keypair))
-    (setf shared (ssh-curve25519-shared private client-public))
+    (if (ssh-mlkem768x25519-p (getf (ssh-session-negotiated session) :kex))
+        (multiple-value-setq (server-public shared)
+          (ssh-mlkem768x25519-server-shared client-public))
+        (progn
+          (multiple-value-setq (private server-public)
+            (ssh-curve25519-keypair))
+          (setf shared (ssh-curve25519-shared private client-public))))
     (setf hash (ssh-exchange-hash
                 (ssh-session-client-version session)
                 (ssh-session-server-version session)
                 (ssh-session-client-kexinit session)
                 (ssh-session-server-kexinit session)
                 host-key-blob
-                client-public server-public shared))
+                client-public server-public shared
+                :string-shared
+                (ssh-mlkem768x25519-p
+                 (getf (ssh-session-negotiated session) :kex))))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
           (ssh-session-ephemeral-private session) private
