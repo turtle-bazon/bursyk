@@ -583,8 +583,6 @@ itself never blocks: this matcher is what a caller supplies."
     ((string-equal name "User") (setf (getf *options* :user) value))
     ((string-equal name "IdentityFile")
      (push value (getf *options* :identity)))
-    ((string-equal name "UserKnownHostsFile")
-     (setf (getf *options* :known-hosts) value))
     ((string-equal name "IdentityAgent") (setf (getf *options* :agent) value))
     ((string-equal name "StrictHostKeyChecking")
      (setf (getf *options* :policy)
@@ -3299,14 +3297,19 @@ and known-hosts files) are printed as this client will actually use them."
        (cl-pnet-ssh:ssh-config-options-canonical-domains options))
       (print-list-oneline
        "globalknownhostsfile"
-       (paths (cl-pnet-ssh:ssh-config-options-global-known-hosts options)))
+       (let ((files (cl-pnet-ssh:ssh-config-options-global-known-hosts
+                     options)))
+         (cond ((eq files :none) nil)
+               (files (paths files))
+               (t cl-pnet-ssh::+ssh-default-global-known-hosts+))))
       (print-list-oneline
        "userknownhostsfile"
        (let ((files (cl-pnet-ssh:ssh-config-options-known-hosts options))
              (cli (getf *options* :known-hosts)))
-         (cond (cli (list cli))
+         (cond (cli (list (cl-pnet-ssh::ssh-config-expand-home cli)))
+               ((eq files :none) nil)
                (files (paths files))
-               (t (list "~/.ssh/known_hosts")))))
+               (t (paths (cl-pnet-ssh::ssh-default-user-known-hosts))))))
       (print-list-oneline
        "revokedhostkeys"
        (paths (reverse

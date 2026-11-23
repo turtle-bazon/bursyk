@@ -1204,6 +1204,31 @@ signal, so the override still works."
     (is (eq t (client-accept-unknown-host-key-for
                client blob (ssh-key-fingerprint blob))))))
 
+(test client-known-hosts-defaults-include-the-system-files
+  "With nothing configured, both the user and the system files are read.
+
+UserKnownHostsFile none removes the user files but not the global ones, and
+nothing is ever written to a global file."
+  (let ((client (cl-pnet-ssh::%make-ssh-client :host "example.org")))
+    (is (equal (append
+                (mapcar #'namestring
+                        (cl-pnet-ssh::ssh-default-user-known-hosts))
+                cl-pnet-ssh::+ssh-default-global-known-hosts+)
+               (mapcar #'namestring
+                       (cl-pnet-ssh::ssh-client-known-hosts-files client))))
+    (is (equal (namestring
+                (first (cl-pnet-ssh::ssh-default-user-known-hosts)))
+               (namestring (cl-pnet-ssh::ssh-client-known-hosts-file client))))
+    ;; No user file means no write target, even though the global files are
+    ;; still read.
+    (setf (cl-pnet-ssh::ssh-client-known-hosts client) :none)
+    (is (equal cl-pnet-ssh::+ssh-default-global-known-hosts+
+               (mapcar #'namestring
+                       (cl-pnet-ssh::ssh-client-known-hosts-files client))))
+    (is (null (cl-pnet-ssh::ssh-client-known-hosts-file client)))
+    (setf (cl-pnet-ssh::ssh-client-global-known-hosts client) :none)
+    (is (null (cl-pnet-ssh::ssh-client-known-hosts-files client)))))
+
 (test client-known-hosts-accepts-a-bare-host-entry-on-another-port
   "A non-default port also tries the bare host name, as ssh does.
 
@@ -3129,14 +3154,27 @@ newline")))
   (is (equal '("given")
              (cl-pnet-ssh::ssh-config-client-identities (facade-options nil) '("given")))))
 
-(test facade-client-known-hosts-put-the-user-file-first
-  (let ((known (cl-pnet-ssh::ssh-config-client-known-hosts
-                (facade-options (list :known-hosts (list #p"/u/known")
-                                      :global-known-hosts (list #p"/e/known")))
-                nil)))
-    (is (equal '("/u/known" "/e/known")
-               (mapcar #'namestring known))))
-  (is (null (cl-pnet-ssh::ssh-config-client-known-hosts (facade-options nil) nil)))
+(test facade-client-known-hosts-keep-user-and-global-files-apart
+  (let* ((options (facade-options
+                   (list :known-hosts (list #p"/u/known")
+                         :global-known-hosts (list #p"/e/known"))))
+         (known (cl-pnet-ssh::ssh-config-client-known-hosts options nil))
+         (global (cl-pnet-ssh::ssh-config-client-global-known-hosts options)))
+    (is (equal '("/u/known") (mapcar #'namestring known)))
+    (is (equal '("/e/known") (mapcar #'namestring global))))
+  ;; Unset keywords take OpenSSH's defaults.
+  (is (equal (mapcar #'namestring (cl-pnet-ssh::ssh-default-user-known-hosts))
+             (mapcar #'namestring
+                     (cl-pnet-ssh::ssh-config-client-known-hosts
+                      (facade-options nil) nil))))
+  (is (equal cl-pnet-ssh::+ssh-default-global-known-hosts+
+             (cl-pnet-ssh::ssh-config-client-global-known-hosts
+              (facade-options nil))))
+  ;; "none" names no file, which is not the same as leaving it out.
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-known-hosts
+                 (facade-options (list :known-hosts :none)) nil)))
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-global-known-hosts
+                 (facade-options (list :global-known-hosts :none)))))
   (is (equal '("/given")
              (mapcar #'namestring
                      (cl-pnet-ssh::ssh-config-client-known-hosts
@@ -3195,8 +3233,10 @@ newline")))
     (is (equal "file-user" (getf parameters :user)))
     (is (equal '("first" "second") (getf parameters :private-key)))
     (is (null (getf parameters :agent)))
-    (is (equal '("/u/known" "/e/known")
+    (is (equal '("/u/known")
                (mapcar #'namestring (getf parameters :known-hosts))))
+    (is (equal '("/e/known")
+               (mapcar #'namestring (getf parameters :global-known-hosts))))
     (is (eq :accept-new (getf parameters :host-key-policy))))
   ;; An explicit command-line answer still wins.
   (let ((parameters
@@ -3474,10 +3514,10 @@ path that selects the agent socket to forward."
     (multiple-value-bind (interactive bulk) (value "IPQoS 46 none")
       (declare (ignore bulk))
       (is (= 46 interactive)))
-    ;; The defaults are ef and none.
+    ;; The defaults are ef and cs0, as OpenSSH 10.6 prints them.
     (multiple-value-bind (interactive bulk) (value "Port 22")
       (is (= #xb8 interactive))
-      (is (eq :none bulk))))
+      (is (= #x00 bulk))))
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
             :directives

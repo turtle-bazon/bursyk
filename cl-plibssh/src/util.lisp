@@ -47,6 +47,7 @@ beside the readable one on every backend."
   agent
   passphrase
   known-hosts
+  global-known-hosts
   (host-key-policy :ask)
   ;; The answer to StrictHostKeyChecking=ask; NIL means there is no one to
   ;; ask, which is a refusal.
@@ -174,7 +175,7 @@ beside the readable one on every backend."
   (host-key-ip-checked nil)
   (host-key-known nil)
   (ip-qos-interactive #xb8)
-  (ip-qos-bulk :none)
+  (ip-qos-bulk #x00)
   (tcp-keep-alive t)
   set-env
   (required-rsa-size +ssh-rsa-minimum-modulus-size+)

@@ -576,7 +576,9 @@ client from falling through to publickey."
     (is (equal "2200" (getf burs::*options* :port)))
     (is (equal "bob" (getf burs::*options* :user)))
     (is (equal '("/tmp/key") (getf burs::*options* :identity)))
-    (is (equal "/tmp/known" (getf burs::*options* :known-hosts)))
+    ;; UserKnownHostsFile stays with the resolver: only it expands ~ and
+    ;; understands "none", and a raw value here would override the parsed one.
+    (is (null (getf burs::*options* :known-hosts)))
     (is (equal "/tmp/agent" (getf burs::*options* :agent)))
     (is (equal "bastion" (getf burs::*options* :jump)))
     (is (equal "nc %h %p" (getf burs::*options* :proxy-command)))))
@@ -889,35 +891,39 @@ and ProxyJump/ProxyCommand stay off the output when unset."
           (text (with-output-to-string (*standard-output*)
                   (burs::print-config-options
                    "alias.example" options nil))))
-      (dolist (line '("canonicaldomains none"
-                      "globalknownhostsfile none"
-                      "userknownhostsfile ~/.ssh/known_hosts"
-                      "revokedhostkeys none"
-                      "logverbose none"
-                      "channeltimeout none"
-                      "permitremoteopen any"
-                      "addkeystoagent false"
-                      "forwardagent no"
-                      "connecttimeout none"
-                      "tunneldevice any:any"
-                      "canonicalizepermittedcnames none"
-                      "controlpersist no"
-                      "rekeylimit 0 0"
-                      "streamlocalbindmask 0177"
-                      "syslogfacility USER"
-                      "compression no"
-                      "stricthostkeychecking ask"
-                      "identitiesonly no"
-                      "kbdinteractiveauthentication yes"
-                      "passwordauthentication yes"
-                      "proxyusefdpass no"
-                      "pubkeyauthentication true"
-                      "tcpkeepalive true"
-                      "updatehostkeys true"
-                      "numberofpasswordprompts 3"
-                      "serveralivecountmax 3"
-                      "serveraliveinterval 0"
-                      "ipqos ef none"))
+      (dolist (line (list "canonicaldomains none"
+                          (format nil "globalknownhostsfile ~{~A~^ ~}"
+                                  cl-pnet-ssh::+ssh-default-global-known-hosts+)
+                          (format nil "userknownhostsfile ~{~A~^ ~}"
+                                  (mapcar
+                                   #'namestring
+                                   (cl-pnet-ssh::ssh-default-user-known-hosts)))
+                          "revokedhostkeys none"
+                          "logverbose none"
+                          "channeltimeout none"
+                          "permitremoteopen any"
+                          "addkeystoagent false"
+                          "forwardagent no"
+                          "connecttimeout none"
+                          "tunneldevice any:any"
+                          "canonicalizepermittedcnames none"
+                          "controlpersist no"
+                          "rekeylimit 0 0"
+                          "streamlocalbindmask 0177"
+                          "syslogfacility USER"
+                          "compression no"
+                          "stricthostkeychecking ask"
+                          "identitiesonly no"
+                          "kbdinteractiveauthentication yes"
+                          "passwordauthentication yes"
+                          "proxyusefdpass no"
+                          "pubkeyauthentication true"
+                          "tcpkeepalive true"
+                          "updatehostkeys true"
+                          "numberofpasswordprompts 3"
+                          "serveralivecountmax 3"
+                          "serveraliveinterval 0"
+                          "ipqos ef cs0"))
         (is (search line text) line))
       (is (search "identityfile" text))
       (is (not (search "proxyjump" text)))

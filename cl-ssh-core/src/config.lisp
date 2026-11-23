@@ -17,6 +17,17 @@
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
 
+(defparameter +ssh-default-global-known-hosts+
+  (list (namestring (merge-pathnames "ssh_known_hosts" +ssh-config-directory+))
+        (namestring (merge-pathnames "ssh_known_hosts2"
+                                     +ssh-config-directory+)))
+  "The system-wide known_hosts files OpenSSH consults by default.")
+
+(defun ssh-default-user-known-hosts ()
+  "The user known_hosts files, in the order OpenSSH consults them."
+  (list (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))
+        (merge-pathnames ".ssh/known_hosts2" (user-homedir-pathname))))
+
 (defparameter +ssh-config-version+ "cl-pnet-ssh_0.0.1.19")
 
 ;;; Every keyword ssh's readconf.c accepts, plus this client's own
@@ -234,7 +245,7 @@ way ssh refuses it.")
   ;; IPQoS: the DSCP value for interactive and bulk sessions; :NONE means
   ;; the operating system default.  ssh's defaults are ef and none.
   (ip-qos-interactive #xb8)
-  (ip-qos-bulk :none)
+  (ip-qos-bulk #x00)
   (exit-on-forward-failure nil)
   ;; PermitRemoteOpen: NIL or :ANY permits every remote-forward target,
   ;; :NONE permits none, and a list holds (HOST . PORT) entries where either
@@ -1291,15 +1302,17 @@ understand them rather than silently match nothing."
         seen options :known-hosts
         (lambda (options)
           (let ((paths (ssh-config-known-host-paths line options context)))
+            ;; NONE is distinct from unset: the default names two files,
+            ;; while "none" names none.
             (setf (ssh-config-options-known-hosts options)
-                  (if (eq paths :none) nil paths))))))
+                  (if (eq paths :none) :none paths))))))
       ((string= keyword "globalknownhostsfile")
        (ssh-config-set-once
         seen options :global-known-hosts
         (lambda (options)
           (let ((paths (ssh-config-known-host-paths line options context)))
             (setf (ssh-config-options-global-known-hosts options)
-                  (if (eq paths :none) nil paths))))))
+                  (if (eq paths :none) :none paths))))))
       ((string= keyword "updatehostkeys")
        (ssh-config-set-once
         seen options :update-host-keys

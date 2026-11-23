@@ -102,11 +102,22 @@ otherwise, so an identity file alone does not disable the agent."
         (when files (reverse files)))))
 
 (defun ssh-config-client-known-hosts (options explicit)
-  "The known_hosts files, EXPLICIT or the config's user then global ones."
+  "The user known_hosts files, EXPLICIT or the config's.
+
+Unset takes OpenSSH's defaults; an explicit \"none\" contributes no file at
+all, which is different from leaving the keyword out."
   (or explicit
-      (let ((user (ssh-config-options-known-hosts options))
-            (global (ssh-config-options-global-known-hosts options)))
-        (when (or user global) (append user global)))))
+      (let ((user (ssh-config-options-known-hosts options)))
+        (cond ((eq user :none) :none)
+              (user user)
+              (t (ssh-default-user-known-hosts))))))
+
+(defun ssh-config-client-global-known-hosts (options)
+  "The global known_hosts files OPTIONS names, or OpenSSH's defaults."
+  (let ((global (ssh-config-options-global-known-hosts options)))
+    (cond ((eq global :none) :none)
+          (global global)
+          (t +ssh-default-global-known-hosts+))))
 
 (defun ssh-config-client-seconds (value)
   "VALUE as a positive number of seconds, or NIL when it is off or absent.
@@ -173,6 +184,7 @@ MAKE-SSH-CLIENT's own defaults."
         :agent (ssh-config-client-agent options agent)
         :passphrase passphrase
         :known-hosts (ssh-config-client-known-hosts options known-hosts)
+        :global-known-hosts (ssh-config-client-global-known-hosts options)
         :kex-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-kex-algorithms

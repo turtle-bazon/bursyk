@@ -197,20 +197,36 @@ as OpenSSH does, not against the alias."
         host
         (format nil "[~A]:~D" host (ssh-client-port client)))))
 
+(defun ssh-client-known-hosts-source-files (source default)
+  "SOURCE as a list of files: NONE for :NONE, DEFAULT when unset."
+  (cond
+    ((eq source :none) '())
+    ((null source) default)
+    ((listp source) source)
+    (t (list source))))
+
 (defun ssh-client-known-hosts-files (client)
   "The known-hosts files CLIENT checks, in order.
 
-KNOWN-HOSTS is one path, a list of paths, or NIL for ~/.ssh/known_hosts."
-  (let ((source (ssh-client-known-hosts client)))
-    (cond
-      ((null source)
-       (list (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))))
-      ((listp source) source)
-      (t (list source)))))
+KNOWN-HOSTS names the user files and GLOBAL-KNOWN-HOSTS the system ones.
+Each is one path, a list of paths, :NONE for no file, or NIL for OpenSSH's
+defaults."
+  (append
+   (ssh-client-known-hosts-source-files
+    (ssh-client-known-hosts client)
+    (ssh-default-user-known-hosts))
+   (ssh-client-known-hosts-source-files
+    (ssh-client-global-known-hosts client)
+    +ssh-default-global-known-hosts+)))
 
 (defun ssh-client-known-hosts-file (client)
-  "The first known-hosts file, the one a newly trusted key is written to."
-  (first (ssh-client-known-hosts-files client)))
+  "The first user known-hosts file, where a newly trusted key is written.
+
+The global files are read but never written; with UserKnownHostsFile none
+there is no file to write and this is NIL."
+  (first (ssh-client-known-hosts-source-files
+          (ssh-client-known-hosts client)
+          (ssh-default-user-known-hosts))))
 
 (defun ssh-client-remember-host-key (client host-key)
   "Record HOST-KEY for this client's host, trust-on-first-use.

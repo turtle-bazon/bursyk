@@ -1119,6 +1119,7 @@ callers learn that through the facade rather than a backend test."
                           agent
                           passphrase
                           known-hosts
+                          global-known-hosts
                           (host-key-policy :ask)
                           host-key-callback
                           connect-timeout
@@ -1176,7 +1177,7 @@ callers learn that through the facade rather than a backend test."
                           check-host-ip
                           (required-rsa-size +ssh-rsa-minimum-modulus-size+)
                           (ip-qos-interactive #xb8)
-                          (ip-qos-bulk :none)
+                          (ip-qos-bulk #x00)
                           (tcp-keep-alive t)
                           set-env
                           (connection-attempts 1)
@@ -1220,6 +1221,7 @@ stream on its pipes instead of dialling."
                  :connect-port (or connect-port port)
                  :user user
                  :known-hosts known-hosts
+                 :global-known-hosts global-known-hosts
                  :host-key-policy (or host-key-policy :ask)
                  :host-key-callback host-key-callback
                  :private-key private-key

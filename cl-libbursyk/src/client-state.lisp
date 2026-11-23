@@ -65,6 +65,7 @@
   (signers nil)
   (auth-index 0)
   (known-hosts nil)
+  (global-known-hosts nil)
   (host-key-policy :ask)
   (host-key-callback nil)
   ;; BatchMode: never ask the user anything, so an unknown host key fails
@@ -205,7 +206,7 @@
   ;; IPQoS: DSCP values for interactive and bulk traffic; :NONE leaves the
   ;; operating system default.
   (ip-qos-interactive #xb8)
-  (ip-qos-bulk :none)
+  (ip-qos-bulk #x00)
   ;; TCPKeepAlive: keep the transport's keepalive probes on, ssh's default.
   (tcp-keep-alive t)
   ;; SetEnv: NAME=VALUE assignments to send on every session.

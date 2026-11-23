@@ -415,6 +415,7 @@ address is known, because it has to be in the same family."
                                  ciphers macs compression
                                  pubkey-accepted-algorithms
                                  ca-signature-algorithms                                 (revoked-host-keys '())
+                                 global-known-hosts
                                  hash-known-hosts
                                  known-hosts-command
                                  (add-keys-to-agent :no)
@@ -451,7 +452,7 @@ address is known, because it has to be in the same family."
                                  (verify-host-key-dns :no)
                                  host-key-dns-resolver
                                  (ip-qos-interactive #xb8)
-                                 (ip-qos-bulk :none)
+                                 (ip-qos-bulk #x00)
                                  (tcp-keep-alive t)
                                  set-env
                                  (connection-attempts 1)
@@ -475,6 +476,7 @@ address is known, because it has to be in the same family."
                     :connect-port (or connect-port port)
                     :user user
                     :known-hosts known-hosts
+                    :global-known-hosts global-known-hosts
                     :host-key-policy (or policy :ask)
                     :host-key-callback host-key-callback
                     :connect-timeout connect-timeout
@@ -629,7 +631,8 @@ is applied here, before any request names a key the configuration forbade."
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
                              (user (ssh-default-user)) private-key agent
-                             passphrase known-hosts (host-key-policy :ask)
+                             passphrase known-hosts global-known-hosts
+                             (host-key-policy :ask)
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
@@ -682,7 +685,7 @@ is applied here, before any request names a key the configuration forbade."
                              (verify-host-key-dns :no)
                              (host-key-dns-resolver #'ssh-dns-resolve-sshfp)
                              (ip-qos-interactive #xb8)
-                             (ip-qos-bulk :none)
+                             (ip-qos-bulk #x00)
                              (tcp-keep-alive t)
                              set-env
                              (connection-attempts 1)
@@ -813,6 +816,7 @@ role-neutral."
                            on-forwarded-streamlocal
                            :kex-algorithms kex-algorithms
                            :host-key-algorithms host-key-algorithms
+                           :global-known-hosts global-known-hosts
                            :ciphers ciphers
                            :macs macs
                            :compression compression
