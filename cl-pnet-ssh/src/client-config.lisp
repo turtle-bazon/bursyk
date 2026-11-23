@@ -47,11 +47,17 @@ itself orders them."
         source)))
 
 (defun ssh-config-client-policy (options)
-  "StrictHostKeyChecking as a MAKE-SSH-CLIENT policy."
+  "StrictHostKeyChecking as a MAKE-SSH-CLIENT policy.
+
+OpenSSH's default is \"ask\": an unknown host key is confirmed on the
+terminal unless BatchMode forbids it.  \"yes\" is the only value that never
+asks, and \"no\"/\"off\" accepts the key and records it like a confirmation
+would."
   (let ((value (ssh-config-options-strict-host-key-checking options)))
-    (cond ((null value) :strict)
+    (cond ((null value) :ask)
           ((member value '("no" "off") :test #'string=) :insecure)
           ((string= value "accept-new") :accept-new)
+          ((string= value "ask") :ask)
           (t :strict))))
 
 (defun ssh-config-client-version-addendum (options host &key user port)
@@ -256,9 +262,11 @@ MAKE-SSH-CLIENT's own defaults."
         :required-rsa-size
         (or (ssh-config-options-required-rsa-size options)
             +ssh-rsa-minimum-modulus-size+)
+        ;; The callback is the answer to "ask", not a replacement for the
+        ;; policy: StrictHostKeyChecking=yes must still refuse to prompt even
+        ;; when the command line supplied one.
         :host-key-policy (or host-key-policy
-                             (and (null host-key-callback)
-                                  (ssh-config-client-policy options)))
+                             (ssh-config-client-policy options))
         :host-key-callback host-key-callback
         :batch-mode (ssh-config-options-batch-mode options)
         :warn-weak-crypto

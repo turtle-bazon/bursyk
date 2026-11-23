@@ -65,7 +65,7 @@
   (signers nil)
   (auth-index 0)
   (known-hosts nil)
-  (host-key-policy :strict)
+  (host-key-policy :ask)
   (host-key-callback nil)
   ;; BatchMode: never ask the user anything, so an unknown host key fails
   ;; even when a confirmation callback was supplied.

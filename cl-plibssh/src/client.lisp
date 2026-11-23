@@ -1119,7 +1119,7 @@ callers learn that through the facade rather than a backend test."
                           agent
                           passphrase
                           known-hosts
-                          (host-key-policy :strict)
+                          (host-key-policy :ask)
                           host-key-callback
                           connect-timeout
                           server-alive-interval
@@ -1220,7 +1220,8 @@ stream on its pipes instead of dialling."
                  :connect-port (or connect-port port)
                  :user user
                  :known-hosts known-hosts
-                 :host-key-policy (or host-key-callback host-key-policy)
+                 :host-key-policy (or host-key-policy :ask)
+                 :host-key-callback host-key-callback
                  :private-key private-key
                  :agent agent
                  :passphrase passphrase

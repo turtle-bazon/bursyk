@@ -213,21 +213,56 @@ KNOWN-HOSTS is one path, a list of paths, or NIL for ~/.ssh/known_hosts."
   (first (ssh-client-known-hosts-files client)))
 
 (defun ssh-client-remember-host-key (client host-key)
-  "Record HOST-KEY for this client's host, trust-on-first-use."
-  (multiple-value-bind (type data) (ssh-public-key-parts host-key)
-    (declare (ignore data))
-    (ssh-remember-known-host (ssh-client-known-hosts-file client)
-                             (ssh-client-host-spec client)
-                             type host-key
-                             :hash (ssh-client-hash-known-hosts client))))
+  "Record HOST-KEY for this client's host, trust-on-first-use.
+
+A client with no known-hosts file has nowhere to write; OpenSSH logs that
+failure and still connects, so this returns NIL rather than signalling.  On
+success the same warning ssh prints is reported at the default log level."
+  (let ((file (ssh-client-known-hosts-file client)))
+    (when file
+      (handler-case
+          (progn
+            (multiple-value-bind (type data) (ssh-public-key-parts host-key)
+              (declare (ignore data))
+              (ssh-remember-known-host file
+                                       (ssh-client-host-spec client)
+                                       type host-key
+                                       :hash (ssh-client-hash-known-hosts client)))
+            (ssh-warn "Warning: Permanently added '~A' (~A) to the list of known hosts."
+                      (ssh-client-host-spec client) (ssh-key-type-name host-key))
+            t)
+        ;; ssh reports a failed write and keeps going rather than losing the
+        ;; connection over a read-only home directory.
+        (error ()
+          (ssh-warn "Failed to add the host to the list of known hosts (~A)."
+                    file)
+          nil)))))
 
 (defun ssh-client-known-host-status (client host-key)
   "How HOST-KEY stands for CLIENT's host across every known-hosts file.
 
 A key found in any file wins over a mismatch in another: the same host may
-be listed in both the user's file and the system-wide one."
-  (ssh-client-known-host-status-for client (ssh-client-host-spec client)
-                                    host-key))
+be listed in both the user's file and the system-wide one.
+
+A non-default port is checked twice: first as known_hosts spells it,
+\"[host]:port\", then, when that is unknown, under the bare host name.
+OpenSSH accepts a key recorded without the port, so an old entry keeps
+working after a server moves to a new port."
+  (let ((status
+          (ssh-client-known-host-status-for client
+                                            (ssh-client-host-spec client)
+                                            host-key)))
+    (if (and (eq status :unknown)
+             (null (ssh-client-host-key-alias client))
+             (/= (ssh-client-port client) 22)
+             (eq :match
+                 (ssh-client-known-host-status-for
+                  client
+                  (or (ssh-client-host-key-host client)
+                      (ssh-client-host client))
+                  host-key)))
+        :match
+        status)))
 
 (defun ssh-client-host-certificate-trusted-p (client certificate)
   "Whether CERTIFICATE is a valid host certificate for CLIENT.
@@ -590,30 +625,41 @@ certificate, its plain key or its CA refuses it without that fallback."
 (defun ssh-client-accept-unknown-host-key (client host-key fingerprint)
   "Decide what to do with a host key never seen before."
   (let ((policy (ssh-client-host-key-policy client)))
-    (cond
-      ((eq policy :insecure) nil)
-      ((eq policy :accept-new)
-       (ssh-client-remember-host-key client host-key))
-      ((eq policy :strict)
-       (error 'ssh-host-key-error
-              :detail "the host key is not in known_hosts"
-              :fingerprint fingerprint))
-      ;; BatchMode forbids asking, so a confirmation callback is not called;
-      ;; OpenSSH treats an unanswered confirmation as a refusal.
-      ((and (ssh-client-batch-mode client) (functionp policy))
-       (error 'ssh-host-key-error
-              :detail "the host key is not in known_hosts"
-              :fingerprint fingerprint))
-      ((functionp policy)
-       (if (funcall policy client fingerprint host-key)
-           (ssh-client-remember-host-key client host-key)
-           (error 'ssh-host-key-error
-                  :detail (format nil "the host key for ~A was rejected"
-                                  (ssh-client-host-spec client))
-                  :fingerprint fingerprint)))
-      (t (error 'ssh-host-key-error
-                :detail (format nil "unknown host key policy ~S" policy)
-                :fingerprint fingerprint)))))
+    (flet ((refuse ()
+             (error 'ssh-host-key-error
+                    :detail "the host key is not in known_hosts"
+                    :fingerprint fingerprint))
+           (confirm (callback)
+             (if (funcall callback client fingerprint host-key)
+                 (ssh-client-remember-host-key client host-key)
+                 (error 'ssh-host-key-error
+                        :detail (format nil "the host key for ~A was rejected"
+                                        (ssh-client-host-spec client))
+                        :fingerprint fingerprint))))
+      (cond
+        ;; StrictHostKeyChecking=no accepts and records the key, exactly as a
+        ;; confirmed prompt would; it is not a policy that forgets the answer.
+        ((eq policy :insecure)
+         (ssh-client-remember-host-key client host-key)
+         t)
+        ((eq policy :accept-new)
+         (ssh-client-remember-host-key client host-key)
+         t)
+        ((eq policy :strict) (refuse))
+        ;; BatchMode forbids asking, so a confirmation callback is not called;
+        ;; OpenSSH treats an unanswered confirmation as a refusal.
+        ((and (ssh-client-batch-mode client)
+              (or (eq policy :ask) (functionp policy)))
+         (refuse))
+        ((eq policy :ask)
+         (let ((callback (ssh-client-host-key-callback client)))
+           (if callback
+               (confirm callback)
+               (refuse))))
+        ((functionp policy) (confirm policy))
+        (t (error 'ssh-host-key-error
+                  :detail (format nil "unknown host key policy ~S" policy)
+                  :fingerprint fingerprint))))))
 
 ;;; ---- Channel inactivity timeouts ----
 

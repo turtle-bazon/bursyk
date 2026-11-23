@@ -421,6 +421,7 @@ address is known, because it has to be in the same family."
                                  (certificate-files '())
                                  no-host-authentication-for-localhost
                                  host-key-alias
+                                 host-key-callback
                                  batch-mode
                                  (warn-weak-crypto t)
                                  (obscure-keystroke-timing
@@ -474,7 +475,8 @@ address is known, because it has to be in the same family."
                     :connect-port (or connect-port port)
                     :user user
                     :known-hosts known-hosts
-                    :host-key-policy policy
+                    :host-key-policy (or policy :ask)
+                    :host-key-callback host-key-callback
                     :connect-timeout connect-timeout
                     :server-alive-interval server-alive-interval
                     :server-alive-count-max (or server-alive-count-max 3)
@@ -627,7 +629,7 @@ is applied here, before any request names a key the configuration forbade."
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
                              (user (ssh-default-user)) private-key agent
-                             passphrase known-hosts (host-key-policy :strict)
+                             passphrase known-hosts (host-key-policy :ask)
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
                              proxy-command
@@ -803,7 +805,7 @@ role-neutral."
    (ssh-make-client-record host (or connect-host host) host-key-host
                            port connect-port user
                            known-hosts
-                           (or host-key-callback host-key-policy)
+                           host-key-policy
                            connect-timeout
                            server-alive-interval server-alive-count-max
                            proxy-command
@@ -825,6 +827,7 @@ role-neutral."
                            :no-host-authentication-for-localhost
                            no-host-authentication-for-localhost
                            :host-key-alias host-key-alias
+                           :host-key-callback host-key-callback
                            :batch-mode batch-mode
                            :warn-weak-crypto warn-weak-crypto
                            :obscure-keystroke-timing

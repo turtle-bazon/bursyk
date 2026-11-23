@@ -591,6 +591,7 @@ itself never blocks: this matcher is what a caller supplies."
            (cond ((member (string-downcase value) '("no" "off") :test #'string=)
                   :insecure)
                  ((string-equal value "accept-new") :accept-new)
+                 ((string-equal value "ask") :ask)
                  (t :strict))))
     ((string-equal name "ProxyJump") (setf (getf *options* :jump) value))
     ((string-equal name "ProxyCommand")
@@ -3066,7 +3067,8 @@ and known-hosts files) are printed as this client will actually use them."
                   (case (getf *options* :policy)
                     (:insecure "no")
                     (:accept-new "accept-new")
-                    (t "yes"))))
+                    (:ask "ask")
+                    (t "ask"))))
       ;; TCPKeepAlive's multistate prints true/false in 10.6.
       (format t "tcpkeepalive ~A~%"
               (true-false
@@ -3489,6 +3491,51 @@ of calling back in the middle of authentication."
   (declare (ignore client))
   (read-keyboard-interactive-answers name instruction prompts))
 
+(defun host-key-prompt-address (client)
+  "The address half of ssh's host-key prompt.
+
+OpenSSH spells a non-default port as [address]:port, both in the
+known_hosts name and in the parenthesised address."
+  (let ((address (or (cl-pnet-ssh::ssh-client-remote-address client) ""))
+        (port (or (cl-pnet-ssh:ssh-client-connect-port client) 22)))
+    (if (= port 22) address (format nil "[~A]:~D" address port))))
+
+(defun ask-host-key (client fingerprint host-key)
+  "Answer StrictHostKeyChecking=ask on the terminal, as ssh's confirm does.
+
+The prompt is written to /dev/tty rather than stdin, so a redirected stdin
+does not swallow it.  An empty answer or \"no\" refuses; \"yes\" or the
+fingerprint accepts.  There is no askpass helper here, so a process without
+a controlling terminal refuses instead of blocking."
+  (let ((tty (probe-file "/dev/tty")))
+    (when tty
+      (handler-case
+          (with-open-file (stream tty :direction :io :if-does-not-exist nil)
+            (when stream
+              (let ((host (cl-pnet-ssh::ssh-client-host-spec client))
+                    (address (host-key-prompt-address client))
+                    (type (cl-pnet-ssh:ssh-key-type-name host-key)))
+                (loop
+                  (format stream "The authenticity of host '~A (~A)' can't be established.~%~A key fingerprint is: ~A~%This key is not known by any other names.~%Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+                          host address type fingerprint)
+                  (finish-output stream)
+                  (let ((answer (read-line stream nil nil)))
+                    (cond
+                      ((null answer) (return nil))
+                      (t
+                       (let ((answer (string-trim '(#\Space #\Tab #\Return)
+                                                  answer)))
+                         (cond
+                           ((zerop (length answer)) (return nil))
+                           ((string-equal answer "no") (return nil))
+                           ((or (string-equal answer "yes")
+                                (string= answer fingerprint))
+                            (return t))
+                           (t
+                            (format stream "Please type 'yes', 'no' or the fingerprint: ")
+                            (finish-output stream)))))))))))
+        (error () nil)))))
+
 (defun start-client (host command command-given-p)
   "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
   (cl-pnet-ssh:make-ssh-client-from-config
@@ -3500,6 +3547,7 @@ of calling back in the middle of authentication."
    :agent (getf *options* :agent)
    :known-hosts (getf *options* :known-hosts)
    :host-key-policy (getf *options* :policy)
+   :host-key-callback #'ask-host-key
    :proxy-jump (getf *options* :jump)
    :proxy-command (getf *options* :proxy-command)
    ;; Every -o keyword reaches the same resolver the file uses, so facts the

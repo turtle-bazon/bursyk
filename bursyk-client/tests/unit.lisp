@@ -562,6 +562,9 @@ client from falling through to publickey."
     (burs::command-line-option "UserKnownHostsFile" "/tmp/known")
     (burs::command-line-option "IdentityAgent" "/tmp/agent")
     (burs::command-line-option "StrictHostKeyChecking" "accept-new")
+    (is (eq :accept-new (getf burs::*options* :policy)))
+    (burs::command-line-option "StrictHostKeyChecking" "ask")
+    (is (eq :ask (getf burs::*options* :policy)))
     (burs::command-line-option "ProxyJump" "bastion")
     (burs::command-line-option "ProxyCommand" "nc %h %p")
     ;; Every other keyword is accepted and ignored.
@@ -575,7 +578,6 @@ client from falling through to publickey."
     (is (equal '("/tmp/key") (getf burs::*options* :identity)))
     (is (equal "/tmp/known" (getf burs::*options* :known-hosts)))
     (is (equal "/tmp/agent" (getf burs::*options* :agent)))
-    (is (eq :accept-new (getf burs::*options* :policy)))
     (is (equal "bastion" (getf burs::*options* :jump)))
     (is (equal "nc %h %p" (getf burs::*options* :proxy-command)))))
 
@@ -904,6 +906,7 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "streamlocalbindmask 0177"
                       "syslogfacility USER"
                       "compression no"
+                      "stricthostkeychecking ask"
                       "identitiesonly no"
                       "kbdinteractiveauthentication yes"
                       "passwordauthentication yes"

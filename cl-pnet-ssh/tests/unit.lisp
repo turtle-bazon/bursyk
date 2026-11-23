@@ -1108,6 +1108,123 @@ signal, so the override still works."
            (is (eq :match (client-known-host-status-for client blob))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test client-ask-policy-prompts-through-the-callback
+  "StrictHostKeyChecking=ask consults the callback and records a yes."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-ask"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (fingerprint (ssh-key-fingerprint blob))
+         (asked nil)
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy :ask
+                  :host-key-callback
+                  (lambda (client fingerprint key)
+                    (declare (ignore client key))
+                    (setf asked fingerprint)
+                    t))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (client-accept-unknown-host-key-for client blob fingerprint)
+           (is (equal fingerprint asked))
+           (is (eq :match (client-known-host-status-for client blob))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test client-ask-policy-refuses-without-a-callback
+  "There is no one to ask when no callback was supplied, so ask refuses."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-ask-none"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy :ask)))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (signals ssh-host-key-error
+             (client-accept-unknown-host-key-for
+              client blob (ssh-key-fingerprint blob)))
+           (is (eq :unknown (client-known-host-status-for client blob))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test client-ask-policy-does-not-prompt-in-batch-mode
+  "BatchMode forbids asking, so the callback must not run."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-ask-batch"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (called nil)
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy :ask
+                  :batch-mode t
+                  :host-key-callback
+                  (lambda (client fingerprint key)
+                    (declare (ignore client fingerprint key))
+                    (setf called t)
+                    t))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (signals ssh-host-key-error
+             (client-accept-unknown-host-key-for
+              client blob (ssh-key-fingerprint blob)))
+           (is (null called)))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test client-insecure-policy-records-an-unknown-key
+  "StrictHostKeyChecking=no accepts and records a new key, as ssh does."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-insecure"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy :insecure)))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (client-accept-unknown-host-key-for
+            client blob (ssh-key-fingerprint blob))
+           (is (eq :match (client-known-host-status-for client blob))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test client-remembering-without-a-known-hosts-file-is-not-an-error
+  "A client with nowhere to write still accepts the key, as ssh logs and goes on."
+  (let* ((blob (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  ;; An explicit list with no path is "no file", unlike NIL,
+                  ;; which means the default ~/.ssh/known_hosts.
+                  :known-hosts (list nil)
+                  :host-key-policy :insecure)))
+    (is (eq t (client-accept-unknown-host-key-for
+               client blob (ssh-key-fingerprint blob))))))
+
+(test client-known-hosts-accepts-a-bare-host-entry-on-another-port
+  "A non-default port also tries the bare host name, as ssh does.
+
+An entry recorded before the server moved ports keeps working; a different
+key under the bare name is still only unknown, so the port entry decides."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-portfallback"))
+         (file (merge-pathnames "known_hosts" directory))
+         (blob (ssh-test-known-host-blob))
+         (other (ssh-test-known-host-blob))
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 2222
+                  :known-hosts (list file))))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (cl-pnet-ssh:ssh-remember-known-host
+            file "example.org" "ssh-ed25519" blob)
+           (is (eq :match (client-known-host-status-for client blob)))
+           (is (eq :unknown (client-known-host-status-for client other))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test client-known-hosts-checks-every-file
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khm"))
          (first-file (merge-pathnames "user_known_hosts" directory))
@@ -2980,7 +3097,11 @@ newline")))
   (is (eq :strict
           (cl-pnet-ssh::ssh-config-client-policy
            (facade-options '(:strict-host-key-checking "yes")))))
-  (is (eq :strict (cl-pnet-ssh::ssh-config-client-policy (facade-options nil)))))
+  ;; OpenSSH's default is ask, and "ask" is the same policy spelled out.
+  (is (eq :ask
+          (cl-pnet-ssh::ssh-config-client-policy
+           (facade-options '(:strict-host-key-checking "ask")))))
+  (is (eq :ask (cl-pnet-ssh::ssh-config-client-policy (facade-options nil)))))
 
 (test facade-client-agent-understands-none-and-the-environment
   (is (eq t (cl-pnet-ssh::ssh-config-client-agent
@@ -5931,7 +6052,8 @@ closed rather than being ignored."
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-revoked"))
              (key-path (merge-pathnames "host_key" directory))
              (revoked (merge-pathnames "revoked_keys" directory))
-             (missing (merge-pathnames "missing_keys" directory)))
+             (missing (merge-pathnames "missing_keys" directory))
+             (known-hosts (merge-pathnames "known_hosts" directory)))
         (ensure-directories-exist key-path)
         (unwind-protect
              (progn
@@ -5948,7 +6070,7 @@ closed rather than being ignored."
                  (flet ((client (&rest arguments)
                           (apply #'cl-pnet-ssh::%make-ssh-client
                                  :host "example.org"
-                                 :known-hosts '()
+                                 :known-hosts (list known-hosts)
                                  :host-key-policy :insecure
                                  arguments)))
                    (signals ssh-host-key-error
@@ -5957,7 +6079,7 @@ closed rather than being ignored."
                    (signals ssh-host-key-error
                      (cl-pnet-ssh::ssh-client-verify-host-key
                       (client :revoked-host-keys (list missing)) blob))
-                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
+                   (is (eq t (cl-pnet-ssh::ssh-client-verify-host-key
                               (client :revoked-host-keys '()) blob))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
@@ -6045,18 +6167,24 @@ allowed by CASignatureAlgorithms."
                         (length (cl-pnet-ssh::ssh-filter-signers
                                  signers nil :minimum-rsa-size 1024))))
                  ;; A small RSA host key is refused before any policy runs.
-                 (let ((client (cl-pnet-ssh::%make-ssh-client
-                                :host "example.org"
-                                :known-hosts '()
-                                :host-key-policy :insecure
-                                :required-rsa-size 2048)))
+                 ;; Each accepted key gets its own host so recording it cannot
+                 ;; make the next key look like a changed host key.
+                 (flet ((verify (name key)
+                          (let ((client (cl-pnet-ssh::%make-ssh-client
+                                         :host name
+                                         :known-hosts
+                                         (list (merge-pathnames
+                                                (format nil "known_hosts-~A"
+                                                        name)
+                                                directory))
+                                         :host-key-policy :insecure
+                                         :required-rsa-size 2048)))
+                            (cl-pnet-ssh::ssh-client-verify-host-key
+                             client (ssh-public-key-blob-of key)))))
                    (signals ssh-host-key-error
-                     (cl-pnet-ssh::ssh-client-verify-host-key
-                      client (ssh-public-key-blob-of short-key)))
-                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
-                              client (ssh-public-key-blob-of long-key))))
-                   (is (null (cl-pnet-ssh::ssh-client-verify-host-key
-                              client (ssh-public-key-blob-of ed-key)))))))
+                     (verify "short.example.org" short-key))
+                   (is (eq t (verify "long.example.org" long-key)))
+                   (is (eq t (verify "ed.example.org" ed-key))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 

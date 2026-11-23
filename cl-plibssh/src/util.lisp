@@ -47,7 +47,10 @@ beside the readable one on every backend."
   agent
   passphrase
   known-hosts
-  (host-key-policy :strict)
+  (host-key-policy :ask)
+  ;; The answer to StrictHostKeyChecking=ask; NIL means there is no one to
+  ;; ask, which is a refusal.
+  (host-key-callback nil)
   host-key-blob
   server-version
   ;; The server's authentication banner, once it has sent one.
