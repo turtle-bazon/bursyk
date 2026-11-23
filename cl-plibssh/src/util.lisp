@@ -70,6 +70,14 @@ beside the readable one on every backend."
   (auth-offered-methods '())
   (last-auth-method nil)
   (password-attempts 0)
+  ;; Hostbased is never enabled by this backend, but the shared auth order
+  ;; reads these slots as it does in the pure client.
+  (hostbased-authentication nil)
+  (hostbased-keys '())
+  hostbased-key
+  ;; AddressFamily narrows resolution and rejects a literal of the other
+  ;; family before a socket is made.
+  address-family
   ;; ObscureKeystrokeTiming is owned by the application, which reads and
   ;; writes it through the same accessor in either backend.  libssh itself
   ;; does not act on it.

@@ -780,7 +780,7 @@ it, and HostKeyAlias turns that exception off."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(def-pure-test client-dials-ipv6-when-asked
+(test client-dials-ipv6-when-asked
   "AddressFamily :INET6 resolves and dials ::1, while :INET rejects that
 address before a socket is opened."
   (if (not (ssh-keygen-available-p))
@@ -832,7 +832,7 @@ address before a socket is opened."
           (ignore-errors
            (uiop:delete-directory-tree directory :validate t))))))
 
-(def-pure-test client-batch-mode-never-asks
+(test client-batch-mode-never-asks
   "BatchMode refuses an unknown host key without consulting the confirmation
 callback; without it the same callback trusts the key."
   (if (not (ssh-keygen-available-p))
@@ -1946,7 +1946,7 @@ share the test, so each must dispatch the same channel requests."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(def-pure-test server-loopback-exec
+(test server-loopback-exec
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (multiple-value-bind (stdout stderr status) (ssh-test-loopback-result)
@@ -2249,7 +2249,7 @@ from, and a source the kernel cannot assign fails the connection."
         (signals error
           (ssh-test-loopback-result :bind-address "192.0.2.1")))))
 
-(def-pure-test server-loopback-exec-rsa-host-key
+(test server-loopback-exec-rsa-host-key
   ;; An ssh-rsa key serves rsa-sha2-512/256, so the client must negotiate one
   ;; of those and verify an RSA signature over the exchange hash.
   (if (not (ssh-keygen-available-p))
@@ -2294,7 +2294,7 @@ from, and a source the kernel cannot assign fails the connection."
 (test server-loopback-no-pty-key-option
   (skip "the pure client transport is not built"))
 
-(def-pure-test server-loopback-exec-ecdsa-host-key
+(test server-loopback-exec-ecdsa-host-key
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (multiple-value-bind (stdout stderr status)
@@ -2364,7 +2364,7 @@ from, and a source the kernel cannot assign fails the connection."
           (when server (ssh-server-close server))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(def-pure-test server-loopback-authentication-methods
+(test server-loopback-authentication-methods
   "publickey,publickey requires two different keys, and ExposeAuthInfo
 records both successful methods."
   (if (not (ssh-keygen-available-p))
@@ -2574,7 +2574,7 @@ STDOUT STDERR STATUS)."
                           (("Password: " nil))))
                        seen)))))))
 
-(def-pure-test server-loopback-authentication-methods-publickey-then-password
+(test server-loopback-authentication-methods-publickey-then-password
   "AuthenticationMethods publickey,password accepts a key and then a password."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -3099,7 +3099,7 @@ carries; without it only the plain algorithm is offered."
                    (cl-pnet-ssh::ssh-server-channel-state channel))))
       (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
 
-(def-pure-test server-channel-global-timeout-closes-all-channels
+(test server-channel-global-timeout-closes-all-channels
   "A global ChannelTimeout runs from the newest activity on any open channel
 and closes them all together."
   (let* ((config (ssh-server-config-load
@@ -3134,7 +3134,7 @@ and closes them all together."
            (is (eq :closed (cl-pnet-ssh::ssh-server-channel-state second))))
       (cl-pnet-ssh::ssh-session-stop-channel-timeout-timer session))))
 
-(def-pure-test server-loopback-exec-multiple-host-keys
+(test server-loopback-exec-multiple-host-keys
   ;; The server advertises several key types and the client picks the one it
   ;; prefers; the KEX must succeed whichever key is chosen.
   (if (not (ssh-keygen-available-p))
@@ -6622,7 +6622,7 @@ cookie in the account's Xauthority; one directive short and it refuses."
   (is (null (cl-pnet-ssh::ssh-config-ipv6-words "1::2::3")))
   (is (= 8 (length (cl-pnet-ssh::ssh-config-ipv6-words "::")))))
 
-(def-pure-test batch-mode-and-switches-suppress-interactive-auth-methods
+(test batch-mode-and-switches-suppress-interactive-auth-methods
   ;; BatchMode means never ask, so even a configured callback is not used.
   (let ((client (cl-pnet-ssh::%make-ssh-client
                  :batch-mode t
@@ -6731,7 +6731,7 @@ cookie in the account's Xauthority; one directive short and it refuses."
                (ssh-read-u8 reader)))
         (is (zerop (ssh-read-u32 reader)))))))
 
-(def-pure-test authentication-methods-follow-the-configured-order
+(test authentication-methods-follow-the-configured-order
   (flet ((client (&rest arguments)
            (apply #'cl-pnet-ssh::%make-ssh-client
                   :password-callback
@@ -6781,7 +6781,7 @@ cookie in the account's Xauthority; one directive short and it refuses."
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists any)))
     (is (null (cl-pnet-ssh::ssh-server-auth-method-lists nil)))))
 
-(def-pure-test pubkey-ok-budget-delays-max-auth-tries
+(test pubkey-ok-budget-delays-max-auth-tries
   "The first max-pk-ok rejected probes are not charged to MaxAuthTries."
   (let* ((config (ssh-server-config-load
                   nil :options '("PubkeyAuthOptions max-pk-ok:2")))

@@ -248,12 +248,17 @@ does, so the hook sees the per-connection values."
   "The methods SESSION may try next, as sshd's authmethods_get reports.
 
 An impossible AuthenticationMethods setting leaves no method, which makes
-every attempt fail rather than quietly falling back to publickey."
+every attempt fail rather than quietly falling back to publickey.  Hostbased
+is removed because libssh exposes no userauth API for it; advertising a
+method this backend cannot complete would be a lie."
   (let ((lists (ssh-session-auth-method-lists session)))
-    (cond
-      ((eq lists :impossible) '())
-      ((null lists) (ssh-server-enabled-auth-methods session))
-      (t (remove-duplicates (mapcar #'first lists) :test #'string=)))))
+    (remove
+     "hostbased"
+     (cond
+       ((eq lists :impossible) '())
+       ((null lists) (ssh-server-enabled-auth-methods session))
+       (t (remove-duplicates (mapcar #'first lists) :test #'string=)))
+     :test #'string=)))
 
 (defun ssh-plibssh-auth-method-bit (name)
   "libssh's bit for the SSH method name NAME, or 0 when it has none."
@@ -264,13 +269,26 @@ every attempt fail rather than quietly falling back to publickey."
     ((string= name "hostbased") +ssh-auth-method-hostbased+)
     (t 0)))
 
-(defun ssh-plibssh-auth-failure (session message)
-  "Refuse a request, advertising the methods SESSION can still complete."
+(defun ssh-plibssh-auth-methods-bits (session)
+  "libssh's bitmask for the methods SESSION can still complete."
   (let ((bits 0))
     (dolist (name (ssh-plibssh-allowed-auth-methods session))
       (setf bits (logior bits (ssh-plibssh-auth-method-bit name))))
-    (ssh-message-auth-set-methods message bits)
-    (ssh-message-reply-default message)))
+    bits))
+
+(defun ssh-plibssh-auth-failure (session message)
+  "Refuse a request, advertising the methods SESSION can still complete."
+  (ssh-message-auth-set-methods message (ssh-plibssh-auth-methods-bits session))
+  (ssh-message-reply-default message))
+
+(defun ssh-plibssh-session-partial-failure (session message)
+  "Report that one AuthenticationMethods entry is done, not the login.
+
+RFC 4252 carries this as USERAUTH_FAILURE with the partial-success flag, and
+the method list still names what the client must do next.  It does not count
+toward MaxAuthTries, as sshd does not count a completed entry."
+  (ssh-message-auth-set-methods message (ssh-plibssh-auth-methods-bits session))
+  (ssh-message-auth-reply-success message 1))
 
 (defun ssh-plibssh-session-auth-failure (session message &key (count t))
   "Refuse one userauth attempt, counting it toward MaxAuthTries when COUNT.
@@ -286,20 +304,77 @@ the reason is recorded and the pump finishes it after the callback returns."
       (setf (ssh-session-pending-close session) :auth-failures)))
   (ssh-plibssh-auth-failure session message))
 
+(defun ssh-plibssh-session-auth-key-used-p (session key-blob)
+  "Whether KEY-BLOB already completed a method on SESSION."
+  (some (lambda (used) (ssh-octets= used key-blob))
+        (ssh-session-auth-used-keys session)))
+
+(defun ssh-plibssh-session-record-auth-success (session method key-blob)
+  "Record METHOD with KEY-BLOB and add its ExposeAuthInfo line.
+
+Password and keyboard-interactive carry no key, so they neither consume a key
+nor contribute an auth-info line."
+  (when key-blob
+    (push key-blob (ssh-session-auth-used-keys session)))
+  (let ((line (ssh-server-auth-info-line method key-blob)))
+    (when line
+      (setf (ssh-session-auth-info-lines session)
+            (append (ssh-session-auth-info-lines session) (list line))))))
+
+(defun ssh-plibssh-session-auth-method-succeeded
+    (session message user method key-blob key-env authorization)
+  "Record one successful method and either finish or ask for the next.
+
+Without AuthenticationMethods this is the whole login.  With it, METHOD is
+removed from the front of every remaining list; a list that becomes empty
+finishes the login, and otherwise the client is told the method was a partial
+success.  Options from all successful keys are merged, and a key already used
+for a method is never accepted again."
+  (let ((lists (ssh-session-auth-method-lists session)))
+    (cond
+      ((eq lists :impossible)
+       (ssh-plibssh-session-auth-failure session message))
+      ((null lists)
+       (ssh-plibssh-session-record-auth-success session method key-blob)
+       (ssh-plibssh-session-complete-auth
+        session message user method key-blob key-env authorization))
+      ((not (some (lambda (list)
+                    (and list (string= (first list) method)))
+                  lists))
+       ;; No remaining list starts with this method; do not advance.
+       (ssh-plibssh-session-auth-failure session message))
+      (t
+       (let* ((empty (ssh-certificate-authorization-options-empty))
+              (merged (ssh-authorization-options-merge
+                       (or (ssh-session-auth-merged-options session) empty)
+                       (or authorization empty))))
+         (unless merged
+           ;; Inconsistent options, such as two different force-commands.
+           (ssh-plibssh-session-auth-failure session message)
+           (return-from ssh-plibssh-session-auth-method-succeeded nil))
+         (let ((remaining (mapcar #'rest lists)))
+           (ssh-plibssh-session-record-auth-success session method key-blob)
+           (setf (ssh-session-auth-merged-options session) merged
+                 (ssh-session-auth-merged-key-env session)
+                 (append (ssh-session-auth-merged-key-env session) key-env))
+           (if (some #'null remaining)
+               (ssh-plibssh-session-complete-auth
+                session message user method key-blob
+                (ssh-session-auth-merged-key-env session) merged)
+               (progn
+                 (setf (ssh-session-auth-method-lists session) remaining)
+                 (ssh-plibssh-session-partial-failure session message)))))))))
+
 (defun ssh-plibssh-session-complete-auth
     (session message user method key-blob key-env authorization)
   "Accept USER for SESSION, then let the application run.
 
 METHOD names the userauth method that completed, KEY-BLOB is its key when
 the method has one, KEY-ENV holds the environment= assignments from the
-authorized_keys line, and AUTHORIZATION the rest of that line's options."
-  ;; Record the method first: the pre-success hook sees the same auth-info
-  ;; lines the pure backend recorded in SSH-SERVER-AUTH-METHOD-SUCCEEDED.
+authorized_keys line, and AUTHORIZATION the rest of that line's options.
+The auth-info lines were recorded by SSH-PLIBSSH-SESSION-AUTH-METHOD-SUCCEEDED."
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
-        (ssh-session-auth-info-lines session)
-        (let ((line (ssh-server-auth-info-line method key-blob)))
-          (if line (list line) '()))
         (ssh-session-key-env session) key-env
         (ssh-session-authorization session) authorization)
   (let ((hook (ssh-server-authorize-login (ssh-session-server session))))
@@ -361,7 +436,7 @@ freed as soon as the request is queued."
   (cond
     ((or (eq result :success) (eq result t))
      (setf (ssh-session-kbd-interactive-pending session) nil)
-     (ssh-plibssh-session-complete-auth
+     (ssh-plibssh-session-auth-method-succeeded
       session message user "keyboard-interactive" nil nil nil))
     ((or (null result) (eq result :failure))
      (setf (ssh-session-kbd-interactive-pending session) nil)
@@ -435,7 +510,7 @@ ordinary login attempt; ssh's own client never sets that flag."
   (let ((hook (ssh-server-authorize-password (ssh-session-server session)))
         (password (ssh-message-auth-password message)))
     (if (and hook password (funcall hook session user password))
-        (ssh-plibssh-session-complete-auth
+        (ssh-plibssh-session-auth-method-succeeded
          session message user "password" nil nil nil)
         (ssh-plibssh-session-auth-failure session message :count count))))
 
@@ -494,6 +569,28 @@ ordinary login attempt; ssh's own client never sets that flag."
            (ssh-plibssh-session-handle-kbdint session message user count))
           (t (ssh-plibssh-session-auth-failure session message :count count)))))))
 
+(defun ssh-server-max-pubkey-ok (session)
+  "SESSION's PubkeyAuthOptions max-pk-ok budget, defaulting to sshd's 6."
+  (or (ssh-session-setting session #'ssh-server-config-max-pubkey-ok) 6))
+
+(defun ssh-server-publickey-offer-counts-p (session)
+  "Record a rejected unsigned publickey probe and say whether it counts.
+
+The first MAX-PK-OK probes do not count against MaxAuthTries, so a client can
+test keys without burning its authentication budget; later ones do."
+  (incf (ssh-session-pk-ok-failures session))
+  (> (ssh-session-pk-ok-failures session)
+     (ssh-server-max-pubkey-ok session)))
+
+(defun ssh-plibssh-session-publickey-failure (session message signed count)
+  "Refuse a publickey attempt, applying the probe budget only to offers."
+  (if signed
+      (ssh-plibssh-session-auth-failure session message :count count)
+      (ssh-plibssh-session-auth-failure
+       session message
+       :count (and (ssh-server-publickey-offer-counts-p session)
+                   count))))
+
 (defun ssh-plibssh-session-handle-publickey (session message user
                                             &optional (count t))
   "Handle a publickey offer (state NONE) or a signed attempt (state VALID).
@@ -505,7 +602,8 @@ authentication attempt."
          (blob (and key (ssh-plibssh-public-key-blob key)))
          (authorized nil)
          (key-env nil)
-         (authorization nil))
+         (authorization nil)
+         (signed (= state +ssh-publickey-state-valid+)))
     (when blob
       (multiple-value-setq (authorized key-env authorization)
         (ssh-server-authorized-key-p
@@ -513,14 +611,18 @@ authentication attempt."
          :address (ssh-session-remote-ip session)
          :session session)))
     (cond
-      ((null key) (ssh-plibssh-session-auth-failure session message
-                                                    :count count))
+      ((null key)
+       (ssh-plibssh-session-publickey-failure session message signed count))
+      ;; sshd refuses a key that already completed a method, even its probe.
+      ((and blob (ssh-plibssh-session-auth-key-used-p session blob))
+       (ssh-plibssh-session-publickey-failure session message signed count))
       ((and authorized (= state +ssh-publickey-state-none+))
        (ssh-message-auth-reply-pk-ok-simple message))
-      ((and authorized (= state +ssh-publickey-state-valid+))
-       (ssh-plibssh-session-complete-auth
+      ((and authorized signed)
+       (ssh-plibssh-session-auth-method-succeeded
         session message user "publickey" blob key-env authorization))
-      (t (ssh-plibssh-session-auth-failure session message :count count)))))
+      (t
+       (ssh-plibssh-session-publickey-failure session message signed count)))))
 
 ;;; ---- Channel opens ----
 
