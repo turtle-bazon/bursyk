@@ -228,18 +228,21 @@ does, so the hook sees the per-connection values."
         (when (and text (plusp (length text)))
           text)))))
 
+(defun ssh-plibssh-session-send-banner-text (session text)
+  "Send TEXT to SESSION as a USERAUTH_BANNER, or do nothing when empty."
+  (when (and text (plusp (length text)))
+    (let* ((octets (ssh-string-octets text))
+           (string (ssh-string-new (length octets))))
+      (unwind-protect
+           (progn
+             (cffi:with-pointer-to-vector-data (pointer octets)
+               (ssh-string-fill string pointer (length octets)))
+             (ssh-send-issue-banner (ssh-session-handle session) string))
+        (ssh-string-free string)))))
+
 (defun ssh-plibssh-session-send-banner (session)
   "Send the configured Banner, as sshd does on the first auth request."
-  (let ((text (ssh-session-banner-text session)))
-    (when text
-      (let* ((octets (ssh-string-octets text))
-             (string (ssh-string-new (length octets))))
-        (unwind-protect
-             (progn
-               (cffi:with-pointer-to-vector-data (pointer octets)
-                 (ssh-string-fill string pointer (length octets)))
-               (ssh-send-issue-banner (ssh-session-handle session) string))
-          (ssh-string-free string))))))
+  (ssh-plibssh-session-send-banner-text session (ssh-session-banner-text session)))
 
 (defun ssh-plibssh-auth-failure (message)
   "Refuse a request, advertising the one method this server offers."
@@ -266,13 +269,30 @@ the reason is recorded and the pump finishes it after the callback returns."
 
 KEY-ENV holds the environment= assignments from the authorized_keys line
 that admitted the key, and AUTHORIZATION the rest of that line's options."
+  ;; Record the method first: the pre-success hook sees the same auth-info
+  ;; lines the pure backend recorded in SSH-SERVER-AUTH-METHOD-SUCCEEDED.
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
         (ssh-session-auth-info-lines session)
         (list (ssh-server-auth-info-line "publickey" key-blob))
         (ssh-session-key-env session) key-env
-        (ssh-session-authorization session) authorization
-        (ssh-session-authenticated session) t
+        (ssh-session-authorization session) authorization)
+  (let ((hook (ssh-server-authorize-login (ssh-session-server session))))
+    (when (and hook (not (funcall hook session user)))
+      (ssh-message-reply-default message)
+      (ssh-session-finish session "Access denied" :close)
+      (return-from ssh-plibssh-session-complete-auth nil)))
+  ;; Login messages a pre-success hook collected -- PAM account text -- go
+  ;; out as a banner before USERAUTH_SUCCESS, as in sshd.
+  (let ((messages (ssh-session-login-messages session)))
+    (when messages
+      (ssh-plibssh-session-send-banner-text
+       session
+       (with-output-to-string (stream)
+         (dolist (text (nreverse messages))
+           (write-string text stream)
+           (terpri stream))))))
+  (setf (ssh-session-authenticated session) t
         (ssh-session-phase session) :ready)
   (setf (ssh-session-login-grace-timer session)
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session)))
@@ -1095,6 +1115,7 @@ this program's error, because a configured list is meant exactly as written."
                           hostbased-key-allowed
                           authorize-password
                           authorize-keyboard-interactive
+                          authorize-login
                           sshd-config
                           user-groups
                           banner
@@ -1182,6 +1203,7 @@ list, applied by the same inactivity accounting as the pure backend."
                   :authorize-password authorize-password
                   :authorize-keyboard-interactive
                   authorize-keyboard-interactive
+                  :authorize-login authorize-login
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

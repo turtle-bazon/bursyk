@@ -153,6 +153,7 @@ presented."
                           hostbased-key-allowed
                           authorize-password
                           authorize-keyboard-interactive
+                          authorize-login
                           sshd-config
                           user-groups
                           banner
@@ -310,6 +311,7 @@ listener and sets DISPLAY in the session's environment."
                   :authorize-password authorize-password
                   :authorize-keyboard-interactive
                   authorize-keyboard-interactive
+                  :authorize-login authorize-login
                   :sshd-config sshd-config
                   :user-groups user-groups
                   :banner banner

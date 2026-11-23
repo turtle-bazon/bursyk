@@ -588,20 +588,23 @@ behaviour without this library knowing about files."
         (when (and text (plusp (length text)))
           text)))))
 
+(defun ssh-server-send-banner-text (session text)
+  "Send TEXT to SESSION as a USERAUTH_BANNER, or do nothing when empty."
+  (when (and text (plusp (length text)))
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-userauth-banner+)
+      (ssh-write-text writer text)
+      ;; Language tag, unused, as in sshd.
+      (ssh-write-text writer "")
+      (ssh-session-send-payload session (ssh-writer-output writer)))))
+
 (defun ssh-server-send-banner (session)
   "Send the configured Banner before the first authentication reply.
 
 RFC 4252 allows banners at any point during authentication; sshd sends one
 when the first USER AUTH REQUEST arrives, after the account name -- and with
 it the Match blocks -- is finally known to the server."
-  (let ((text (ssh-session-banner-text session)))
-    (when text
-      (let ((writer (ssh-writer)))
-        (ssh-write-u8 writer +ssh-msg-userauth-banner+)
-        (ssh-write-text writer text)
-        ;; Language tag, unused, as in sshd.
-        (ssh-write-text writer "")
-        (ssh-session-send-payload session (ssh-writer-output writer))))))
+  (ssh-server-send-banner-text session (ssh-session-banner-text session)))
 
 (defun ssh-server-allowed-auth-methods (session)
   "The methods SESSION may try next, as sshd's authmethods_get reports.
@@ -765,7 +768,24 @@ already used for a method is never accepted again."
 KEY-ENV holds the environment= assignments from the authorized_keys line
 that admitted the key; the application applies them under
 PermitUserEnvironment.  AUTHORIZATION holds that line's remaining options,
-which the transport enforces for pty and forwarding requests."
+which the transport enforces for pty and forwarding requests.  An
+AUTHORIZE-LOGIN hook runs before the success reply; refusing there closes the
+connection the way sshd's PAM account failure does."
+  (let ((hook (ssh-server-authorize-login (ssh-session-server session))))
+    (when (and hook (not (funcall hook session user)))
+      (ssh-session-send-payload-and-close
+       session (ssh-disconnect-payload "Access denied") :close)
+      (return-from ssh-server-complete-auth nil)))
+  ;; sshd sends the login messages a pre-success hook collected -- PAM's
+  ;; account-management text -- as a banner before USERAUTH_SUCCESS.
+  (let ((messages (ssh-session-login-messages session)))
+    (when messages
+      (ssh-server-send-banner-text
+       session
+       (with-output-to-string (stream)
+         (dolist (message (nreverse messages))
+           (write-string message stream)
+           (terpri stream))))))
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
         (ssh-session-key-env session) key-env
@@ -959,14 +979,20 @@ request so the client's terminal can hide a password."
             (ssh-server-auth-method-succeeded
              session "keyboard-interactive" user nil nil nil))
            (t
-            (let ((prompts (getf result :prompts)))
-              (unless prompts
+            (let ((prompts (getf result :prompts))
+                  (name (getf result :name))
+                  (instruction (getf result :instruction)))
+              ;; A round may carry text and no prompts, which sshd sends for
+              ;; PAM_TEXT_INFO/PAM_ERROR_MSG; the client answers with an empty
+              ;; INFO_RESPONSE.  A round with nothing at all would spin.
+              (unless (or prompts
+                          (and name (plusp (length name)))
+                          (and instruction (plusp (length instruction))))
                 (error 'ssh-protocol-error
-                       :detail "keyboard-interactive hook returned no prompts"))
+                       :detail "keyboard-interactive hook returned empty round"))
               (setf (ssh-session-kbd-interactive-pending session) t)
               (ssh-server-send-info-request
-               session (getf result :name) (getf result :instruction)
-               prompts)))))))))
+               session name instruction prompts)))))))))
 
 (defun ssh-server-handle-keyboard-interactive
     (session user reader &key (count t))

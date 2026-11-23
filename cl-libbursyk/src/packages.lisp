@@ -65,6 +65,7 @@
    #:ssh-session-user
    #:ssh-session-authorized-key
    #:ssh-session-auth-info-lines
+   #:ssh-session-login-messages
    #:ssh-session-key-env
    #:ssh-session-authorization
    #:ssh-session-client-version
@@ -106,6 +107,7 @@
    #:ssh-server-authorize-user
    #:ssh-server-authorize-password
    #:ssh-server-authorize-keyboard-interactive
+   #:ssh-server-authorize-login
    #:ssh-server-enabled-auth-methods
    #:ssh-server-session-channel-count
    #:ssh-server-channel
@@ -284,6 +286,9 @@
    #:ssh-server-config-authentication-methods
    #:ssh-server-config-password-authentication
    #:ssh-server-config-kbd-interactive-authentication
+   #:ssh-server-config-permit-empty-passwords
+   #:ssh-server-config-use-pam
+   #:ssh-server-config-pam-service-name
    #:ssh-server-config-pubkey-auth-options
    #:ssh-server-config-max-pubkey-ok
    #:ssh-server-config-authorized-keys-files

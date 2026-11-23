@@ -26,6 +26,12 @@
 (defvar *auth-info-files* (make-hash-table :test #'eq)
   "ExposeAuthInfo files, keyed by the session that owns them.")
 
+(defvar *session-environment-extension* nil
+  "A function of SESSION returning NAME=VALUE strings to add to its child.
+
+The program layer uses it for the PAM environment, which sshd copies in
+before the administrator's SetEnv.")
+
 #-win32
 (cffi:defcfun ("chmod" c-chmod) :int (path :string) (mode :unsigned-int))
 
@@ -179,6 +185,14 @@ replaces the global one here as it does in sshd."
                  (merge-pathnames ".ssh/environment"
                                   (uiop:ensure-directory-pathname home))
                  session environment)))))
+    ;; PAM environment, before the administrator's SetEnv as in sshd.
+    (when *session-environment-extension*
+      (dolist (assignment
+               (funcall *session-environment-extension* session))
+        (multiple-value-bind (name value)
+            (environment-assignment-parts assignment)
+          (when name
+            (setf environment (environment-put environment name value))))))
     (let ((set-env (or (session-config-setting
                         session #'cl-pnet-ssh:ssh-server-config-set-env)
                        (cl-pnet-ssh:ssh-server-set-env server))))

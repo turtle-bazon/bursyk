@@ -68,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.85"
+(defparameter +bursyk-server-version+ "0.0.2.86"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -2668,31 +2668,40 @@ publickey and hostbased alone."
             (user-groups user)))))
 
 (defun password-authentication (session user password)
-  "Accept USER's account password, subject to the same account policy."
+  "Accept USER's account password, subject to the same account policy.
+
+With UsePAM the account database belongs to PAM, as it does in sshd; without
+it the account's /etc/shadow entry is checked directly.  sshd refuses an
+over-long password and an empty one unless PermitEmptyPasswords is on; PAM
+gets the same empty-password rule through PAM_DISALLOW_NULL_AUTHTOK."
   (and (user-allowed-p session user "password")
+       (<= (length password) 1024)
+       (or (plusp (length password))
+           (eq (session-config-setting
+                session
+                #'cl-pnet-ssh:ssh-server-config-permit-empty-passwords)
+               :yes))
+       #-win32
+       (if (pam-enabled-p session)
+           (pam-password-check session user password)
+           (verify-user-password user password))
+       #+win32
        (verify-user-password user password)))
 
+#-win32
 (defun keyboard-interactive-authentication (session user request)
-  "Ask for the account password through keyboard-interactive, then check it.
+  "PAM keyboard-interactive authentication.
 
-The first round names the prompt; the answer round uses the same account
-policy and crypt(3) check as PasswordAuthentication."
-  (let ((responses (getf request :responses))
-        (allowed (user-allowed-p session user "keyboard-interactive")))
-    (cond
-      ((null responses)
-       ;; Check root and AllowUsers/DenyUsers before prompting, so an account
-       ;; the policy refuses is not asked for a password first.
-       (if allowed
-           (list :name "bursyk-server"
-                 :instruction ""
-                 :prompts (list (list "Password: " nil)))
-           :failure))
-      ((not allowed)
-       :failure)
-      ((verify-user-password user (or (first responses) ""))
-       :success)
-      (t :failure))))
+It is offered only when UsePAM is on; PAM itself owns the prompts, including
+the account and password-change questions for an expired password."
+  (if (user-allowed-p session user "keyboard-interactive")
+      (pam-keyboard-interactive session user request)
+      :failure))
+
+#+win32
+(defun keyboard-interactive-authentication (session user request)
+  (declare (ignore session user request))
+  :failure)
 
 ;;; ---- Banner ----
 
@@ -2811,7 +2820,26 @@ guess, so only an explicit PidFile is written."
            :authorize-user #'user-allowed-p
            :hostbased-key-allowed #'hostbased-key-allowed-p
            :authorize-password #'password-authentication
-           :authorize-keyboard-interactive #'keyboard-interactive-authentication
+           ;; Keyboard-interactive is PAM-only, so with UsePAM off the server
+           ;; must not advertise it at all.
+           :authorize-keyboard-interactive
+           #-win32
+           (and (eq (config-setting
+                     #'cl-pnet-ssh:ssh-server-config-use-pam)
+                    :yes)
+                #'keyboard-interactive-authentication)
+           #+win32
+           nil
+           ;; PAM account management runs before USERAUTH_SUCCESS for methods
+           ;; that did not authenticate through PAM themselves.
+           :authorize-login
+           #-win32
+           (and (eq (config-setting
+                     #'cl-pnet-ssh:ssh-server-config-use-pam)
+                    :yes)
+                #'pam-authorize-login)
+           #+win32
+           nil
            :sshd-config *server-config*
            :user-groups #'user-groups
            :permit-user-environment
@@ -2885,8 +2913,10 @@ guess, so only an explicit PidFile is written."
                           (cl-pnet-ssh:ssh-session-user session)
                           (cl-pnet-ssh:ssh-session-remote-address
                            session))
-                         ;; sshd writes this once authentication succeeds,
-                         ;; before any channel can run.
+                         ;; sshd opens its PAM session before any channel
+                         ;; can run, then writes the auth-info file.
+                         #-win32
+                         (pam-open-session session)
                          (write-auth-info-file session))
            :on-direct-tcpip
            (lambda (session host port origin origin-port)
@@ -2962,6 +2992,8 @@ guess, so only an explicit PidFile is written."
                         session :info "closed session for ~A: ~A"
                         (cl-pnet-ssh:ssh-session-user session)
                         (close-reason-text reason))
+                       #-win32
+                       (pam-close-session session)
                        (delete-auth-info-file session)
                        (close-remote-forwards session))
            :on-error (lambda (session condition)

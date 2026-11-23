@@ -40,6 +40,11 @@
   ;; carries the previous round's answers as its :RESPONSES list, empty on the
   ;; first call.
   (authorize-keyboard-interactive nil)
+  ;; Called once every AuthenticationMethods requirement has succeeded and
+  ;; before USERAUTH_SUCCESS, as sshd runs PAM account management in
+  ;; userauth_finish.  A function of (SESSION USER) answers whether the login
+  ;; may proceed; NIL admits every authenticated user.
+  (authorize-login nil)
   ;; The sshd_config the connection-scoped Match blocks are resolved from.
   ;; NIL means the program configured the server directly and there is
   ;; nothing to re-read per connection.
@@ -183,6 +188,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   (kbd-interactive-pending nil)
   ;; ExposeAuthInfo lines, one per successful method, in completion order.
   (auth-info-lines '())
+  ;; Text a pre-success hook such as PAM account management wants the client
+  ;; to read; the transport sends it as a banner just before USERAUTH_SUCCESS.
+  (login-messages '())
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())

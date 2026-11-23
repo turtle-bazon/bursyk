@@ -113,8 +113,8 @@ socket address and has no routing domains.")
     "kerberosticketcleanup" "kerberosgetafstoken"
     "authorizedkeysfile2"
     ;; 10.6 directives that describe OpenSSH's privsep helpers or features
-    ;; this server refuses outright (PAM and GSSAPI).
-    "sshdauthpath" "sshdsessionpath" "pamservicename"
+    ;; this server refuses outright (GSSAPI).
+    "sshdauthpath" "sshdsessionpath"
     "gssapidelegatecredentials" "warnweakcrypto"))
 
 ;;; Keywords whose default or "off" value describes this server exactly.  A
@@ -123,8 +123,6 @@ socket address and has no routing domains.")
 (defparameter +ssh-server-config-accepted-off-keywords+
   '(("permittunnel" . "no")
     ("skeyauthentication" . "no")
-    ("usepam" . "no")
-    ("permitemptypasswords" . "no")
     ("gssapiauthentication" . "no")
     ("kerberosauthentication" . "no")
     ("permittty" . "yes")
@@ -160,6 +158,13 @@ socket address and has no routing domains.")
   ;; supplied the matching authentication hook.
   (password-authentication nil)
   (kbd-interactive-authentication nil)
+  ;; PermitEmptyPasswords, :YES or :NO; NIL is sshd's default of no.
+  (permit-empty-passwords nil)
+  ;; UsePAM is global-only: :YES when the application should run PAM,
+  ;; :NO or NIL otherwise.  PAMServiceName names the PAM service and is
+  ;; resolved per connection; NIL means sshd's default of "sshd".
+  (use-pam nil)
+  (pam-service-name nil)
   ;; NIL means the default; sshd's "none" entries are skipped, so a list of
   ;; only "none" disables public-key authentication.
   (authorized-keys-files nil)
@@ -728,6 +733,8 @@ error, never an accidental no-match: sshd fatals in the same situation."
     permit-listen pubkey-accepted-algorithms required-rsa-size
     pubkey-auth-options max-pubkey-ok
     authentication-methods subsystems log-level
+    password-authentication kbd-interactive-authentication
+    permit-empty-passwords pam-service-name
     hostbased-authentication hostbased-accepted-algorithms
     hostbased-uses-name-from-packet-only ignore-rhosts
     gateway-ports allow-tcp-forwarding allow-agent-forwarding
@@ -971,6 +978,27 @@ cannot apply per connection."
         (if (ssh-server-config-flag
              line (ssh-server-config-one-argument line))
             :yes :no)))
+      ((string= keyword "permitemptypasswords")
+       (ssh-server-config-set-once
+        config 'permit-empty-passwords
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "usepam")
+       ;; UsePAM is global-only, like sshd's SSHCFG_GLOBAL setting.
+       (ssh-server-config-set-once
+        config 'use-pam
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "pamservicename")
+       ;; PAM service names are file names under /etc/pam.d; sshd accepts any
+       ;; one argument here and lets PAM report a service it cannot load.
+       (let ((value (ssh-server-config-one-argument line)))
+         (when (zerop (length value))
+           (ssh-server-config-line-error
+            line "PAMServiceName needs a name"))
+         (ssh-server-config-set-once config 'pam-service-name value)))
       ((member keyword '("kbdinteractiveauthentication"
                          "challengeresponseauthentication")
                :test #'string=)

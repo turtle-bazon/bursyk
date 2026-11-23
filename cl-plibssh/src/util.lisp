@@ -155,6 +155,9 @@ beside the readable one on every backend."
   ;; request, so neither hook can complete a login here yet.
   authorize-password
   authorize-keyboard-interactive
+  ;; Called once every required method has succeeded, before libssh reports
+  ;; success; NIL admits every user.
+  authorize-login
   ;; The sshd_config the connection-scoped Match blocks are resolved from,
   ;; and a function of USER returning group names for Match Group.
   sshd-config
@@ -231,6 +234,9 @@ beside the readable one on every backend."
   (auth-merged-options nil)
   (auth-merged-key-env '())
   (auth-info-lines '())
+  ;; Text a pre-success hook such as PAM account management wants the client
+  ;; to read; kept for the same accessor the pure backend exports.
+  (login-messages '())
   ;; The environment= options of the authorized_keys line that authenticated
   ;; the user, applied only when PermitUserEnvironment allows them.
   (key-env '())

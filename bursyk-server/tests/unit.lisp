@@ -465,6 +465,200 @@ PermitRootLogin yes"))))
              (cl-pnet-ssh:ssh-server-config-warnings
               (config-from-text "PrintMotd no")))))
 
+(test sshd-config-reads-the-pam-switches
+  (let ((config (config-from-text
+                 "UsePAM yes
+PAMServiceName bursyk-test
+PermitEmptyPasswords yes")))
+    (is (eq :yes (cl-pnet-ssh:ssh-server-config-use-pam config)))
+    (is (equal "bursyk-test"
+               (cl-pnet-ssh:ssh-server-config-pam-service-name config)))
+    (is (eq :yes
+            (cl-pnet-ssh:ssh-server-config-permit-empty-passwords config))))
+  ;; UsePAM is off unless asked for, as in sshd.
+  (is (null (cl-pnet-ssh:ssh-server-config-use-pam
+             (config-from-text "Port 2222"))))
+  (is (null (cl-pnet-ssh:ssh-server-config-pam-service-name
+             (config-from-text "Port 2222"))))
+  ;; PAMServiceName is a Match keyword in sshd; UsePAM is not.
+  (is (equal "other"
+             (cl-pnet-ssh:ssh-server-config-pam-service-name
+              (cl-pnet-ssh:ssh-server-config-for-connection
+               (config-from-text "Match all
+PAMServiceName other")
+               :user "alice"))))
+  (signals cl-pnet-ssh:ssh-server-config-error
+    (config-from-text "Match all
+UsePAM yes")))
+
+;;; PAM fixtures.  Linux-PAM 1.4's pam_start_confdir lets a test load a
+;;; service from a temporary directory, so nothing under /etc/pam.d is
+;;; touched and the test user needs no password database.
+
+#-win32
+(defun pam-fixture-directory ()
+  (let ((dir (merge-pathnames
+              (format nil "bursyk-pam-~D-~D/"
+                      (get-universal-time) (random 1000000))
+              (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "service" dir))
+    (flet ((write-file (name text)
+             (with-open-file (out (merge-pathnames name dir)
+                                  :direction :output
+                                  :if-exists :supersede
+                                  :external-format :utf-8)
+               (write-string text out)))
+           (service (name text)
+             (with-open-file (out (merge-pathnames name dir)
+                                  :direction :output
+                                  :if-exists :supersede
+                                  :external-format :utf-8)
+               (write-string text out))))
+      (write-file "message" "bursyk pam message
+")
+      (write-file "check.sh" "#!/bin/sh
+read -r password
+[ \"$password\" = \"secret\" ]
+")
+      (uiop:run-program
+       (list "chmod" "+x" (namestring (merge-pathnames "check.sh" dir))))
+      (service "bursyk-permit"
+               "auth required pam_permit.so
+account required pam_permit.so
+session required pam_permit.so
+")
+      (service "bursyk-deny"
+               "auth required pam_deny.so
+account required pam_permit.so
+session required pam_permit.so
+")
+      (service "bursyk-account-deny"
+               "auth required pam_permit.so
+account required pam_deny.so
+session required pam_permit.so
+")
+      (service "bursyk-echo"
+               (format nil
+                       "auth required pam_echo.so file=~A
+account required pam_permit.so
+session required pam_permit.so
+"
+                       (namestring (merge-pathnames "message" dir))))
+      (service "bursyk-check"
+               (format nil
+                       "auth required pam_exec.so expose_authtok ~A
+account required pam_permit.so
+session required pam_permit.so
+"
+                       (namestring (merge-pathnames "check.sh" dir)))))
+    dir))
+
+#-win32
+(defmacro with-pam-fixture ((variable) &body body)
+  `(let ((,variable (pam-fixture-directory)))
+     (unwind-protect
+          (progn ,@body)
+       (ignore-errors
+         (uiop:delete-directory-tree ,variable :validate t
+                                     :if-does-not-exist :ignore)))))
+
+#-win32
+(defmacro with-pam (&body body)
+  "Run BODY when libpam is present; skip this test otherwise."
+  `(if (bursyk-server::load-pam)
+       (progn ,@body)
+       (skip "libpam is not available")))
+
+#-win32
+(test pam-password-accept-and-refuse
+  (with-pam
+    (with-pam-fixture (dir)
+      (let ((bursyk-server::*pam-conf-dir* dir))
+        (flet ((accepted-p (service)
+                 (let ((handle (bursyk-server::pam-start service "tester")))
+                   (unwind-protect
+                        (= 0 (bursyk-server::pam-authenticate-password
+                              handle "secret"))
+                     (bursyk-server::pam-end handle 0)))))
+          (is (accepted-p "bursyk-permit"))
+          (is (not (accepted-p "bursyk-deny"))))))))
+
+#-win32
+(test pam-account-management-reports-failure-and-text
+  (with-pam
+    (with-pam-fixture (dir)
+      (let ((bursyk-server::*pam-conf-dir* dir))
+        (let ((handle (bursyk-server::pam-start "bursyk-account-deny"
+                                                "tester")))
+          (unwind-protect
+               (multiple-value-bind (status messages)
+                   (bursyk-server::pam-account handle)
+                 (is (/= 0 status))
+                 (is (null messages)))
+            (bursyk-server::pam-end handle 0)))
+        ;; pam_echo's auth text is collected for the pre-success banner.
+        (let ((handle (bursyk-server::pam-start "bursyk-echo" "tester")))
+          (unwind-protect
+               (multiple-value-bind (status messages)
+                   (bursyk-server::pam-authenticate-password handle "secret")
+                 (is (= 0 status))
+                 (is (some (lambda (message)
+                             (search "bursyk pam message" message))
+                           messages)))
+            (bursyk-server::pam-end handle 0)))))))
+
+#-win32
+(test pam-environment-is-returned-and-filtered
+  (with-pam
+    (with-pam-fixture (dir)
+      (let ((bursyk-server::*pam-conf-dir* dir))
+        (let ((handle (bursyk-server::pam-start "bursyk-permit" "tester")))
+          (unwind-protect
+               (progn
+                 (bursyk-server::pam-putenv handle "BURSYK_TEST=yes")
+                 (bursyk-server::pam-putenv handle "SSH_CONNECTION=leak")
+                 (is (member "BURSYK_TEST=yes"
+                             (bursyk-server::pam-environment handle)
+                             :test #'string=)))
+            (bursyk-server::pam-end handle 0)))
+        (is (bursyk-server::pam-name-denied-p "SSH_AUTH_INFO_0"))
+        (is (bursyk-server::pam-name-denied-p "SSH_CONNECTION"))
+        (is (not (bursyk-server::pam-name-denied-p "BURSYK_TEST")))))))
+
+#-win32
+(test pam-keyboard-interactive-carries-text-and-prompts
+  (with-pam
+    (with-pam-fixture (dir)
+      (let ((bursyk-server::*pam-conf-dir* dir))
+        ;; A text-only round is shown without asking an answer.
+        (let* ((handle (bursyk-server::pam-start "bursyk-echo" "tester"))
+               (attempt (bursyk-server::pam-start-interactive
+                         handle "tester" "bursyk-echo")))
+          (let ((event (bursyk-server::pam-attempt-next-event attempt 10)))
+            (is (eq (first event) :round))
+            (is (some (lambda (text)
+                        (search "bursyk pam message" text))
+                      (second event)))
+            (is (null (third event))))
+          (let ((done (bursyk-server::pam-attempt-next-event attempt 10)))
+            (is (eq (first done) :done))
+            (is (= 0 (second done))))
+          (bursyk-server::pam-attempt-join attempt)
+          (bursyk-server::pam-end handle 0))
+        ;; A prompt round waits for the client's answer and delivers it.
+        (let* ((handle (bursyk-server::pam-start "bursyk-check" "tester"))
+               (attempt (bursyk-server::pam-start-interactive
+                         handle "tester" "bursyk-check")))
+          (let ((event (bursyk-server::pam-attempt-next-event attempt 10)))
+            (is (eq (first event) :round))
+            (is (equal '(("Password: " nil)) (third event))))
+          (bursyk-server::pam-attempt-answer attempt (list "secret"))
+          (let ((done (bursyk-server::pam-attempt-next-event attempt 10)))
+            (is (eq (first done) :done))
+            (is (= 0 (second done))))
+          (bursyk-server::pam-attempt-join attempt)
+          (bursyk-server::pam-end handle 0))))))
+
 (test sshd-config-reads-algorithm-policy
   (let ((config (config-from-text
                  "Ciphers +chacha20-poly1305@openssh.com
@@ -1910,18 +2104,46 @@ DenyGroups banned")))
                          "tester" "secret")))))
         (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
-(test keyboard-interactive-asks-once-and-checks-the-answer
-  (let ((request (list :responses '())))
-    (let ((step (bursyk-server::keyboard-interactive-authentication
-                 nil "tester" request)))
-      (is (getf step :prompts))
-      (is (equal "Password: " (first (first (getf step :prompts)))))
-      (is (not (second (first (getf step :prompts)))))))
-  ;; Only the account policy and crypt(3) decide the answer round, so an
-  ;; unknown user fails without pretending a prompt is still due.
+(test password-authentication-refuses-empty-and-overlong-passwords
+  ;; sshd refuses an empty password unless PermitEmptyPasswords is on, and
+  ;; anything longer than 1024 characters.
+  (is (null (bursyk-server::password-authentication nil "tester" "")))
+  (is (null (bursyk-server::password-authentication
+             nil "tester" (make-string 1025 :initial-element #\a)))))
+
+(test keyboard-interactive-is-pam-only
+  ;; Without UsePAM the server does not offer keyboard-interactive, and the
+  ;; hook refuses before asking anything; there is no password-prompt
+  ;; fallback, because the password database belongs to PAM.
   (is (eq :failure
           (bursyk-server::keyboard-interactive-authentication
-           nil "these-accounts-do-not-exist" (list :responses '("x"))))))
+           nil "tester" (list :responses '()))))
+  (is (eq :failure
+          (bursyk-server::keyboard-interactive-authentication
+           nil "these-accounts-do-not-exist" (list :responses '("x")))))
+  ;; With UsePAM, PAM owns the conversation: a prompted round asks the
+  ;; client, and the answer is what the module sees.
+  #-win32
+  (with-pam
+    (with-pam-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (config (config-from-text
+                      "UsePAM yes
+PAMServiceName bursyk-check"))
+             (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+             (session (cl-pnet-ssh::%make-ssh-session
+                       :server server :user "tester")))
+        (unwind-protect
+             (let ((round (bursyk-server::keyboard-interactive-authentication
+                           session "tester" (list :responses '()))))
+               (is (equal "Password: "
+                          (first (first (getf round :prompts)))))
+               (is (not (second (first (getf round :prompts)))))
+               (is (eq :success
+                       (bursyk-server::keyboard-interactive-authentication
+                        session "tester"
+                        (list :responses '("secret"))))))
+          (bursyk-server::pam-close-session session))))))
 
 (test forced-commands-only-root-needs-a-forced-command
   ;; PermitRootLogin forced-commands-only is decided when the key matches:
