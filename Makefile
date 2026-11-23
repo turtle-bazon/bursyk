@@ -129,12 +129,24 @@ test-server: deps-check
 	  --eval '(ql:quickload :bursyk-server-tests)' \
 	  --eval '(sb-ext:exit :abort t :code (if (fiveam:run! (quote bursyk-server-tests::bursyk-server)) 0 1))'
 
-# The SSH library and facade suite.  SSH_BACKEND=libssh needs libssh.so.4 at
-# runtime; the pure lisp backend needs nothing beyond libc/libm.
+# The SSH facade suite.  It is the same suite and the same expectations on
+# both backends: SSH_BACKEND=libssh needs libssh.so.4 at runtime, while the
+# pure lisp backend needs nothing beyond libc/libm.
+#
+# The pure transport's own wire- and state-level tests live in
+# CL-LIBBURSKY-TESTS, not in this facade suite, because libssh owns the wire
+# protocol and exposes none of it.  Running them under :ssh-backend-ffi would
+# be a test of internals the backend does not have, so they run only for the
+# pure stack; the facade results stay comparable across backends.
 test-ssh: deps-check
 	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
 	  --eval '(ql:quickload :cl-pnet-ssh-tests)' \
 	  --eval '(sb-ext:exit :abort t :code (if (fiveam:run! (quote cl-pnet-ssh-tests::cl-pnet-ssh)) 0 1))'
+ifeq ($(SSH_BACKEND_NAME),lisp)
+	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
+	  --eval '(ql:quickload :cl-libbursyk-tests)' \
+	  --eval '(sb-ext:exit :abort t :code (if (fiveam:run! (quote cl-pnet-ssh-tests::lisp-internals)) 0 1))'
+endif
 
 # Optional: a live client test against a reachable sshd.  Kept out of `test`
 # because it needs SSH_TEST_HOST, a key and a server; see tests/live.lisp.
@@ -148,8 +160,10 @@ test-ssh-live: deps-check
 # SSH stacks (lisp = cl-libbursyk, libssh = cl-plibssh).  The cells run one
 # at a time, and each keeps its fasls in _build/matrix/<ssh>-<pnet>/fasl so
 # a later test-matrix reuses the matching build instead of recompiling it.
-# The SSH suite's pure-transport internals report as skips under libssh; the
-# facade and the live loopback tests still run in every cell.
+# Every cell runs the same facade suite.  The pure transport's internal
+# wire/state tests belong to cl-libbursyk and run in the lisp cells only;
+# they are not facade behaviour, so the libssh cells neither run nor skip
+# them.
 #
 # MATRIX_ENV carries an extra environment for every cell, for a libssh built
 # outside the loader's default search path:
