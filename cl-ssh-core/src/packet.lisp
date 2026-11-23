@@ -33,18 +33,34 @@
        (member cipher '("aes128-ctr" "aes192-ctr" "aes256-ctr")
                :test #'string=)))
 
+(defun ssh-cipher-cbc-p (cipher)
+  (and cipher
+       (member cipher '("3des-cbc" "aes128-cbc" "aes192-cbc" "aes256-cbc")
+               :test #'string=)))
+
 (defun ssh-cipher-aead-p (cipher)
   "Whether CIPHER authenticates each packet and ignores the negotiated MAC."
   (or (ssh-cipher-chacha-p cipher) (ssh-cipher-gcm-p cipher)))
 
+(defun ssh-cipher-block-cipher (cipher)
+  "The ironclad name of CIPHER's block primitive, or NIL for the AEADs."
+  (cond ((ssh-cipher-cbc-p cipher)
+         (if (string= cipher "3des-cbc") :3des :aes))
+        ((ssh-cipher-ctr-p cipher) :aes)
+        (t nil)))
+
 (defun ssh-cipher-key-length (cipher)
   "The key length of CIPHER, or NIL when it is not implemented."
   (cond ((ssh-cipher-chacha-p cipher) 64)
-        ((member cipher '("aes128-gcm@openssh.com" "aes128-ctr")
+        ((member cipher '("aes128-gcm@openssh.com" "aes128-ctr"
+                          "aes128-cbc")
                  :test #'string=)
          16)
-        ((string= cipher "aes192-ctr") 24)
-        ((member cipher '("aes256-gcm@openssh.com" "aes256-ctr")
+        ((member cipher '("aes192-ctr" "aes192-cbc") :test #'string=)
+         24)
+        ((and cipher (string= cipher "3des-cbc")) 24)
+        ((member cipher '("aes256-gcm@openssh.com" "aes256-ctr"
+                          "aes256-cbc")
                  :test #'string=)
          32)
         (t nil)))
@@ -53,13 +69,18 @@
   "The IV length of CIPHER, or NIL when it is not implemented."
   (cond ((ssh-cipher-chacha-p cipher) 0)
         ((ssh-cipher-ctr-p cipher) 16)
+        ((and cipher (string= cipher "3des-cbc")) 8)
+        ((ssh-cipher-cbc-p cipher) 16)
         ((ssh-cipher-gcm-p cipher) 12)
         (t nil)))
 
 (defun ssh-cipher-block-size (cipher)
   "The block alignment CIPHER gives a packet, or NIL when unknown."
   (cond ((ssh-cipher-chacha-p cipher) 8)
-        ((or (ssh-cipher-ctr-p cipher) (ssh-cipher-gcm-p cipher)) 16)
+        ((and cipher (string= cipher "3des-cbc")) 8)
+        ((or (ssh-cipher-ctr-p cipher) (ssh-cipher-gcm-p cipher)
+             (ssh-cipher-cbc-p cipher))
+         16)
         (t nil)))
 
 (defun ssh-cipher-tag-length (cipher)
@@ -137,6 +158,13 @@ the two constructions cannot share one call."
   (decrypt-offset 0)
   (encrypt-packet 0)
   (decrypt-packet 0)
+  ;; CBC keeps a stateful cipher object whose IV chains across packets, and
+  ;; a copy of the current IV so a partial packet can peek at its length
+  ;; without advancing that chain.
+  (encrypt-cbc nil)
+  (decrypt-cbc nil)
+  (encrypt-cbc-iv nil)
+  (decrypt-cbc-iv nil)
   (encrypt-mac-key nil)
   (decrypt-mac-key nil)
   (encrypt-mac nil)
@@ -224,6 +252,34 @@ AES-GCM numbers packets by adding to the last four octets of its nonce."
 (defun ssh-gcm-nonce (iv counter)
   "IV with its last four octets advanced by COUNTER."
   (ssh-counter-block iv counter))
+
+;;; ---- CBC helpers ----
+
+(defun ssh-cbc-crypt (cipher data decrypt-p)
+  "Run DATA through the stateful CBC CIPHER and return fresh octets.
+
+DATA must be a whole number of blocks.  The cipher object carries its IV
+from one packet to the next, as SSH's CBC modes require."
+  (let ((output (make-array (length data)
+                            :element-type '(unsigned-byte 8))))
+    (if decrypt-p
+        (ironclad-unsafe:decrypt cipher data output)
+        (ironclad-unsafe:encrypt cipher data output))
+    output))
+
+(defun ssh-cbc-peek-block (ecb iv block)
+  "Decrypt one CBC BLOCK with ECB ECB under IV, without touching any chain."
+  (let* ((size (length block))
+         (plain (make-array size :element-type '(unsigned-byte 8)))
+         (output (make-array size :element-type '(unsigned-byte 8))))
+    (ironclad-unsafe:decrypt ecb block plain)
+    (dotimes (index size output)
+      (setf (aref output index)
+            (logxor (aref plain index) (aref iv index))))))
+
+(defun ssh-cbc-last-block (octets block-size)
+  "The last BLOCK-SIZE octets of OCTETS, as the next packet's CBC IV."
+  (subseq octets (- (length octets) block-size)))
 
 ;;; ---- Encoding ----
 
@@ -313,6 +369,39 @@ whole packet is then encrypted."
                 (mod (1+ sequence) (expt 2 32)))
           (if mac (ssh-concat encrypted mac) encrypted)))))
 
+(defun ssh-cbc-encode (payload state)
+  "PAYLOAD as a CBC packet with an hmac appended in the clear.
+
+CBC chains the IV from one packet into the next, so the cipher object keeps
+the state and only the current IV is mirrored here.  With an encrypt-then-MAC
+algorithm the length stays plaintext and only the body is chained; a plain
+MAC is taken over the plaintext packet before the whole packet is encrypted."
+  (let* ((sequence (ssh-cipher-state-send-sequence state))
+         (block-size (ssh-cipher-state-send-block-size state))
+         (etm (ssh-cipher-state-encrypt-etm state))
+         (padding-length (ssh-packet-padding-length
+                          (length payload) (if etm 0 4) block-size))
+         (body (ssh-packet-body payload padding-length))
+         (length-octets (ssh-uint32-octets (length body)))
+         (plain (ssh-concat length-octets body))
+         (cipher (ssh-cipher-state-encrypt-cbc state)))
+    (if etm
+        (let* ((encrypted-body (ssh-cbc-crypt cipher body nil))
+               (packet (ssh-concat length-octets encrypted-body))
+               (mac (ssh-mac-tag state :send packet)))
+          (setf (ssh-cipher-state-encrypt-cbc-iv state)
+                (ssh-cbc-last-block encrypted-body block-size)
+                (ssh-cipher-state-send-sequence state)
+                (mod (1+ sequence) (expt 2 32)))
+          (if mac (ssh-concat packet mac) packet))
+        (let* ((mac (ssh-mac-tag state :send plain))
+               (encrypted (ssh-cbc-crypt cipher plain nil)))
+          (setf (ssh-cipher-state-encrypt-cbc-iv state)
+                (ssh-cbc-last-block encrypted block-size)
+                (ssh-cipher-state-send-sequence state)
+                (mod (1+ sequence) (expt 2 32)))
+          (if mac (ssh-concat encrypted mac) encrypted)))))
+
 (defun ssh-encode-packet (payload state)
   "Cycle STATE's sequence and return PAYLOAD as wire octets."
   (let* ((payload (if (ssh-cipher-state-send-compression-enabled state)
@@ -328,6 +417,8 @@ whole packet is then encrypted."
        (ssh-gcm-encode payload state))
       ((ssh-cipher-ctr-p name)
        (ssh-ctr-encode payload state))
+      ((ssh-cipher-cbc-p name)
+       (ssh-cbc-encode payload state))
       (t
        (error 'ssh-protocol-error
               :detail (format nil "cannot encrypt with cipher ~A" name))))))
@@ -515,6 +606,84 @@ and padding, against a cipher's block limits.  The tag is not part of it."
               (values (ssh-strip-padding (subseq packet 4) length)
                       needed)))))))
 
+(defun ssh-cbc-decode (buffer state)
+  "Decode one CBC packet from BUFFER.
+
+A plain MAC leaves the length encrypted, so the first block is decrypted
+under the current IV with a stateless ECB operation: that reads the length
+without advancing the chain, and an incomplete packet leaves everything as
+it was.  Encrypt-then-MAC keeps the length in the clear, verifies before
+decrypting, and chains only the body."
+  (let* ((block-size (ssh-cipher-state-receive-block-size state))
+         (etm (ssh-cipher-state-decrypt-etm state))
+         (cipher (ssh-cipher-state-decrypt-cbc state))
+         (mac-length (ssh-packet-mac-length state :receive)))
+    (if etm
+        (progn
+          (when (< (length buffer) 4)
+            (return-from ssh-cbc-decode (values :incomplete 0)))
+          (let* ((length (ssh-octets-uint32 buffer))
+                 (needed (+ 4 length mac-length)))
+            (unless (<= 1 length +ssh-max-packet+)
+              (error 'ssh-protocol-error
+                     :detail (format nil "packet length ~D outside 1..~D"
+                                     length +ssh-max-packet+)))
+            (unless (zerop (mod length block-size))
+              (error 'ssh-protocol-error
+                     :detail (format nil "CBC body length ~D is not a multiple of ~D"
+                                     length block-size)))
+            (when (< (length buffer) needed)
+              (return-from ssh-cbc-decode (values :incomplete 0)))
+            (let* ((sequence (ssh-cipher-state-receive-sequence state))
+                   (encrypted (subseq buffer 4 (+ 4 length)))
+                   (wire (subseq buffer 0 (+ 4 length))))
+              (when (plusp mac-length)
+                (let ((expected (subseq buffer (+ 4 length) needed))
+                      (actual (ssh-mac-tag state :receive wire)))
+                  (unless (ssh-octets= expected actual)
+                    (error 'ssh-protocol-error
+                           :detail "packet MAC does not verify"))))
+              (let ((body (ssh-cbc-crypt cipher encrypted t)))
+                (setf (ssh-cipher-state-decrypt-cbc-iv state)
+                      (ssh-cbc-last-block encrypted block-size)
+                      (ssh-cipher-state-receive-sequence state)
+                      (mod (1+ sequence) (expt 2 32)))
+                (values (ssh-strip-padding body length) needed)))))
+        (progn
+          (when (< (length buffer) block-size)
+            (return-from ssh-cbc-decode (values :incomplete 0)))
+          (let* ((first (ssh-cbc-peek-block
+                         (ssh-cipher-state-decrypt-ecb state)
+                         (ssh-cipher-state-decrypt-cbc-iv state)
+                         (subseq buffer 0 block-size)))
+                 (length (ssh-octets-uint32 first))
+                 (needed (+ 4 length mac-length)))
+            (unless (<= 1 length +ssh-max-packet+)
+              (error 'ssh-protocol-error
+                     :detail (format nil "packet length ~D outside 1..~D"
+                                     length +ssh-max-packet+)))
+            (unless (zerop (mod (+ 4 length) block-size))
+              (error 'ssh-protocol-error
+                     :detail (format nil "CBC packet length ~D is not a multiple of ~D"
+                                     (+ 4 length) block-size)))
+            (when (< (length buffer) needed)
+              (return-from ssh-cbc-decode (values :incomplete 0)))
+            (let* ((sequence (ssh-cipher-state-receive-sequence state))
+                   (encrypted (subseq buffer 0 (+ 4 length)))
+                   (packet (ssh-cbc-crypt cipher encrypted t)))
+              (when (plusp mac-length)
+                (let ((expected (subseq buffer (+ 4 length) needed))
+                      (actual (ssh-mac-tag state :receive packet)))
+                  (unless (ssh-octets= expected actual)
+                    (error 'ssh-protocol-error
+                           :detail "packet MAC does not verify"))))
+              (setf (ssh-cipher-state-decrypt-cbc-iv state)
+                    (ssh-cbc-last-block encrypted block-size)
+                    (ssh-cipher-state-receive-sequence state)
+                    (mod (1+ sequence) (expt 2 32)))
+              (values (ssh-strip-padding (subseq packet 4) length)
+                      needed)))))))
+
 (defun ssh-plain-decode (buffer state)
   "Decode one plain or hmac-tagged packet from BUFFER."
   (when (< (length buffer) 4)
@@ -553,6 +722,8 @@ and padding, against a cipher's block limits.  The tag is not part of it."
            (ssh-gcm-decode buffer state))
           ((ssh-cipher-ctr-p name)
            (ssh-ctr-decode buffer state))
+          ((ssh-cipher-cbc-p name)
+           (ssh-cbc-decode buffer state))
           (t
            (error 'ssh-protocol-error
                   :detail (format nil "cannot decrypt with cipher ~A" name))))
@@ -694,7 +865,9 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
     (let* ((name (if encrypt-cipher-p
                      encrypt-cipher
                      (and aead "chacha20-poly1305@openssh.com")))
-           (block-size (or (ssh-cipher-block-size name) +ssh-block-size+)))
+           (block-size (or (ssh-cipher-block-size name) +ssh-block-size+))
+           (block-cipher (ssh-cipher-block-cipher name))
+           (cbc (ssh-cipher-cbc-p name)))
       (setf (ssh-cipher-state-encrypt state)
             (if (ssh-cipher-chacha-p name)
                 (ssh-chacha-packet-key encrypt)
@@ -702,8 +875,17 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
             (ssh-cipher-state-encrypt-name state) name
             (ssh-cipher-state-encrypt-iv state) encrypt-iv
             (ssh-cipher-state-encrypt-ecb state)
-            (and (ssh-cipher-ctr-p name)
-                 (ironclad-unsafe:make-cipher :aes :key encrypt :mode :ecb))
+            (and block-cipher
+                 (ironclad-unsafe:make-cipher block-cipher :key encrypt
+                                              :mode :ecb))
+            (ssh-cipher-state-encrypt-cbc state)
+            (and cbc
+                 (ironclad-unsafe:make-cipher block-cipher :key encrypt
+                                              :mode :cbc
+                                              :initialization-vector
+                                              (copy-seq encrypt-iv)))
+            (ssh-cipher-state-encrypt-cbc-iv state)
+            (and cbc (copy-seq encrypt-iv))
             (ssh-cipher-state-encrypt-offset state) 0
             (ssh-cipher-state-encrypt-packet state) 0
             (ssh-cipher-state-send-block-size state) block-size
@@ -712,7 +894,9 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
     (let* ((name (if decrypt-cipher-p
                      decrypt-cipher
                      (and aead "chacha20-poly1305@openssh.com")))
-           (block-size (or (ssh-cipher-block-size name) +ssh-block-size+)))
+           (block-size (or (ssh-cipher-block-size name) +ssh-block-size+))
+           (block-cipher (ssh-cipher-block-cipher name))
+           (cbc (ssh-cipher-cbc-p name)))
       (setf (ssh-cipher-state-decrypt state)
             (if (ssh-cipher-chacha-p name)
                 (ssh-chacha-packet-key decrypt)
@@ -720,8 +904,17 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
             (ssh-cipher-state-decrypt-name state) name
             (ssh-cipher-state-decrypt-iv state) decrypt-iv
             (ssh-cipher-state-decrypt-ecb state)
-            (and (ssh-cipher-ctr-p name)
-                 (ironclad-unsafe:make-cipher :aes :key decrypt :mode :ecb))
+            (and block-cipher
+                 (ironclad-unsafe:make-cipher block-cipher :key decrypt
+                                              :mode :ecb))
+            (ssh-cipher-state-decrypt-cbc state)
+            (and cbc
+                 (ironclad-unsafe:make-cipher block-cipher :key decrypt
+                                              :mode :cbc
+                                              :initialization-vector
+                                              (copy-seq decrypt-iv)))
+            (ssh-cipher-state-decrypt-cbc-iv state)
+            (and cbc (copy-seq decrypt-iv))
             (ssh-cipher-state-decrypt-offset state) 0
             (ssh-cipher-state-decrypt-packet state) 0
             (ssh-cipher-state-receive-block-size state) block-size

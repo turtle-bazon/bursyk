@@ -1035,8 +1035,12 @@ PermitListen 8080 127.0.0.1:9000")))
               "PubkeyAcceptedAlgorithms ssh-ed25519
 PubkeyAcceptedKeyTypes rsa-sha2-512")))
   ;; An algorithm this build cannot offer is an error, not a quiet drop.
+  ;; CBC is implemented but outside the default offer, so naming it works.
+  (is (equal '("aes128-cbc")
+             (config-value #'cl-pnet-ssh:ssh-server-config-ciphers
+                           "Ciphers aes128-cbc")))
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "Ciphers aes128-cbc"))
+    (config-from-text "Ciphers aes128-nope"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "KexAlgorithms no-such-kex"))
   (signals cl-pnet-ssh:ssh-server-config-error

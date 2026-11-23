@@ -1069,7 +1069,8 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'ciphers
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-ciphers+ "Ciphers")))
+         line arguments +ssh-ciphers+ "Ciphers"
+         :all +ssh-all-ciphers+)))
       ((string= keyword "macs")
        (ssh-server-config-set-once
         config 'macs

@@ -89,14 +89,19 @@ CLI's decision and at the plist it filled."
   (is (equal '("2") (burs::query-answer "protocol-version")))
   (is (equal (burs::query-answer "cipher")
              (burs::query-answer "Ciphers")))
-  ;; -Q cipher-auth lists only the AEAD constructions; the CTR ciphers rely
-  ;; on the negotiated MAC and belong to -Q cipher alone.
+  ;; -Q cipher-auth lists only the AEAD constructions; the CTR and CBC
+  ;; ciphers rely on the negotiated MAC and belong to -Q cipher alone.
   (let ((ciphers (burs::query-answer "cipher"))
         (auth (burs::query-answer "cipher-auth")))
     (is (member "aes128-ctr" ciphers :test #'string=))
     (is (not (member "aes128-ctr" auth :test #'string=)))
     (is (member "aes128-gcm@openssh.com" auth :test #'string=))
-    (is (member "chacha20-poly1305@openssh.com" auth :test #'string=)))
+    (is (member "chacha20-poly1305@openssh.com" auth :test #'string=))
+    ;; CBC is implemented and listed, but not offered unless named.
+    (dolist (cipher '("3des-cbc" "aes128-cbc" "aes192-cbc" "aes256-cbc"))
+      (is (member cipher ciphers :test #'string=))
+      (is (not (member cipher auth :test #'string=)))
+      (is (not (member cipher cl-pnet-ssh:+ssh-ciphers+ :test #'string=)))))
   ;; -Q key splits cleanly into plain and certificate spellings.
   (is (every (lambda (name)
                (not (burs::certificate-algorithm-name-p name)))

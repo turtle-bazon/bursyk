@@ -440,13 +440,16 @@ even though it is implemented; -G reports this list, as ssh does."
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
                  cl-pnet-ssh:+ssh-kex-default-algorithms+)))
 
-(defun check-algorithm-list (option value supported)
+(defun check-algorithm-list (option value supported &optional all)
   "Reject an algorithm choice this build cannot offer.
 
 ssh's +/-^ prefixes and glob patterns are applied exactly as in ssh_config, so
-a name this build lacks is an error instead of a silently widened offer."
+a name this build lacks is an error instead of a silently widened offer.  ALL
+is the set a pattern may name when it is wider than the default offer, as it
+is for the CBC ciphers."
   (handler-case
-      (cl-pnet-ssh:ssh-resolve-algorithm-list (split-list value) supported option)
+      (cl-pnet-ssh:ssh-resolve-algorithm-list (split-list value) supported option
+                                              :all (or all supported))
     (cl-pnet-ssh:ssh-config-error (condition)
       (fail "~A" condition))))
 
@@ -479,7 +482,8 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-R" "remote forwarding is not implemented by this transport"))
   (when (getf *options* :ciphers)
     (check-algorithm-list "-c" (getf *options* :ciphers)
-                          cl-pnet-ssh:+ssh-ciphers+))
+                          cl-pnet-ssh:+ssh-ciphers+
+                          cl-pnet-ssh:+ssh-all-ciphers+))
   (when (getf *options* :macs)
     (check-algorithm-list "-m" (getf *options* :macs)
                           (supported-mac-algorithms)))
@@ -835,12 +839,12 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
   (let ((name (string-downcase what)))
     (cond
       ((member name '("cipher" "ciphers") :test #'string=)
-       cl-pnet-ssh:+ssh-ciphers+)
+       cl-pnet-ssh:+ssh-all-ciphers+)
       ;; -Q cipher-auth names only the ciphers that authenticate their own
-      ;; packets; the CTR modes rely on the negotiated MAC instead.
+      ;; packets; the CTR and CBC modes rely on the negotiated MAC instead.
       ((string= name "cipher-auth")
        (remove-if-not #'cl-pnet-ssh::ssh-cipher-aead-p
-                      cl-pnet-ssh:+ssh-ciphers+))
+                      cl-pnet-ssh:+ssh-all-ciphers+))
       ((member name '("mac" "macs") :test #'string=)
        (supported-mac-algorithms))
       ((member name '("kex" "kexalgorithms") :test #'string=)
@@ -3214,7 +3218,8 @@ and known-hosts files) are printed as this client will actually use them."
           (format t "bindinterface ~A~%" value)))
       (format t "ciphers ~{~A~^,~}~%"
               (algorithms #'cl-pnet-ssh:ssh-config-options-ciphers
-                          cl-pnet-ssh::+ssh-ciphers+ "Ciphers"))
+                          cl-pnet-ssh::+ssh-ciphers+ "Ciphers"
+                          cl-pnet-ssh::+ssh-all-ciphers+))
       (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
         (when (and path (not (eq path :none)) (not (string-equal path "none")))
           (format t "controlpath ~A~%"

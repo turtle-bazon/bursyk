@@ -169,10 +169,28 @@ default.")
     "aes128-ctr"
     "aes192-ctr"
     "aes256-ctr")
-  "The ciphers this build implements, in OpenSSH's default order.
+  "The ciphers this build offers by default, in OpenSSH's default order.
 
-The CBC modes OpenSSH still lists for old peers are not here: this build
-offers only the CTR and AEAD constructions it implements.")
+The CBC modes OpenSSH still accepts for old peers are implemented but, as in
+OpenSSH, deliberately left out of the default offer.  +SSH-ALL-CIPHERS+ is
+the set -Q cipher and the Ciphers directive resolve against.")
+
+(defparameter +ssh-all-ciphers+
+  '("3des-cbc"
+    "aes128-cbc"
+    "aes192-cbc"
+    "aes256-cbc"
+    "aes128-ctr"
+    "aes192-ctr"
+    "aes256-ctr"
+    "aes128-gcm@openssh.com"
+    "aes256-gcm@openssh.com"
+    "chacha20-poly1305@openssh.com")
+  "Every cipher this build implements, in OpenSSH's -Q cipher order.
+
+CBC is here because OpenSSH still negotiates it with old peers, but the
+default offer above does not include it: a user has to name it with Ciphers
+or -c.")
 
 ;; chacha20-poly1305@openssh.com is an AEAD and ignores the MAC, but RFC 4253
 ;; still negotiates one of these, and OpenSSH expects a common choice.

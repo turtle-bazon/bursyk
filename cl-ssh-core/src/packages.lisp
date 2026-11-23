@@ -591,6 +591,7 @@
    #:+ssh-kex-default-algorithms+
    #:+ssh-host-key-algorithms+
    #:+ssh-ciphers+
+   #:+ssh-all-ciphers+
    #:+ssh-macs+
    #:+ssh-compressions+
    #:+ssh-keystroke-default-interval-ms+))

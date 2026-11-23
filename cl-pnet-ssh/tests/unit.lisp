@@ -448,6 +448,127 @@ a changed octet, for both the 64-bit and 128-bit tags."
     (setf (aref wire 8) (logxor 1 (aref wire 8)))
     (signals ssh-protocol-error (ssh-decode-packet wire receive))))
 
+(test cbc-cipher-descriptions
+  "The CBC ciphers report their block, key and IV sizes, and stay out of
+the default offer even though -Q cipher knows them."
+  (is (= 24 (cl-pnet-ssh::ssh-cipher-key-length "3des-cbc")))
+  (is (= 8 (cl-pnet-ssh::ssh-cipher-iv-length "3des-cbc")))
+  (is (= 8 (cl-pnet-ssh::ssh-cipher-block-size "3des-cbc")))
+  (dolist (case '(("aes128-cbc" 16) ("aes192-cbc" 24) ("aes256-cbc" 32)))
+    (is (= (second case)
+           (cl-pnet-ssh::ssh-cipher-key-length (first case))))
+    (is (= 16 (cl-pnet-ssh::ssh-cipher-iv-length (first case))))
+    (is (= 16 (cl-pnet-ssh::ssh-cipher-block-size (first case)))))
+  (is (cl-pnet-ssh::ssh-cipher-cbc-p "aes128-cbc"))
+  (is (not (cl-pnet-ssh::ssh-cipher-cbc-p "aes128-ctr")))
+  (dolist (cipher '("3des-cbc" "aes128-cbc" "aes192-cbc" "aes256-cbc"))
+    (is (member cipher cl-pnet-ssh:+ssh-all-ciphers+ :test #'string=))
+    (is (not (member cipher cl-pnet-ssh:+ssh-ciphers+ :test #'string=)))))
+
+(test cbc-matches-the-nist-vector
+  "The AES-CBC primitive matches NIST SP 800-38A's first vector."
+  (let ((cipher (ironclad-unsafe:make-cipher
+                 :aes
+                 :key (hex-octets "2b7e151628aed2a6abf7158809cf4f3c")
+                 :mode :cbc
+                 :initialization-vector
+                 (hex-octets "000102030405060708090a0b0c0d0e0f")))
+        (plain (hex-octets
+                "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710"))
+        (expected (hex-octets
+                   "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7")))
+    (is (equalp expected (cl-pnet-ssh::ssh-cbc-crypt cipher plain nil)))))
+
+(test 3des-cbc-matches-its-vector
+  "3des-cbc uses the 24-octet EDE key and the 8-octet CBC block."
+  (let ((cipher (ironclad-unsafe:make-cipher
+                 :3des
+                 :key (hex-octets
+                       "0123456789abcdef23456789abcdef01456789abcdef0123")
+                 :mode :cbc
+                 :initialization-vector (hex-octets "1234567890abcdef")))
+        (plain (octets-ascii "Now is the time for all "))
+        (expected (hex-octets "f3c0ff026c023089656fbb169def7edb30ba36075d6f0176")))
+    (is (equalp expected (cl-pnet-ssh::ssh-cbc-crypt cipher plain nil)))))
+
+(test cbc-packet-round-trip
+  "Each CBC cipher frames several packets on one chained IV."
+  (dolist (cipher '("3des-cbc" "aes128-cbc" "aes192-cbc" "aes256-cbc"))
+    (let* ((key (ssh-random-octets (cl-pnet-ssh::ssh-cipher-key-length cipher)))
+           (iv (ssh-random-octets (cl-pnet-ssh::ssh-cipher-iv-length cipher)))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state)))
+      (install-test-cipher send cipher key iv :send)
+      (install-test-cipher receive cipher key iv :receive)
+      (dotimes (index 5)
+        (let ((payload (concatenated (hex-octets "5e")
+                                     (ssh-random-octets (+ 3 index)))))
+          (let ((wire (ssh-encode-packet payload send)))
+            (is (not (equalp payload wire)))
+            (multiple-value-bind (decoded consumed)
+                (ssh-decode-packet wire receive)
+              (is (equalp payload decoded))
+              (is (= (length wire) consumed)))))))))
+
+(test cbc-partial-packet-does-not-advance-the-chain
+  "A buffer that stops after the first CBC block reads the length but
+must not consume or advance the chaining IV."
+  (let* ((cipher "aes128-cbc")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state))
+         (payload (concatenated (hex-octets "5e")
+                                (ssh-random-octets 40)))
+         (wire (progn
+                 (install-test-cipher send cipher key iv :send)
+                 (ssh-encode-packet payload send))))
+    (install-test-cipher receive cipher key iv :receive)
+    (multiple-value-bind (value consumed)
+        (ssh-decode-packet (subseq wire 0 16) receive)
+      (is (eq :incomplete value))
+      (is (zerop consumed)))
+    ;; The peek left the chain untouched, so the whole packet still decodes.
+    (multiple-value-bind (decoded consumed)
+        (ssh-decode-packet wire receive)
+      (is (equalp payload decoded))
+      (is (= (length wire) consumed)))))
+
+(test cbc-packet-detects-tampering
+  (let* ((cipher "aes128-cbc")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state))
+         (wire (progn
+                 (install-test-cipher send cipher key iv :send)
+                 (ssh-encode-packet (concatenated (hex-octets "15")
+                                                  (ssh-random-octets 40))
+                                    send))))
+    (install-test-cipher receive cipher key iv :receive)
+    (setf (aref wire 10) (logxor 1 (aref wire 10)))
+    (signals ssh-protocol-error (ssh-decode-packet wire receive))))
+
+(test etm-cbc-packet-round-trip
+  "Encrypt-then-MAC leaves the length in the clear and chains the bodies."
+  (dolist (cipher '("3des-cbc" "aes128-cbc" "aes192-cbc" "aes256-cbc"))
+    (let* ((key (ssh-random-octets (cl-pnet-ssh::ssh-cipher-key-length cipher)))
+           (iv (ssh-random-octets (cl-pnet-ssh::ssh-cipher-iv-length cipher)))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state)))
+      (install-test-etm-cipher send cipher key iv :send)
+      (install-test-etm-cipher receive cipher key iv :receive)
+      (dotimes (index 3)
+        (let ((payload (concatenated (hex-octets "5e")
+                                     (ssh-random-octets (+ 5 index)))))
+          (let* ((wire (ssh-encode-packet payload send))
+                 (length (ssh-octets-uint32 wire)))
+            (is (zerop (mod length (cl-pnet-ssh::ssh-cipher-block-size cipher))))
+            (multiple-value-bind (decoded consumed)
+                (ssh-decode-packet wire receive)
+              (is (equalp payload decoded))
+              (is (= (length wire) consumed)))))))))
+
 (test gcm-packet-round-trip
   "AES-GCM authenticates the length field and encrypts the body."
   (dolist (cipher '("aes128-gcm@openssh.com" "aes256-gcm@openssh.com"))
@@ -3857,9 +3978,20 @@ path that selects the agent socket to forward."
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("curve25519-sha256")
               cl-pnet-ssh:+ssh-kex-real-algorithms+ "KexAlgorithms")))
+  ;; CBC is implemented but outside the default offer, so it resolves only
+  ;; against the wider set a Ciphers directive may draw from.
+  (is (equal '("aes128-cbc")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("aes128-cbc") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"
+              :all cl-pnet-ssh:+ssh-all-ciphers+)))
+  (is (equal (append cl-pnet-ssh:+ssh-ciphers+ '("aes128-cbc"))
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("+aes128-cbc") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"
+              :all cl-pnet-ssh:+ssh-all-ciphers+)))
   (signals cl-pnet-ssh:ssh-config-error
     (cl-pnet-ssh:ssh-resolve-algorithm-list
-     '("aes128-cbc") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"))
+     '("aes128-nope") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"
+     :all cl-pnet-ssh:+ssh-all-ciphers+))
   (signals cl-pnet-ssh:ssh-config-error
     (cl-pnet-ssh:ssh-resolve-algorithm-list
      '("-*") cl-pnet-ssh:+ssh-macs+ "MACs")))
@@ -3878,13 +4010,12 @@ path that selects the agent socket to forward."
           (cl-pnet-ssh::ssh-config-client-parameters
            "alias"
            (facade-options
-            (list :ciphers '("chacha20-poly1305@openssh.com")
+            (list :ciphers '("aes128-cbc")
                   :macs '("hmac-sha2-512")
                   :kex-algorithms '("curve25519-sha256")
                   :host-key-algorithms '("ssh-ed25519")
                   :pubkey-accepted-algorithms '("ssh-ed25519"))))))
-    (is (equal '("chacha20-poly1305@openssh.com")
-               (getf parameters :ciphers)))
+    (is (equal '("aes128-cbc") (getf parameters :ciphers)))
     (is (equal '("hmac-sha2-512") (getf parameters :macs)))
     (is (equal '("curve25519-sha256") (getf parameters :kex-algorithms)))
     (is (equal '("ssh-ed25519") (getf parameters :host-key-algorithms)))

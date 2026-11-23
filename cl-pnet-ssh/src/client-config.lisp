@@ -199,7 +199,7 @@ MAKE-SSH-CLIENT's own defaults."
         :ciphers
         (ssh-config-client-algorithms
          options #'ssh-config-options-ciphers
-         +ssh-ciphers+ "Ciphers")
+         +ssh-ciphers+ "Ciphers" :all +ssh-all-ciphers+)
         :macs
         (ssh-config-client-algorithms
          options #'ssh-config-options-macs
