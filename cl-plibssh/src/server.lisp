@@ -9,44 +9,57 @@
 ;;;; would wait returns SSH_AGAIN and the watch comes back when the socket
 ;;;; moves, exactly as on the client side.
 
-(defun ssh-plibssh-listen (address port)
-  "Bind and listen on ADDRESS:PORT, returning a non-blocking descriptor."
-  (let ((fd (cl-pnet-sockets:c-socket
-             (if (cl-pnet-sockets:ipv6-address-p address)
-                 cl-pnet-sockets:+af-inet6+
-                 cl-pnet-sockets:+af-inet+)
-             cl-pnet-sockets:+sock-stream+
-             cl-pnet-sockets:+ipproto-tcp+)))
-    (when (minusp fd)
+(defun ssh-plibssh-listen (address port &key v6only family)
+  "Bind and listen on ADDRESS:PORT, returning a non-blocking descriptor.
+
+FAMILY and V6ONLY mirror the pure backend's listener: a name is resolved
+within FAMILY, and an IPv6 wildcard with V6ONLY refuses IPv4 clients instead
+of accepting them through the dual-stack socket."
+  (multiple-value-bind (bind-address bind-family)
+      (cl-pnet-sockets:resolve-bind-address address :family family)
+    (unless bind-address
       (error 'ssh-connection-error
-             :detail (format nil "could not make a socket (~A)"
-                             (cl-pnet-sockets:c-strerror
-                              (cl-pnet-sockets:c-errno)))))
-    (flet ((fail (detail)
-             (cl-pnet-sockets:c-close fd)
-             (error 'ssh-connection-error :detail detail)))
-      ;; Best effort: a refused REUSEADDR must not stop a listener from
-      ;; binding a fresh port, only a restart from reusing a fresh one.
-      (cl-pnet-sockets:set-socket-option
-       fd cl-pnet-sockets:+sol-socket+ cl-pnet-sockets:+so-reuseaddr+ 1)
-      (multiple-value-bind (sockaddr length)
-          (cl-pnet-sockets:make-sockaddr address port)
-        (unless sockaddr
-          (fail (format nil "not an address: ~A" address)))
-        (let ((result (cl-pnet-sockets:c-bind fd sockaddr length)))
-          (cffi:foreign-free sockaddr)
-          (when (minusp result)
-            (fail (format nil "could not bind ~A:~D (~A)"
-                          address port
-                          (cl-pnet-sockets:c-strerror
-                           (cl-pnet-sockets:c-errno)))))))
-      (when (minusp (cl-pnet-sockets:c-listen fd 128))
-        (fail (format nil "could not listen on ~A:~D (~A)"
-                      address port
-                      (cl-pnet-sockets:c-strerror
-                       (cl-pnet-sockets:c-errno)))))
-      (cl-pnet-sockets:set-nonblocking fd)
-      fd)))
+             :detail (format nil "not an address: ~A" address)))
+    (let ((fd (cl-pnet-sockets:c-socket
+               (if (eq bind-family :inet6)
+                   cl-pnet-sockets:+af-inet6+
+                   cl-pnet-sockets:+af-inet+)
+               cl-pnet-sockets:+sock-stream+
+               cl-pnet-sockets:+ipproto-tcp+)))
+      (when (minusp fd)
+        (error 'ssh-connection-error
+               :detail (format nil "could not make a socket (~A)"
+                               (cl-pnet-sockets:c-strerror
+                                (cl-pnet-sockets:c-errno)))))
+      (flet ((fail (detail)
+               (cl-pnet-sockets:c-close fd)
+               (error 'ssh-connection-error :detail detail)))
+        ;; Best effort: a refused REUSEADDR must not stop a listener from
+        ;; binding a fresh port, only a restart from reusing a fresh one.
+        (cl-pnet-sockets:set-socket-option
+         fd cl-pnet-sockets:+sol-socket+ cl-pnet-sockets:+so-reuseaddr+ 1)
+        (when (and v6only (eq bind-family :inet6))
+          (cl-pnet-sockets:set-socket-option
+           fd cl-pnet-sockets:+ipproto-ipv6+
+           cl-pnet-sockets:+ipv6-v6only+ 1))
+        (multiple-value-bind (sockaddr length)
+            (cl-pnet-sockets:make-sockaddr bind-address port)
+          (unless sockaddr
+            (fail (format nil "not an address: ~A" address)))
+          (let ((result (cl-pnet-sockets:c-bind fd sockaddr length)))
+            (cffi:foreign-free sockaddr)
+            (when (minusp result)
+              (fail (format nil "could not bind ~A:~D (~A)"
+                            address port
+                            (cl-pnet-sockets:c-strerror
+                             (cl-pnet-sockets:c-errno)))))))
+        (when (minusp (cl-pnet-sockets:c-listen fd 128))
+          (fail (format nil "could not listen on ~A:~D (~A)"
+                        address port
+                        (cl-pnet-sockets:c-strerror
+                         (cl-pnet-sockets:c-errno)))))
+        (cl-pnet-sockets:set-nonblocking fd)
+        fd))))
 
 (defun ssh-plibssh-bound-port (fd)
   "The port FD is actually bound to; needed when the caller asked for zero."
@@ -1598,6 +1611,8 @@ this program's error, because a configured list is meant exactly as written."
                           (unused-connection-timeout 0)
                           channel-timeouts
                           (tcp-keep-alive t)
+                          v6only
+                          address-family
                           accept-env
                           server-version
                           version-addendum
@@ -1804,7 +1819,9 @@ list, applied by the same inactivity accounting as the pure backend."
                    :detail (format nil "libssh rejected the host key ~A: ~A"
                                    path detail))))))
     (handler-case
-        (let ((fd (ssh-plibssh-listen address port)))
+        (let ((fd (ssh-plibssh-listen address port
+                                      :v6only v6only
+                                      :family address-family)))
           (setf (ssh-server-listener server) fd
                 (ssh-server-port server) (or (ssh-plibssh-bound-port fd) port)
                 (ssh-server-watcher server)
