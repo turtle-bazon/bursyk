@@ -430,9 +430,10 @@ and refuse the key without ever asking."
       (ssh-reset-send-sequence cipher))
     (ssh-install-keys cipher
                       :encrypt (getf keys :encrypt)
+                      :encrypt-iv (getf keys :encrypt-iv)
+                      :encrypt-cipher (getf keys :encrypt-cipher)
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
-                      :encrypt-mac (getf keys :encrypt-mac)
-                      :aead (getf keys :aead))
+                      :encrypt-mac (getf keys :encrypt-mac))
     ;; NEWKEYS itself went out under the old stream; EXT_INFO below belongs
     ;; to the new one, as it does in OpenSSH.
     (ssh-install-send-compression
@@ -466,9 +467,10 @@ and refuse the key without ever asking."
       (ssh-reset-receive-sequence cipher))
     (ssh-install-keys cipher
                       :decrypt (getf keys :decrypt)
+                      :decrypt-iv (getf keys :decrypt-iv)
+                      :decrypt-cipher (getf keys :decrypt-cipher)
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
-                      :decrypt-mac (getf keys :decrypt-mac)
-                      :aead (getf keys :aead))
+                      :decrypt-mac (getf keys :decrypt-mac))
     (ssh-install-receive-compression
      cipher
      (getf (ssh-session-negotiated session) :compression-c2s)

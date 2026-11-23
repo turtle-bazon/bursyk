@@ -429,16 +429,6 @@ do.  DIGEST is the hash the key exchange negotiated."
                       (ssh-hash digest k exchange-hash material))))
     (subseq material 0 length)))
 
-(defun ssh-cipher-key-length (cipher)
-  "The key length of CIPHER, or NIL when it is not implemented."
-  (cond ((string= cipher "chacha20-poly1305@openssh.com") 64)
-        (t nil)))
-
-(defun ssh-cipher-iv-length (cipher)
-  "The IV length of CIPHER, or NIL when it is not implemented."
-  (cond ((string= cipher "chacha20-poly1305@openssh.com") 0)
-        (t nil)))
-
 (defun ssh-mac-name-keyword (mac)
   "The ironclad name for MAC, or NIL when it is not implemented."
   (cond ((string= mac "hmac-sha2-256") :sha256)
@@ -452,41 +442,45 @@ do.  DIGEST is the hash the key exchange negotiated."
 
 (defun ssh-session-keys (negotiated shared exchange-hash session-id
                          &key server string-shared (digest :sha256))
-  "All six derived keys, as a plist keyed by direction and purpose.
+  "The derived keys and IVs, as a plist keyed by direction and purpose.
 
-SERVER selects the server half: the letters swap, because C/D and E/F name
-the client-to-server and server-to-client directions, not the two ends."
+SERVER selects the server half: the letters swap, because A/B name the IVs
+and C/D the keys of the client-to-server and server-to-client directions,
+not the two ends.  The cipher names ride along so the caller can install
+the right framing for each direction."
   (let ((cipher-c2s (getf negotiated :cipher-c2s))
         (cipher-s2c (getf negotiated :cipher-s2c))
         (mac-c2s (ssh-mac-key-length (getf negotiated :mac-c2s)))
         (mac-s2c (ssh-mac-key-length (getf negotiated :mac-s2c))))
     (unless (and cipher-c2s cipher-s2c mac-c2s mac-s2c)
       (error 'ssh-protocol-error :detail "unsupported session algorithms"))
-    (list :encrypt (ssh-derive-key shared exchange-hash session-id
-                                   (if server #\D #\C)
-                                   (ssh-cipher-key-length
-                                    (if server cipher-s2c cipher-c2s))
-                                   :string-shared string-shared
-                                   :digest digest)
-          :decrypt (ssh-derive-key shared exchange-hash session-id
-                                   (if server #\C #\D)
-                                   (ssh-cipher-key-length
-                                    (if server cipher-c2s cipher-s2c))
-                                   :string-shared string-shared
-                                   :digest digest)
-          :encrypt-mac-key (ssh-derive-key shared exchange-hash session-id
-                                           (if server #\F #\E)
-                                           (if server mac-s2c mac-c2s)
-                                           :string-shared string-shared
-                                           :digest digest)
-          :decrypt-mac-key (ssh-derive-key shared exchange-hash session-id
-                                           (if server #\E #\F)
-                                           (if server mac-c2s mac-s2c)
-                                           :string-shared string-shared
-                                           :digest digest)
-          :encrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-c2s))
-          :decrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-s2c))
-          :aead t)))
+    (flet ((derive (letter length)
+             (ssh-derive-key shared exchange-hash session-id letter length
+                             :string-shared string-shared :digest digest)))
+      (list :encrypt (derive (if server #\D #\C)
+                             (ssh-cipher-key-length
+                              (if server cipher-s2c cipher-c2s)))
+            :decrypt (derive (if server #\C #\D)
+                             (ssh-cipher-key-length
+                              (if server cipher-c2s cipher-s2c)))
+            :encrypt-iv (derive (if server #\B #\A)
+                                (ssh-cipher-iv-length
+                                 (if server cipher-s2c cipher-c2s)))
+            :decrypt-iv (derive (if server #\A #\B)
+                                (ssh-cipher-iv-length
+                                 (if server cipher-c2s cipher-s2c)))
+            :encrypt-cipher (if server cipher-s2c cipher-c2s)
+            :decrypt-cipher (if server cipher-c2s cipher-s2c)
+            :encrypt-mac-key (derive (if server #\F #\E)
+                                     (if server mac-s2c mac-c2s))
+            :decrypt-mac-key (derive (if server #\E #\F)
+                                     (if server mac-c2s mac-s2c))
+            :encrypt-mac (ssh-mac-name-keyword
+                          (if server (getf negotiated :mac-s2c)
+                              (getf negotiated :mac-c2s)))
+            :decrypt-mac (ssh-mac-name-keyword
+                          (if server (getf negotiated :mac-c2s)
+                              (getf negotiated :mac-s2c)))))))
 
 ;;; ---- Host key and signature ----
 

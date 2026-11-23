@@ -1001,7 +1001,8 @@ HostKeyAlgorithms ssh-ed25519
 PubkeyAcceptedAlgorithms rsa-sha2-512,ssh-ed25519
 RequiredRSASize 2048
 PermitListen 8080 127.0.0.1:9000")))
-    (is (equal '("chacha20-poly1305@openssh.com")
+    ;; "+name" appends to the build's list; chacha is already there.
+    (is (equal cl-pnet-ssh:+ssh-ciphers+
                (cl-pnet-ssh:ssh-server-config-ciphers config)))
     ;; "-name" removes from the build's list and leaves the rest in order.
     (is (equal '("hmac-sha2-512")
@@ -1034,7 +1035,7 @@ PermitListen 8080 127.0.0.1:9000")))
 PubkeyAcceptedKeyTypes rsa-sha2-512")))
   ;; An algorithm this build cannot offer is an error, not a quiet drop.
   (signals cl-pnet-ssh:ssh-server-config-error
-    (config-from-text "Ciphers aes128-ctr"))
+    (config-from-text "Ciphers aes128-cbc"))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "KexAlgorithms no-such-kex"))
   (signals cl-pnet-ssh:ssh-server-config-error

@@ -826,9 +826,11 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
     (cond
       ((member name '("cipher" "ciphers") :test #'string=)
        cl-pnet-ssh:+ssh-ciphers+)
-      ;; Every cipher this build offers is an AEAD, so the authenticated list
-      ;; is the whole list.
-      ((string= name "cipher-auth") cl-pnet-ssh:+ssh-ciphers+)
+      ;; -Q cipher-auth names only the ciphers that authenticate their own
+      ;; packets; the CTR modes rely on the negotiated MAC instead.
+      ((string= name "cipher-auth")
+       (remove-if-not #'cl-pnet-ssh::ssh-cipher-aead-p
+                      cl-pnet-ssh:+ssh-ciphers+))
       ((member name '("mac" "macs") :test #'string=)
        cl-pnet-ssh:+ssh-macs+)
       ((member name '("kex" "kexalgorithms") :test #'string=)

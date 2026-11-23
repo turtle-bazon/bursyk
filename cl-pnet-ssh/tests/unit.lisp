@@ -185,6 +185,144 @@
         (is (eq :incomplete payload))
         (is (zerop consumed))))))
 
+(test aes-ctr-matches-the-nist-vector
+  "The AES-CTR keystream is the standard 128-bit counter construction."
+  (let* ((key (hex-octets "2b7e151628aed2a6abf7158809cf4f3c"))
+         (iv (hex-octets "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"))
+         (ecb (ironclad-unsafe:make-cipher :aes :key key :mode :ecb))
+         (plain (hex-octets "6bc1bee22e409f96e93d7e117393172a"))
+         (expected (hex-octets "874d6191b620e3261bef6864990db6ce")))
+    (is (equalp expected (cl-pnet-ssh::ssh-aes-ctr-xor ecb iv 0 plain)))))
+
+(defun install-test-cipher (state cipher key iv direction)
+  (let ((mac-key (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 7)))
+    (ecase direction
+      (:send (ssh-install-keys state :encrypt key :encrypt-iv iv
+                               :encrypt-cipher cipher
+                               :encrypt-mac-key mac-key :encrypt-mac :sha256))
+      (:receive (ssh-install-keys state :decrypt key :decrypt-iv iv
+                                  :decrypt-cipher cipher
+                                  :decrypt-mac-key mac-key
+                                  :decrypt-mac :sha256)))))
+
+(test ctr-counter-carries-across-octets
+  "AES-CTR's counter is a 128-bit integer, not a byte-wise stream."
+  (let ((iv (make-array 16 :element-type '(unsigned-byte 8)
+                           :initial-element 0)))
+    (setf (aref iv 15) #xff
+          (aref iv 14) #xff)
+    (let ((block (cl-pnet-ssh::ssh-counter-block iv 1)))
+      (is (zerop (aref block 15)))
+      (is (zerop (aref block 14)))
+      (is (= 1 (aref block 13))))))
+
+(test ctr-stream-carries-the-counter-between-packets
+  "A counter that wraps 0xff carries into the next octet mid-stream."
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (make-array 16 :element-type '(unsigned-byte 8)
+                            :initial-element 0))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state)))
+    ;; The first packet is 20 octets, so the second starts at block 1 and
+    ;; forces IV+1 to carry out of the last octet.
+    (setf (aref iv 15) #xff)
+    (install-test-cipher send cipher key iv :send)
+    (install-test-cipher receive cipher key iv :receive)
+    (dotimes (index 3)
+      (let ((payload (concatenated (hex-octets "5e")
+                                   (ssh-random-octets (+ 3 index)))))
+        (multiple-value-bind (decoded consumed)
+            (ssh-decode-packet (ssh-encode-packet payload send) receive)
+          (is (equalp payload decoded))
+          (is (plusp consumed)))))))
+
+(test ctr-packet-round-trip
+  "AES-CTR frames and decrypts several packets on one continuous stream."
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state)))
+    (install-test-cipher send cipher key iv :send)
+    (install-test-cipher receive cipher key iv :receive)
+    (dotimes (index 4)
+      (let ((payload (concatenated (hex-octets "5e")
+                                   (ssh-random-octets (+ 7 index)))))
+        (let ((wire (ssh-encode-packet payload send)))
+          (is (not (equalp payload wire)))
+          (multiple-value-bind (decoded consumed)
+              (ssh-decode-packet wire receive)
+            (is (equalp payload decoded))
+            (is (= (length wire) consumed))))))))
+
+(test aes192-and-aes256-ctr-round-trip
+  "The 24- and 32-octet AES keys work through the same framing."
+  (dolist (cipher '("aes192-ctr" "aes256-ctr"))
+    (let* ((key (ssh-random-octets (cl-pnet-ssh::ssh-cipher-key-length cipher)))
+           (iv (ssh-random-octets 16))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state))
+           (payload (concatenated (hex-octets "5e")
+                                  (ssh-random-octets 200))))
+      (install-test-cipher send cipher key iv :send)
+      (install-test-cipher receive cipher key iv :receive)
+      (multiple-value-bind (decoded consumed)
+          (ssh-decode-packet (ssh-encode-packet payload send) receive)
+        (is (equalp payload decoded))
+        (is (plusp consumed))))))
+
+(test ctr-packet-detects-tampering
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state))
+         (wire (progn
+                 (install-test-cipher send cipher key iv :send)
+                 (ssh-encode-packet (concatenated (hex-octets "15")
+                                                  (ssh-random-octets 40))
+                                    send))))
+    (install-test-cipher receive cipher key iv :receive)
+    (setf (aref wire 10) (logxor 1 (aref wire 10)))
+    (signals ssh-protocol-error (ssh-decode-packet wire receive))))
+
+(test gcm-packet-round-trip
+  "AES-GCM authenticates the length field and encrypts the body."
+  (dolist (cipher '("aes128-gcm@openssh.com" "aes256-gcm@openssh.com"))
+    (let* ((key (ssh-random-octets (cl-pnet-ssh::ssh-cipher-key-length cipher)))
+           (iv (ssh-random-octets 12))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state)))
+      (install-test-cipher send cipher key iv :send)
+      (install-test-cipher receive cipher key iv :receive)
+      (dotimes (index 3)
+        (let ((payload (concatenated (hex-octets "5e")
+                                     (ssh-random-octets (+ 9 index)))))
+          (let ((wire (ssh-encode-packet payload send)))
+            (is (not (equalp payload wire)))
+            (multiple-value-bind (decoded consumed)
+                (ssh-decode-packet wire receive)
+              (is (equalp payload decoded))
+              (is (= (length wire) consumed)))))))))
+
+(test gcm-packet-detects-tampering
+  (let* ((cipher "aes128-gcm@openssh.com")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 12))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state))
+         (wire (progn
+                 (install-test-cipher send cipher key iv :send)
+                 (ssh-encode-packet (concatenated (hex-octets "15")
+                                                  (ssh-random-octets 40))
+                                    send))))
+    (install-test-cipher receive cipher key iv :receive)
+    (setf (aref wire (1- (length wire)))
+          (logxor 1 (aref wire (1- (length wire)))))
+    (signals ssh-protocol-error (ssh-decode-packet wire receive))))
+
 (test aead-padding-aligns-the-encrypted-length
   (let* ((key (ssh-random-octets 64))
          (send (ssh-make-cipher-state))
@@ -3439,7 +3577,7 @@ path that selects the agent socket to forward."
               cl-pnet-ssh:+ssh-kex-real-algorithms+ "KexAlgorithms")))
   (signals cl-pnet-ssh:ssh-config-error
     (cl-pnet-ssh:ssh-resolve-algorithm-list
-     '("aes128-ctr") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"))
+     '("aes128-cbc") cl-pnet-ssh:+ssh-ciphers+ "Ciphers"))
   (signals cl-pnet-ssh:ssh-config-error
     (cl-pnet-ssh:ssh-resolve-algorithm-list
      '("-*") cl-pnet-ssh:+ssh-macs+ "MACs")))

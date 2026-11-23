@@ -162,7 +162,17 @@ This is sshd's all-signatures set minus the security-key names: ssh-rsa is
 verifiable here, so an administrator may opt back into it, but it is not a
 default.")
 
-(defparameter +ssh-ciphers+ '("chacha20-poly1305@openssh.com"))
+(defparameter +ssh-ciphers+
+  '("chacha20-poly1305@openssh.com"
+    "aes128-gcm@openssh.com"
+    "aes256-gcm@openssh.com"
+    "aes128-ctr"
+    "aes192-ctr"
+    "aes256-ctr")
+  "The ciphers this build implements, in OpenSSH's default order.
+
+The CBC modes OpenSSH still lists for old peers are not here: this build
+offers only the CTR and AEAD constructions it implements.")
 
 ;; chacha20-poly1305@openssh.com is an AEAD and ignores the MAC, but RFC 4253
 ;; still negotiates one of these, and OpenSSH expects a common choice.
