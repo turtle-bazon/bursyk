@@ -603,29 +603,16 @@ uses whichever of the two it saw first instead of chaining them."
            :proxy-use-fdpass (getf parameters :proxy-use-fdpass)
            :bind-address (getf parameters :bind-address)
            :bind-interface (getf parameters :bind-interface)
-           ;; AddressFamily needs a resolver that can ask for one family.
-           ;; libssh resolves the name itself and has no such option, so the
-           ;; pure backend takes it and the libssh build refuses it instead
-           ;; of silently dialling the other family.
-           #-ssh-backend-ffi
+           ;; Both transports receive the whole option surface.  A feature a
+           ;; transport cannot honour is refused by that transport with
+           ;; SSH-UNSUPPORTED-FEATURE, never omitted here.
            :address-family (getf parameters :address-family)
-           ;; Agent forwarding is a pure-backend feature; the libssh client
-           ;; has no channel interface for a local agent socket, so asking
-           ;; for it there would silently do nothing.
-           #-ssh-backend-ffi
            :forward-agent (getf parameters :forward-agent)
-           #-ssh-backend-ffi
            :forward-agent-sock-path
            (getf parameters :forward-agent-sock-path)
-           ;; X11 forwarding is a pure-backend feature too: the libssh client
-           ;; has no x11 channel interface.
-           #-ssh-backend-ffi
            :forward-x11 (getf parameters :forward-x11)
-           #-ssh-backend-ffi
            :forward-x11-trusted (getf parameters :forward-x11-trusted)
-           #-ssh-backend-ffi
            :forward-x11-timeout (getf parameters :forward-x11-timeout)
-           #-ssh-backend-ffi
            :xauth-location (getf parameters :xauth-location)
            :on-open on-open
            :on-error on-error

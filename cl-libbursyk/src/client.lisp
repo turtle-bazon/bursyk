@@ -881,14 +881,21 @@ role-neutral."
   (ssh-client-finish client :client-closed :close)
   client)
 
-(defun ssh-client-host-key-randomart (client)
-  "The randomart picture of CLIENT's host key, once KEX has seen it."
-  (let ((blob (ssh-client-host-key-blob client)))
-    (and blob (ssh-key-randomart
-               blob (ssh-client-fingerprint-hash client)))))
-
 (defun ssh-client-host-key-fingerprint (client)
   "The fingerprint of the key the server presented, once the KEX has seen it."
   (let ((blob (ssh-client-host-key-blob client)))
     (and blob (ssh-key-fingerprint
                blob (ssh-client-fingerprint-hash client)))))
+
+(defun ssh-client-feature-supported-p (feature)
+  "Whether the pure transport can honour FEATURE.
+
+Applications ask this through CL-PNET-SSH instead of testing which backend
+was built, so the same client code runs unchanged against either transport."
+  (not (null (member feature '(:remote-forward :streamlocal-forward
+                               :x11-forward :hostbased-authentication
+                               :version-addendum :agent-forward)))))
+
+(defun ssh-client-supported-authentication-methods ()
+  "The client authentication method names the pure transport implements."
+  '("publickey" "hostbased" "keyboard-interactive" "password"))

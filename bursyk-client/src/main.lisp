@@ -6,10 +6,9 @@
 ;;;;
 ;;;; The option surface follows ssh(1): the same short flags, clustered where
 ;;;; they are flags and with an attached value where they take one.  Features
-;;;; this client cannot honour (agent forwarding and address-family
-;;;; selection in the libssh build, compression, remote forwarding, control
-;;;; sockets, TUN devices) are refused with a diagnostic instead of being
-;;;; silently ignored.
+;;;; the selected transport cannot honour (X11 forwarding, remote forwarding,
+;;;; compression, PKCS#11, GSSAPI, TUN devices) are refused with a diagnostic
+;;;; instead of being silently ignored.
 
 ;;; ---- Command line ----
 
@@ -411,17 +410,18 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
   (when (getf *options* :gssapi-auth)
     (unsupported "-K" "GSSAPI authentication is not implemented"))
-  #+ssh-backend-ffi
-  (when (eq (getf *options* :x11-forward) :yes)
-    (unsupported "-X" "X11 forwarding needs the pure SSH backend"))
-  #+ssh-backend-ffi
-  (when (eq (getf *options* :x11-forward) :trust)
-    (unsupported "-Y" "X11 forwarding needs the pure SSH backend"))
-  #+ssh-backend-ffi
-  (when (getf *options* :forward-agent)
-    (unsupported "-A" "agent forwarding needs the pure SSH backend"))
+  (when (and (eq (getf *options* :x11-forward) :yes)
+             (not (cl-pnet-ssh:ssh-client-feature-supported-p :x11-forward)))
+    (unsupported "-X" "X11 forwarding is not implemented by this transport"))
+  (when (and (eq (getf *options* :x11-forward) :trust)
+             (not (cl-pnet-ssh:ssh-client-feature-supported-p :x11-forward)))
+    (unsupported "-Y" "X11 forwarding is not implemented by this transport"))
   (when (getf *options* :compression)
     (unsupported "-C" "only uncompressed streams are implemented"))
+  (when (and (getf *options* :remote-forward)
+             (not (cl-pnet-ssh:ssh-client-feature-supported-p
+                   :remote-forward)))
+    (unsupported "-R" "remote forwarding is not implemented by this transport"))
   (when (getf *options* :ciphers)
     (check-algorithm-list "-c" (getf *options* :ciphers)
                           cl-pnet-ssh:+ssh-ciphers+))
@@ -434,14 +434,7 @@ a name this build lacks is an error instead of a silently widened offer."
   (when (getf *options* :address-family)
     (let ((family (getf *options* :address-family)))
       (unless (member family '("inet" "inet6" "any") :test #'string-equal)
-        (fail "invalid address family ~A" family))
-      ;; The pure backend asks the resolver for one family.  libssh has no
-      ;; such option and resolves the name itself, so a family it cannot
-      ;; enforce is refused rather than quietly ignored.
-      #+ssh-backend-ffi
-      (unless (string-equal family "any")
-        (unsupported "AddressFamily"
-                     "the libssh backend chooses the address family itself"))))
+        (fail "invalid address family ~A" family))))
   (when (and (getf *options* :stdio-forward)
              (getf *options* :subsystem))
     (fail "-W and -s cannot be combined"))
@@ -461,25 +454,29 @@ a name this build lacks is an error instead of a silently widened offer."
 (defun check-config-supported (client)
   "Fail when CLIENT's resolved config asks for a feature this build lacks.
 
-The command line is checked before connecting, but Compression and, in the
-libssh build, agent forwarding, X11 forwarding and AddressFamily can arrive
-from ~/.ssh/config too.
-Dropping them silently would leave the user believing they are on, so they
-are refused with the same message the matching flag gets.  An explicit -x
-still disables X11 and therefore silences the refusal."
+The command line is checked before connecting, but Compression and a
+transport limitation on X11 or remote forwarding can arrive from
+~/.ssh/config too.  Dropping them silently would leave the user believing
+they are on, so they are refused with the same message the matching flag
+gets.  An explicit -x still disables X11 and therefore silences the
+refusal."
   (let ((options (and client (cl-pnet-ssh:ssh-client-config-options client))))
     (when options
-      #+ssh-backend-ffi
-      (when (cl-pnet-ssh:ssh-config-options-forward-agent options)
-        (unsupported "ForwardAgent" "agent forwarding needs the pure SSH backend"))
       (when (cl-pnet-ssh:ssh-config-options-compression options)
         (unsupported "Compression" "only uncompressed streams are implemented"))
-      #+ssh-backend-ffi
+      (when (and (cl-pnet-ssh:ssh-config-options-remote-forwards options)
+                 (not (cl-pnet-ssh:ssh-client-feature-supported-p
+                       :remote-forward)))
+        (unsupported "RemoteForward"
+                     "remote forwarding is not implemented by this transport"))
       (when (and (or (cl-pnet-ssh:ssh-config-options-forward-x11 options)
                      (cl-pnet-ssh:ssh-config-options-forward-x11-trusted
                       options))
-                 (not (eq (getf *options* :x11-forward) :no)))
-        (unsupported "ForwardX11" "X11 forwarding needs the pure SSH backend"))
+                 (not (eq (getf *options* :x11-forward) :no))
+                 (not (cl-pnet-ssh:ssh-client-feature-supported-p
+                       :x11-forward)))
+        (unsupported "ForwardX11"
+                     "X11 forwarding is not implemented by this transport"))
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
@@ -497,45 +494,22 @@ still disables X11 and therefore silences the refusal."
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
           (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
-      ;; The pure backend also implements password and keyboard-interactive,
-      ;; so PubkeyAuthentication no and a PreferredAuthentications list
-      ;; without publickey are real requests there.  libssh still offers
-      ;; publickey alone.
-      #+ssh-backend-ffi
-      (when (eq (cl-pnet-ssh:ssh-config-options-pubkey-authentication options)
-                :no)
-        (unsupported "PubkeyAuthentication no"
-                     "public-key authentication is the only method implemented"))
-      #+ssh-backend-ffi
+      ;; A PreferredAuthentications list that leaves none of the methods the
+      ;; transport implements is a real request this build cannot satisfy,
+      ;; so it is refused rather than silently widened.
       (let ((methods
               (cl-pnet-ssh:ssh-config-options-preferred-authentications
-               options)))
-        (when (and methods
-                   (not (member "publickey" methods :test #'string-equal)))
-          (unsupported
-           "PreferredAuthentications"
-           (format nil "~{~A~^,~} excludes publickey, the only method implemented"
-                   methods))))
-      #-ssh-backend-ffi
-      (let ((methods
-              (cl-pnet-ssh:ssh-config-options-preferred-authentications
-               options)))
+               options))
+            (supported
+              (cl-pnet-ssh:ssh-client-supported-authentication-methods)))
         (when (and methods
                    (notany (lambda (method)
-                             (member method
-                                     '("publickey" "hostbased"
-                                       "keyboard-interactive" "password")
-                                     :test #'string-equal))
+                             (member method supported :test #'string-equal))
                            methods))
           (unsupported
            "PreferredAuthentications"
            (format nil "~{~A~^,~} names no authentication method implemented"
-                   methods))))
-      #+ssh-backend-ffi
-      (when (member (cl-pnet-ssh:ssh-config-options-address-family options)
-                    '(:inet :inet6))
-        (unsupported "AddressFamily"
-                     "the libssh backend chooses the address family itself")))))
+                   methods)))))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -3238,11 +3212,7 @@ of calling back in the middle of authentication."
    :on-config-error (lambda (condition) (fail "~A" condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-forwarded-streamlocal #'forwarded-streamlocal-target
-   ;; The libssh backend has no password or keyboard-interactive binding yet,
-   ;; so it gets no callbacks and keeps failing early when no key is usable.
-   #-ssh-backend-ffi
    :password-callback #'password-authentication-prompt
-   #-ssh-backend-ffi
    :kbd-interactive-callback
    #'keyboard-interactive-authentication-prompt
    :on-open

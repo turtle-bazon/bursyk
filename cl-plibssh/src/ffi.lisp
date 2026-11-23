@@ -95,6 +95,8 @@
 (defconstant +ssh-options-strict-host-key-check+ 21)
 (defconstant +ssh-options-publickey-accepted-types+ 37)
 (defconstant +ssh-options-process-config+ 38)
+(defconstant +ssh-options-rekey-data+ 39)
+(defconstant +ssh-options-rekey-time+ 40)
 (defconstant +ssh-options-identity-agent+ 42)
 
 ;;; enum ssh_bind_options_e
@@ -256,6 +258,11 @@
   (session ssh-session) (callbacks :pointer))
 (cffi:defcfun ("ssh_set_channel_callbacks" ssh-set-channel-callbacks) :int
   (channel ssh-channel) (callbacks :pointer))
+(cffi:defcfun ("ssh_channel_open_forward_unix" ssh-channel-open-forward-unix)
+    :int
+  (channel :pointer) (remote-path :string) (source-host :string)
+  (local-port :int))
+
 (cffi:defcfun ("ssh_channel_open_forward" ssh-channel-open-forward) :int
   (channel ssh-channel) (remotehost :string) (remoteport :int)
   (sourcehost :string) (localport :int))

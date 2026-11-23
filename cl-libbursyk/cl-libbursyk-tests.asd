@@ -4,8 +4,8 @@
   :license "GPL-3.0-or-later"
   ;; These tests drive wire messages and transport state directly.  They are
   ;; not facade behaviour, so they live with the pure backend rather than in
-  ;; the backend-agnostic CL-PNET-SSH-TESTS suite.  Only the pure build can
-  ;; load them: the functions they call do not exist under :ssh-backend-ffi.
+  ;; the backend-agnostic CL-PNET-SSH-TESTS suite.  Only the pure transport's
+  ;; own test system loads them.
   ;;
   ;; The shared fixtures (key generation, temporary directories, DNS and
   ;; certificate helpers) stay in CL-PNET-SSH-TESTS, which is why this system

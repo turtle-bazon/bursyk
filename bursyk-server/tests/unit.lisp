@@ -1394,7 +1394,6 @@ LC_ALL=C~%"))
              (is (null (assoc "BROKEN" environment :test #'string=)))))
       (ignore-errors (delete-file path)))))
 
-#-ssh-backend-ffi
 (test session-environment-follows-sshd-precedence
   "SetEnv beats ~/.ssh/environment, which beats the key options and client."
   (let* ((server (cl-pnet-ssh::%make-ssh-server

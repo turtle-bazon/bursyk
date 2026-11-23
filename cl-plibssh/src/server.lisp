@@ -1593,9 +1593,12 @@ this program's error, because a configured list is meant exactly as written."
                           on-channel
                           on-direct-tcpip
                           on-direct-streamlocal
+                          on-tcpip-forward
+                          on-cancel-tcpip-forward
                           on-streamlocal-forward
                           on-cancel-streamlocal-forward
                           on-agent-forward
+                          x11-authority-file
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -1619,6 +1622,8 @@ MAX-STARTUPS, PER-SOURCE-MAX-STARTUPS, PER-SOURCE-NET-BLOCK-SIZE,
 UNUSED-CONNECTION-TIMEOUT and TCP-KEEP-ALIVE are the pure backend's, with
 the same meanings and defaults.  CHANNEL-TIMEOUTS is sshd's ChannelTimeout
 list, applied by the same inactivity accounting as the pure backend."
+  (declare (ignore on-tcpip-forward on-cancel-tcpip-forward
+                   x11-authority-file))
   (when host-certificate
     (error 'ssh-connection-error
            :detail "the libssh backend cannot present host certificates"))
@@ -1823,3 +1828,25 @@ list, applied by the same inactivity accounting as the pure backend."
           (ssh-session-finish session :server-closed :close)))
       (when bind (ssh-bind-free bind))))
   server)
+
+(defun ssh-server-feature-supported-p (feature)
+  "Whether the libssh server transport can honour FEATURE.
+
+Agent forwarding is implemented; remote forwarding and X11 forwarding are
+not, and the server application learns that through the facade."
+  (not (null (member feature '(:agent-forward)))))
+
+(defun ssh-server-open-forwarded-tcpip (session bind-address bind-port
+                                       &rest arguments)
+  "Refuse to open a forwarded-tcpip channel; libssh cannot carry one."
+  (declare (ignore session bind-address bind-port arguments))
+  (error 'ssh-unsupported-feature
+         :feature "forwarded-tcpip"
+         :detail "the libssh transport cannot open forwarded channels"))
+
+(defun ssh-server-open-forwarded-streamlocal (session path &rest arguments)
+  "Refuse to open a forwarded-streamlocal channel; libssh cannot carry one."
+  (declare (ignore session path arguments))
+  (error 'ssh-unsupported-feature
+         :feature "forwarded-streamlocal@openssh.com"
+         :detail "the libssh transport cannot open forwarded channels"))

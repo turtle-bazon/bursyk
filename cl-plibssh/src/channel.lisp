@@ -193,6 +193,38 @@ request is queued for the moment the peer confirms the channel."
                             :on-data on-data :on-eof on-eof
                             :on-close on-close :on-error on-error))
 
+(defun ssh-open-direct-streamlocal (client path
+                                    &key on-data on-open on-eof on-close
+                                      on-error)
+  "Ask the peer to connect to the Unix socket PATH and carry its bytes."
+  (ssh-plibssh-open-channel client "direct-streamlocal@openssh.com"
+                            :target-host path
+                            :on-data on-data :on-open on-open :on-eof on-eof
+                            :on-close on-close :on-error on-error))
+
+(defun ssh-client-send-global-request (client name &key fields on-success
+                                                     on-failure)
+  "Refuse a global request; libssh exposes no asynchronous entry point.
+
+Remote forwarding is the only caller, and SSH-CLIENT-FEATURE-SUPPORTED-P
+reports it as unavailable, so this is a guard rather than a path a working
+client takes."
+  (declare (ignore client fields on-success on-failure))
+  (error 'ssh-unsupported-feature
+         :feature name
+         :detail "global requests are not available in the libssh transport"))
+
+(defun ssh-client-connect-forward-target (channel host port)
+  "Refuse a server-initiated forwarded connection.
+
+libssh has no forwarded-tcpip channel-open callback, so the libssh server
+cannot ask this client to dial a target either."
+  (declare (ignore host port))
+  (error 'ssh-unsupported-feature
+         :feature "forwarded-tcpip"
+         :detail (format nil "the libssh transport cannot bridge a forwarded ~
+                              channel (~A)" channel)))
+
 ;;; ---- Requests ----
 
 (defun ssh-plibssh-issue-request (channel request)
@@ -350,6 +382,20 @@ its own request call takes and queued like SSH-CHANNEL-EXEC."
     (t
      (ssh-channel-queue-request channel (list :exec command))
      (ssh-plibssh-drive-channel channel)))
+  channel)
+
+(defun ssh-channel-subsystem (channel subsystem)
+  "Run SUBSYSTEM on CHANNEL's session, or queue it until the channel opens."
+  (case (ssh-channel-state channel)
+    (:closed (error 'ssh-channel-error
+                    :channel channel :detail "channel is closed"))
+    (:closing nil)
+    (t
+     (ssh-channel-queue-request channel (list :subsystem subsystem))
+     (ssh-plibssh-drive-channel channel)))
+  (unless (eq (ssh-channel-state channel) :closed)
+    (ssh-channel-set-x-type
+     channel (concatenate 'string "session:subsystem:" subsystem)))
   channel)
 
 ;;; ---- Writing ----
@@ -521,14 +567,23 @@ exit without one."
 (defun ssh-plibssh-open-channel-now (channel)
   "Send CHANNEL's open request; true once libssh reports it open."
   (let* ((client (ssh-channel-client channel))
-         (rc (if (string= (ssh-channel-type channel) "session")
-                 (ssh-channel-open-session (ssh-channel-handle channel))
-                 (ssh-channel-open-forward
-                  (ssh-channel-handle channel)
-                  (ssh-channel-target-host channel)
-                  (ssh-channel-target-port channel)
-                  (ssh-channel-origin-address channel)
-                  (ssh-channel-origin-port channel)))))
+         (rc (cond
+               ((string= (ssh-channel-type channel) "session")
+                (ssh-channel-open-session (ssh-channel-handle channel)))
+               ((string= (ssh-channel-type channel)
+                         "direct-streamlocal@openssh.com")
+                (ssh-channel-open-forward-unix
+                 (ssh-channel-handle channel)
+                 (ssh-channel-target-host channel)
+                 (ssh-channel-origin-address channel)
+                 (ssh-channel-origin-port channel)))
+               (t
+                (ssh-channel-open-forward
+                 (ssh-channel-handle channel)
+                 (ssh-channel-target-host channel)
+                 (ssh-channel-target-port channel)
+                 (ssh-channel-origin-address channel)
+                 (ssh-channel-origin-port channel))))))
     (cond
       ((zerop rc)
        (setf (ssh-channel-state channel) :open)

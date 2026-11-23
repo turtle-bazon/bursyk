@@ -98,6 +98,10 @@ beside the readable one on every backend."
   connect-timeout
   server-alive-interval
   (server-alive-count-max 3)
+  ;; RekeyLimit: the byte volume that forces a rekey (0 keeps libssh's
+  ;; default) and the interval in seconds (0 disables time-based rekeying).
+  (rekey-limit 0)
+  (rekey-interval 0)
   connect-timer
   alive-timer
   (alive-misses 0)
@@ -537,6 +541,21 @@ FUNCTION receives (BUFFER COUNT) and must return libssh's byte count."
   "ssh_options_set SESSION CODE to the integer VALUE."
   (cffi:with-foreign-object (pointer :uint)
     (setf (cffi:mem-ref pointer :uint) value)
+    (ssh-options-set session code pointer)))
+
+(defun ssh-plibssh-set-u64-option (session code value)
+  "ssh_options_set SESSION CODE to the unsigned 64-bit VALUE.
+
+RekeyLimit's byte volume is a uint64_t, so the 32-bit helper would truncate
+anything above 4 GiB."
+  (cffi:with-foreign-object (pointer :uint64)
+    (setf (cffi:mem-ref pointer :uint64) value)
+    (ssh-options-set session code pointer)))
+
+(defun ssh-plibssh-set-u32-option (session code value)
+  "ssh_options_set SESSION CODE to the unsigned 32-bit VALUE."
+  (cffi:with-foreign-object (pointer :uint32)
+    (setf (cffi:mem-ref pointer :uint32) value)
     (ssh-options-set session code pointer)))
 
 (defun ssh-plibssh-bind-string-option (bind code value)

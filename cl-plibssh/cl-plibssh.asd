@@ -4,7 +4,7 @@
   :license "GPL-3.0-or-later"
   :version "0.0.1.77"
   :depends-on (#:cffi
-               #:cl-libbursyk
+               #:cl-ssh-core
                #:cl-pnet
                #:cl-pnet-sockets
                #:burzay

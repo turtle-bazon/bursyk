@@ -1006,23 +1006,18 @@ refuses to pair a certificate with a different key."
 
 ;; Both backends accept a list of known-hosts files, as ssh_config's
 ;; UserKnownHostsFile and GlobalKnownHostsFile produce, and a key found in
-;; either one is trusted.
+;; either one is trusted.  The policy functions are shared, so these helpers
+;; need no backend choice.
 (defun client-known-host-status-for (client blob)
-  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-known-host-status client blob)
-  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-known-host-status client blob))
+  (cl-pnet-ssh::ssh-client-known-host-status client blob))
 
 (defun client-remember-host-key-for (client blob)
-  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-remember-host-key client blob)
-  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-remember-host-key client blob))
+  (cl-pnet-ssh::ssh-client-remember-host-key client blob))
 
 (defun client-host-spec-for (client)
-  #+ssh-backend-ffi (cl-pnet-ssh::ssh-plibssh-host-spec client)
-  #-ssh-backend-ffi (cl-pnet-ssh::ssh-client-host-spec client))
+  (cl-pnet-ssh::ssh-client-host-spec client))
 
 (defun client-accept-unknown-host-key-for (client blob fingerprint)
-  #+ssh-backend-ffi
-  (cl-pnet-ssh::ssh-plibssh-accept-unknown-host-key client blob fingerprint)
-  #-ssh-backend-ffi
   (cl-pnet-ssh::ssh-client-accept-unknown-host-key client blob fingerprint))
 
 (test client-known-hosts-uses-the-host-name-for-an-alias
@@ -1371,8 +1366,8 @@ key on the line."
     (write-string (ssh-octets-string data)
                   (ecase kind (:stdout stdout) (:stderr stderr)))))
 
-(defun ssh-test-loopback-start (client stdout stderr state)
-  "Open one session, run the test command, and record its exit in STATE.
+(defun ssh-test-loopback-start (client stdout stderr state &key command)
+  "Open one session, run COMMAND, and record its exit in STATE.
 
 STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
   (let ((channel
@@ -1390,7 +1385,9 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                        (declare (ignore channel))
                        (setf (second state) condition)
                        (cl-pnet:event-loop-stop)))))
-    (ssh-channel-exec channel "printf hello; printf oops >&2; exit 3")))
+    (ssh-channel-exec channel
+                      (or command
+                          "printf hello; printf oops >&2; exit 3"))))
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
                               &key (host "127.0.0.1")
@@ -1402,7 +1399,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 host-key-alias batch-mode version-addendum
                                 verify-host-key-dns host-key-dns-resolver
                                 bind-address bind-interface
-                                rekey-limit rekey-interval
+                                rekey-limit rekey-interval command
                                 password kbd-interactive
                                 password-authentication
                                 kbd-interactive-authentication
@@ -1467,7 +1464,8 @@ added on first use."
             :connect-timeout 10
             :server-alive-interval 1
             :on-open (lambda (client)
-                       (ssh-test-loopback-start client stdout stderr state))
+                       (ssh-test-loopback-start client stdout stderr state
+                                                 :command command))
             :on-error (lambda (client condition)
                         (declare (ignore client))
                         (setf (second state) condition)
@@ -1494,7 +1492,8 @@ added on first use."
 
 (defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
                                       bind-address bind-interface
-                                      sshd-options rekey-limit rekey-interval)
+                                      sshd-options rekey-limit rekey-interval
+                                      command)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
@@ -1539,7 +1538,8 @@ Returns (VALUES STDOUT STDERR STATUS)."
                           :bind-address bind-address
                           :bind-interface bind-interface
                           :rekey-limit rekey-limit
-                          :rekey-interval rekey-interval)))
+                          :rekey-interval rekey-interval
+                          :command command)))
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
                      status)))

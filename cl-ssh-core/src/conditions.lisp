@@ -17,6 +17,13 @@
              (format stream "SSH connection error~@[: ~A~]"
                      (ssh-error-detail condition)))))
 
+(define-condition ssh-unsupported-feature (ssh-connection-error)
+  ((feature :initarg :feature :reader ssh-unsupported-feature-name))
+  (:report (lambda (condition stream)
+             (format stream "~A is not supported by this transport~@[: ~A~]"
+                     (ssh-unsupported-feature-name condition)
+                     (ssh-error-detail condition)))))
+
 (define-condition ssh-authentication-error (ssh-error) ()
   (:report (lambda (condition stream)
              (format stream "SSH authentication failed~@[: ~A~]"

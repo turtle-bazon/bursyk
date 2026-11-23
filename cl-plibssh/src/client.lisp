@@ -18,42 +18,13 @@
   (when (and fd (not (minusp fd)))
     (cl-pnet-sockets:c-close fd)))
 
-(defun ssh-plibssh-host-spec (client)
-  "The host as known_hosts spells it: bracketed on a non-default port.
+(defun ssh-client-transport-fd (client)
+  "The descriptor carrying CLIENT's stream, or NIL.
 
-HOST-KEY-HOST names the HostName a config alias resolved to, so a
-\"Host gh / HostName github.com\" connection is checked against github.com
-as OpenSSH does, not against the alias."
-  (let ((host (or (ssh-client-host-key-host client) (ssh-client-host client))))
-    (if (= (ssh-client-port client) 22)
-        host
-        (format nil "[~A]:~D" host (ssh-client-port client)))))
-
-(defun ssh-plibssh-known-hosts-files (client)
-  "The known-hosts files CLIENT checks, in order."
-  (let ((source (ssh-client-known-hosts client)))
-    (cond
-      ((null source)
-       (list (merge-pathnames ".ssh/known_hosts" (user-homedir-pathname))))
-      ((listp source) source)
-      (t (list source)))))
-
-(defun ssh-plibssh-remember-host-key (client key-blob)
-  "Record KEY-BLOB in the first known-hosts file, trust-on-first-use."
-  (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
-    (declare (ignore data))
-    (ssh-remember-known-host (first (ssh-plibssh-known-hosts-files client))
-                             (ssh-plibssh-host-spec client)
-                             type key-blob)))
-
-(defun ssh-plibssh-known-host-status (client key-blob)
-  "How KEY-BLOB stands for CLIENT's host across every known-hosts file."
-  (let ((host (ssh-plibssh-host-spec client))
-        (status :unknown))
-    (dolist (file (ssh-plibssh-known-hosts-files client) status)
-      (case (ssh-known-host-status file host key-blob)
-        (:match (return :match))
-        (:mismatch (setf status :mismatch))))))
+A ProxyCommand hands libssh a pipe and CLIENT never holds the descriptor, so
+per-socket options such as IPQoS have nothing to act on there."
+  (let ((fd (ssh-client-fd client)))
+    (and fd (not (minusp fd)) fd)))
 
 (defun ssh-plibssh-verify-host-key (client)
   "Apply CLIENT's host-key policy to the key the server presented, or signal.
@@ -73,34 +44,6 @@ NoHostAuthenticationForLocalhost decide identically on either transport."
   (let ((session (ssh-client-session client)))
     (when session
       (ssh-send-ignore session "chaff"))))
-
-(defun ssh-plibssh-accept-unknown-host-key (client blob fingerprint)
-  "Decide what to do with a host key never seen before."
-  (let ((policy (ssh-client-host-key-policy client)))
-    (cond
-      ((eq policy :insecure) nil)
-      ((eq policy :accept-new)
-       (ssh-plibssh-remember-host-key client blob))
-      ((eq policy :strict)
-       (error 'ssh-host-key-error
-              :detail "the host key is not in known_hosts"
-              :fingerprint fingerprint))
-      ;; BatchMode forbids asking, so a confirmation callback is not called;
-      ;; OpenSSH treats an unanswered confirmation as a refusal.
-      ((and (ssh-client-batch-mode client) (functionp policy))
-       (error 'ssh-host-key-error
-              :detail "the host key is not in known_hosts"
-              :fingerprint fingerprint))
-      ((functionp policy)
-       (if (funcall policy client fingerprint blob)
-           (ssh-plibssh-remember-host-key client blob)
-           (error 'ssh-host-key-error
-                  :detail (format nil "the host key for ~A was rejected"
-                                  (ssh-plibssh-host-spec client))
-                  :fingerprint fingerprint)))
-      (t (error 'ssh-host-key-error
-                :detail (format nil "unknown host key policy ~S" policy)
-                :fingerprint fingerprint)))))
 
 (defun ssh-plibssh-server-key-blob (client)
   "The host key CLIENT's server presented, as the SSH wire blob."
@@ -384,6 +327,24 @@ host is named but no descriptor is passed: libssh dials nothing itself."
         (error 'ssh-connection-error
                :detail (format nil "libssh rejected the ProxyCommand: ~A"
                                (ssh-plibssh-error session)))))
+    ;; RekeyLimit uses OpenSSH's meaning: the byte volume that forces a
+    ;; rekey, plus an optional interval.  Zero leaves libssh's own default.
+    (when (and (ssh-client-rekey-limit client)
+               (plusp (ssh-client-rekey-limit client)))
+      (when (minusp (ssh-plibssh-set-u64-option
+                     session +ssh-options-rekey-data+
+                     (ssh-client-rekey-limit client)))
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected RekeyLimit: ~A"
+                               (ssh-plibssh-error session)))))
+    (when (and (ssh-client-rekey-interval client)
+               (plusp (ssh-client-rekey-interval client)))
+      (when (minusp (ssh-plibssh-set-u32-option
+                     session +ssh-options-rekey-time+
+                     (ssh-client-rekey-interval client)))
+        (error 'ssh-connection-error
+               :detail (format nil "libssh rejected RekeyInterval: ~A"
+                               (ssh-plibssh-error session)))))
     (when fd
       (cffi:with-foreign-object (pointer :int)
         (setf (cffi:mem-ref pointer :int) fd)
@@ -414,6 +375,10 @@ host is named but no descriptor is passed: libssh dials nothing itself."
              ;; looking for even when libssh consumes the reply internally.
              (setf (ssh-client-alive-misses client) 0)
              (ssh-plibssh-client-pump client))))
+    ;; The session type is not known yet; the application raises this to the
+    ;; interactive value once it decides whether to request a pty, exactly as
+    ;; the pure backend does.
+    (ssh-client-set-ip-qos client nil)
     (ssh-plibssh-client-pump client)
     client))
 
@@ -1112,11 +1077,24 @@ a request just because a symbol is true."
 
 Silently ignoring a configured feature would make the two backends behave
 differently without saying so, which is exactly what the matrix is meant to
-prevent."
+prevent.  The condition is the facade's, so an application can turn any
+transport limitation into the same diagnostic."
   (when (ssh-plibssh-option-meaningful-p value)
-    (error 'ssh-connection-error
-           :detail (format nil "the libssh backend does not support ~A"
-                           name))))
+    (error 'ssh-unsupported-feature
+           :feature name
+           :detail "by the libssh transport")))
+
+(defun ssh-client-feature-supported-p (feature)
+  "Whether the libssh transport can honour FEATURE.
+
+Agent forwarding, password and keyboard-interactive authentication and the
+common option surface are implemented; the remaining entries are not, and
+callers learn that through the facade rather than a backend test."
+  (not (null (member feature '(:agent-forward)))))
+
+(defun ssh-client-supported-authentication-methods ()
+  "The client authentication method names the libssh transport implements."
+  '("publickey" "keyboard-interactive" "password"))
 
 (defun make-ssh-client (host
                         &key
@@ -1214,9 +1192,13 @@ the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
   (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
   (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
-  (ssh-plibssh-reject-option "RekeyLimit" rekey-limit)
-  (ssh-plibssh-reject-option "RekeyInterval" rekey-interval)
+  ;; libssh owns its banner and hashes it into the exchange hash, so a
+  ;; VersionAddendum cannot be applied by this transport.
   (ssh-plibssh-reject-option "VersionAddendum" version-addendum)
+  ;; The libssh channel API has no x11 channel interface, so ForwardX11 and
+  ;; ForwardX11Trusted are refused rather than silently left off.
+  (ssh-plibssh-reject-option "X11 forwarding"
+                             (or forward-x11 forward-x11-trusted))
   (let ((client (%make-ssh-client
                  :host host
                  :connect-host (or connect-host host)
@@ -1266,6 +1248,8 @@ stream on its pipes instead of dialling."
                  :bind-interface bind-interface
                  :warn-weak-crypto warn-weak-crypto
                  :channel-timeouts channel-timeouts
+                 :rekey-limit (or rekey-limit 0)
+                 :rekey-interval (or rekey-interval 0)
                  :ca-signature-algorithms ca-signature-algorithms
                  :revoked-host-keys revoked-host-keys
                  :hash-known-hosts hash-known-hosts

@@ -2980,52 +2980,42 @@ guess, so only an explicit PidFile is written."
            (lambda (session path)
              (declare (ignore session path))
              nil)
-           ;; The libssh backend has no forwarded-tcpip channels yet, so it
-           ;; must not be handed these hooks: its MAKE-SSH-SERVER does not
-           ;; take them, and libssh refuses a client's tcpip-forward request
-           ;; itself instead of the request being accepted and then dropped.
-           #-ssh-backend-ffi
+           ;; The hooks below are part of the facade for both transports.
+           ;; One a transport cannot honour is ignored there, and the request
+           ;; itself is refused at the protocol layer.
            :on-tcpip-forward
-           #-ssh-backend-ffi
            (lambda (session bind-address bind-port)
              (start-remote-forward session bind-address bind-port))
-           #-ssh-backend-ffi
            :on-cancel-tcpip-forward
-           #-ssh-backend-ffi
            (lambda (session bind-address bind-port)
              (cancel-remote-forward session bind-address bind-port))
-           #-(or win32 ssh-backend-ffi)
+           ;; OS, not backend, decides whether these have a local socket to
+           ;; offer.
+           #-win32
            :on-streamlocal-forward
-           #-(or win32 ssh-backend-ffi)
+           #-win32
            (lambda (session path)
              (start-streamlocal-remote-forward session path))
-           #-(or win32 ssh-backend-ffi)
+           #-win32
            :on-cancel-streamlocal-forward
-           #-(or win32 ssh-backend-ffi)
+           #-win32
            (lambda (session path)
              (cancel-streamlocal-remote-forward session path))
            ;; Agent forwarding: the library applies AllowAgentForwarding,
            ;; DisableForwarding and the key's no-agent-forwarding, then asks
            ;; this hook for the Unix socket the session's SSH_AUTH_SOCK names.
-           #-ssh-backend-ffi
-           :on-agent-forward
-           #-ssh-backend-ffi
            #-win32
            (lambda (session) (start-agent-forward session))
-           #-ssh-backend-ffi
            #+win32
            (lambda (session)
              (declare (ignore session))
              nil)
            ;; X11 forwarding: the library binds the display listener and asks
            ;; where to record the account's fake cookie.
-           #-ssh-backend-ffi
-           :x11-authority-file
-           #-ssh-backend-ffi
            #-win32
-           #'x11-authority-file
-           #-ssh-backend-ffi
+           :x11-authority-file #'x11-authority-file
            #+win32
+           :x11-authority-file
            (lambda (session)
              (declare (ignore session))
              nil)
@@ -3049,11 +3039,12 @@ guess, so only an explicit PidFile is written."
             (cl-pnet-ssh:ssh-server-address *server*)
             (cl-pnet-ssh:ssh-server-port *server*))
     ;; Say it once at startup rather than let a client's -R fail with no
-    ;; explanation from this side: the libssh backend refuses forwarded-tcpip.
-    #+ssh-backend-ffi
-    (log-at :error
-            "the libssh backend does not support remote forwarding; ~
-             a client's -R or RemoteForward will be refused")
+    ;; explanation from this side.  The transport reports what it supports;
+    ;; the server application never tests which one was built.
+    (unless (cl-pnet-ssh:ssh-server-feature-supported-p :remote-forward)
+      (log-at :error
+              "this server transport does not support remote forwarding; ~
+               a client's -R or RemoteForward will be refused"))
     (write-pid-file)
     *server*))
 

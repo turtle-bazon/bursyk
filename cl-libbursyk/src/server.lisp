@@ -373,4 +373,12 @@ listener and sets DISPLAY in the session's environment."
         (ssh-session-finish session :server-closed :close))))
   server)
 
+(defun ssh-server-feature-supported-p (feature)
+  "Whether the pure server transport can honour FEATURE.
+
+This is the server-side counterpart of SSH-CLIENT-FEATURE-SUPPORTED-P and
+keeps backend selection out of the server application."
+  (not (null (member feature '(:remote-forward :streamlocal-forward
+                               :x11-forward :agent-forward)))))
+
 

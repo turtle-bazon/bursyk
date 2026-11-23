@@ -760,6 +760,32 @@ channel and global deadlines."
   (unless (ssh-client-closed client)
     (ssh-client-refresh-channel-timeout-timer client)))
 
+;;; ---- Session controls both backends expose ----
+
+(defun ssh-client-set-ip-qos (client interactive-p)
+  "Apply CLIENT's IPQoS DSCP value for an interactive or bulk session.
+
+ssh sets the bulk value when the connection is made and raises it to the
+interactive value once it knows a pty will carry the session.  The value is
+:NO when the directive says none, and a number otherwise."
+  (let ((value (if interactive-p
+                   (ssh-client-ip-qos-interactive client)
+                   (ssh-client-ip-qos-bulk client)))
+        (fd (ssh-client-transport-fd client)))
+    (when (and fd (integerp value))
+      (cl-pnet-sockets:set-socket-option
+       fd cl-pnet-sockets:+ipproto-ip+
+       cl-pnet-sockets:+ip-tos+ value))))
+
+(defun ssh-client-host-key-randomart (client)
+  "The randomart picture of CLIENT's host key, once KEX has seen it.
+
+VisualHostKey prints this instead of the bare fingerprint.  Both transports
+keep the server's key blob, so the picture is built the same way."
+  (let ((blob (ssh-client-host-key-blob client)))
+    (and blob (ssh-key-randomart
+               blob (ssh-client-fingerprint-hash client)))))
+
 ;;; ---- Signer filtering ----
 
 (defun ssh-filter-signers (signers patterns &key minimum-rsa-size)

@@ -504,6 +504,13 @@
    #:ssh-channel-error-channel
    #:ssh-revoked-keys-error
    #:ssh-revoked-keys-error-path
+   #:ssh-unsupported-feature
+   #:ssh-unsupported-feature-name
+   ;; What the selected transport can do, asked through the facade so an
+   ;; application never tests a backend feature itself.
+   #:ssh-client-feature-supported-p
+   #:ssh-client-supported-authentication-methods
+   #:ssh-server-feature-supported-p
    ;; protocol core: shared by the client and a future server
    #:ssh-octets
    #:ssh-copy-octets
