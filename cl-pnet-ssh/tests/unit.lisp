@@ -312,6 +312,105 @@
   (is (eq :sha1
           (cl-pnet-ssh::ssh-mac-name-keyword "hmac-sha1-etm@openssh.com"))))
 
+(test umac-matches-the-rfc-vectors
+  "UMAC-64 and UMAC-96 match RFC 4418's appendix vectors.
+
+The SSH names use the same construction with a 64-bit or 128-bit tag; the
+96-bit column is checked too because it exercises a third hash iteration."
+  (let ((key (octets-ascii "abcdefghijklmnop"))
+        (nonce (octets-ascii "bcdefghi"))
+        (a-1024 (make-string 1024 :initial-element #\a))
+        (a-32768 (make-string 32768 :initial-element #\a))
+        (abc-500 (with-output-to-string (stream)
+                   (dotimes (i 500)
+                     (write-string "abc" stream)))))
+    (dolist (case (list (list "" "6E155FAD26900BE1" "32FEDB100C79AD58F07FF764")
+                        (list "aaa" "44B5CB542F220104"
+                              "185E4FE905CBA7BD85E4C2DC")
+                        (list a-1024 "26BF2F5D60118BD9"
+                              "7A54ABE04AF82D60FB298C3C")
+                        (list a-32768 "27F8EF643B0D118D"
+                              "7B136BD911E4B734286EF2BE")
+                        (list abc-500 "D4CF26DDEFD5C01A"
+                              "8824A260C53C66A36C9260A6")))
+      (destructuring-bind (message tag64 tag96) case
+        (let ((data (octets-ascii message))
+              (sequence (ssh-octets-uint64 nonce)))
+          (is (string= tag64
+                       (octets-hex (cl-pnet-ssh::ssh-umac
+                                    key data sequence :tag-length 8)))
+              "64-bit tag for ~D octets" (length data))
+          (is (string= tag96
+                       (octets-hex (cl-pnet-ssh::ssh-umac
+                                    key data sequence :tag-length 12)))
+              "96-bit tag for ~D octets" (length data)))))))
+
+(test umac-names-select-their-tag-and-key-length
+  "The SSH MAC names map to UMAC with the right tag and key sizes."
+  (is (eq :umac-64
+          (cl-pnet-ssh::ssh-mac-name-keyword "umac-64-etm@openssh.com")))
+  (is (eq :umac-128
+          (cl-pnet-ssh::ssh-mac-name-keyword "umac-128@openssh.com")))
+  (is (= 16 (cl-pnet-ssh::ssh-mac-key-length "umac-64@openssh.com")))
+  (is (= 16 (cl-pnet-ssh::ssh-mac-key-length "umac-128@openssh.com")))
+  (is (= 8 (cl-pnet-ssh::ssh-hmac-length :umac-64)))
+  (is (= 16 (cl-pnet-ssh::ssh-hmac-length :umac-128)))
+  (is (cl-pnet-ssh::ssh-mac-umac-p "umac-64-etm@openssh.com"))
+  (is (not (cl-pnet-ssh::ssh-mac-umac-p "hmac-sha2-256"))))
+
+(test umac-etm-packet-round-trip
+  "A UMAC packet authenticates with the sequence as its nonce and rejects
+a changed octet, for both the 64-bit and 128-bit tags."
+  (dolist (mac '(:umac-64 :umac-128))
+    (let* ((cipher "aes128-ctr")
+           (key (ssh-random-octets 16))
+           (iv (ssh-random-octets 16))
+           (mac-key (ssh-random-octets 16))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state)))
+      (ssh-install-keys send :encrypt key :encrypt-iv iv
+                        :encrypt-cipher cipher
+                        :encrypt-mac-key mac-key :encrypt-mac mac
+                        :encrypt-mac-etm t)
+      (ssh-install-keys receive :decrypt key :decrypt-iv iv
+                        :decrypt-cipher cipher
+                        :decrypt-mac-key mac-key :decrypt-mac mac
+                        :decrypt-mac-etm t)
+      (let* ((payload (ssh-random-octets 37))
+             (wire (ssh-encode-packet payload send)))
+        (multiple-value-bind (decoded consumed)
+            (ssh-decode-packet wire receive)
+          (is (equalp payload decoded))
+          (is (= (length wire) consumed)))
+        ;; The next sequence number is a different nonce, so replaying the
+        ;; first packet must not verify.
+        (signals ssh-protocol-error (ssh-decode-packet wire receive))
+        ;; A changed ciphertext octet is caught before decryption.
+        (let ((tampered (copy-seq wire))
+              (fresh (ssh-make-cipher-state)))
+          (ssh-install-keys fresh :decrypt key :decrypt-iv iv
+                            :decrypt-cipher cipher
+                            :decrypt-mac-key mac-key :decrypt-mac mac
+                            :decrypt-mac-etm t)
+          (setf (aref tampered 6) (logxor 1 (aref tampered 6)))
+          (signals ssh-protocol-error
+            (ssh-decode-packet tampered fresh)))))))
+
+(test umac-plain-packet-round-trip
+  "The non-EtM UMAC names authenticate the plaintext packet."
+  (dolist (mac '(:umac-64 :umac-128))
+    (let* ((mac-key (ssh-random-octets 16))
+           (send (ssh-make-cipher-state))
+           (receive (ssh-make-cipher-state))
+           (payload (ssh-random-octets 29)))
+      (ssh-install-keys send :encrypt-mac-key mac-key :encrypt-mac mac)
+      (ssh-install-keys receive :decrypt-mac-key mac-key :decrypt-mac mac)
+      (let ((wire (ssh-encode-packet payload send)))
+        (multiple-value-bind (decoded consumed)
+            (ssh-decode-packet wire receive)
+          (is (equalp payload decoded))
+          (is (= (length wire) consumed)))))))
+
 (test etm-ctr-packet-round-trip
   "Encrypt-then-MAC leaves the length in the clear and tags the ciphertext."
   (let* ((cipher "aes128-ctr")

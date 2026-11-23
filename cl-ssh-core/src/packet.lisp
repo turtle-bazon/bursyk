@@ -74,11 +74,51 @@
          (and (not (minusp start))
               (string= +ssh-etm-suffix+ mac :start2 start)))))
 
+(defparameter +ssh-mac-openssh-suffix+ "@openssh.com")
+
 (defun ssh-mac-base-name (mac)
-  "MAC without its -etm@openssh.com suffix."
-  (if (ssh-mac-etm-p mac)
-      (subseq mac 0 (- (length mac) (length +ssh-etm-suffix+)))
-      mac))
+  "MAC without its -etm@openssh.com or @openssh.com suffix.
+
+UMAC is spelled umac-64@openssh.com while its encrypt-then-MAC variant is
+umac-64-etm@openssh.com, so stripping the -etm suffix alone is not enough
+to reach the construction's name."
+  (let* ((name (if (ssh-mac-etm-p mac)
+                   (subseq mac 0 (- (length mac) (length +ssh-etm-suffix+)))
+                   mac))
+         (start (- (length name) (length +ssh-mac-openssh-suffix+))))
+    (if (and (not (minusp start))
+             (string= +ssh-mac-openssh-suffix+ name :start2 start))
+        (subseq name 0 start)
+        name)))
+
+(defun ssh-mac-umac-p (mac)
+  "Whether MAC is one of the UMAC constructions."
+  (member (ssh-mac-base-name mac) '("umac-64" "umac-128")
+          :test #'string=))
+
+(defun ssh-mac-tag (state direction data)
+  "The MAC over DATA for DIRECTION, or NIL when none is negotiated.
+
+HMAC prefixes the sequence number to DATA; UMAC takes it as the nonce, so
+the two constructions cannot share one call."
+  (let* ((receive (eq direction :receive))
+         (name (if receive
+                   (ssh-cipher-state-decrypt-mac state)
+                   (ssh-cipher-state-encrypt-mac state)))
+         (key (if receive
+                  (ssh-cipher-state-decrypt-mac-key state)
+                  (ssh-cipher-state-encrypt-mac-key state)))
+         (umac (if receive
+                   (ssh-cipher-state-decrypt-umac state)
+                   (ssh-cipher-state-encrypt-umac state)))
+         (sequence (if receive
+                       (ssh-cipher-state-receive-sequence state)
+                       (ssh-cipher-state-send-sequence state))))
+    (when name
+      (if umac
+          (ssh-umac-digest umac data sequence)
+          (ssh-hmac key (ssh-concat (ssh-uint32-octets sequence) data)
+                    name)))))
 
 (defstruct (ssh-cipher-state (:constructor ssh-make-cipher-state))
   ;; ENCRYPT and DECRYPT hold the key material the cipher routines need:
@@ -103,6 +143,9 @@
   (decrypt-mac nil)
   (encrypt-etm nil)
   (decrypt-etm nil)
+  ;; UMAC's key schedule, when the negotiated MAC is one of its names.
+  (encrypt-umac nil)
+  (decrypt-umac nil)
   (send-sequence 0 :type (unsigned-byte 32))
   (receive-sequence 0 :type (unsigned-byte 32))
   (block-size +ssh-block-size+)
@@ -230,15 +273,8 @@ associated data, so the body alone is padded to the 16-octet block size."
          (packet (ssh-concat (ssh-uint32-octets (+ 1 (length payload)
                                                    padding-length))
                              body))
-         (mac-key (ssh-cipher-state-encrypt-mac-key state))
-         (mac-name (ssh-cipher-state-encrypt-mac state))
-         (output (if mac-name
-                     (ssh-concat packet
-                                 (ssh-hmac mac-key
-                                           (ssh-concat (ssh-uint32-octets sequence)
-                                                       packet)
-                                           mac-name))
-                     packet)))
+         (mac (ssh-mac-tag state :send packet))
+         (output (if mac (ssh-concat packet mac) packet)))
     (setf (ssh-cipher-state-send-sequence state) (mod (1+ sequence) (expt 2 32)))
     output))
 
@@ -257,29 +293,19 @@ whole packet is then encrypted."
          (body (ssh-packet-body payload padding-length))
          (length-octets (ssh-uint32-octets (length body)))
          (plain (ssh-concat length-octets body))
-         (mac-key (ssh-cipher-state-encrypt-mac-key state))
-         (mac-name (ssh-cipher-state-encrypt-mac state))
          (ecb (ssh-cipher-state-encrypt-ecb state))
          (iv (ssh-cipher-state-encrypt-iv state))
          (offset (ssh-cipher-state-encrypt-offset state)))
     (if etm
         (let* ((encrypted-body (ssh-aes-ctr-xor ecb iv offset body))
                (packet (ssh-concat length-octets encrypted-body))
-               (mac (and mac-name
-                         (ssh-hmac mac-key
-                                   (ssh-concat (ssh-uint32-octets sequence)
-                                               packet)
-                                   mac-name))))
+               (mac (ssh-mac-tag state :send packet)))
           (setf (ssh-cipher-state-encrypt-offset state)
                 (+ offset (length body))
                 (ssh-cipher-state-send-sequence state)
                 (mod (1+ sequence) (expt 2 32)))
           (if mac (ssh-concat packet mac) packet))
-        (let* ((mac (and mac-name
-                         (ssh-hmac mac-key
-                                   (ssh-concat (ssh-uint32-octets sequence)
-                                               plain)
-                                   mac-name)))
+        (let* ((mac (ssh-mac-tag state :send plain))
                (encrypted (ssh-aes-ctr-xor ecb iv offset plain)))
           (setf (ssh-cipher-state-encrypt-offset state)
                 (+ offset (length plain))
@@ -446,10 +472,7 @@ and padding, against a cipher's block limits.  The tag is not part of it."
                    (wire (subseq buffer 0 (+ 4 length))))
               (when (plusp mac-length)
                 (let ((expected (subseq buffer (+ 4 length) needed))
-                      (actual (ssh-hmac
-                               (ssh-cipher-state-decrypt-mac-key state)
-                               (ssh-concat (ssh-uint32-octets sequence) wire)
-                               (ssh-cipher-state-decrypt-mac state))))
+                      (actual (ssh-mac-tag state :receive wire)))
                   (unless (ssh-octets= expected actual)
                     (error 'ssh-protocol-error
                            :detail "packet MAC does not verify"))))
@@ -481,10 +504,7 @@ and padding, against a cipher's block limits.  The tag is not part of it."
                                             (subseq buffer 0 (+ 4 length)))))
               (when (plusp mac-length)
                 (let ((expected (subseq buffer (+ 4 length) needed))
-                      (actual (ssh-hmac
-                               (ssh-cipher-state-decrypt-mac-key state)
-                               (ssh-concat (ssh-uint32-octets sequence) packet)
-                               (ssh-cipher-state-decrypt-mac state))))
+                      (actual (ssh-mac-tag state :receive packet)))
                   (unless (ssh-octets= expected actual)
                     (error 'ssh-protocol-error
                            :detail "packet MAC does not verify"))))
@@ -512,10 +532,7 @@ and padding, against a cipher's block limits.  The tag is not part of it."
            (packet (subseq buffer 0 (+ 4 length))))
       (when (plusp mac-length)
         (let ((expected (subseq buffer (+ 4 length) needed))
-              (actual (ssh-hmac
-                       (ssh-cipher-state-decrypt-mac-key state)
-                       (ssh-concat (ssh-uint32-octets sequence) packet)
-                       (ssh-cipher-state-decrypt-mac state))))
+              (actual (ssh-mac-tag state :receive packet)))
           (unless (ssh-octets= expected actual)
             (error 'ssh-protocol-error :detail "packet MAC does not verify"))))
       (setf (ssh-cipher-state-receive-sequence state)
@@ -714,9 +731,17 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
   (when decrypt-mac-key-p
     (setf (ssh-cipher-state-decrypt-mac-key state) decrypt-mac-key))
   (when encrypt-mac-p
-    (setf (ssh-cipher-state-encrypt-mac state) encrypt-mac))
+    (setf (ssh-cipher-state-encrypt-mac state) encrypt-mac
+          (ssh-cipher-state-encrypt-umac state)
+          (when (member encrypt-mac '(:umac-64 :umac-128))
+            (ssh-make-umac-state encrypt-mac-key
+                                 :tag-length (ssh-hmac-length encrypt-mac)))))
   (when decrypt-mac-p
-    (setf (ssh-cipher-state-decrypt-mac state) decrypt-mac))
+    (setf (ssh-cipher-state-decrypt-mac state) decrypt-mac
+          (ssh-cipher-state-decrypt-umac state)
+          (when (member decrypt-mac '(:umac-64 :umac-128))
+            (ssh-make-umac-state decrypt-mac-key
+                                 :tag-length (ssh-hmac-length decrypt-mac)))))
   (when encrypt-mac-etm-p
     (setf (ssh-cipher-state-encrypt-etm state) encrypt-mac-etm))
   (when decrypt-mac-etm-p

@@ -27,6 +27,7 @@
                              (:file "wire")
                              (:file "crypto")
                              (:file "x11")
+                             (:file "umac")
                              (:file "packet")
                              (:file "keys")
                              (:file "known-hosts")

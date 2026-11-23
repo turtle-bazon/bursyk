@@ -177,16 +177,22 @@ offers only the CTR and AEAD constructions it implements.")
 ;; chacha20-poly1305@openssh.com is an AEAD and ignores the MAC, but RFC 4253
 ;; still negotiates one of these, and OpenSSH expects a common choice.
 (defparameter +ssh-macs+
-  '("hmac-sha2-256-etm@openssh.com"
+  '("umac-64-etm@openssh.com"
+    "umac-128-etm@openssh.com"
+    "hmac-sha2-256-etm@openssh.com"
     "hmac-sha2-512-etm@openssh.com"
     "hmac-sha1-etm@openssh.com"
+    "umac-64@openssh.com"
+    "umac-128@openssh.com"
     "hmac-sha2-256"
     "hmac-sha2-512"
     "hmac-sha1")
   "The MACs this build implements, in OpenSSH's default order.
 
-The UMAC constructions OpenSSH lists first are not here, but every HMAC it
-offers is, with the encrypt-then-MAC variants ahead of the plain ones.")
+The UMAC constructions come first, as OpenSSH lists them, and each is
+followed later by its plain (non-encrypt-then-MAC) spelling.  The pure
+transport implements all of them; libssh has no UMAC, so it filters them
+out before offering anything.")
 
 (defparameter +ssh-compressions+ '("none" "zlib@openssh.com")
   "The compression methods this build understands, in the order OpenSSH

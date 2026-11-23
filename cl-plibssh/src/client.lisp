@@ -303,6 +303,10 @@ host is named but no descriptor is passed: libssh dials nothing itself."
      session +ssh-options-ciphers-c-s+ (ssh-client-ciphers client) "Ciphers")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-ciphers-s-c+ (ssh-client-ciphers client) "Ciphers")
+    (when (some #'ssh-mac-umac-p (ssh-client-macs client))
+      (error 'ssh-unsupported-feature
+             :feature :umac
+             :detail "by the libssh transport"))
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hmac-c-s+ (ssh-client-macs client) "MACs")
     (ssh-plibssh-apply-algorithm-option
@@ -1112,7 +1116,8 @@ transport limitation into the same diagnostic."
 
 Agent forwarding, password and keyboard-interactive authentication and the
 common option surface are implemented; the remaining entries are not, and
-callers learn that through the facade rather than a backend test."
+callers learn that through the facade rather than a backend test.  In
+particular libssh 0.10 has no UMAC, so :UMAC is absent here."
   (not (null (member feature '(:agent-forward :compression)))))
 
 (defun ssh-client-supported-authentication-methods ()

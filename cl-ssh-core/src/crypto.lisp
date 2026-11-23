@@ -22,11 +22,16 @@
     (ironclad-unsafe:hmac-digest hmac)))
 
 (defun ssh-hmac-length (digest)
-  "The tag length of the named HMAC DIGEST."
+  "The tag length of the named MAC DIGEST.
+
+UMAC names ride along here so callers that only need the tag size do not
+have to know which construction produced it."
   (ecase digest
     (:sha1 20)
     (:sha256 32)
-    (:sha512 64)))
+    (:sha512 64)
+    (:umac-64 8)
+    (:umac-128 16)))
 
 (defun ssh-poly1305 (key data)
   "The Poly1305 one-time tag of DATA under KEY (32 octets)."
