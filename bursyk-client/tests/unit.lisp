@@ -25,6 +25,7 @@
         :control-command nil :host nil :no-control-persist nil
         :pkcs11 nil :bind-interface nil
         :bind-address nil :gssapi-auth nil :tunnel nil :x11-forward nil
+        :tag nil :protocol-1 nil :protocol-2 nil
         :escape-char nil))
 
 (defun parse (arguments)
@@ -62,6 +63,36 @@ CLI's decision and at the plist it filled."
     (is (equal "alice" (getf options :user)))
     ;; -i may repeat; both keys are kept for authentication.
     (is (equal '("two" "one") (getf options :identity)))))
+
+(test protocol-flags-and-tag-are-accepted
+  ;; ssh keeps -1 and -2 for old scripts.  -2 is the default and inert; -1
+  ;; is recorded here and refused before connecting.
+  (multiple-value-bind (destination command options)
+      (parse '("-2" "-1" "-P" "work" "host"))
+    (declare (ignore destination command))
+    (is (getf options :protocol-2))
+    (is (getf options :protocol-1))
+    (is (equal "work" (getf options :tag)))))
+
+(test algorithm-queries-cover-ssh-spellings
+  (let ((plain (burs::query-answer "sig"))
+        (all (burs::query-answer "key-sig")))
+    ;; sig is the plain signature list; key-sig adds certificate names.
+    (is (member "rsa-sha2-512" plain :test #'string=))
+    (is (not (member "ssh-ed25519-cert-v01@openssh.com" plain
+                     :test #'string=)))
+    (is (member "ssh-ed25519-cert-v01@openssh.com" all :test #'string=)))
+  (is (equal '("none" "zlib@openssh.com")
+             (burs::query-answer "compression")))
+  (is (equal '("2") (burs::query-answer "protocol-version")))
+  (is (equal (burs::query-answer "cipher")
+             (burs::query-answer "Ciphers")))
+  ;; -Q key splits cleanly into plain and certificate spellings.
+  (is (every (lambda (name)
+               (not (burs::certificate-algorithm-name-p name)))
+             (burs::query-answer "key-plain")))
+  (is (every #'burs::certificate-algorithm-name-p
+             (burs::query-answer "key-cert"))))
 
 (test double-dash-ends-option-parsing
   (multiple-value-bind (destination command options)

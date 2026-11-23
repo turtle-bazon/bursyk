@@ -91,6 +91,11 @@ for every invocation keeps two parses from sharing state."
               :short #\G :long "print-config")
    (burs-flag :gateway-ports "Allow remote hosts to use forwarded ports"
               :short #\g :long "gateway-ports")
+   ;; ssh still accepts the protocol flags so old scripts do not trip over
+   ;; them: -1 is refused because protocol 1 is gone, -2 is the default and
+   ;; is ignored.
+   (burs-flag :protocol-1 "Request SSH protocol 1 (refused)" :short #\1)
+   (burs-flag :protocol-2 "Request SSH protocol 2 (the default)" :short #\2)
    (burs-flag :gssapi-auth "Enable GSSAPI authentication" :short #\K)
    (burs-flag :no-gssapi-auth "Disable GSSAPI authentication" :short #\k)
    (burs-flag :control-master "Enable control-master mode" :short #\M)
@@ -158,6 +163,8 @@ for every invocation keeps two parses from sharing state."
                 :short #\W :long "stdio-forward" :parameter "HOST:PORT")
    (burs-string :tunnel "Tunnel a TUN device" :short #\w
                 :parameter "LOCAL[:REMOTE]")
+   (burs-string :tag "Tag this connection for ssh_config selection"
+                :short #\P :parameter "TAG")
    ;; The readable spellings this client has always had.  ssh itself spells
    ;; everything through -o.
    (burs-string :address-family "Select the address family"
@@ -332,6 +339,9 @@ the order the old push-based parser kept them in."
             (getf *options* :pkcs11) (value :pkcs11)
             (getf *options* :bind-interface) (value :bind-interface)
             (getf *options* :bind-address) (value :bind-address)
+            (getf *options* :protocol-1) (flag :protocol-1)
+            (getf *options* :protocol-2) (flag :protocol-2)
+            (getf *options* :tag) (value :tag)
             (getf *options* :gssapi-auth) (flag :gssapi-auth)
             (getf *options* :tunnel) (value :tunnel)
             (getf *options* :x11-forward)
@@ -410,6 +420,8 @@ a name this build lacks is an error instead of a silently widened offer."
     (unsupported "-I" "PKCS#11 keys are not implemented"))
   (when (getf *options* :tunnel)
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
+  (when (getf *options* :protocol-1)
+    (fail "SSH protocol v.1 is no longer supported"))
   (when (getf *options* :gssapi-auth)
     (unsupported "-K" "GSSAPI authentication is not implemented"))
   (when (and (eq (getf *options* :x11-forward) :yes)
@@ -726,23 +738,80 @@ session down."
 
 ;;; ---- -Q: algorithm queries ----
 
+(defun certificate-algorithm-name-p (name)
+  "Whether NAME is a certificate key or signature type."
+  (or (search "-cert-v01@" name)
+      ;; ML-DSA certificate names end in plain "-cert".
+      (and (search "-cert" name)
+           (not (search "-cert-v01@" name)))))
+
+(defun query-plain-key-algorithms ()
+  "Key types this client can load, without the certificate spellings."
+  (remove-if #'certificate-algorithm-name-p
+             cl-pnet-ssh:+ssh-host-key-algorithms+))
+
+(defun query-certificate-key-algorithms ()
+  "Certificate key types this client can present."
+  (remove-if-not #'certificate-algorithm-name-p
+                 cl-pnet-ssh:+ssh-host-key-algorithms+))
+
+(defparameter +query-plain-signature-names+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "rsa-sha2-512"
+    "rsa-sha2-256")
+  "Signature names this client can make or check, without certificates.")
+
+(defun query-signature-algorithms (&key plain-only)
+  "Signature names this client can verify, certificate forms included.
+
+PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
+  (if plain-only
+      +query-plain-signature-names+
+      (loop for name in +query-plain-signature-names+
+            append (list name
+                         (concatenate 'string name
+                                      "-cert-v01@openssh.com")))))
+
 (defun query-answer (what)
   (let ((name (string-downcase what)))
     (cond
-      ((member name '("cipher" "cipher-auth") :test #'string=)
+      ((member name '("cipher" "ciphers") :test #'string=)
        cl-pnet-ssh:+ssh-ciphers+)
-      ((string= name "mac") cl-pnet-ssh:+ssh-macs+)
-      ((string= name "kex")
+      ;; Every cipher this build offers is an AEAD, so the authenticated list
+      ;; is the whole list.
+      ((string= name "cipher-auth") cl-pnet-ssh:+ssh-ciphers+)
+      ((member name '("mac" "macs") :test #'string=)
+       cl-pnet-ssh:+ssh-macs+)
+      ((member name '("kex" "kexalgorithms") :test #'string=)
        (remove-if (lambda (algorithm)
                     (or (search "ext-info" algorithm)
                         (search "kex-strict" algorithm)))
                   cl-pnet-ssh:+ssh-kex-algorithms+))
-      ((member name '("key" "key-plain" "key-cert") :test #'string=)
-       cl-pnet-ssh:+ssh-host-key-algorithms+)
+      ((string= name "compression") cl-pnet-ssh:+ssh-compressions+)
+      ((string= name "key")
+       (append (query-plain-key-algorithms)
+               (query-certificate-key-algorithms)))
+      ((string= name "key-plain") (query-plain-key-algorithms))
+      ((string= name "key-cert") (query-certificate-key-algorithms))
+      ((string= name "key-sig") (query-signature-algorithms))
+      ((member name '("sig" "key-ca-sign" "casignaturealgorithms")
+               :test #'string=)
+       (query-signature-algorithms :plain-only t))
+      ((member name '("pubkeyacceptedkeytypes" "pubkeyacceptedalgorithms"
+                      "hostkeyalgorithms" "hostbasedkeytypes"
+                      "hostbasedacceptedkeytypes"
+                      "hostbasedacceptedalgorithms")
+               :test #'string=)
+       (query-signature-algorithms))
       ((string= name "protocol-version") '("2"))
+      ((string= name "addressfamily") '("any" "inet" "inet6"))
       ((string= name "help")
-       '("cipher" "cipher-auth" "mac" "kex" "key" "key-cert"
-         "key-plain" "protocol-version"))
+       '("addressfamily" "cipher" "cipher-auth" "compression" "kex"
+         "key" "key-cert" "key-plain" "key-sig" "mac" "protocol-version"
+         "sig"))
       (t (fail "unknown query option ~A (try -Q help)" what)))))
 
 (defun print-query (what)
@@ -2969,7 +3038,8 @@ and known-hosts files) are printed as this client will actually use them."
                       options)))
         (when command
           (format t "knownhostscommand ~A~%" command)))
-      (let ((tag (cl-pnet-ssh:ssh-config-options-tag options)))
+      (let ((tag (or (getf *options* :tag)
+                     (cl-pnet-ssh:ssh-config-options-tag options))))
         (when tag
           (format t "tag ~A~%" tag)))
       (when (cl-pnet-ssh:ssh-config-options-version-addendum options)
