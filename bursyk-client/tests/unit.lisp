@@ -12,7 +12,8 @@
 
 (defun empty-options ()
   "The CLI's defaults, freshly allocated so a test cannot leak into another."
-  (list :port nil :user nil :identity nil :config nil :known-hosts nil
+  (list :port nil :user nil :identity nil :identity-arguments nil
+        :config nil :known-hosts nil
         :policy nil :agent nil :options nil :jump nil :proxy-command nil
         :verbose 0 :quiet nil :log-file nil :address-family nil
         :ciphers nil :macs nil :kex-algorithms nil :compression nil
@@ -20,6 +21,7 @@
         :no-command nil :stdin-null nil :subsystem nil :stdio-forward nil
         :local-forward nil :remote-forward nil :dynamic-forward nil
         :query nil :help nil :version nil :print-config nil
+        :dump-public-keys nil
         :background nil :background-child nil :control-master-daemon nil
         :control-master nil :control-path nil
         :control-command nil :host nil :no-control-persist nil
@@ -968,6 +970,152 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "proxyusefdpass yes"
                       "updatehostkeys ask"))
         (is (search line text) line)))))
+
+;;; ---- ssh -Z ----
+
+(defun dump-key-blob (&optional (fill 7))
+  "A syntactically valid ssh-ed25519 public key blob for -Z tests."
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-string writer
+                                  (cl-pnet-ssh:ssh-string-octets "ssh-ed25519"))
+    (cl-pnet-ssh:ssh-write-string
+     writer (make-array 32 :element-type '(unsigned-byte 8)
+                           :initial-element fill))
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun dump-certificate-blob ()
+  "A blob whose type marks it as a certificate, for ordering tests."
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh:ssh-write-string
+     writer
+     (cl-pnet-ssh:ssh-string-octets
+      "ssh-ed25519-cert-v01@openssh.com"))
+    (cl-pnet-ssh:ssh-write-string
+     writer (make-array 32 :element-type '(unsigned-byte 8)
+                           :initial-element 9))
+    (cl-pnet-ssh:ssh-writer-output writer)))
+
+(defun write-public-key (path blob)
+  "Write BLOB to PATH in authorized_keys format."
+  (ensure-directories-exist path)
+  (with-open-file (stream path :direction :output :if-exists :supersede
+                               :if-does-not-exist :create)
+    (format stream "ssh-ed25519 ~A test~%"
+            (cl-pnet-ssh:ssh-octets-base64 blob)))
+  path)
+
+(defmacro with-dump-directory ((variable) &body body)
+  "Bind VARIABLE to a fresh temporary directory, removing it afterwards."
+  `(let ((,variable
+           (merge-pathnames
+            (format nil "burs-z-~D-~D/" (get-universal-time)
+                    (random 1000000))
+            (uiop:temporary-directory))))
+     (ensure-directories-exist ,variable)
+     (unwind-protect (progn ,@body)
+       (ignore-errors
+         (uiop:delete-directory-tree ,variable :validate t)))))
+
+(defun dump-lines (host)
+  "The ssh -Z output for HOST under the current *OPTIONS*."
+  (with-output-to-string (stream)
+    (burs::dump-public-key-identities host stream)))
+
+(test dump-public-key-line-matches-format-identity
+  (let ((blob (dump-key-blob)))
+    (is (equal
+         (format nil "~A ED25519 ~A explicit~%"
+                 "/k" (cl-pnet-ssh:ssh-key-fingerprint blob))
+         (with-output-to-string (stream)
+           (burs::dump-public-key-line stream "/k" blob 1 nil))))
+    (is (equal
+         (format nil "~A ED25519 ~A~%"
+                 "/k" (cl-pnet-ssh:ssh-key-fingerprint blob))
+         (with-output-to-string (stream)
+           (burs::dump-public-key-line stream "/k" blob 0 nil))))
+    ;; A file that could not be read keeps the separator but no type or
+    ;; fingerprint, exactly as format_identity writes it.
+    (is (equal (format nil "/k  explicit~%")
+               (with-output-to-string (stream)
+                 (burs::dump-public-key-line stream "/k" nil 1 nil))))
+    (is (equal (format nil "/k ~%")
+               (with-output-to-string (stream)
+                 (burs::dump-public-key-line stream "/k" nil 0 nil))))
+    (is (equal
+         (format nil "~A ED25519 ~A agent~%"
+                 "/k" (cl-pnet-ssh:ssh-key-fingerprint blob))
+         (with-output-to-string (stream)
+           (burs::dump-public-key-line stream "/k" blob 0 t))))))
+
+(test dump-sort-identities-keeps-explicit-entries-in-place
+  (let* ((plain-a (list "a" (dump-key-blob 1) 0))
+         (plain-b (list "b" (dump-key-blob 2) 0))
+         (cert (list "c" (dump-certificate-blob) 0))
+         (explicit (list "e" (dump-key-blob 3) 1))
+         (sorted (burs::dump-sort-identities
+                  (list plain-a explicit plain-b cert))))
+    ;; Certificates sort before plain keys, and the explicit key does not
+    ;; move, so it stays between the two slots the others fill.
+    (is (equal '("c" "e" "a" "b")
+               (mapcar #'first sorted)))))
+
+(test dump-public-key-identities-reads-config-identities
+  (with-dump-directory (directory)
+    (let* ((present (merge-pathnames "id_ed25519" directory))
+           (missing (merge-pathnames "gone" directory))
+           (config (merge-pathnames "config" directory))
+           (blob (dump-key-blob)))
+      (write-public-key (merge-pathnames "id_ed25519.pub" directory) blob)
+      (with-open-file (stream config :direction :output :if-exists :supersede
+                                     :if-does-not-exist :create)
+        (format stream "IdentityFile ~A~%IdentityFile ~A~%"
+                (namestring present) (namestring missing)))
+      (let ((burs::*options* (empty-options)))
+        (setf (getf burs::*options* :config) (namestring config))
+        (let ((text (dump-lines "example.org")))
+          (is (search (format nil "~A ED25519 ~A explicit~%"
+                              (namestring present)
+                              (cl-pnet-ssh:ssh-key-fingerprint blob))
+                      text))
+          ;; A missing configured identity is still listed, with an empty
+          ;; type and fingerprint.
+          (is (search (format nil "~A  explicit~%" (namestring missing))
+                      text))
+          (is (= 2 (count #\Newline text))))))))
+
+(test dump-public-key-identities-drops-a-missing-i-path
+  (let ((burs::*options* (empty-options)))
+    (setf (getf burs::*options* :config) "none"
+          (getf burs::*options* :identity-arguments)
+          (list "/definitely/not/here"))
+    (let ((text (dump-lines "example.org")))
+      ;; ssh's option parser drops a -i path that does not exist, so the
+      ;; default names are offered instead.
+      (is (not (search "/definitely/not/here" text)))
+      (is (search "id_rsa" text))
+      (is (not (search "explicit" text))))))
+
+(test dump-public-key-identities-keeps-i-and-config-duplicates
+  (with-dump-directory (directory)
+    (let* ((path (merge-pathnames "id_ed25519" directory))
+           (config (merge-pathnames "config" directory))
+           (blob (dump-key-blob)))
+      (write-public-key (merge-pathnames "id_ed25519.pub" directory) blob)
+      ;; -i is kept only when the named path itself exists, even though the
+      ;; public half is what gets read.
+      (with-open-file (stream path :direction :output :if-exists :supersede
+                                   :if-does-not-exist :create)
+        (write-line "placeholder" stream))
+      (with-open-file (stream config :direction :output :if-exists :supersede
+                                     :if-does-not-exist :create)
+        (format stream "IdentityFile ~A~%" (namestring path)))
+      (let ((burs::*options* (empty-options)))
+        (setf (getf burs::*options* :config) (namestring config)
+              (getf burs::*options* :identity-arguments)
+              (list (namestring path)))
+        ;; -i records userprovided 1 and a config file 2, so readconf keeps
+        ;; both copies rather than collapsing them.
+        (is (= 2 (count #\Newline (dump-lines "example.org"))))))))
 
 ;;; ---- Child processes and the signal mask ----
 

@@ -114,6 +114,7 @@ for every invocation keeps two parses from sharing state."
    (burs-flag :x11-trust "Forward X11 with trusted cookies" :short #\Y)
    (burs-flag :version "Display the client version and exit" :short #\V
               :long "version")
+   (burs-flag :dump-public-keys "Dump the public keys and exit" :short #\Z)
    (clingon:make-option :counter
                         :key :verbose
                         :description "Increase logging verbosity (repeatable)"
@@ -288,6 +289,12 @@ the order the old push-based parser kept them in."
              (flag (key) (funcall getopt key)))
       (setf (getf *options* :port) (value :port)
             (getf *options* :user) (value :user)
+            ;; -i only.  -o IdentityFile values are pushed into :IDENTITY
+            ;; later, and ssh -Z has to tell the two apart: readconf records
+            ;; -i as userprovided 1 and -o as 2, so their duplicate paths do
+            ;; not collapse together.
+            (getf *options* :identity-arguments)
+            (parsed-list command :identity)
             (getf *options* :identity) (parsed-list command :identity)
             (getf *options* :config) (value :config)
             (getf *options* :known-hosts) (value :known-hosts)
@@ -329,6 +336,7 @@ the order the old push-based parser kept them in."
             (getf *options* :help) nil
             (getf *options* :version) (flag :version)
             (getf *options* :print-config) (flag :print-config)
+            (getf *options* :dump-public-keys) (flag :dump-public-keys)
             (getf *options* :background) (flag :background)
             (getf *options* :background-child) (flag :background-child)
             (getf *options* :control-master-daemon)
@@ -2694,6 +2702,202 @@ AddressFamily selected, as the asynchronous path does."
   (finish-output)
   (uiop:quit 0))
 
+(defun dump-public-key-blob (path)
+  "PATH's public key blob, as ssh -Z loads one.
+
+Tries PATH as a public key file, then PATH.pub, then the public half of a
+private key at PATH.  An unreadable file yields NIL."
+  (let ((name (namestring path)))
+    (or (cl-pnet-ssh::ssh-public-key-file-blob name)
+        (cl-pnet-ssh::ssh-public-key-file-blob
+         (concatenate 'string name ".pub"))
+        (handler-case
+            (cl-pnet-ssh:ssh-public-key-blob-of
+             (cl-pnet-ssh:ssh-load-private-key name))
+          (error () nil)))))
+
+(defun dump-public-certificate-blob (path)
+  "PATH's certificate blob, trying the name as given and with .pub appended."
+  (let ((name (namestring path)))
+    (or (cl-pnet-ssh::ssh-public-key-file-blob name)
+        (cl-pnet-ssh::ssh-public-key-file-blob
+         (concatenate 'string name ".pub")))))
+
+(defun dump-public-key-line (stream name blob explicit-p agent-p)
+  "One ssh -Z line: FILENAME TYPE FINGERPRINT [explicit] [agent].
+
+A key that could not be loaded leaves the type and fingerprint empty, as
+OpenSSH's format_identity does."
+  (format stream "~A ~A~@[ ~A~]~:[~; explicit~]~:[~; agent~]~%"
+          name
+          (if blob (cl-pnet-ssh:ssh-key-type-name blob) "")
+          (and blob (cl-pnet-ssh:ssh-key-fingerprint blob))
+          (and (integerp explicit-p) (plusp explicit-p))
+          agent-p))
+
+(defun dump-public-key-priority (blob)
+  "OpenSSH's identity priority for BLOB: certificates before plain keys.
+
+The SecurityKey priorities (0 and 2) cannot occur here because this client
+has no FIDO keys."
+  (if (and blob (cl-pnet-ssh::ssh-certificate-blob-p blob)) 1 3))
+
+(defun dump-sort-identities (entries)
+  "Sort the non-explicit ENTRIES by key priority, leaving explicit ones put.
+
+ENTRIES are (NAME BLOB USERPROVIDED ...) lists.  OpenSSH's
+order_identities_by_prio sorts only identities that did not come from the
+command line or a user configuration, so an explicit key keeps its place and
+the rest are reordered among the slots they occupy."
+  (let* ((sortable (remove-if (lambda (entry)
+                                (plusp (or (third entry) 0)))
+                              entries))
+         (sorted (stable-sort
+                  (copy-list sortable) #'<
+                  :key (lambda (entry)
+                         (dump-public-key-priority (second entry)))))
+         (next sorted))
+    (mapcar (lambda (entry)
+              (if (plusp (or (third entry) 0))
+                  entry
+                  (prog1 (first next) (setf next (rest next)))))
+            entries)))
+
+(defun dump-public-key-identities (host &optional (stream *standard-output*))
+  "Print the keys authentication would offer for HOST, as ssh -Z does.
+
+Mirrors OpenSSH's pubkey_prepare: CertificateFile certificates first, then
+agent keys, then identity files.  A key that is both an identity file and in
+the agent is shown once, under the file's name, with both annotations.  A
+file that cannot be read is still listed with an empty type and fingerprint;
+only a -i path that does not exist at all is dropped, as ssh's option parser
+drops it."
+  (multiple-value-bind (options canonical)
+      (resolve-config-options host)
+    (declare (ignore canonical))
+    (let* ((explicit
+             (loop for path in (reverse
+                                (getf *options* :identity-arguments))
+                   for name = (cl-pnet-ssh::ssh-config-expand-home
+                               (namestring path))
+                   when (probe-file name)
+                     collect name))
+           (configured
+             (reverse
+              (cl-pnet-ssh:ssh-config-options-identity-files options)))
+           (configured-userprovided
+             (reverse
+              (cl-pnet-ssh:ssh-config-options-identity-files-userprovided
+               options)))
+           (defaults
+             (unless (or explicit configured)
+               (mapcar
+                (lambda (name)
+                  (namestring
+                   (merge-pathnames (format nil ".ssh/~A" name)
+                                    (user-homedir-pathname))))
+                cl-pnet-ssh::+ssh-default-identity-names+)))
+           (files '()))
+      (labels ((add (name blob explicit-p)
+                 "Add (NAME BLOB EXPLICIT-P) unless that pair is already there."
+                 (unless (find-if (lambda (entry)
+                                    (and (string= (first entry) name)
+                                         (eql (third entry) explicit-p)))
+                                  files)
+                   (push (list name blob explicit-p) files))))
+        (dolist (name explicit)
+          (add name (dump-public-key-blob name) 1))
+        (loop for path in configured
+              for explicit-p in configured-userprovided
+              for name = (namestring path)
+              do (add name (dump-public-key-blob name) explicit-p))
+        (dolist (name defaults)
+          (add name (dump-public-key-blob name) 0)))
+      (setf files (nreverse files))
+      ;; A readable identity also contributes its implicit -cert.pub
+      ;; certificate, unless a CertificateFile was named.
+      (let ((certificate-files
+              (cl-pnet-ssh:ssh-config-options-certificate-files options)))
+        (unless certificate-files
+          (setf files
+                (loop for entry in files
+                      append
+                      (append
+                       (list entry)
+                       (let* ((name (first entry))
+                              (blob (second entry))
+                              (certificate
+                                (and blob
+                                     (dump-public-certificate-blob
+                                      (concatenate 'string
+                                                   name "-cert.pub")))))
+                         (when (and certificate
+                                    (cl-pnet-ssh::ssh-certificate-blob-p
+                                     certificate))
+                           (list (list name certificate
+                                       (third entry)))))))))
+        ;; CertificateFile certificates come before everything else.
+        (let ((certs
+                (loop for path in (reverse certificate-files)
+                      for explicit-p in
+                        (reverse
+                         (cl-pnet-ssh:ssh-config-options-certificate-files-userprovided
+                          options))
+                      for name = (namestring path)
+                      for blob = (dump-public-certificate-blob name)
+                      when (and blob
+                                (cl-pnet-ssh::ssh-certificate-blob-p blob))
+                        collect (list name blob explicit-p)))
+              (remaining files)
+              (agent-matched '())
+              (agent-only '()))
+          (setf certs (dump-sort-identities certs))
+          (let ((agent (cl-pnet-ssh::ssh-config-client-agent options nil)))
+            (when agent
+              (handler-case
+                  (dolist (entry
+                           (cl-pnet-ssh:ssh-agent-identities-blocking
+                            :path agent))
+                    (let* ((blob (car entry))
+                           (comment (cdr entry))
+                           (file (find-if
+                                  (lambda (candidate)
+                                    (and (second candidate)
+                                         (cl-pnet-ssh::ssh-octets=
+                                          blob (second candidate))))
+                                  remaining)))
+                      (if file
+                          (progn
+                            (setf remaining (delete file remaining))
+                            (push (list (first file) blob (third file) t)
+                                  agent-matched))
+                          (push (list (if (and comment
+                                               (plusp (length comment)))
+                                          comment
+                                          "(none)")
+                                      blob nil t)
+                                agent-only))))
+                (error () nil))))
+          (dolist (entry certs)
+            (dump-public-key-line stream (first entry) (second entry)
+                                  (third entry) nil))
+          ;; OpenSSH lists agent keys that are also identity files before the
+          ;; agent-only keys, then sorts the non-explicit ones by priority.
+          (dolist (entry (dump-sort-identities
+                          (append (nreverse agent-matched)
+                                  (nreverse agent-only))))
+            (dump-public-key-line stream (first entry) (second entry)
+                                  (third entry) (fourth entry)))
+          (dolist (entry (dump-sort-identities remaining))
+            (dump-public-key-line stream (first entry) (second entry)
+                                  (third entry) nil)))))))
+
+(defun dump-public-keys (host)
+  "Print the public keys and exit, as ssh -Z does."
+  (dump-public-key-identities host)
+  (finish-output)
+  (uiop:quit 0))
+
 (defun print-list-oneline (name values)
   "Print NAME and VALUES on one line, with ssh -G's \"none\" for empty."
   (format t "~A" name)
@@ -3441,8 +3645,12 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
               (fail "-s requires a subsystem name"))
             (when (and (getf *options* :stdio-forward) command)
               (fail "-W cannot be combined with a remote command"))
+            ;; -G wins when both are given: ssh dumps the configuration
+            ;; before it reaches the public key dump.
             (when (getf *options* :print-config)
               (print-config host))
+            (when (getf *options* :dump-public-keys)
+              (dump-public-keys host))
             (setf *mux-daemon*
                   (and (getf *options* :control-master-daemon) t))
             (when *mux-daemon*

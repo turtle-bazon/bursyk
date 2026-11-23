@@ -392,3 +392,83 @@ rsa-sha2-512); ed25519 uses 0."
              (error (condition) (funcall on-error condition))))
          on-error))
     (error (condition) (funcall on-error condition))))
+
+;;; ---- A blocking query for ssh -Z ----
+
+(defun ssh-agent-blocking-write (fd octets)
+  "Write all of OCTETS to the blocking descriptor FD."
+  (let ((have 0)
+        (end (length octets)))
+    (loop while (< have end)
+          do (multiple-value-bind (count errno)
+                 (cl-pnet-sockets:write-octets fd octets
+                                               :start have :end end)
+               (cond
+                 ((plusp count) (incf have count))
+                 ((eql errno 4))        ; EINTR
+                 (t
+                  (error 'ssh-authentication-error
+                         :detail
+                         (format nil
+                                 "cannot write to the ssh-agent: ~A"
+                                 (cl-pnet-sockets:c-strerror errno)))))))))
+
+(defun ssh-agent-blocking-read (fd count)
+  "Read exactly COUNT octets from the blocking descriptor FD."
+  (let ((buffer (make-array count :element-type '(unsigned-byte 8)))
+        (have 0))
+    (loop while (< have count)
+          do (multiple-value-bind (octets got errno)
+                 (cl-pnet-sockets:read-octets fd (- count have))
+               (cond
+                 ((plusp got)
+                  (replace buffer octets :start1 have)
+                  (incf have got))
+                 ((and (minusp got) (eql errno 4))) ; EINTR
+                 (t
+                  (error 'ssh-authentication-error
+                         :detail
+                         "the ssh-agent closed the connection before answering")))))
+    buffer))
+
+(defun ssh-agent-identities-blocking (&key path)
+  "The agent at PATH's (KEY-BLOB . COMMENT) pairs, waiting for the answer.
+
+Authentication uses the asynchronous SSH-AGENT-IDENTITIES so a slow agent
+cannot stall the event loop.  ssh -Z runs before any loop exists and has
+nothing else to do, so it asks synchronously through a blocking socket."
+  (let* ((path (ssh-agent-path path))
+         (writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-agentc-request-identities+)
+    (let* ((payload (ssh-writer-output writer))
+           (message (ssh-concat (ssh-uint32-octets (length payload))
+                                payload))
+           (fd (cl-pnet-sockets:c-socket cl-pnet-sockets:+af-unix+
+                                         cl-pnet-sockets:+sock-stream+ 0)))
+      (when (minusp fd)
+        (error 'ssh-authentication-error
+               :detail
+               (format nil "cannot open a socket for the ssh-agent at ~A: ~A"
+                       path (cl-pnet-sockets:c-strerror
+                             (cl-pnet-sockets:c-errno)))))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (address length)
+                 (cl-pnet-sockets:make-sockaddr-un path)
+               (unwind-protect
+                    (when (minusp (cl-pnet-sockets:c-connect fd address
+                                                             length))
+                      (error 'ssh-authentication-error
+                             :detail
+                             (format nil
+                                     "cannot connect to the ssh-agent at ~A: ~A"
+                                     path
+                                     (cl-pnet-sockets:c-strerror
+                                      (cl-pnet-sockets:c-errno)))))
+                 (cffi:foreign-free address)))
+             (ssh-agent-blocking-write fd message)
+             (let* ((header (ssh-agent-blocking-read fd 4))
+                    (length (ssh-octets-uint32 header)))
+               (ssh-agent-parse-identities
+                (ssh-agent-blocking-read fd length))))
+        (cl-pnet-sockets:c-close fd)))))

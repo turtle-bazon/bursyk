@@ -82,7 +82,14 @@ way ssh refuses it.")
   ;; quotes and internal spacing have to survive tokenization.
   (raw nil)
   (path nil)
-  (number nil))
+  (number nil)
+  ;; How IdentityFile was supplied, as OpenSSH records it: 1 from -i on the
+  ;; command line, 2 from -o or a user configuration file (-F or
+  ;; ~/.ssh/config), and 0 from the system ssh_config.  A nonzero value is
+  ;; what ssh -Z marks "explicit"; the exact value also decides which
+  ;; duplicate paths collapse, because readconf's add_identity_file compares
+  ;; it too.
+  (userprovided 0))
 
 (defstruct (ssh-config-context (:constructor %make-ssh-config-context))
   (original-host nil)
@@ -105,7 +112,11 @@ way ssh refuses it.")
   (user nil)
   (port nil)
   (identity-files nil)
+  ;; Parallel to IDENTITY-FILES, in the same order: whether each file came from
+  ;; a user configuration, which ssh -Z reports as "explicit".
+  (identity-files-userprovided nil)
   (certificate-files nil)
+  (certificate-files-userprovided nil)
   (identity-agent nil)
   ;; HostbasedAuthentication and its host keys.  EnableSSHKeysign is parsed
   ;; for compatibility; this client signs with a readable host key directly.
@@ -285,13 +296,14 @@ way ssh refuses it.")
   (extra nil))
 
 (defparameter +ssh-default-identity-names+
-  '("id_ed25519" "id_ecdsa" "id_rsa")
-  "Identity files OpenSSH would try, in the order offered here.
+  '("id_rsa" "id_ecdsa" "id_ecdsa_sk" "id_ed25519" "id_ed25519_sk"
+    "id_mldsa44_ed25519")
+  "Identity files OpenSSH tries when no IdentityFile is configured.
 
-ed25519 comes first because it is what OpenSSH generates by default; ECDSA
-and RSA follow because many existing accounts still have only one of those.
-This is a config default rather than backend state, so the libssh build
-reports the same identityfile lines as the pure one.")
+The names and their order match OpenSSH 10.6's readconf.c, so -G and ssh -Z
+report the same default identityfile lines.  This is a config default rather
+than backend state, so the libssh build reports the same lines as the pure
+one.")
 
 (defun ssh-default-user ()
   "The local user name, or ROOT when the environment does not say."
@@ -655,7 +667,8 @@ relative Include is anchored and whether ~ is allowed in one."
                                 :args (rest tokens)
                                 :raw (ssh-config-line-remainder line)
                                 :path path
-                                :number number)
+                                :number number
+                                :userprovided (if user-config 2 0))
                                directives)))))))
     (nreverse directives)))
 
@@ -667,7 +680,8 @@ USER-CONFIG selects user-configuration Include anchoring, as OpenSSH does for
   (let ((path (pathname (ssh-config-expand-home (namestring path)))))
     (when (probe-file path)
       (%make-ssh-config :path path
-                        :directives (ssh-config-read-directives path 0)))))
+                        :directives (ssh-config-read-directives
+                                     path 0 :user-config user-config)))))
 
 (defun ssh-config-combine (&rest configs)
   "CONFIGS as one directive stream, in the order given, skipping absent ones.
@@ -701,6 +715,9 @@ Every keyword the file understands works here too, including HostName."
            (%make-ssh-config-line
             :keyword (string-downcase keyword)
             :args (mapcar (lambda (arg) (princ-to-string arg)) args)
+            ;; -o goes through process_config_line with SSHCONF_USERCONF, so
+            ;; readconf records it as 2, the same as a user config file.
+            :userprovided 2
             :raw (or raw
                      (format nil "~{~A~^ ~}"
                              (mapcar (lambda (arg) (princ-to-string arg))
@@ -1190,10 +1207,14 @@ understand them rather than silently match nothing."
        ;; IdentityFile2 is OpenSSH's obsolete spelling of IdentityFile; it
        ;; still names an identity and joins the same ordered list.
        (push (ssh-config-path-value line options context)
-             (ssh-config-options-identity-files options)))
+             (ssh-config-options-identity-files options))
+       (push (ssh-config-line-userprovided line)
+             (ssh-config-options-identity-files-userprovided options)))
       ((string= keyword "certificatefile")
        (push (ssh-config-path-value line options context)
-             (ssh-config-options-certificate-files options)))
+             (ssh-config-options-certificate-files options))
+       (push (ssh-config-line-userprovided line)
+             (ssh-config-options-certificate-files-userprovided options)))
       ((string= keyword "identityagent")
        (ssh-config-set-once
         seen options :identity-agent

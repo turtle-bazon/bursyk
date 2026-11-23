@@ -42,8 +42,9 @@
   "OpenSSH's fingerprint of KEY-BLOB.
 
 HASH is :SHA256 for the modern SHA256:base64 form, or :MD5 for the legacy
-MD5:aa:bb:... form."
-  (let ((digest (ssh-hash hash key-blob)))
+MD5:aa:bb:... form.  A certificate is fingerprinted through its plain key,
+as OpenSSH's sshkey_fingerprint does with force_plain."
+  (let ((digest (ssh-hash hash (ssh-key-plain-blob key-blob))))
     (ecase hash
       (:sha256
        (concatenate 'string "SHA256:"
@@ -826,6 +827,31 @@ it is, so every caller fails closed instead of trusting the wrapper."
   (if (ssh-certificate-blob-p key-blob)
       (or (ssh-certificate-plain-key-blob key-blob) key-blob)
       key-blob))
+
+(defun ssh-key-type-name (key-blob)
+  "OpenSSH's short name for KEY-BLOB's type, as ssh -Z prints it.
+
+A certificate adds \"-CERT\" to the plain key's short name, so an Ed25519
+certificate is ED25519-CERT and an RSA one is RSA-CERT."
+  (multiple-value-bind (plain data)
+      (ssh-public-key-parts (ssh-key-plain-blob key-blob))
+    (declare (ignore data))
+    (let ((name
+            (cond
+              ((string= plain "ssh-ed25519") "ED25519")
+              ((string= plain "ssh-rsa") "RSA")
+              ((member plain '("ecdsa-sha2-nistp256"
+                               "ecdsa-sha2-nistp384"
+                               "ecdsa-sha2-nistp521")
+                       :test #'string=)
+               "ECDSA")
+              ((string= plain "sk-ssh-ed25519@openssh.com") "ED25519-SK")
+              ((string= plain "sk-ecdsa-sha2-nistp256@openssh.com")
+               "ECDSA-SK")
+              (t (string-upcase plain)))))
+      (if (ssh-certificate-blob-p key-blob)
+          (concatenate 'string name "-CERT")
+          name))))
 
 (defun ssh-certificate-signature-valid-p (certificate)
   "Whether CERTIFICATE's body carries a valid CA signature.

@@ -162,6 +162,7 @@
    #:ssh-config-options-user
    #:ssh-config-options-port
    #:ssh-config-options-identity-files
+   #:ssh-config-options-identity-files-userprovided
    #:ssh-config-options-identity-agent
    #:ssh-config-options-add-keys-to-agent
    #:ssh-config-options-hostbased-authentication
@@ -241,6 +242,7 @@
    #:ssh-config-options-forward-agent-sock-path
    #:ssh-config-options-compression
    #:ssh-config-options-certificate-files
+   #:ssh-config-options-certificate-files-userprovided
    #:ssh-config-options-bind-address
    #:ssh-config-options-bind-interface
    #:ssh-config-options-forward-x11-timeout
@@ -433,6 +435,7 @@
    #:ssh-known-host-status
    #:ssh-remember-known-host
    #:ssh-key-fingerprint
+   #:ssh-key-type-name
    #:ssh-key-randomart
    #:ssh-load-known-hosts
    ;; keys (useful to applications that pass a parsed key)
@@ -488,6 +491,7 @@
    #:ssh-private-key-signer
    ;; ssh-agent
    #:ssh-agent-identities
+   #:ssh-agent-identities-blocking
    #:ssh-agent-sign
    #:ssh-agent-add-identity
    #:ssh-agent-signers
