@@ -2408,14 +2408,16 @@ command that cannot run authorizes nothing."
                                  certificate))))))
       (handler-case
           (multiple-value-bind (output error-output status)
-              (uiop:run-program
-               (cons (first arguments)
-                     (mapcar (lambda (argument)
-                               (expand-command-tokens argument substitutions))
-                             (rest arguments)))
-               :output :string
-               :error-output :string
-               :ignore-error-status t)
+              (call-with-deferrable-signals-unblocked
+               (lambda ()
+                 (uiop:run-program
+                  (cons (first arguments)
+                        (mapcar (lambda (argument)
+                                  (expand-command-tokens argument substitutions))
+                                (rest arguments)))
+                  :output :string
+                  :error-output :string
+                  :ignore-error-status t)))
             (declare (ignore error-output))
             (if (zerop status)
                 (uiop:split-string output :separator '(#\Newline))
@@ -2486,10 +2488,12 @@ as sshd's user_key_command_allowed2 does."
                  (list user))))
       (handler-case
           (multiple-value-bind (output error-output status)
-              (uiop:run-program (cons program program-arguments)
-                                :output :string
-                                :error-output :string
-                                :ignore-error-status t)
+              (call-with-deferrable-signals-unblocked
+               (lambda ()
+                 (uiop:run-program (cons program program-arguments)
+                                   :output :string
+                                   :error-output :string
+                                   :ignore-error-status t)))
             (declare (ignore error-output))
             (if (zerop status)
                 (uiop:split-string output :separator '(#\Newline))

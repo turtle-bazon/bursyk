@@ -35,6 +35,34 @@ before the administrator's SetEnv.")
 #-win32
 (cffi:defcfun ("chmod" c-chmod) :int (path :string) (mode :unsigned-int))
 
+;;; A child is waited for with SB-EXT:PROCESS-WAIT, which serves events, and
+;;; SBCL aborts the whole process when a deferrable signal is blocked at that
+;;; point.  The puma backend keeps SIGINT blocked so its signalfd sees it, so
+;;; an AuthorizedKeysCommand or AuthorizedPrincipalsCommand child would kill
+;;; the server.  Unblock SBCL's deferrable set for the child and put the exact
+;;; mask back afterwards; a signal delivered during the wait is handled as
+;;; usual.
+#+(and sbcl (not win32))
+(cffi:defcfun ("pthread_sigmask" c-pthread-sigmask) :int
+  (how :int) (set :pointer) (oldset :pointer))
+
+#+(and sbcl (not win32))
+(defun call-with-deferrable-signals-unblocked (function)
+  "Call FUNCTION with SBCL's deferrable signals unblocked, then restore."
+  ;; SIG_BLOCK with a null set only reads the thread's mask; SIG_SETMASK
+  ;; restores it exactly, so signals the caller had blocked stay blocked.
+  (cffi:with-foreign-object (saved :uint8 128)
+    (c-pthread-sigmask 0 (cffi:null-pointer) saved)
+    (unwind-protect
+         (progn
+           (sb-unix::unblock-deferrable-signals)
+           (funcall function))
+      (c-pthread-sigmask 2 saved (cffi:null-pointer)))))
+
+#-(and sbcl (not win32))
+(defun call-with-deferrable-signals-unblocked (function)
+  (funcall function))
+
 (defun auth-info-file (session)
   "The ExposeAuthInfo file SESSION owns, or NIL."
   (gethash session *auth-info-files*))

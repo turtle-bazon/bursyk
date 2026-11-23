@@ -803,9 +803,11 @@ The child must inherit fd 0: run-program hangs when the same terminal is
 opened again just to be handed over as INPUT, while INHERIT works."
   (handler-case
       (string-trim '(#\Newline #\Return)
-                   (uiop:run-program
-                    (cons "stty" arguments)
-                    :input :interactive :output :string :error-output nil))
+                   (call-with-deferrable-signals-unblocked
+                    (lambda ()
+                      (uiop:run-program
+                       (cons "stty" arguments)
+                       :input :interactive :output :string :error-output nil))))
     (error () nil)))
 
 (defun mux-master-message (master connection type reader payload)

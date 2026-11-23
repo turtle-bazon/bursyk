@@ -923,3 +923,30 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "proxyusefdpass yes"
                       "updatehostkeys ask"))
         (is (search line text) line)))))
+
+;;; ---- Child processes and the signal mask ----
+
+(test child-waits-with-deferrable-signals-unblocked
+  "A child wait does not abort SBCL when a deferrable signal is blocked.
+
+The puma backend blocks SIGWINCH so its signalfd sees terminal resizes, and
+SBCL refuses to serve events while a deferrable signal is blocked.  Running
+STTY or a LocalCommand in that state used to kill the client instead of
+returning; the helper unblocks the signal for the child and restores the
+mask afterwards."
+  #-sbcl (skip "SBCL-only signal mask")
+  #+sbcl
+  (let ((handle (handler-case
+                    (cl-pnet:signal-start sb-unix:sigwinch (lambda () nil))
+                  (error () nil))))
+    (unwind-protect
+         (is (eql 0
+                  (nth-value
+                   2
+                   (burs::call-with-deferrable-signals-unblocked
+                    (lambda ()
+                      (uiop:run-program '("/bin/sh" "-c" "exit 0")
+                                        :ignore-error-status t))))))
+      (when handle
+        (ignore-errors (cl-pnet:signal-stop handle))))))
+

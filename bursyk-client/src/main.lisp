@@ -1973,11 +1973,13 @@ closed afterwards."
          (shell (or (uiop:getenv "SHELL") "/bin/sh")))
     (handler-case
         (let ((status (nth-value 2
-                                 (uiop:run-program
-                                  (list shell "-c" command)
-                                  :output *standard-output*
-                                  :error-output *error-output*
-                                  :ignore-error-status t))))
+                                 (call-with-deferrable-signals-unblocked
+                                  (lambda ()
+                                    (uiop:run-program
+                                     (list shell "-c" command)
+                                     :output *standard-output*
+                                     :error-output *error-output*
+                                     :ignore-error-status t))))))
           (unless (eql status 0)
             (log-line "local command exited with status ~A" status)))
       (error (condition)

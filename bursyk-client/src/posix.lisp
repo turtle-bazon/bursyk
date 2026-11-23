@@ -17,6 +17,33 @@
 (cffi:defcfun ("dup2" c-dup2) :int (old :int) (new :int))
 (cffi:defcfun ("close" c-close) :int (fd :int))
 
+;;; A child is waited for with SB-EXT:PROCESS-WAIT, which serves events, and
+;;; SBCL aborts the whole process when a deferrable signal is blocked at that
+;;; point.  The puma backend keeps signals blocked so its signalfd sees them,
+;;; so a STTY, LocalCommand or control-master child would kill the client.
+;;; Unblock SBCL's deferrable set for the child and put the exact mask back
+;;; afterwards; a signal delivered during the wait is handled as usual.
+#+sbcl
+(cffi:defcfun ("pthread_sigmask" c-pthread-sigmask) :int
+  (how :int) (set :pointer) (oldset :pointer))
+
+#+sbcl
+(defun call-with-deferrable-signals-unblocked (function)
+  "Call FUNCTION with SBCL's deferrable signals unblocked, then restore."
+  ;; SIG_BLOCK with a null set only reads the thread's mask; SIG_SETMASK
+  ;; restores it exactly, so signals the caller had blocked stay blocked.
+  (cffi:with-foreign-object (saved :uint8 128)
+    (c-pthread-sigmask 0 (cffi:null-pointer) saved)
+    (unwind-protect
+         (progn
+           (sb-unix::unblock-deferrable-signals)
+           (funcall function))
+      (c-pthread-sigmask 2 saved (cffi:null-pointer)))))
+
+#-sbcl
+(defun call-with-deferrable-signals-unblocked (function)
+  (funcall function))
+
 (defun background-ready ()
   "Tell the waiting parent that authentication succeeded, then detach stdio."
   (write-line "BURS-AUTH-OK" *standard-output*)
@@ -36,10 +63,12 @@
     (let ((saved *terminal-saved*))
       (setf *terminal-saved* nil)
       (ignore-errors
-       (uiop:run-program (list "stty" saved)
-                         :input :interactive
-                         :output nil
-                         :error-output nil)))))
+       (call-with-deferrable-signals-unblocked
+        (lambda ()
+          (uiop:run-program (list "stty" saved)
+                            :input :interactive
+                            :output nil
+                            :error-output nil)))))))
 
 (defun run-stty (&rest arguments)
   "Run stty with ARGUMENTS on our terminal; its output, or NIL.
@@ -48,10 +77,12 @@ STTY -G and STTY SIZE talk to stdin, so the child inherits fd 0.  A caller
 must already know that stdin is a terminal."
   (handler-case
       (string-trim '(#\Newline #\Return)
-                   (uiop:run-program (cons "stty" arguments)
-                                     :input :interactive
-                                     :output :string
-                                     :error-output nil))
+                   (call-with-deferrable-signals-unblocked
+                    (lambda ()
+                      (uiop:run-program (cons "stty" arguments)
+                                        :input :interactive
+                                        :output :string
+                                        :error-output nil))))
     (error () nil)))
 
 (defun terminal-size ()

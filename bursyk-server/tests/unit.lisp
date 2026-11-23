@@ -4172,3 +4172,28 @@ Match User alice
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Match User alice
   HostKeyAgent /run/agent.sock")))
+
+;;; ---- Child processes and the signal mask ----
+
+(test child-waits-with-deferrable-signals-unblocked
+  "A child wait does not abort SBCL when a deferrable signal is blocked.
+
+The puma backend blocks SIGINT so its signalfd sees it, and SBCL refuses to
+serve events while a deferrable signal is blocked.  AuthorizedKeysCommand
+and AuthorizedPrincipalsCommand run in that state, so their wait must
+unblock the signal and restore the mask."
+  #-sbcl (skip "SBCL-only signal mask")
+  #+sbcl
+  (let ((handle (handler-case
+                    (cl-pnet:signal-start sb-unix:sigint (lambda () nil))
+                  (error () nil))))
+    (unwind-protect
+         (is (eql 0
+                  (nth-value
+                   2
+                   (bursyk-server::call-with-deferrable-signals-unblocked
+                    (lambda ()
+                      (uiop:run-program '("/bin/sh" "-c" "exit 0")
+                                        :ignore-error-status t))))))
+      (when handle
+        (ignore-errors (cl-pnet:signal-stop handle))))))

@@ -88,6 +88,10 @@
 (defun stdin-terminal-p ()
   (not (null (console-mode (c-get-std-handle +std-input-handle+)))))
 
+(defun call-with-deferrable-signals-unblocked (function)
+  "Call FUNCTION; Windows has no signal mask to work around."
+  (funcall function))
+
 (defun terminal-size ()
   "The console window's (VALUES ROWS COLUMNS), or (VALUES NIL NIL)."
   (let ((handle (c-get-std-handle +std-output-handle+)))
