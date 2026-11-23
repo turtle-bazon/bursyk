@@ -3008,6 +3008,7 @@ guess, so only an explicit PidFile is written."
            ;; Agent forwarding: the library applies AllowAgentForwarding,
            ;; DisableForwarding and the key's no-agent-forwarding, then asks
            ;; this hook for the Unix socket the session's SSH_AUTH_SOCK names.
+           :on-agent-forward
            #-win32
            (lambda (session) (start-agent-forward session))
            #+win32
@@ -3020,6 +3021,7 @@ guess, so only an explicit PidFile is written."
            :x11-authority-file #'x11-authority-file
            #+win32
            :x11-authority-file
+           #+win32
            (lambda (session)
              (declare (ignore session))
              nil)
@@ -3068,6 +3070,58 @@ guess, so only an explicit PidFile is written."
   (close-server)
   (cl-pnet:event-loop-stop))
 
+;;; SBCL aborts when a deferrable signal is blocked at a GC or allocation
+;;; safepoint, and SIGINT/SIGTERM are deferrable.  The puma backend's signal
+;;; support blocks them so a signalfd can report them, which makes the server
+;;; die during ordinary work.  Watch the signals with SBCL's own handlers and
+;;; a pipe instead: the handler only writes a byte, and the event loop's fd
+;;; watcher runs SHUTDOWN on the loop thread.  A backend that cannot watch
+;;; signals on this platform must not stop the server listening, so a failure
+;;; to install one is reported and ignored.
+#+(and sbcl (not win32))
+(defvar *shutdown-octet*
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+
+#+(and sbcl (not win32))
+(defvar *shutdown-write-fd* nil)
+
+#+(and sbcl (not win32))
+(defun request-shutdown ()
+  (when *shutdown-write-fd*
+    (sb-unix:unix-write *shutdown-write-fd* *shutdown-octet* 0 1)))
+
+#+(and sbcl (not win32))
+(defun install-shutdown-signals ()
+  (multiple-value-bind (read-fd write-fd) (sb-unix:unix-pipe)
+    (setf *shutdown-write-fd* write-fd)
+    (cl-pnet:fd-watch
+     read-fd :on-readable
+     (lambda (watcher)
+       (declare (ignore watcher))
+       (shutdown)))
+    (dolist (signum '(2 15))
+      (handler-case
+          (sb-sys:enable-interrupt
+           signum
+           (lambda (signal info context)
+             (declare (ignore signal info context))
+             (request-shutdown)))
+        (error (condition)
+          (format *error-output*
+                  "bursyk-server: no handler for signal ~D: ~A~%"
+                  signum condition))))))
+
+#-(and sbcl (not win32))
+(defun install-shutdown-signals ()
+  (dolist (signum '(2 15))
+    (handler-case
+        (push (cl-pnet:signal-start signum (lambda () (shutdown)))
+              *signals*)
+      (error (condition)
+        (format *error-output*
+                "bursyk-server: no handler for signal ~D: ~A~%"
+                signum condition)))))
+
 (defun main ()
   "Entry point for the BURSYK-SERVER program."
   (handler-case
@@ -3084,14 +3138,7 @@ guess, so only an explicit PidFile is written."
         ;; that cannot watch signals on this platform must not stop the server
         ;; listening.  SIGTERM is what a service manager sends, and it must
         ;; remove the PidFile just as Ctrl-C does.
-        (dolist (signum '(2 15))
-          (handler-case
-              (push (cl-pnet:signal-start signum (lambda () (shutdown)))
-                    *signals*)
-            (error (condition)
-              (format *error-output*
-                      "bursyk-server: no handler for signal ~D: ~A~%"
-                      signum condition))))
+        (install-shutdown-signals)
         (cl-pnet:event-loop-run)
         (dolist (signal *signals*)
           (cl-pnet:signal-stop signal))
