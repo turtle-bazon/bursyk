@@ -23,7 +23,16 @@
   (decrypt-mac nil)
   (send-sequence 0 :type (unsigned-byte 32))
   (receive-sequence 0 :type (unsigned-byte 32))
-  (block-size +ssh-block-size+))
+  (block-size +ssh-block-size+)
+  ;; RFC 4253 6.2 compression.  The codec objects live for the whole
+  ;; connection and are reset at every NEWKEYS; the ENABLED flags stay false
+  ;; for zlib@openssh.com until authentication succeeds, because that method
+  ;; starts compressing only after USERAUTH_SUCCESS.
+  (send-compression nil)
+  (receive-compression nil)
+  (send-compression-prefix nil)
+  (send-compression-enabled nil)
+  (receive-compression-enabled nil))
 
 (defun ssh-packet-padding-length (payload-length &optional (length-octets 4))
   "The smallest padding of at least four octets that aligns the packet.
@@ -83,9 +92,12 @@ length field travels outside the encrypted body."
 
 (defun ssh-encode-packet (payload state)
   "Cycle STATE's sequence and return PAYLOAD as wire octets."
-  (if (ssh-cipher-state-encrypt state)
-      (ssh-aead-encode payload state)
-      (ssh-plain-encode payload state)))
+  (let ((payload (if (ssh-cipher-state-send-compression-enabled state)
+                     (ssh-compress-payload payload state)
+                     payload)))
+    (if (ssh-cipher-state-encrypt state)
+        (ssh-aead-encode payload state)
+        (ssh-plain-encode payload state))))
 
 (defun ssh-packet-mac-length (state direction)
   "How many MAC octets a packet in DIRECTION carries."
@@ -195,9 +207,120 @@ and padding, against a cipher's block limits.  The tag is not part of it."
 
 (defun ssh-decode-packet (buffer state)
   "One packet from BUFFER as (VALUES PAYLOAD CONSUMED), or :INCOMPLETE."
-  (if (ssh-cipher-state-decrypt state)
-      (ssh-aead-decode buffer state)
-      (ssh-plain-decode buffer state)))
+  (multiple-value-bind (payload consumed)
+      (if (ssh-cipher-state-decrypt state)
+          (ssh-aead-decode buffer state)
+          (ssh-plain-decode buffer state))
+    (if (eq payload :incomplete)
+        (values :incomplete 0)
+        (values (if (ssh-cipher-state-receive-compression-enabled state)
+                    (ssh-decompress-payload payload state)
+                    payload)
+                consumed))))
+
+(defun ssh-compress-payload (payload state)
+  "PAYLOAD compressed for the send stream, including any reset header.
+
+zlib@openssh.com wraps one persistent zlib stream around every packet in a
+direction.  Each packet is written and partially flushed, so the peer can
+inflate it without seeing the end of the stream.  A NEWKEYS reset returns the
+new zlib header from the codec; it must ride in front of the next packet."
+  (let* ((compressor (ssh-cipher-state-send-compression state))
+         (prefix (ssh-cipher-state-send-compression-prefix state))
+         (written (cl-newzlib:deflate-state-write compressor payload))
+         (flushed (cl-newzlib:deflate-state-flush compressor :mode :partial)))
+    (setf (ssh-cipher-state-send-compression-prefix state) nil)
+    (if prefix
+        (ssh-concat prefix written flushed)
+        (ssh-concat written flushed))))
+
+(defun ssh-decompress-payload (payload state)
+  "PAYLOAD inflated from the receive stream.
+
+A corrupt stream is a protocol error, and a packet that inflates past the
+largest packet this build accepts is refused rather than trusted, matching
+OpenSSH's PACKET_MAX_SIZE check."
+  (handler-case
+      (let ((plain (cl-newzlib:inflate-packet
+                    (ssh-cipher-state-receive-compression state) payload)))
+        (when (> (length plain) +ssh-max-packet+)
+          (error 'ssh-protocol-error
+                 :detail (format nil "packet inflates to ~D octets, over the ~D-octet limit"
+                                 (length plain) +ssh-max-packet+)))
+        plain)
+    (cl-newzlib:newzlib-error (condition)
+      (error 'ssh-protocol-error
+             :detail (format nil "packet decompression failed: ~A"
+                             condition)))))
+
+(defun ssh-end-send-compression (state)
+  (when (ssh-cipher-state-send-compression state)
+    (ignore-errors
+      (cl-newzlib:deflate-state-end (ssh-cipher-state-send-compression state))))
+  (setf (ssh-cipher-state-send-compression state) nil
+        (ssh-cipher-state-send-compression-prefix state) nil
+        (ssh-cipher-state-send-compression-enabled state) nil))
+
+(defun ssh-end-receive-compression (state)
+  (when (ssh-cipher-state-receive-compression state)
+    (ignore-errors
+      (cl-newzlib:inflate-state-end
+       (ssh-cipher-state-receive-compression state))))
+  (setf (ssh-cipher-state-receive-compression state) nil
+        (ssh-cipher-state-receive-compression-enabled state) nil))
+
+(defun ssh-install-send-compression (state name &key after-authentication)
+  "Prepare STATE's outgoing compression for NAME at NEWKEYS.
+
+NAME is \"none\" or \"zlib@openssh.com\".  A zlib stream is created at the
+first NEWKEYS but stays inactive until authentication succeeds, because
+zlib@openssh.com is delayed; a later NEWKEYS resets the live stream and keeps
+the new zlib header for the first packet that follows."
+  (if (not (and name (string= name "zlib@openssh.com")))
+      (ssh-end-send-compression state)
+      (let ((existing (ssh-cipher-state-send-compression state)))
+        (if existing
+            (setf (ssh-cipher-state-send-compression-prefix state)
+                  (cl-newzlib:deflate-state-reset existing))
+            (setf (ssh-cipher-state-send-compression state)
+                  (cl-newzlib:make-deflate-state
+                   :format :zlib :level 1 :strategy :huffman-only
+                   :window-bits 15 :mem-level 8)
+                  (ssh-cipher-state-send-compression-prefix state) nil))
+        (when (or after-authentication
+                  (ssh-cipher-state-send-compression-enabled state))
+          (setf (ssh-cipher-state-send-compression-enabled state) t))))
+  state)
+
+(defun ssh-install-receive-compression (state name &key after-authentication)
+  "Prepare STATE's incoming compression for NAME at NEWKEYS.
+
+The inflate side mirrors SSH-INSTALL-SEND-COMPRESSION: the decoder is created
+at the first NEWKEYS, reset on every later one, and starts consuming the
+peer's stream only once authentication succeeds."
+  (if (not (and name (string= name "zlib@openssh.com")))
+      (ssh-end-receive-compression state)
+      (let ((existing (ssh-cipher-state-receive-compression state)))
+        (if existing
+            (cl-newzlib:inflate-state-reset existing)
+            (setf (ssh-cipher-state-receive-compression state)
+                  (cl-newzlib:make-inflate-state :format :zlib)))
+        (when (or after-authentication
+                  (ssh-cipher-state-receive-compression-enabled state))
+          (setf (ssh-cipher-state-receive-compression-enabled state) t))))
+  state)
+
+(defun ssh-enable-delayed-compression (state)
+  "Start both directions of a negotiated zlib@openssh.com stream.
+
+OpenSSH calls this once USERAUTH_SUCCESS has crossed: the server after
+sending it, the client after receiving it.  A state that was never negotiated
+is left alone, and calling this twice is harmless."
+  (when (ssh-cipher-state-send-compression state)
+    (setf (ssh-cipher-state-send-compression-enabled state) t))
+  (when (ssh-cipher-state-receive-compression state)
+    (setf (ssh-cipher-state-receive-compression-enabled state) t))
+  state)
 
 (defun ssh-install-keys (state &key (encrypt nil encrypt-p)
                                    (decrypt nil decrypt-p)

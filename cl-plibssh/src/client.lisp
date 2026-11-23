@@ -307,6 +307,18 @@ host is named but no descriptor is passed: libssh dials nothing itself."
      session +ssh-options-hmac-c-s+ (ssh-client-macs client) "MACs")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hmac-s-c+ (ssh-client-macs client) "MACs")
+    ;; Compression is delayed: libssh offers the OpenSSH name and starts the
+    ;; stream after authentication, matching the pure transport.  This list is
+    ;; what "Compression yes" sets internally; libssh's default leaves
+    ;; compression off unless the server insists.
+    (when (ssh-client-compression client)
+      (dolist (code (list +ssh-options-compression-c-s+
+                          +ssh-options-compression-s-c+))
+        (when (minusp (ssh-plibssh-set-string-option
+                       session code "zlib@openssh.com,none"))
+          (error 'ssh-connection-error
+                 :detail (format nil "libssh rejected Compression: ~A"
+                                 (ssh-plibssh-error session))))))
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-key-exchange+ (ssh-client-kex-algorithms client)
      "KexAlgorithms")
@@ -1090,7 +1102,7 @@ transport limitation into the same diagnostic."
 Agent forwarding, password and keyboard-interactive authentication and the
 common option surface are implemented; the remaining entries are not, and
 callers learn that through the facade rather than a backend test."
-  (not (null (member feature '(:agent-forward)))))
+  (not (null (member feature '(:agent-forward :compression)))))
 
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the libssh transport implements."
@@ -1119,6 +1131,7 @@ callers learn that through the facade rather than a backend test."
                           host-key-algorithms
                           ciphers
                           macs
+                          compression
                           pubkey-accepted-algorithms
                           (password-authentication t)
                           (kbd-interactive-authentication t)
@@ -1220,6 +1233,7 @@ stream on its pipes instead of dialling."
                  :host-key-algorithms host-key-algorithms
                  :ciphers ciphers
                  :macs macs
+                 :compression compression
                  :pubkey-accepted-algorithms pubkey-accepted-algorithms
                  :password-authentication password-authentication
                  :kbd-interactive-authentication

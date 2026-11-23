@@ -304,6 +304,7 @@
    #:ssh-server-config-permit-open
    #:ssh-server-config-permit-listen
    #:ssh-server-config-ciphers
+   #:ssh-server-config-compression
    #:ssh-server-config-macs
    #:ssh-server-config-kex-algorithms
    #:ssh-server-config-host-key-algorithms

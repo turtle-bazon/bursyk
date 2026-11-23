@@ -126,8 +126,7 @@ socket address and has no routing domains.")
     ("gssapiauthentication" . "no")
     ("kerberosauthentication" . "no")
     ("permittty" . "yes")
-    ("permituserrc" . "yes")
-    ("compression" . "no")))
+    ("permituserrc" . "yes")))
 
 ;;; Recognised sshd keywords this server does not implement at all.
 (defparameter +ssh-server-config-unsupported-keywords+
@@ -198,6 +197,9 @@ socket address and has no routing domains.")
   ;; PubkeyAcceptedAlgorithms and RequiredRSASize may come from a Match block.
   (ciphers nil)
   (macs nil)
+  ;; Compression: NIL is sshd's default of yes, :NO keeps "none" alone in the
+  ;; KEXINIT offer.  zlib@openssh.com itself is still negotiated by the client.
+  (compression nil)
   (kex-algorithms nil)
   (host-key-algorithms nil)
   (pubkey-accepted-algorithms nil)
@@ -1283,6 +1285,12 @@ cannot apply per connection."
       ((string= keyword "x11forwarding")
        (ssh-server-config-set-once
         config 'x11-forwarding
+        (if (ssh-server-config-flag
+             line (ssh-server-config-one-argument line))
+            :yes :no)))
+      ((string= keyword "compression")
+       (ssh-server-config-set-once
+        config 'compression
         (if (ssh-server-config-flag
              line (ssh-server-config-one-argument line))
             :yes :no)))

@@ -183,6 +183,7 @@ MAKE-SSH-CLIENT's own defaults."
         (ssh-config-client-algorithms
          options #'ssh-config-options-macs
          +ssh-macs+ "MACs")
+        :compression (ssh-config-options-compression options)
         :pubkey-accepted-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-pubkey-accepted-algorithms
@@ -556,6 +557,7 @@ uses whichever of the two it saw first instead of chaining them."
            :host-key-algorithms (getf parameters :host-key-algorithms)
            :ciphers (getf parameters :ciphers)
            :macs (getf parameters :macs)
+           :compression (getf parameters :compression)
            :pubkey-accepted-algorithms
            (getf parameters :pubkey-accepted-algorithms)
            :ca-signature-algorithms (getf parameters :ca-signature-algorithms)

@@ -7,11 +7,10 @@
 ;;;; The option surface follows ssh(1): the same short flags, clustered where
 ;;;; they are flags and with an attached value where they take one.  Features
 ;;;; the selected transport cannot honour (X11 forwarding, remote forwarding,
-;;;; compression, PKCS#11, TUN devices) are refused with a diagnostic instead
-;;;; of being silently ignored.  GSSAPIAuthentication is only a switch for a
-;;;; method this build lacks, so a config that sets it is ignored as OpenSSH
-;;;; without GSSAPI ignores it; -K, which asks for that method outright, is
-;;;; still refused.
+;;;; PKCS#11, TUN devices) are refused with a diagnostic instead of being
+;;;; silently ignored.  GSSAPIAuthentication is only a switch for a method this
+;;;; build lacks, so a config that sets it is ignored as OpenSSH without GSSAPI
+;;;; ignores it; -K, which asks for that method outright, is still refused.
 
 ;;; ---- Command line ----
 
@@ -420,7 +419,8 @@ a name this build lacks is an error instead of a silently widened offer."
              (not (cl-pnet-ssh:ssh-client-feature-supported-p :x11-forward)))
     (unsupported "-Y" "X11 forwarding is not implemented by this transport"))
   (when (getf *options* :compression)
-    (unsupported "-C" "only uncompressed streams are implemented"))
+    (when (not (cl-pnet-ssh:ssh-client-feature-supported-p :compression))
+      (unsupported "-C" "compression is not implemented by this transport")))
   (when (and (getf *options* :remote-forward)
              (not (cl-pnet-ssh:ssh-client-feature-supported-p
                    :remote-forward)))
@@ -466,7 +466,9 @@ refusal."
   (let ((options (and client (cl-pnet-ssh:ssh-client-config-options client))))
     (when options
       (when (cl-pnet-ssh:ssh-config-options-compression options)
-        (unsupported "Compression" "only uncompressed streams are implemented"))
+        (unless (cl-pnet-ssh:ssh-client-feature-supported-p :compression)
+          (unsupported "Compression"
+                       "compression is not implemented by this transport")))
       (when (and (cl-pnet-ssh:ssh-config-options-remote-forwards options)
                  (not (cl-pnet-ssh:ssh-client-feature-supported-p
                        :remote-forward)))
@@ -610,6 +612,10 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
       (push (format nil "MACs ~A" (getf *options* :macs)) options))
     (when (getf *options* :ciphers)
       (push (format nil "Ciphers ~A" (getf *options* :ciphers)) options))
+    ;; -C is a dedicated flag, so it outranks an -o or the file's
+    ;; Compression, and -G reports it as a resolved setting.
+    (when (getf *options* :compression)
+      (push "Compression yes" options))
     ;; A dedicated -b or -B outranks an -o for the same keyword, as every
     ;; dedicated flag does; they also make -G report what will be dialled.
     (when (getf *options* :bind-address)

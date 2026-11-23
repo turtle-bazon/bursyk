@@ -141,7 +141,14 @@ default.")
 ;; still negotiates one of these, and OpenSSH expects a common choice.
 (defparameter +ssh-macs+ '("hmac-sha2-256" "hmac-sha2-512"))
 
-(defparameter +ssh-compressions+ '("none"))
+(defparameter +ssh-compressions+ '("none" "zlib@openssh.com")
+  "The compression methods this build understands, in the order OpenSSH
+offers them when compression is not requested.  Negotiation takes the first
+entry of the client's list that the server also offers, so \"none\" first
+leaves compression off unless the client asks for it.")
+
+(defparameter +ssh-compressions-preferred+ '("zlib@openssh.com" "none")
+  "The offer a client makes after -C or Compression yes, as OpenSSH does.")
 
 (defparameter +ssh-rsa-minimum-modulus-size+ 1024
   "OpenSSH's SSH_RSA_MINIMUM_MODULUS_SIZE, the floor under RequiredRSASize.")

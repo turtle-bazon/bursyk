@@ -6,6 +6,7 @@
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
+               #:cl-newzlib
                #:cl-pnet
                #:cl-pnet-sockets
                #:burzay

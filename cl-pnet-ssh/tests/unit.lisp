@@ -1400,6 +1400,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 verify-host-key-dns host-key-dns-resolver
                                 bind-address bind-interface
                                 rekey-limit rekey-interval command
+                                compression
                                 password kbd-interactive
                                 password-authentication
                                 kbd-interactive-authentication
@@ -1459,6 +1460,7 @@ added on first use."
             :address-family address-family
             :rekey-limit rekey-limit
             :rekey-interval rekey-interval
+            :compression compression
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -1493,7 +1495,7 @@ added on first use."
 (defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
                                       bind-address bind-interface
                                       sshd-options rekey-limit rekey-interval
-                                      command)
+                                      compression command)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
@@ -1539,6 +1541,7 @@ Returns (VALUES STDOUT STDERR STATUS)."
                           :bind-interface bind-interface
                           :rekey-limit rekey-limit
                           :rekey-interval rekey-interval
+                          :compression compression
                           :command command)))
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
@@ -1688,6 +1691,46 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+(test compression-loopback-exec
+  "A compressed session runs a command and returns its output."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-loopback-result :compression t)
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))
+
+(test compression-loopback-streams-more-than-one-window
+  "A compressed stream survives many packets and the codec's 32 KiB window."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-loopback-result :compression t
+                                    :command "seq 1 20000")
+        (declare (ignore stderr))
+        (is (eql 0 status))
+        (let ((lines (remove "" (uiop:split-string
+                                 stdout :separator '(#\Newline))
+                             :test #'string=)))
+          (is (eql 20000 (length lines)))
+          (is (string= "20000" (car (last lines))))))))
+
+(test server-compression-no-still-connects
+  "Compression no narrows the offer but a -C client still connects."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (multiple-value-bind (stdout stderr status)
+          (ssh-test-loopback-result :compression t
+                                    :sshd-options '("Compression no"))
+        (is (equal "hello" stdout))
+        (is (equal "oops" stderr))
+        (is (eql 3 status)))))
+
+(test compression-feature-is-advertised
+  "Both transports tell the facade they can run compression."
+  (is (cl-pnet-ssh:ssh-client-feature-supported-p :compression)))
 
 ;;; ---- Agent forwarding ----
 

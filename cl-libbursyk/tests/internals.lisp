@@ -1082,7 +1082,8 @@ flag at a rekey would make the two sides count packets differently."
                                     :cipher-s2c "chacha20-poly1305@openssh.com"
                                     :mac-c2s "hmac-sha2-256"
                                     :mac-s2c "hmac-sha2-256"
-                                    :compression "none"
+                                    :compression-c2s "none"
+                                    :compression-s2c "none"
                                     :strict negotiated)))
                       (setf (symbol-function
                              'cl-pnet-ssh::ssh-client-send-payload)
@@ -1177,7 +1178,8 @@ flag at a rekey would make the two sides count packets differently."
                           :ciphers-s2c ("chacha20-poly1305@openssh.com")
                           :macs-c2s ("hmac-sha2-256" "hmac-sha2-512")
                           :macs-s2c ("hmac-sha2-256" "hmac-sha2-512")
-                          :compressions-c2s ("none")))))
+                          :compressions-c2s ("none")
+                          :compressions-s2c ("none")))))
                  (is (equal "curve25519-sha256@libssh.org"
                             (getf negotiated :kex)))
                  (is (equal "rsa-sha2-512" (getf negotiated :host-key)))
@@ -1403,6 +1405,150 @@ flag at a rekey would make the two sides count packets differently."
                              (cl-pnet-ssh::ssh-make-cipher-state))))
                (is (= cl-pnet-ssh::+ssh-msg-newkeys+ (aref decoded 0))))))
       (setf (symbol-function 'cl-pnet:send-data) original))))
+
+(defun compression-payload (length)
+  "A deterministic payload of LENGTH octets that compresses well."
+  (let ((octets (make-array length :element-type '(unsigned-byte 8))))
+    (dotimes (i length octets)
+      (setf (aref octets i) (+ 65 (mod i 26))))))
+
+(defun compressed-round-trip (sender receiver payload)
+  "Encode PAYLOAD through SENDER and decode it through RECEIVER."
+  (let ((wire (ssh-encode-packet payload sender)))
+    (multiple-value-bind (decoded consumed) (ssh-decode-packet wire receiver)
+      (is (= (length wire) consumed))
+      decoded)))
+
+(test compression-is-delayed-until-authentication
+  "zlib@openssh.com leaves the stream plain until USERAUTH_SUCCESS."
+  (let ((sender (cl-pnet-ssh::ssh-make-cipher-state))
+        (receiver (cl-pnet-ssh::ssh-make-cipher-state))
+        (payload (compression-payload 200)))
+    (cl-pnet-ssh::ssh-install-send-compression sender "zlib@openssh.com")
+    (cl-pnet-ssh::ssh-install-receive-compression receiver "zlib@openssh.com")
+    ;; Both codecs exist but stay idle, so this first packet is plain.  A
+    ;; sender that compressed here would hand the receiver its compressed
+    ;; bytes as the payload, which is exactly what the equality catches.
+    (is (equalp payload (compressed-round-trip sender receiver payload)))
+    (is (not (cl-pnet-ssh::ssh-cipher-state-send-compression-enabled sender)))
+    (cl-pnet-ssh::ssh-enable-delayed-compression sender)
+    (cl-pnet-ssh::ssh-enable-delayed-compression receiver)
+    (is (cl-pnet-ssh::ssh-cipher-state-send-compression-enabled sender))
+    ;; Now the same bytes must survive a compressed round trip in both
+    ;; directions, which a codec on only one side cannot fake.
+    (is (equalp payload (compressed-round-trip sender receiver payload)))))
+
+(test compression-resets-at-newkeys
+  "A rekey resets both streams and the new zlib header rides the next packet."
+  (let ((sender (cl-pnet-ssh::ssh-make-cipher-state))
+        (receiver (cl-pnet-ssh::ssh-make-cipher-state))
+        (payload (compression-payload 500)))
+    (cl-pnet-ssh::ssh-install-send-compression sender "zlib@openssh.com"
+                                              :after-authentication t)
+    (cl-pnet-ssh::ssh-install-receive-compression receiver "zlib@openssh.com"
+                                                  :after-authentication t)
+    (is (equalp payload (compressed-round-trip sender receiver payload)))
+    ;; NEWKEYS: both directions discard their window.  The compressor hands
+    ;; back the fresh zlib header, which must lead the next packet.
+    (cl-pnet-ssh::ssh-install-send-compression sender "zlib@openssh.com"
+                                              :after-authentication t)
+    (is (not (null (cl-pnet-ssh::ssh-cipher-state-send-compression-prefix
+                    sender))))
+    (cl-pnet-ssh::ssh-install-receive-compression receiver "zlib@openssh.com"
+                                                  :after-authentication t)
+    (is (equalp payload (compressed-round-trip sender receiver payload)))
+    (is (null (cl-pnet-ssh::ssh-cipher-state-send-compression-prefix
+               sender)))))
+
+(test compression-round-trips-a-window-sized-packet
+  "A packet larger than the codec's 32 KiB chunk survives both directions."
+  (let ((sender (cl-pnet-ssh::ssh-make-cipher-state))
+        (receiver (cl-pnet-ssh::ssh-make-cipher-state))
+        (payload (compression-payload 70000)))
+    (cl-pnet-ssh::ssh-install-send-compression sender "zlib@openssh.com"
+                                              :after-authentication t)
+    (cl-pnet-ssh::ssh-install-receive-compression receiver "zlib@openssh.com"
+                                                  :after-authentication t)
+    (is (equalp payload (compressed-round-trip sender receiver payload)))))
+
+(test compression-round-trips-a-one-octet-packet
+  "An empty block still has a flushed packet boundary to inflate."
+  (let ((sender (cl-pnet-ssh::ssh-make-cipher-state))
+        (receiver (cl-pnet-ssh::ssh-make-cipher-state))
+        (payload (compression-payload 1)))
+    (cl-pnet-ssh::ssh-install-send-compression sender "zlib@openssh.com"
+                                              :after-authentication t)
+    (cl-pnet-ssh::ssh-install-receive-compression receiver "zlib@openssh.com"
+                                                  :after-authentication t)
+    (is (equalp payload (compressed-round-trip sender receiver payload)))))
+
+(test compression-none-installs-no-codec
+  "Negotiated none never creates a compressor or inflater."
+  (let ((state (cl-pnet-ssh::ssh-make-cipher-state))
+        (payload (compression-payload 100)))
+    (cl-pnet-ssh::ssh-install-send-compression state "none")
+    (cl-pnet-ssh::ssh-install-receive-compression state "none")
+    (is (null (cl-pnet-ssh::ssh-cipher-state-send-compression state)))
+    (is (null (cl-pnet-ssh::ssh-cipher-state-receive-compression state)))
+    (let ((wire (ssh-encode-packet payload state)))
+      (multiple-value-bind (decoded consumed) (ssh-decode-packet wire state)
+        (is (= (length wire) consumed))
+        (is (equalp payload decoded))))))
+
+(test compression-corrupt-stream-is-refused
+  "Garbage on a compressed stream is a protocol error, not a packet."
+  (let ((state (cl-pnet-ssh::ssh-make-cipher-state)))
+    (cl-pnet-ssh::ssh-install-receive-compression state "zlib@openssh.com"
+                                                  :after-authentication t)
+    (signals cl-pnet-ssh::ssh-protocol-error
+      (cl-pnet-ssh::ssh-decompress-payload
+       (make-array 8 :element-type '(unsigned-byte 8)
+                     :initial-element #xff)
+       state))))
+
+(test kexinit-compression-offer-follows-the-request
+  "A -C client offers zlib first; the default leaves it second."
+  (let ((default (ssh-parse-kexinit-payload (ssh-make-kexinit-payload)))
+        (requested
+          (ssh-parse-kexinit-payload
+           (ssh-make-kexinit-payload
+            :compressions cl-pnet-ssh::+ssh-compressions-preferred+))))
+    (is (equal '("none" "zlib@openssh.com")
+               (getf default :compressions-c2s)))
+    (is (equal '("zlib@openssh.com" "none")
+               (getf requested :compressions-c2s)))
+    (is (equal (getf requested :compressions-c2s)
+               (getf requested :compressions-s2c)))))
+
+(test negotiate-honours-the-client-compression-order
+  "The client's list decides compression, not the server's own order."
+  (let ((server-offer
+          (ssh-parse-kexinit-payload
+           (ssh-make-kexinit-payload
+            :compressions '("none" "zlib@openssh.com")))))
+    (let ((negotiated (ssh-negotiate server-offer)))
+      (is (string= "none" (getf negotiated :compression-c2s)))
+      (is (string= "none" (getf negotiated :compression-s2c))))
+    (let ((negotiated
+            (ssh-negotiate
+             server-offer
+             :compressions cl-pnet-ssh::+ssh-compressions-preferred+)))
+      (is (string= "zlib@openssh.com" (getf negotiated :compression-c2s)))
+      (is (string= "zlib@openssh.com" (getf negotiated :compression-s2c))))))
+
+(test server-compression-offer-follows-compression-no
+  "sshd offers zlib by default and only none when Compression is off."
+  (let ((on (cl-pnet-ssh::%make-ssh-server :host-keys nil))
+        (off (cl-pnet-ssh::%make-ssh-server
+              :host-keys nil
+              :sshd-config (ssh-server-config-load
+                            nil :options '("Compression no")))))
+    (is (equal '("none" "zlib@openssh.com")
+               (cl-pnet-ssh::ssh-server-compression-offer
+                (cl-pnet-ssh::%make-ssh-session :server on))))
+    (is (equal '("none")
+               (cl-pnet-ssh::ssh-server-compression-offer
+                (cl-pnet-ssh::%make-ssh-session :server off))))))
 
 (test rekey-limit-triggers-on-volume-or-time
   "The client rekeys only after auth, and only once a packet has crossed."

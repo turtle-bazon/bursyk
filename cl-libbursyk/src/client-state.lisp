@@ -120,6 +120,10 @@
   (host-key-algorithms nil)
   (ciphers nil)
   (macs nil)
+  ;; Compression, from -C or Compression yes.  NIL keeps the offer
+  ;; "none,zlib@openssh.com", so the server's preference cannot turn it on;
+  ;; true offers "zlib@openssh.com,none" as OpenSSH does.
+  (compression nil)
   ;; PubkeyAcceptedAlgorithms: key types that may authenticate.  NIL offers
   ;; every signer; a list of patterns filters them before the first request.
   (pubkey-accepted-algorithms nil)

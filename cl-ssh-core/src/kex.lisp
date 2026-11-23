@@ -280,19 +280,20 @@ An agent-backed key cannot sign synchronously; the KEX path asks the agent."
       (unless (member marker result :test #'string=)
         (setf result (append result (list marker)))))))
 
-(defun ssh-make-kexinit-payload (&key kex host-keys ciphers macs)
+(defun ssh-make-kexinit-payload (&key kex host-keys ciphers macs compressions)
   "A fresh SSH_MSG_KEXINIT, offering the caller's lists or this build's."
   (let ((writer (ssh-writer))
         (kex (if kex (ssh-kex-with-markers kex) +ssh-kex-algorithms+))
         (host-keys (or host-keys +ssh-host-key-algorithms+))
         (ciphers (or ciphers +ssh-ciphers+))
-        (macs (or macs +ssh-macs+)))
+        (macs (or macs +ssh-macs+))
+        (compressions (or compressions +ssh-compressions+)))
     (ssh-write-u8 writer +ssh-msg-kexinit+)
     (ssh-write-octets writer (ssh-random-octets 16))
     (iter (for list in (list kex host-keys
                              ciphers ciphers
                              macs macs
-                             +ssh-compressions+ +ssh-compressions+
+                             compressions compressions
                              '() '()))
       (ssh-write-name-list writer list))
     (ssh-write-boolean writer nil)
@@ -318,17 +319,19 @@ An agent-backed key cannot sign synchronously; the KEX path asks the agent."
           :first-kex-packet-follows (ssh-read-boolean reader))))
 
 (defun ssh-negotiate (server-kexinit &key kex-algorithms host-key-algorithms
-                                       ciphers macs)
+                                       ciphers macs compressions)
   "The mutually acceptable algorithms as a plist, or signal when empty.
 
 :STRICT is true when the peer offered OpenSSH's strict-KEX marker, which
 makes both sides reset packet sequence numbers at NEWKEYS.  The keyword
-arguments override this build's lists, for ssh_config Ciphers and friends."
+arguments override this build's lists, for ssh_config Ciphers and friends.
+Compression is chosen separately for each direction, as RFC 4253 requires."
   (let* ((kex-algorithms (or kex-algorithms +ssh-kex-algorithms+))
          (host-key-algorithms (or host-key-algorithms
                                   +ssh-host-key-algorithms+))
          (ciphers (or ciphers +ssh-ciphers+))
          (macs (or macs +ssh-macs+))
+         (compressions (or compressions +ssh-compressions+))
          (kex (ssh-choose-algorithm kex-algorithms
                                     (getf server-kexinit :kex)))
          (host-key (ssh-choose-algorithm host-key-algorithms
@@ -341,16 +344,23 @@ arguments override this build's lists, for ssh_config Ciphers and friends."
                                         (getf server-kexinit :macs-c2s)))
          (mac-s2c (ssh-choose-algorithm macs
                                         (getf server-kexinit :macs-s2c)))
-         (compression (ssh-choose-algorithm +ssh-compressions+
-                                            (getf server-kexinit
-                                                  :compressions-c2s))))
-    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c compression)
+         (compression-c2s (ssh-choose-algorithm
+                           compressions
+                           (getf server-kexinit :compressions-c2s)))
+         (compression-s2c (ssh-choose-algorithm
+                           compressions
+                           (getf server-kexinit :compressions-s2c))))
+    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c
+                 compression-c2s compression-s2c)
       (error 'ssh-protocol-error
-             :detail (format nil "no common algorithm (we offer kex ~{~A~^,~}; host key ~{~A~^,~}; cipher ~{~A~^,~}; mac ~{~A~^,~})"
-                             kex-algorithms host-key-algorithms ciphers macs)))
+             :detail (format nil "no common algorithm (we offer kex ~{~A~^,~}; host key ~{~A~^,~}; cipher ~{~A~^,~}; mac ~{~A~^,~}; compression ~{~A~^,~})"
+                             kex-algorithms host-key-algorithms ciphers macs
+                             compressions)))
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
           :mac-c2s mac-c2s :mac-s2c mac-s2c
+          :compression-c2s compression-c2s
+          :compression-s2c compression-s2c
           :strict (member "kex-strict-s-v00@openssh.com"
                           (getf server-kexinit :kex) :test #'string=)
           :guess-wrong (and (getf server-kexinit :first-kex-packet-follows)

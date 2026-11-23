@@ -86,6 +86,8 @@
 (defconstant +ssh-options-known-hosts+ 8)
 (defconstant +ssh-options-ciphers-c-s+ 15)
 (defconstant +ssh-options-ciphers-s-c+ 16)
+(defconstant +ssh-options-compression-c-s+ 17)
+(defconstant +ssh-options-compression-s-c+ 18)
 (defconstant +ssh-options-proxy-command+ 19)
 (defconstant +ssh-options-key-exchange+ 24)
 (defconstant +ssh-options-hostkeys+ 25)

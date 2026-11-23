@@ -1499,6 +1499,18 @@ application's ON-CLOSE runs without waiting for the peer's half."
             (error 'ssh-connection-error
                    :detail (format nil "could not attach a session: ~A"
                                    detail)))))
+      ;; Compression no narrows the offer to "none".  libssh's server default
+      ;; is "none,zlib@openssh.com", which already matches sshd, and the
+      ;; client's preference order decides whether the stream is used.
+      (let ((config (ssh-server-sshd-config server)))
+        (when (and config
+                   (eq (ssh-server-config-compression config) :no))
+          (dolist (code (list +ssh-options-compression-c-s+
+                              +ssh-options-compression-s-c+))
+            (when (minusp (ssh-plibssh-set-string-option handle code "none"))
+              (error 'ssh-connection-error
+                     :detail (format nil "libssh rejected Compression: ~A"
+                                     (ssh-plibssh-error handle)))))))
       (setf (gethash session (ssh-server-sessions server)) session)
       (ssh-plibssh-register-session handle session)
       (ssh-session-start-login-grace-timer session)

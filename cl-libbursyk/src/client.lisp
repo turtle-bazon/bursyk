@@ -412,7 +412,8 @@ address is known, because it has to be in the same family."
                                on-open on-error on-close on-forwarded-tcpip
                                on-forwarded-streamlocal
                                &key kex-algorithms host-key-algorithms
-                                 ciphers macs pubkey-accepted-algorithms
+                                 ciphers macs compression
+                                 pubkey-accepted-algorithms
                                  ca-signature-algorithms                                 (revoked-host-keys '())
                                  hash-known-hosts
                                  known-hosts-command
@@ -493,6 +494,7 @@ address is known, because it has to be in the same family."
                     :host-key-algorithms host-key-algorithms
                     :ciphers ciphers
                     :macs macs
+                    :compression compression
                     :pubkey-accepted-algorithms pubkey-accepted-algorithms
                     :ca-signature-algorithms ca-signature-algorithms
                     :revoked-host-keys revoked-host-keys
@@ -640,7 +642,7 @@ is applied here, before any request names a key the configuration forbade."
                              forward-x11-timeout
                              xauth-location
                              kex-algorithms host-key-algorithms
-                             ciphers macs pubkey-accepted-algorithms
+                             ciphers macs compression pubkey-accepted-algorithms
                              ca-signature-algorithms
                              (revoked-host-keys '())
                              hash-known-hosts
@@ -811,6 +813,7 @@ role-neutral."
                            :host-key-algorithms host-key-algorithms
                            :ciphers ciphers
                            :macs macs
+                           :compression compression
                            :pubkey-accepted-algorithms
                            pubkey-accepted-algorithms
                            :ca-signature-algorithms ca-signature-algorithms
@@ -894,7 +897,8 @@ Applications ask this through CL-PNET-SSH instead of testing which backend
 was built, so the same client code runs unchanged against either transport."
   (not (null (member feature '(:remote-forward :streamlocal-forward
                                :x11-forward :hostbased-authentication
-                               :version-addendum :agent-forward)))))
+                               :version-addendum :agent-forward
+                               :compression)))))
 
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the pure transport implements."

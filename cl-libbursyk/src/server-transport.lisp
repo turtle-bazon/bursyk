@@ -34,6 +34,16 @@ only curve25519 does not turn off either extension."
    (ssh-session-setting session #'ssh-server-config-host-key-algorithms)
    (ssh-server-host-certificates (ssh-session-server session))))
 
+(defun ssh-server-compression-offer (session)
+  "The compression methods SESSION advertises.
+
+sshd offers \"none,zlib@openssh.com\" by default and only \"none\" when
+Compression is off.  The client's order decides, so a server that keeps the
+default still lets a -C client turn compression on."
+  (if (eq (ssh-session-setting session #'ssh-server-config-compression) :no)
+      '("none")
+      +ssh-compressions+))
+
 (defun ssh-server-make-kexinit-payload (session)
   "A fresh server SSH_MSG_KEXINIT advertising SESSION's configured offers."
   (let* ((ciphers (ssh-session-algorithm-list
@@ -47,7 +57,8 @@ only curve25519 does not turn off either extension."
                              (ssh-server-host-key-algorithms-for session)
                              ciphers ciphers
                              macs macs
-                             +ssh-compressions+ +ssh-compressions+
+                             (ssh-server-compression-offer session)
+                             (ssh-server-compression-offer session)
                              '() '()))
       (ssh-write-name-list writer list))
     (ssh-write-boolean writer nil)
@@ -190,35 +201,45 @@ while key exchange is in progress, so it can never answer for KEX traffic."
   "Choose algorithms from CLIENT-KEXINIT for the server role.
 
 The host key offer is built from SESSION's loaded keys, so every algorithm
-advertised can be signed with."
-  (let* ((kex (ssh-choose-algorithm
-               (remove-if #'ssh-kex-marker-p
-                          (ssh-server-kex-offer session))
-               (getf client-kexinit :kex)))
-         (host-key (ssh-choose-algorithm
-                    (ssh-server-host-key-algorithms-for session)
-                    (getf client-kexinit :host-keys)))
+advertised can be signed with.  Each choice follows RFC 4253: the first
+method on the client's list that the server also offers.  Using the server's
+own order here would let the two sides disagree when their preferences
+differ, which compression exposes immediately."
+  (let* ((kex-offer (remove-if #'ssh-kex-marker-p
+                               (ssh-server-kex-offer session)))
+         (host-key-offer (ssh-server-host-key-algorithms-for session))
          (ciphers (ssh-session-algorithm-list
                    session #'ssh-server-config-ciphers +ssh-ciphers+))
          (macs (ssh-session-algorithm-list
                 session #'ssh-server-config-macs +ssh-macs+))
-         (cipher-c2s (ssh-choose-algorithm ciphers
-                                           (getf client-kexinit :ciphers-c2s)))
-         (cipher-s2c (ssh-choose-algorithm ciphers
-                                           (getf client-kexinit :ciphers-s2c)))
-         (mac-c2s (ssh-choose-algorithm macs
-                                        (getf client-kexinit :macs-c2s)))
-         (mac-s2c (ssh-choose-algorithm macs
-                                        (getf client-kexinit :macs-s2c)))
-         (compression (ssh-choose-algorithm +ssh-compressions+
-                                            (getf client-kexinit
-                                                  :compressions-c2s))))
-    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c compression)
+         (compressions (ssh-server-compression-offer session))
+         (kex (ssh-choose-algorithm
+               (getf client-kexinit :kex) kex-offer))
+         (host-key (ssh-choose-algorithm
+                    (getf client-kexinit :host-keys) host-key-offer))
+         (cipher-c2s (ssh-choose-algorithm
+                      (getf client-kexinit :ciphers-c2s) ciphers))
+         (cipher-s2c (ssh-choose-algorithm
+                      (getf client-kexinit :ciphers-s2c) ciphers))
+         (mac-c2s (ssh-choose-algorithm
+                   (getf client-kexinit :macs-c2s) macs))
+         (mac-s2c (ssh-choose-algorithm
+                   (getf client-kexinit :macs-s2c) macs))
+         (compression-c2s (ssh-choose-algorithm
+                           (getf client-kexinit :compressions-c2s)
+                           compressions))
+         (compression-s2c (ssh-choose-algorithm
+                           (getf client-kexinit :compressions-s2c)
+                           compressions)))
+    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c
+                 compression-c2s compression-s2c)
       (error 'ssh-protocol-error
              :detail "no common algorithm for the server"))
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
           :mac-c2s mac-c2s :mac-s2c mac-s2c
+          :compression-c2s compression-c2s
+          :compression-s2c compression-s2c
           :ext-info (and (member "ext-info-c" (getf client-kexinit :kex)
                                  :test #'string=)
                          t)
@@ -389,6 +410,12 @@ and refuse the key without ever asking."
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
                       :encrypt-mac (getf keys :encrypt-mac)
                       :aead (getf keys :aead))
+    ;; NEWKEYS itself went out under the old stream; EXT_INFO below belongs
+    ;; to the new one, as it does in OpenSSH.
+    (ssh-install-send-compression
+     cipher
+     (getf (ssh-session-negotiated session) :compression-s2c)
+     :after-authentication (ssh-session-after-authentication session))
     (setf (ssh-session-keys-sent session) t
           (ssh-session-kexinit-sent session) nil
           ;; OpenSSH resets its send counters when the new keys are
@@ -419,6 +446,10 @@ and refuse the key without ever asking."
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
                       :decrypt-mac (getf keys :decrypt-mac)
                       :aead (getf keys :aead))
+    (ssh-install-receive-compression
+     cipher
+     (getf (ssh-session-negotiated session) :compression-c2s)
+     :after-authentication (ssh-session-after-authentication session))
     (setf (ssh-session-keys-received session) t
           (ssh-session-received-packets session) 0
           (ssh-session-received-blocks session) 0)
@@ -796,6 +827,9 @@ connection the way sshd's PAM account failure does."
         (ssh-session-cancel-timer (ssh-session-login-grace-timer session)))
   (ssh-server-send-auth-success session)
   (setf (ssh-session-after-authentication session) t)
+  ;; zlib@openssh.com starts with the next packet in each direction; the
+  ;; USERAUTH_SUCCESS just sent was the last uncompressed one.
+  (ssh-enable-delayed-compression (ssh-session-cipher session))
   (ssh-session-start-client-alive-timer session)
   (ssh-session-start-rekey-timer session)
   (when (ssh-server-on-session (ssh-session-server session))

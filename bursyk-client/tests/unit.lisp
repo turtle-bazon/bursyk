@@ -348,6 +348,13 @@ client from falling through to publickey."
            :gssapi-authentication t))
     (is (null (burs::check-config-supported client)))))
 
+(test compression-config-is-accepted
+  "Compression is implemented, so -C and Compression yes must not be refused."
+  (let ((client (cl-pnet-ssh::%make-ssh-client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options :compression t))
+    (is (null (burs::check-config-supported client)))))
+
 (test stream-local-forwarding-specifications-parse
   ;; -L local_socket:remote_socket
   (let ((forward
@@ -755,6 +762,18 @@ other dedicated flags use; neither flag leaves the config alone."
     (is (member "ForwardAgent no" (lines :no) :test #'equal))
     (is (notany (lambda (line)
                   (search "ForwardAgent" line :test #'char-equal))
+                (lines nil)))))
+
+(test command-line-compression-reaches-config
+  "-C becomes a Compression yes line, so resolution and -G both see the
+request; no flag leaves the file alone."
+  (flet ((lines (option)
+           (let ((burs::*options* (empty-options)))
+             (setf (getf burs::*options* :compression) option)
+             (burs::resolver-option-list))))
+    (is (member "Compression yes" (lines t) :test #'equal))
+    (is (notany (lambda (line)
+                  (search "Compression" line :test #'char-equal))
                 (lines nil)))))
 
 (test print-config-reports-a-forward-agent-socket-path

@@ -92,6 +92,9 @@ beside the readable one on every backend."
   host-key-algorithms
   ciphers
   macs
+  ;; Compression from -C or Compression yes.  True asks libssh to offer
+  ;; "zlib@openssh.com,none"; NIL keeps its "none,zlib@openssh.com" default.
+  compression
   pubkey-accepted-algorithms
   ;; Connection timing, from ConnectTimeout and ServerAlive* in ssh_config.
   ;; A NIL timeout or interval means the feature is off.

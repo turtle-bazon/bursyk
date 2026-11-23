@@ -4,6 +4,12 @@
 ;;;; userauth, then dispatch to channels. Everything runs from cl-pnet
 ;;;; callbacks, so no function here waits for the peer.
 
+(defun ssh-client-compression-offer (client)
+  "The compression methods CLIENT advertises, in its preference order."
+  (if (ssh-client-compression client)
+      +ssh-compressions-preferred+
+      +ssh-compressions+))
+
 (defun ssh-client-connected (client connection)
   "CLIENT's TCP connection is up: greet and offer our KEXINIT."
   (setf (ssh-client-connection client) connection
@@ -27,7 +33,8 @@
                   :kex (ssh-client-kex-algorithms client)
                   :host-keys (ssh-client-host-key-algorithms client)
                   :ciphers (ssh-client-ciphers client)
-                  :macs (ssh-client-macs client))))
+                  :macs (ssh-client-macs client)
+                  :compressions (ssh-client-compression-offer client))))
     (setf (ssh-client-client-kexinit client) kexinit
           (ssh-client-kexinit-sent client) t)
     (ssh-client-send-payload client kexinit)))
@@ -217,7 +224,8 @@ its KEXINIT when the connection came up."
                     :kex (ssh-client-kex-algorithms client)
                     :host-keys (ssh-client-host-key-algorithms client)
                     :ciphers (ssh-client-ciphers client)
-                    :macs (ssh-client-macs client))))
+                    :macs (ssh-client-macs client)
+                    :compressions (ssh-client-compression-offer client))))
       (setf (ssh-client-client-kexinit client) kexinit
             (ssh-client-kexinit-sent client) t)
       (ssh-client-send-payload client kexinit)))
@@ -235,7 +243,8 @@ its KEXINIT when the connection came up."
                          :host-key-algorithms
                          (ssh-client-host-key-algorithms client)
                          :ciphers (ssh-client-ciphers client)
-                         :macs (ssh-client-macs client))
+                         :macs (ssh-client-macs client)
+                         :compressions (ssh-client-compression-offer client))
           ;; Strict KEX is negotiated once.  A rekey's KEXINIT leaves the
           ;; marker out, but the connection stays strict, so neither side may
           ;; forget it or the sequence resets at NEWKEYS stop matching.
@@ -245,11 +254,13 @@ its KEXINIT when the connection came up."
           (ssh-client-ignore-next-kex-packet client)
           (getf (ssh-client-negotiated client) :guess-wrong))
     (let ((negotiated (ssh-client-negotiated client)))
-      (ssh-log "key exchange ~A, host key ~A, cipher ~A, mac ~A"
+      (ssh-log "key exchange ~A, host key ~A, cipher ~A, mac ~A, compression ~A/~A"
                (getf negotiated :kex)
                (getf negotiated :host-key)
-               (getf negotiated :cipher)
-               (getf negotiated :mac)))
+               (getf negotiated :cipher-c2s)
+               (getf negotiated :mac-c2s)
+               (getf negotiated :compression-c2s)
+               (getf negotiated :compression-s2c)))
     (ssh-client-send-kex-init client)))
 
 (defun ssh-client-send-kex-init (client)
@@ -301,6 +312,10 @@ its KEXINIT when the connection came up."
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
                       :encrypt-mac (getf keys :encrypt-mac)
                       :aead (getf keys :aead))
+    (ssh-install-send-compression
+     (ssh-client-cipher client)
+     (getf (ssh-client-negotiated client) :compression-c2s)
+     :after-authentication (ssh-client-after-authentication client))
     (setf (ssh-client-keys-sent client) t
           ;; OpenSSH resets its send counters when the new keys are
           ;; installed, so a rekeyed session starts a fresh volume budget.
@@ -325,6 +340,10 @@ its KEXINIT when the connection came up."
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
                       :decrypt-mac (getf keys :decrypt-mac)
                       :aead (getf keys :aead))
+    (ssh-install-receive-compression
+     (ssh-client-cipher client)
+     (getf (ssh-client-negotiated client) :compression-s2c)
+     :after-authentication (ssh-client-after-authentication client))
     (setf (ssh-client-keys-received client) t
           (ssh-client-kexinit-sent client) nil
           (ssh-client-received-packets client) 0
@@ -424,7 +443,8 @@ after every rekey, so an otherwise idle connection does not rekey."
                     :kex (ssh-client-kex-algorithms client)
                     :host-keys (ssh-client-host-key-algorithms client)
                     :ciphers (ssh-client-ciphers client)
-                    :macs (ssh-client-macs client))))
+                    :macs (ssh-client-macs client)
+                    :compressions (ssh-client-compression-offer client))))
       (setf (ssh-client-rekeying client) t
             (ssh-client-client-kexinit client) kexinit
             (ssh-client-kexinit-sent client) t
@@ -773,6 +793,9 @@ has no use for it either."
   (ssh-log "authenticated as ~A" (ssh-client-user client))
   (setf (ssh-client-phase client) :ready
         (ssh-client-after-authentication client) t)
+  ;; zlib@openssh.com starts after USERAUTH_SUCCESS, and this packet itself
+  ;; was the last uncompressed one in each direction.
+  (ssh-enable-delayed-compression (ssh-client-cipher client))
   (ssh-client-cancel-connect-timer client)
   (ssh-client-start-alive-timer client)
   (ssh-client-start-rekey-timer client)
