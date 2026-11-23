@@ -640,6 +640,7 @@ authentication attempt."
     (setf (gethash id (ssh-session-channels session)) channel)
     (ssh-session-note-channel-change session)
     (ssh-server-channel-start-inactivity-timeout channel)
+    (ssh-plibssh-session-install-agent-callback channel)
     channel))
 
 (defun ssh-plibssh-session-handle-open (session message)
@@ -705,6 +706,175 @@ is refused instead of allocated."
   (loop for channel being the hash-values of (ssh-session-channels session)
         when (cffi:pointer-eq (ssh-server-channel-handle channel) handle)
           return channel))
+
+;;; ---- Agent forwarding ----
+
+(cffi:defcallback ssh-plibssh-channel-agent-request-callback
+    :void ((session :pointer) (handle :pointer) (userdata :pointer))
+  (declare (ignore userdata))
+  (let ((object (ssh-plibssh-session-object session)))
+    (when object
+      (let ((channel
+              (ssh-plibssh-session-channel-for-handle object handle)))
+        (when channel
+          (ssh-plibssh-session-handle-agent-request channel))))))
+
+(defun ssh-plibssh-session-install-agent-callback (channel)
+  "Register the per-channel callback libssh uses for auth-agent requests.
+
+libssh answers the request itself when a callback is present, so it is only
+installed where the application offers an agent-forwarding hook."
+  (when (and (ssh-server-on-agent-forward
+              (ssh-session-server (ssh-server-channel-session channel)))
+             (ssh-server-channel-handle channel))
+    (let* ((type 'ssh-channel-callbacks-struct)
+           (struct (cffi:foreign-alloc (list :struct type))))
+      (setf (cffi:foreign-slot-value struct (list :struct type) 'size)
+            (ssh-plibssh-callback-struct-size type))
+      (dolist (slot '(userdata channel-data-function channel-eof-function
+                      channel-close-function channel-signal-function
+                      channel-exit-status-function channel-exit-signal-function
+                      channel-pty-request-function channel-shell-request-function
+                      channel-x11-req-function
+                      channel-pty-window-change-function
+                      channel-exec-request-function channel-env-request-function
+                      channel-subsystem-request-function
+                      channel-write-wontblock-function))
+        (setf (cffi:foreign-slot-value struct (list :struct type) slot)
+              (cffi:null-pointer)))
+      (setf (cffi:foreign-slot-value
+             struct (list :struct type) 'channel-auth-agent-req-function)
+            (cffi:callback ssh-plibssh-channel-agent-request-callback))
+      (if (minusp (ssh-set-channel-callbacks
+                   (ssh-server-channel-handle channel) struct))
+          (cffi:foreign-free struct)
+          (setf (ssh-server-channel-callbacks channel) struct)))))
+
+(defun ssh-plibssh-session-handle-agent-request (channel)
+  "Create the listener an auth-agent request asks for.
+
+libssh has already answered success once this callback runs; the pure
+backend's policy checks still decide whether a listener is created."
+  (let ((session (ssh-server-channel-session channel)))
+    (unless (ssh-session-agent-forward session)
+      (if (not (ssh-session-permits-agent-forwarding-p session))
+          (ssh-log "agent forwarding disabled")
+          (let ((hook (ssh-server-on-agent-forward
+                       (ssh-session-server session))))
+            (when hook
+              (multiple-value-bind (fd path cleanup)
+                  (funcall hook session)
+                (when (and fd path)
+                  (let ((agent (%make-ssh-agent-forward
+                                :session session
+                                :fd fd
+                                :path path
+                                :cleanup cleanup)))
+                    (setf (ssh-session-agent-forward session) agent)
+                    (push (cons "SSH_AUTH_SOCK" path)
+                          (ssh-server-channel-env channel))
+                    (setf (ssh-agent-forward-watcher agent)
+                          (cl-pnet:fd-watch
+                           fd :on-readable
+                           (lambda (watcher)
+                             (declare (ignore watcher))
+                             (ssh-plibssh-session-agent-accept agent)))))))))))))
+
+(defun ssh-plibssh-session-agent-accept (agent)
+  "Turn every pending connection on AGENT's listener into a channel."
+  (loop for fd = (cl-pnet-sockets:accept-socket (ssh-agent-forward-fd agent))
+        while fd
+        do (if (minusp (cl-pnet-sockets:set-nonblocking fd))
+               (ignore-errors (cl-pnet-sockets:close-open-fd fd))
+               (ssh-plibssh-session-open-agent-channel agent fd))))
+
+(defun ssh-plibssh-session-open-agent-channel (agent fd)
+  "Open an auth-agent channel toward the client and bridge FD to it."
+  (let* ((session (ssh-agent-forward-session agent))
+         (handle (ssh-channel-new (ssh-session-handle session)))
+         (id (ssh-session-next-channel-id session)))
+    (if (ssh-plibssh-null-p handle)
+        (progn
+          (ignore-errors (cl-pnet-sockets:close-open-fd fd))
+          nil)
+        (let ((channel (%make-ssh-server-channel
+                        :session session
+                        :handle handle
+                        :local-id id
+                        :type "auth-agent@openssh.com"
+                        :state :opening
+                        :remote-address (ssh-session-remote-address session))))
+          (incf (ssh-session-next-channel-id session))
+          (setf (gethash id (ssh-session-channels session)) channel)
+          (let ((relay (%make-ssh-fd-relay
+                        :fd fd
+                        :on-data
+                        (lambda (relay octets)
+                          (declare (ignore relay))
+                          (ssh-server-channel-write channel octets))
+                        :on-eof
+                        (lambda (relay)
+                          (declare (ignore relay))
+                          (ssh-server-channel-eof channel))
+                        :on-error
+                        (lambda (relay condition)
+                          (declare (ignore relay))
+                          (ssh-plibssh-server-channel-fail channel condition)))))
+            (setf (ssh-server-channel-agent-relay channel) relay
+                  (ssh-server-channel-on-data channel)
+                  (lambda (channel data kind)
+                    (declare (ignore channel kind))
+                    (ssh-fd-relay-queue relay data))
+                  (ssh-server-channel-on-eof channel)
+                  (lambda (channel)
+                    (declare (ignore channel))
+                    (ssh-fd-relay-shutdown-write relay))
+                  (ssh-server-channel-on-close channel)
+                  (lambda (channel)
+                    (declare (ignore channel))
+                    (ssh-fd-relay-close relay))
+                  (ssh-server-channel-on-error channel)
+                  (lambda (channel condition)
+                    (declare (ignore channel condition))
+                    (ssh-fd-relay-close relay)))
+            (ssh-plibssh-session-drive-agent-channel channel)
+            channel)))))
+
+(defun ssh-plibssh-session-drive-agent-channel (channel)
+  "Retry opening CHANNEL until the client accepts, then start the relay."
+  (when (eq (ssh-server-channel-state channel) :opening)
+    (let ((rc (ssh-channel-open-auth-agent
+               (ssh-server-channel-handle channel))))
+      (cond
+        ((zerop rc)
+         (setf (ssh-server-channel-state channel) :open)
+         (when (ssh-server-channel-agent-relay channel)
+           (ssh-fd-relay-start (ssh-server-channel-agent-relay channel))))
+        ((= rc +ssh-again+) nil)
+        (t
+         (ssh-plibssh-server-channel-fail
+          channel
+          (make-condition 'ssh-channel-error
+                          :channel channel
+                          :detail
+                          (format nil "could not open an agent channel: ~A"
+                                  (ssh-plibssh-error
+                                   (ssh-session-handle
+                                    (ssh-server-channel-session channel)))))))))))
+
+(defun ssh-plibssh-session-close-agent-forward (session)
+  "Remove SESSION's agent listener and its socket, once."
+  (let ((agent (ssh-session-agent-forward session)))
+    (when agent
+      (setf (ssh-session-agent-forward session) nil)
+      (when (ssh-agent-forward-watcher agent)
+        (ignore-errors
+         (cl-pnet:fd-unwatch (ssh-agent-forward-watcher agent))))
+      (when (ssh-agent-forward-fd agent)
+        (ignore-errors
+         (cl-pnet-sockets:close-open-fd (ssh-agent-forward-fd agent))))
+      (when (ssh-agent-forward-cleanup agent)
+        (ignore-errors (funcall (ssh-agent-forward-cleanup agent)))))))
 
 (defun ssh-plibssh-session-handle-channel-request (session message)
   "Dispatch one CHANNEL REQUEST message."
@@ -951,6 +1121,10 @@ terminal name and both sizes are kept."
   "Read, write and finish CHANNEL as far as its descriptor allows."
   (unless (ssh-server-channel-close-reported channel)
     (case (ssh-server-channel-state channel)
+      (:opening
+       (ssh-plibssh-session-drive-agent-channel channel)
+       (when (eq (ssh-server-channel-state channel) :open)
+         (ssh-plibssh-server-channel-drive channel)))
       (:open
        (ssh-plibssh-server-channel-read channel nil)
        (ssh-plibssh-server-channel-read channel t)
@@ -979,6 +1153,12 @@ terminal name and both sizes are kept."
               (ssh-server-channel-session channel)))
     (ssh-session-note-channel-change (ssh-server-channel-session channel))
     (ssh-plibssh-server-channel-close-target channel)
+    (when (ssh-server-channel-agent-relay channel)
+      (ssh-fd-relay-close (ssh-server-channel-agent-relay channel))
+      (setf (ssh-server-channel-agent-relay channel) nil))
+    (when (ssh-server-channel-callbacks channel)
+      (cffi:foreign-free (ssh-server-channel-callbacks channel))
+      (setf (ssh-server-channel-callbacks channel) nil))
     (let ((handle (ssh-server-channel-handle channel)))
       (setf (ssh-server-channel-handle channel) nil)
       (when handle (ssh-channel-free handle)))
@@ -1261,6 +1441,7 @@ application's ON-CLOSE runs without waiting for the peer's half."
     (when watcher (cl-pnet:fd-unwatch watcher))
     (when write-watcher (cl-pnet:fd-unwatch write-watcher))
     (when handle
+      (ssh-plibssh-unregister-session handle)
       (ssh-disconnect handle)
       (ssh-free handle))
     (when write-fd (ssh-plibssh-close-fd write-fd))))
@@ -1273,6 +1454,7 @@ application's ON-CLOSE runs without waiting for the peer's half."
           (ssh-session-close-reason session) reason)
     (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
+    (ssh-plibssh-session-close-agent-forward session)
     (let ((server (ssh-session-server session)))
       (when server
         (remhash session (ssh-server-sessions server))))
@@ -1318,6 +1500,7 @@ application's ON-CLOSE runs without waiting for the peer's half."
                    :detail (format nil "could not attach a session: ~A"
                                    detail)))))
       (setf (gethash session (ssh-server-sessions server)) session)
+      (ssh-plibssh-register-session handle session)
       (ssh-session-start-login-grace-timer session)
       (setf (ssh-session-watcher session)
             (cl-pnet:fd-watch
@@ -1412,6 +1595,7 @@ this program's error, because a configured list is meant exactly as written."
                           on-direct-streamlocal
                           on-streamlocal-forward
                           on-cancel-streamlocal-forward
+                          on-agent-forward
                           on-error
                           on-close)
   "Listen on ADDRESS:PORT and serve SSH clients, returning at once.
@@ -1509,6 +1693,7 @@ list, applied by the same inactivity accounting as the pure backend."
                   :on-direct-streamlocal on-direct-streamlocal
                   :on-streamlocal-forward on-streamlocal-forward
                   :on-cancel-streamlocal-forward on-cancel-streamlocal-forward
+                  :on-agent-forward on-agent-forward
                   :on-error on-error
                   :on-close on-close))
          (bind (ssh-bind-new)))

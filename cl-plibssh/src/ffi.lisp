@@ -31,6 +31,38 @@
 (cffi:defctype ssh-message :pointer)
 (cffi:defctype ssh-string :pointer)
 
+;;; Callback structures.  Only the fields this library fills are named, but
+;;; every field up to the one used must be present, because libssh copies the
+;;; opaque layout by size.  The sizes below are the ones libssh 0.10 compiles.
+(cffi:defcstruct ssh-callbacks-struct
+  (size :size)
+  (userdata :pointer)
+  (auth-function :pointer)
+  (log-function :pointer)
+  (connect-status-function :pointer)
+  (global-request-function :pointer)
+  (channel-open-request-x11-function :pointer)
+  (channel-open-request-auth-agent-function :pointer))
+
+(cffi:defcstruct ssh-channel-callbacks-struct
+  (size :size)
+  (userdata :pointer)
+  (channel-data-function :pointer)
+  (channel-eof-function :pointer)
+  (channel-close-function :pointer)
+  (channel-signal-function :pointer)
+  (channel-exit-status-function :pointer)
+  (channel-exit-signal-function :pointer)
+  (channel-pty-request-function :pointer)
+  (channel-shell-request-function :pointer)
+  (channel-auth-agent-req-function :pointer)
+  (channel-x11-req-function :pointer)
+  (channel-pty-window-change-function :pointer)
+  (channel-exec-request-function :pointer)
+  (channel-env-request-function :pointer)
+  (channel-subsystem-request-function :pointer)
+  (channel-write-wontblock-function :pointer))
+
 ;;; SSH return codes.
 (defconstant +ssh-ok+ 0)
 (defconstant +ssh-error+ -1)
@@ -157,6 +189,10 @@
   (session ssh-session) (methods :int))
 (cffi:defcfun ("ssh_send_keepalive" ssh-send-keepalive) :int
   (session ssh-session))
+;; Chaff: a decoy packet an observer cannot tell from traffic.  libssh has no
+;; OpenSSH PING packet, so SSH_MSG_IGNORE serves the same purpose.
+(cffi:defcfun ("ssh_send_ignore" ssh-send-ignore) :int
+  (session ssh-session) (data :string))
 
 ;;; ---- Host keys and known hosts ----
 
@@ -214,6 +250,12 @@
 (cffi:defcfun ("ssh_channel_free" ssh-channel-free) :void (channel ssh-channel))
 (cffi:defcfun ("ssh_channel_open_session" ssh-channel-open-session) :int
   (channel ssh-channel))
+(cffi:defcfun ("ssh_channel_open_auth_agent" ssh-channel-open-auth-agent) :int
+  (channel ssh-channel))
+(cffi:defcfun ("ssh_set_callbacks" ssh-set-callbacks) :int
+  (session ssh-session) (callbacks :pointer))
+(cffi:defcfun ("ssh_set_channel_callbacks" ssh-set-channel-callbacks) :int
+  (channel ssh-channel) (callbacks :pointer))
 (cffi:defcfun ("ssh_channel_open_forward" ssh-channel-open-forward) :int
   (channel ssh-channel) (remotehost :string) (remoteport :int)
   (sourcehost :string) (localport :int))
@@ -221,6 +263,19 @@
   (channel ssh-channel) (command :string))
 (cffi:defcfun ("ssh_channel_request_env" ssh-channel-request-env) :int
   (channel ssh-channel) (name :string) (value :string))
+(cffi:defcfun ("ssh_channel_request_pty_size" ssh-channel-request-pty-size) :int
+  (channel ssh-channel) (term :string) (columns :int) (rows :int))
+(cffi:defcfun ("ssh_channel_request_shell" ssh-channel-request-shell) :int
+  (channel ssh-channel))
+(cffi:defcfun ("ssh_channel_request_subsystem" ssh-channel-request-subsystem) :int
+  (channel ssh-channel) (subsystem :string))
+(cffi:defcfun ("ssh_channel_change_pty_size" ssh-channel-change-pty-size) :int
+  (channel ssh-channel) (columns :int) (rows :int))
+(cffi:defcfun ("ssh_channel_request_auth_agent" ssh-channel-request-auth-agent) :int
+  (channel ssh-channel))
+(cffi:defcfun ("ssh_channel_request_x11" ssh-channel-request-x11) :int
+  (channel ssh-channel) (single-connection :int) (protocol :string)
+  (cookie :string) (screen-number :int))
 (cffi:defcfun ("ssh_channel_read_nonblocking" ssh-channel-read-nonblocking) :int
   (channel ssh-channel) (buffer :pointer) (length :uint32) (stderr :int))
 (cffi:defcfun ("ssh_channel_poll" ssh-channel-poll) :int
@@ -315,6 +370,9 @@
 (cffi:defcfun ("ssh_message_channel_request_open_reply_accept"
           ssh-message-open-reply-accept) ssh-channel
   (message ssh-message))
+(cffi:defcfun ("ssh_message_channel_request_open_reply_accept_channel"
+          ssh-message-open-reply-accept-channel) :int
+  (message ssh-message) (channel ssh-channel))
 
 (cffi:defcfun ("ssh_message_channel_request_channel"
           ssh-message-channel-request-channel) ssh-channel

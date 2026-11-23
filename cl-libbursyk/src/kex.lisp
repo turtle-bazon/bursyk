@@ -509,3 +509,24 @@ that plain key while the exchange hash still covers the certificate."
            signature-blob exchange-hash)
     (error 'ssh-protocol-error
            :detail "host key signature does not verify")))
+
+(defun ssh-server-pair-host-certificates (keys certificates)
+  "CERTIFICATES whose plain key is one of KEYS, dropping the rest.
+
+sshd pairs each HostCertificate with the HostKey it certifies and logs a
+certificate that matches none, because such a certificate could never be
+presented."
+  (remove-if-not
+   (lambda (blob)
+     (let* ((certificate (ssh-certificate-parse blob))
+            (plain (and certificate
+                        (ssh-certificate-plain-blob certificate)))
+            (key (and plain
+                      (find-if (lambda (key)
+                                 (ssh-octets= plain
+                                              (ssh-public-key-blob-of key)))
+                               keys))))
+       (unless key
+         (ssh-log "host certificate has no matching HostKey"))
+       key))
+   certificates))

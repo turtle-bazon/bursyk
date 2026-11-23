@@ -114,6 +114,83 @@ beside the readable one on every backend."
   on-forwarded-tcpip
   ;; The resolved ssh_config this client was built from, if any.
   config-options
+  ;; Identification and policy slots the pure backend and the shared
+  ;; CLIENT-POLICY code read.  Keeping them here means one class of client
+  ;; for both transports.
+  (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.19")
+  (version-addendum nil)
+  (negotiated nil)
+  (warn-weak-crypto t)
+  (non-pq-kex-warned nil)
+  (ping-supported nil)
+  (agent-forward-supported nil)
+  (forward-agent nil)
+  (forward-agent-sock-path nil)
+  (forward-x11 nil)
+  (forward-x11-trusted nil)
+  (forward-x11-timeout nil)
+  xauth-location
+  (x11-display nil)
+  (x11-proto nil)
+  (x11-saved-data nil)
+  (x11-fake-data nil)
+  (x11-refuse-time nil)
+  (ca-signature-algorithms nil)
+  (revoked-host-keys '())
+  (hash-known-hosts nil)
+  (known-hosts-command nil)
+  (add-keys-to-agent :no)
+  (certificate-files '())
+  (no-host-authentication-for-localhost nil)
+  (host-key-alias nil)
+  (canonicalize-hostname :no)
+  (canonical-domains '())
+  (canonicalize-max-dots 1)
+  (canonicalize-fallback-local t)
+  resolver
+  (hostbased-accepted-algorithms nil)
+  (update-host-keys :yes)
+  (host-keys-seen nil)
+  (fingerprint-hash :sha256)
+  (visual-host-key nil)
+  (check-host-ip nil)
+  (verify-host-key-dns :no)
+  (host-key-dns-resolver nil)
+  (host-key-dns-records nil)
+  (host-key-dns-secure nil)
+  (host-key-dns-queried nil)
+  (host-key-dns-accepted nil)
+  (remote-address nil)
+  (host-key-ip-checked nil)
+  (host-key-known nil)
+  (ip-qos-interactive #xb8)
+  (ip-qos-bulk :none)
+  (tcp-keep-alive t)
+  set-env
+  (required-rsa-size +ssh-rsa-minimum-modulus-size+)
+  proxy-use-fdpass
+  bind-address
+  bind-interface
+  bind-address-resolved
+  pipe
+  (connection-attempts 1)
+  (connection-attempt 0)
+  retry-timer
+  ;; ChannelTimeout, shared with the pure backend's timer code.
+  (channel-timeouts nil)
+  channel-timeout-timer
+  (channel-last-used nil)
+  (pending-actions nil)
+  (pending-global-requests nil)
+  on-forwarded-streamlocal
+  ;; The common-callback structure libssh keeps a pointer to; it must outlive
+  ;; the session.
+  callbacks
+  (window 2097152)
+  (max-packet 32768)
+  (signers nil)
+  (auth-index 0)
+  (kexinit-sent nil)
   (closed nil)
   close-reason)
 
@@ -143,6 +220,25 @@ beside the readable one on every backend."
   (sent-close nil)
   (want-close nil)
   (close-reported nil)
+  ;; Slot names the pure backend uses for request queueing and the shared
+  ;; ChannelTimeout code.  Libssh drives its own request queue, but the
+  ;; accessors must still exist for callers and the facade suite.
+  (on-open nil)
+  (open-extra nil)
+  (local-window 2097152)
+  (local-max-packet 32768)
+  (remote-window 0)
+  (remote-max-packet 32768)
+  (pending-env nil)
+  (pending-exec nil)
+  (pending-subsystem nil)
+  (pending-agent-request nil)
+  (pending-x11-request nil)
+  ;; The local socket bridged to a server-initiated auth-agent channel.
+  agent-relay
+  (x-type nil)
+  (last-used 0)
+  (inactive-timeout 0)
   on-data
   on-eof
   on-exit
@@ -215,6 +311,9 @@ beside the readable one on every backend."
   (on-direct-streamlocal nil)
   (on-streamlocal-forward nil)
   (on-cancel-streamlocal-forward nil)
+  ;; Agent forwarding: a function of SESSION returning (VALUES FD PATH CLEANUP)
+  ;; once sshd would create the listener, exactly as in the pure backend.
+  (on-agent-forward nil)
   (on-error nil)
   (on-close nil)
   (sessions (make-hash-table :test #'eq))
@@ -267,6 +366,9 @@ beside the readable one on every backend."
   ;; user it was resolved for.
   (config nil)
   (config-user nil)
+  ;; The agent listener this session forwards to, as SSHD's
+  ;; SSH-AUTH-SOCK session environment is created by auth-agent-req.
+  agent-forward
   ;; Userauth bookkeeping, as in the pure backend: sshd exempts the first
   ;; "none" probe and counts every refusal after it.
   (auth-attempts 0)
@@ -341,7 +443,44 @@ beside the readable one on every backend."
   on-subsystem
   on-window-change
   on-close
-  on-error)
+  on-error
+  ;; libssh holds a pointer to this channel's callback structure for the
+  ;; channel's whole life; it is freed with the channel record.
+  callbacks
+  ;; The accepted local socket bridged to a server-initiated agent channel.
+  agent-relay)
+
+(defstruct (ssh-agent-forward (:constructor %make-ssh-agent-forward))
+  session
+  fd
+  path
+  cleanup
+  watcher
+  ;; RFC 9987's agent-connect instead of auth-agent@openssh.com.
+  (new-style nil))
+
+;;; ---- Session registry ----
+;;;
+;;; libssh callbacks receive the bare session pointer.  This table maps it
+;;; back to the Lisp record so a callback can find the client or server that
+;;; owns the session.
+
+(defvar *ssh-plibssh-sessions* (make-hash-table :test #'eql))
+
+(defun ssh-plibssh-register-session (session object)
+  (setf (gethash (cffi:pointer-address session) *ssh-plibssh-sessions*)
+        object))
+
+(defun ssh-plibssh-unregister-session (session)
+  (when session
+    (remhash (cffi:pointer-address session) *ssh-plibssh-sessions*)))
+
+(defun ssh-plibssh-session-object (session)
+  (gethash (cffi:pointer-address session) *ssh-plibssh-sessions*))
+
+(defun ssh-plibssh-callback-struct-size (type)
+  (cffi:foreign-type-size (list :struct type)))
+
 
 ;;; ---- Small octets helpers ----
 
@@ -427,6 +566,31 @@ libssh exports the blob as base64, the same text a public key file holds."
   (when timer
     (cl-pnet:timer-stop timer))
   nil)
+
+;;; The names the pure backend defines for the same jobs.  CLIENT-POLICY and
+;;; the facade suite call these without knowing which transport is loaded.
+(defun ssh-client-now ()
+  "Monotonic time in seconds, for the channel timers."
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun ssh-client-closed-p (client)
+  "True once CLIENT has shut down."
+  (ssh-client-closed client))
+
+(defun ssh-client-cancel-timer (timer)
+  "Stop TIMER when it is set, answering NIL for the caller to store."
+  (ssh-plibssh-cancel-timer timer))
+
+(defun ssh-client-stop-timers (client)
+  "Disarm CLIENT's connection timers, once."
+  (setf (ssh-client-connect-timer client)
+        (ssh-client-cancel-timer (ssh-client-connect-timer client))
+        (ssh-client-retry-timer client)
+        (ssh-client-cancel-timer (ssh-client-retry-timer client))
+        (ssh-client-alive-timer client)
+        (ssh-client-cancel-timer (ssh-client-alive-timer client))
+        (ssh-client-channel-timeout-timer client)
+        (ssh-client-cancel-timer (ssh-client-channel-timeout-timer client))))
 
 (defun ssh-plibssh-stop-timers (client)
   "Disarm CLIENT's connect timeout and keepalive timer, once."

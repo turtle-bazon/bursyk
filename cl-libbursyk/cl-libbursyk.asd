@@ -48,18 +48,24 @@
                              (:file "agent")
                              ;; Bridging a raw descriptor to a channel, shared
                              ;; by agent forwarding on the client and server.
-                             (:file "channel-fd" :if-feature (:not :ssh-backend-ffi))
+                             (:file "channel-fd")
                              ;; Both ends of the protocol.  A build with
                              ;; :ssh-backend-ffi gets these from CL-PLIBSSH
                              ;; instead, so the pure roles are not compiled.
                              ;; Signers describe a key; they are useful to
                              ;; either transport and do not name a socket.
                              (:file "client-signer")
-                             (:file "client-state"
-                              :if-feature (:not :ssh-backend-ffi))
                              ;; SSHFP lookups for VerifyHostKeyDNS; the DNS
                              ;; systems are optional and found at call time.
-                             (:file "client-dns"
+                             (:file "client-dns")
+                             ;; The client policy both backends must apply:
+                             ;; host key verification, SSHFP trust, the
+                             ;; version addendum, weak-crypto notices, chaff
+                             ;; and ChannelTimeout.  It reads only the
+                             ;; SSH-CLIENT and SSH-CHANNEL slots, so the FFI
+                             ;; backend builds the same clauses.
+                             (:file "client-policy")
+                             (:file "client-state"
                               :if-feature (:not :ssh-backend-ffi))
                              (:file "client-transport"
                               :if-feature (:not :ssh-backend-ffi))

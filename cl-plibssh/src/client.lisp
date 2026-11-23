@@ -56,22 +56,23 @@ as OpenSSH does, not against the alias."
         (:mismatch (setf status :mismatch))))))
 
 (defun ssh-plibssh-verify-host-key (client)
-  "Apply CLIENT's host-key policy to the key the server presented, or signal."
-  (let* ((blob (ssh-plibssh-server-key-blob client))
-         (fingerprint (and blob (ssh-key-fingerprint blob))))
+  "Apply CLIENT's host-key policy to the key the server presented, or signal.
+
+The policy itself is CLIENT-POLICY's, shared with the pure backend, so
+known_hosts markers, RevokedHostKeys, RequiredRSASize, SSHFP records and
+NoHostAuthenticationForLocalhost decide identically on either transport."
+  (let ((blob (ssh-plibssh-server-key-blob client)))
     (unless blob
       (error 'ssh-host-key-error
              :detail "the server did not present a host key"))
     (setf (ssh-client-host-key-blob client) blob)
-    (ecase (ssh-plibssh-known-host-status client blob)
-      (:match t)
-      (:mismatch
-       (error 'ssh-host-key-error
-              :detail (format nil "the host key for ~A changed"
-                              (ssh-plibssh-host-spec client))
-              :fingerprint fingerprint))
-      (:unknown
-       (ssh-plibssh-accept-unknown-host-key client blob fingerprint)))))
+    (ssh-client-verify-host-key client blob)))
+
+(defun ssh-client-send-chaff-packet (client)
+  "Put one decoy packet on the wire while the session is idle."
+  (let ((session (ssh-client-session client)))
+    (when session
+      (ssh-send-ignore session "chaff"))))
 
 (defun ssh-plibssh-accept-unknown-host-key (client blob fingerprint)
   "Decide what to do with a host key never seen before."
@@ -146,43 +147,157 @@ as OpenSSH does, not against the alias."
     (:inet6 (cl-pnet-sockets:ipv6-address-p address))
     (t t)))
 
+(defun ssh-plibssh-client-bind-failed (client errno)
+  "Report a source address the kernel refused."
+  (ssh-client-fail
+   client
+   (make-condition
+    'ssh-connection-error
+    :detail
+    (format nil "could not bind ~A for ~A:~D (~A)"
+            (let ((address (or (ssh-client-bind-address-resolved client)
+                               (ssh-client-bind-address client))))
+              (or address
+                  (format nil "interface ~A"
+                          (ssh-client-bind-interface client))))
+            (ssh-client-connect-host client)
+            (or (ssh-client-connect-port client) (ssh-client-port client))
+            (cl-pnet-sockets:c-strerror errno)))))
+
 (defun ssh-plibssh-client-start-tcp (client address)
-  "Open a non-blocking TCP connection to ADDRESS for CLIENT."
-  (multiple-value-bind (socket length)
-      (cl-pnet-sockets:make-sockaddr
-       address (or (ssh-client-connect-port client) (ssh-client-port client)))
-    (unless socket
-      (ssh-plibssh-client-connect-failed client 22))
-    (unwind-protect
-         (let ((fd (cl-pnet-sockets:c-socket
-                    (if (cl-pnet-sockets:ipv6-address-p address)
-                        cl-pnet-sockets:+af-inet6+
-                        cl-pnet-sockets:+af-inet+)
-                    cl-pnet-sockets:+sock-stream+
-                    cl-pnet-sockets:+ipproto-tcp+)))
-           (when (minusp fd)
-             (ssh-plibssh-client-connect-failed
-              client (cl-pnet-sockets:c-errno)))
-           (cl-pnet-sockets:set-nonblocking fd)
-           (let ((result (cl-pnet-sockets:c-connect fd socket length))
-                 (errno (cl-pnet-sockets:c-errno)))
-             (cond
-               ((zerop result)
-                (ssh-plibssh-client-take-fd client fd))
-               ((member errno *connect-pending-errno* :test #'eql)
-                (setf (ssh-client-fd client) fd)
-                (setf (ssh-client-watcher client)
-                      (cl-pnet:fd-watch
-                       fd
-                       :on-writable
-                       (lambda (watcher)
-                         (declare (ignore watcher))
-                         (ssh-plibssh-client-check-connect client)))))
-               (t
-                (ssh-plibssh-close-fd fd)
-                (ssh-plibssh-client-connect-failed client errno)))))
-      (cffi:foreign-free socket)))
+  "Open a non-blocking TCP connection to ADDRESS for CLIENT.
+
+The descriptor is made here rather than by libssh so BindAddress and
+BindInterface reach the socket before connect(2), exactly as the pure
+backend does; the connected descriptor is then handed to libssh."
+  (setf (ssh-client-remote-address client) address)
+  (let ((port (or (ssh-client-connect-port client) (ssh-client-port client)))
+        (bind (or (ssh-client-bind-address-resolved client)
+                  (ssh-client-bind-address client)))
+        (interface (ssh-client-bind-interface client)))
+    (ssh-log "connecting to ~A:~D~@[ bound to ~A~]"
+             address port
+             (and (or bind interface)
+                  (or bind (format nil "interface ~A" interface))))
+    (multiple-value-bind (fd state errno stage)
+        (cl-pnet-sockets:connect-tcp address port
+                                     :bind-address bind
+                                     :bind-interface interface)
+      (cond
+        ((null fd)
+         (if (eq stage :connect)
+             (ssh-plibssh-client-connect-failed client errno)
+             (ssh-plibssh-client-bind-failed client errno)))
+        ((eq state :connected)
+         (ssh-plibssh-client-take-fd client fd))
+        (t
+         (setf (ssh-client-fd client) fd
+               (ssh-client-watcher client)
+               (cl-pnet:fd-watch
+                fd
+                :on-writable
+                (lambda (watcher)
+                  (declare (ignore watcher))
+                  (ssh-plibssh-client-check-connect client))))))))
   client)
+
+(defun ssh-plibssh-client-dial (client address)
+  "Dial ADDRESS, resolving CLIENT's BindAddress first when it is a name."
+  (if (and (or (ssh-client-bind-address client)
+               (ssh-client-bind-interface client))
+           (not (ssh-client-bind-address-resolved-p client address)))
+      (ssh-client-resolve-bind-address
+       client address (lambda () (ssh-plibssh-client-start-tcp client address)))
+      (ssh-plibssh-client-start-tcp client address))
+  client)
+
+(defun ssh-plibssh-client-open-direct (client)
+  "Resolve CONNECT-HOST for CLIENT and dial it, honouring CanonicalDomains."
+  (let ((original (ssh-client-connect-host client)))
+    (labels ((dial (name on-failure)
+               ;; NAME becomes CONNECT-HOST before the family check, so an
+               ;; error names the candidate that actually resolved badly.
+               (lambda (address)
+                 (setf (ssh-client-connect-host client) name)
+                 (if (ssh-client-address-in-family-p client address)
+                     (ssh-plibssh-client-dial client address)
+                     (funcall
+                      on-failure
+                      (make-condition
+                       'ssh-connection-error
+                       :detail (format nil "~A is not an ~A address"
+                                       address
+                                       (ssh-client-address-family-name client)))))))
+             (try (names)
+               (if names
+                   (let ((next (lambda (condition)
+                                 (declare (ignore condition))
+                                 (try (rest names)))))
+                     (ssh-log "resolving ~A" (first names))
+                     (ssh-client-resolve-host
+                      client (first names) (dial (first names) next) next))
+                   (if (ssh-client-canonicalize-fallback-local client)
+                       (progn
+                         (ssh-log "resolving ~A" original)
+                         (ssh-client-resolve-host
+                          client original
+                          (dial original
+                                (lambda (condition)
+                                  (ssh-client-fail
+                                   client
+                                   (make-condition
+                                    'ssh-connection-error
+                                    :detail (format nil "could not resolve ~A: ~A"
+                                                    original condition)))))
+                          (lambda (condition)
+                            (ssh-client-fail
+                             client
+                             (make-condition
+                              'ssh-connection-error
+                              :detail (format nil "could not resolve ~A: ~A"
+                                              original condition))))))
+                       (ssh-client-fail
+                        client
+                        (make-condition
+                         'ssh-connection-error
+                         :detail
+                         (format nil "no CanonicalDomains candidate resolved ~A"
+                                 original)))))))
+      (let ((candidates (ssh-canonicalize-candidates client)))
+        (if candidates
+            (try candidates)
+            (progn
+              (ssh-log "resolving ~A" original)
+              (ssh-client-resolve-host
+               client original
+               (dial original
+                     (lambda (condition)
+                       (ssh-client-fail
+                        client
+                        (make-condition
+                         'ssh-connection-error
+                         :detail (format nil "could not resolve ~A: ~A"
+                                         original condition)))))
+               (lambda (condition)
+                 (ssh-client-fail
+                  client
+                  (make-condition
+                   'ssh-connection-error
+                   :detail (format nil "could not resolve ~A: ~A"
+                                   original condition))))))))))
+  client)
+
+(defun ssh-plibssh-client-open (client)
+  "Look up SSHFP records when needed, then open CLIENT's transport."
+  (labels ((proceed ()
+             (if (ssh-client-proxy-command client)
+                 (ssh-plibssh-client-start-proxy client)
+                 (ssh-plibssh-client-open-direct client))))
+    (if (ssh-client-host-key-dns-needed-p client)
+        (ssh-client-query-host-key-dns client #'proceed)
+        (proceed)))
+  client)
+
 
 (defun ssh-plibssh-client-take-fd (client fd)
   "CLIENT's TCP connection is FD: hand it to a session and start SSH."
@@ -215,6 +330,7 @@ host is named but no descriptor is passed: libssh dials nothing itself."
     (when (ssh-plibssh-null-p session)
       (error 'ssh-connection-error :detail "could not allocate a libssh session"))
     (setf (ssh-client-session client) session)
+    (ssh-plibssh-register-session session client)
     ;; This library owns ~/.ssh/config; libssh must not read it again behind
     ;; the caller's back, nor dial from the options it would add.
     (when (minusp (ssh-plibssh-set-int-option
@@ -411,6 +527,26 @@ socket in the interval as the proof of life OpenSSH looks for."
       (ssh-private-key-path key)
       key))
 
+(defun ssh-plibssh-copy-certificate (key certificate-path)
+  "Attach CERTIFICATE-PATH's certificate to the imported libssh KEY."
+  (cffi:with-foreign-object (pointer :pointer)
+    (if (zerop (ssh-pki-import-cert-file
+                (namestring certificate-path) pointer))
+        (let ((certificate-key (cffi:mem-ref pointer :pointer)))
+          (unwind-protect
+               (unless (zerop (ssh-pki-copy-cert-to-privkey
+                               certificate-key key))
+                 (error 'ssh-authentication-error
+                        :detail
+                        (format nil
+                                "could not attach certificate ~A"
+                                certificate-path)))
+            (ssh-key-free certificate-key)))
+        (error 'ssh-authentication-error
+               :detail (format nil "could not load certificate ~A"
+                               certificate-path))))
+  key)
+
 (defun ssh-plibssh-attach-certificate (key path)
   "Attach PATH's -cert.pub to the imported KEY when one exists.
 
@@ -432,21 +568,7 @@ than a quiet fallback to the plain key, matching ssh."
                  (format nil
                          "certificate ~A does not match private key ~A"
                          certificate-path path)))
-        (cffi:with-foreign-object (pointer :pointer)
-          (if (zerop (ssh-pki-import-cert-file certificate-path pointer))
-              (let ((certificate-key (cffi:mem-ref pointer :pointer)))
-                (unwind-protect
-                     (unless (zerop (ssh-pki-copy-cert-to-privkey
-                                     certificate-key key))
-                       (error 'ssh-authentication-error
-                              :detail
-                              (format nil
-                                      "could not attach certificate ~A"
-                                      certificate-path)))
-                  (ssh-key-free certificate-key)))
-              (error 'ssh-authentication-error
-                     :detail (format nil "could not load certificate ~A"
-                                     certificate-path))))))
+        (ssh-plibssh-copy-certificate key certificate-path)))
     key))
 
 (defun ssh-plibssh-import-key (path passphrase)
@@ -485,6 +607,33 @@ an agent is configured, and an error only when neither source exists."
                              ":AGENT, or create ~/.ssh/id_ed25519, id_ecdsa "
                              "or id_rsa")))))))
 
+(defun ssh-plibssh-attach-explicit-certificates (client handles)
+  "Attach each CertificateFile to the imported key it certifies.
+
+A bad or non-user certificate is logged and skipped, as ssh does, and a
+certificate that matches no imported key is skipped too."
+  (dolist (path (ssh-client-certificate-files client))
+    (let ((blob (and path (ssh-public-key-file-blob path))))
+      (cond
+        ((null blob)
+         (ssh-log "could not load certificate file ~A" path))
+        ((not (ssh-certificate-blob-p blob))
+         (ssh-log "~A is not a certificate" path))
+        (t
+         (let ((certificate (ssh-certificate-parse blob)))
+           (cond
+             ((null certificate)
+              (ssh-log "~A is not a readable certificate" path))
+             ((/= (ssh-certificate-cert-type certificate) 1)
+              (ssh-log "ignoring certificate ~A: not a user certificate"
+                       path))
+             (t
+              (let ((plain (ssh-certificate-plain-blob certificate)))
+                (dolist (key handles)
+                  (when (ssh-octets= plain
+                                     (ssh-plibssh-public-key-blob key))
+                    (ssh-plibssh-copy-certificate key path))))))))))))
+
 (defun ssh-plibssh-load-client-keys (client passphrase)
   "Import every key CLIENT may offer, in order."
   (let ((handles
@@ -495,6 +644,7 @@ an agent is configured, and an error only when neither source exists."
                                  :detail
                                  "a private key has no file path libssh can load"))
                       passphrase)))))
+    (ssh-plibssh-attach-explicit-certificates client handles)
     (setf (ssh-client-key-handles client) handles
           (ssh-client-key-index client) 0)))
 
@@ -848,18 +998,22 @@ and is freed."
   (let ((watcher (ssh-client-watcher client))
         (write-watcher (ssh-client-write-watcher client))
         (session (ssh-client-session client))
+        (callbacks (ssh-client-callbacks client))
         (fd (ssh-client-fd client))
         (write-fd (ssh-client-write-fd client)))
     (setf (ssh-client-watcher client) nil
           (ssh-client-write-watcher client) nil
           (ssh-client-session client) nil
+          (ssh-client-callbacks client) nil
           (ssh-client-fd client) nil
           (ssh-client-write-fd client) nil)
     (when watcher (cl-pnet:fd-unwatch watcher))
     (when write-watcher (cl-pnet:fd-unwatch write-watcher))
     (when session
+      (ssh-plibssh-unregister-session session)
       (ssh-disconnect session)
       (ssh-free session))
+    (when callbacks (cffi:foreign-free callbacks))
     (ssh-plibssh-close-fd fd)
     (when write-fd (ssh-plibssh-close-fd write-fd))
     (iter (for key in (ssh-client-key-handles client))
@@ -943,30 +1097,7 @@ helper and hands back a socketpair to watch."
   (handler-case
       (progn
         (ssh-plibssh-load-client-keys client passphrase)
-        (if (ssh-client-proxy-command client)
-            (ssh-plibssh-client-start-proxy client)
-            (burzay:resolve-host
-             (ssh-client-connect-host client)
-             (lambda (address)
-               (unless (ssh-client-closed client)
-                 (if (ssh-client-address-in-family-p client address)
-                     (ssh-plibssh-client-start-tcp client address)
-                     (ssh-client-fail
-                      client
-                      (make-condition
-                       'ssh-connection-error
-                       :detail
-                       (format nil "~A is not an ~A address"
-                               address
-                               (ssh-client-address-family-name client)))))))
-             (lambda (condition)
-               (ssh-client-fail
-                client
-                (make-condition 'ssh-connection-error
-                                :detail (format nil "could not resolve ~A: ~A"
-                                                (ssh-client-connect-host client)
-                                                condition))))
-             :family (ssh-client-address-family client))))
+        (ssh-plibssh-client-open client))
     (error (condition) (ssh-client-fail client condition))))
 
 (defun ssh-plibssh-option-meaningful-p (value)
@@ -1024,12 +1155,15 @@ prevent."
                           ;; Anything this backend cannot honour is refused
                           ;; rather than dropped.
                           hostbased-authentication
+                          hostbased-accepted-algorithms
                           hostbased-keys
                           certificate-files
                           no-host-authentication-for-localhost
                           host-key-alias
                           canonicalize-hostname
                           canonical-domains
+                          (canonicalize-max-dots 1)
+                          (canonicalize-fallback-local t)
                           resolver
                           verify-host-key-dns
                           host-key-dns-resolver
@@ -1038,11 +1172,36 @@ prevent."
                           rekey-limit
                           rekey-interval
                           version-addendum
+                          (warn-weak-crypto t)
+                          channel-timeouts
+                          ca-signature-algorithms
+                          (revoked-host-keys '())
+                          hash-known-hosts
+                          known-hosts-command
+                          (add-keys-to-agent :no)
+                          (update-host-keys :yes)
+                          (fingerprint-hash :sha256)
+                          visual-host-key
+                          check-host-ip
+                          (required-rsa-size +ssh-rsa-minimum-modulus-size+)
+                          (ip-qos-interactive #xb8)
+                          (ip-qos-bulk :none)
+                          (tcp-keep-alive t)
+                          set-env
+                          (connection-attempts 1)
+                          proxy-use-fdpass
+                          forward-agent
+                          forward-agent-sock-path
+                          forward-x11
+                          forward-x11-trusted
+                          forward-x11-timeout
+                          xauth-location
                           address-family
                           on-open
                           on-error
                           on-close
-                          on-forwarded-tcpip)
+                          on-forwarded-tcpip
+                          on-forwarded-streamlocal)
   "Connect to HOST as USER, authenticate, return at once.
 
 The libssh backend resolves HOST off the event loop and dials the address
@@ -1055,17 +1214,6 @@ the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
   (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
   (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
-  (ssh-plibssh-reject-option "CertificateFile" certificate-files)
-  (ssh-plibssh-reject-option "NoHostAuthenticationForLocalhost"
-                             no-host-authentication-for-localhost)
-  (ssh-plibssh-reject-option "HostKeyAlias" host-key-alias)
-  (ssh-plibssh-reject-option "CanonicalizeHostname" canonicalize-hostname)
-  (ssh-plibssh-reject-option "CanonicalDomains" canonical-domains)
-  (ssh-plibssh-reject-option "Resolver" resolver)
-  (ssh-plibssh-reject-option "VerifyHostKeyDNS" verify-host-key-dns)
-  (ssh-plibssh-reject-option "HostKeyDNSResolver" host-key-dns-resolver)
-  (ssh-plibssh-reject-option "BindAddress" bind-address)
-  (ssh-plibssh-reject-option "BindInterface" bind-interface)
   (ssh-plibssh-reject-option "RekeyLimit" rekey-limit)
   (ssh-plibssh-reject-option "RekeyInterval" rekey-interval)
   (ssh-plibssh-reject-option "VersionAddendum" version-addendum)
@@ -1101,12 +1249,51 @@ stream on its pipes instead of dialling."
                  :password-callback password-callback
                  :kbd-interactive-callback kbd-interactive-callback
                  :hostbased-authentication hostbased-authentication
+                 :hostbased-accepted-algorithms hostbased-accepted-algorithms
                  :hostbased-keys hostbased-keys
+                 :certificate-files certificate-files
+                 :no-host-authentication-for-localhost
+                 no-host-authentication-for-localhost
+                 :host-key-alias host-key-alias
+                 :canonicalize-hostname (or canonicalize-hostname :no)
+                 :canonical-domains canonical-domains
+                 :canonicalize-max-dots canonicalize-max-dots
+                 :canonicalize-fallback-local canonicalize-fallback-local
+                 :resolver resolver
+                 :verify-host-key-dns (or verify-host-key-dns :no)
+                 :host-key-dns-resolver host-key-dns-resolver
+                 :bind-address bind-address
+                 :bind-interface bind-interface
+                 :warn-weak-crypto warn-weak-crypto
+                 :channel-timeouts channel-timeouts
+                 :ca-signature-algorithms ca-signature-algorithms
+                 :revoked-host-keys revoked-host-keys
+                 :hash-known-hosts hash-known-hosts
+                 :known-hosts-command known-hosts-command
+                 :add-keys-to-agent add-keys-to-agent
+                 :update-host-keys update-host-keys
+                 :fingerprint-hash fingerprint-hash
+                 :visual-host-key visual-host-key
+                 :check-host-ip check-host-ip
+                 :required-rsa-size required-rsa-size
+                 :ip-qos-interactive ip-qos-interactive
+                 :ip-qos-bulk ip-qos-bulk
+                 :tcp-keep-alive tcp-keep-alive
+                 :set-env set-env
+                 :connection-attempts connection-attempts
+                 :proxy-use-fdpass proxy-use-fdpass
+                 :forward-agent forward-agent
+                 :forward-agent-sock-path forward-agent-sock-path
+                 :forward-x11 forward-x11
+                 :forward-x11-trusted forward-x11-trusted
+                 :forward-x11-timeout forward-x11-timeout
+                 :xauth-location xauth-location
                  :address-family (ssh-normalize-address-family address-family)
                  :on-open on-open
                  :on-error on-error
                  :on-close on-close
-                 :on-forwarded-tcpip on-forwarded-tcpip)))
+                 :on-forwarded-tcpip on-forwarded-tcpip
+                 :on-forwarded-streamlocal on-forwarded-streamlocal)))
     (ssh-plibssh-start-client client passphrase)
     client))
 

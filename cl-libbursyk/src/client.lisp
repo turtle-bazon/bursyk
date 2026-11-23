@@ -302,61 +302,7 @@ through the same event-loop watchers the proxy path uses."
                     (ssh-proxy-connect-complete client)))))))))
   client)
 
-(defun ssh-canonicalize-candidates (client)
-  "The names CanonicalDomains adds to CONNECT-HOST, or NIL to skip."
-  (let ((mode (ssh-client-canonicalize-hostname client))
-        (host (ssh-client-connect-host client)))
-    (when (and (member mode '(:yes :always))
-               (or (eq mode :always)
-                   (null (ssh-client-proxy-command client)))
-               (or (eq mode :always)
-                   (<= (count #\. host)
-                       (ssh-client-canonicalize-max-dots client))))
-      (mapcar (lambda (domain)
-                (if (zerop (length domain))
-                    (concatenate 'string host ".")
-                    (format nil "~A.~A" host domain)))
-              (ssh-client-canonical-domains client)))))
 
-(defun ssh-client-dns-host (client)
-  "The name SSHFP records are looked up under."
-  (or (ssh-client-host-key-host client) (ssh-client-host client)))
-
-(defun ssh-client-host-key-dns-needed-p (client)
-  "Whether CLIENT should look up SSHFP records before connecting."
-  (let ((host (ssh-client-dns-host client)))
-    (and (null (ssh-client-host-key-dns-queried client))
-         (member (ssh-client-verify-host-key-dns client) '(:yes :ask))
-         (ssh-client-host-key-dns-resolver client)
-         host
-         (not (burzay:numeric-address-p host)))))
-
-(defun ssh-client-query-host-key-dns (client done)
-  "Ask for CLIENT's SSHFP records, then call DONE.
-
-The query runs on the event loop.  Any failure is only logged and DONE runs
-anyway: VerifyHostKeyDNS supplements known_hosts and must not turn a DNS
-outage into a refusal to connect."
-  (setf (ssh-client-host-key-dns-queried client) t)
-  (handler-case
-      (funcall (ssh-client-host-key-dns-resolver client)
-               (ssh-client-dns-host client)
-               (lambda (records secure)
-                 (unless (ssh-client-closed-p client)
-                   (setf (ssh-client-host-key-dns-records client) records
-                         (ssh-client-host-key-dns-secure client) secure)
-                   (when records
-                     (ssh-log "found ~D SSHFP record~:P for ~A~:[ (insecure)~;~]"
-                              (length records) (ssh-client-dns-host client)
-                              secure))
-                   (funcall done)))
-               (lambda (condition)
-                 (unless (ssh-client-closed-p client)
-                   (ssh-log "SSHFP lookup failed: ~A" condition)
-                   (funcall done))))
-    (error (condition)
-      (ssh-log "SSHFP lookup failed: ~A" condition)
-      (funcall done))))
 
 (defun ssh-open-connection (client)
   "Look up SSHFP records, then open CLIENT's transport.
@@ -369,47 +315,8 @@ client's callbacks."
       (ssh-open-transport client))
   client)
 
-(defun ssh-client-bind-address-resolved-p (client remote-address)
-  "Whether CLIENT's source address is ready for REMOTE-ADDRESS's family.
-
-A numeric BindAddress needs nothing, and an interface's address is picked
-by the socket layer once the remote family is known."
-  (let ((raw (ssh-client-bind-address client))
-        (cached (ssh-client-bind-address-resolved client)))
-    (cond
-      ((null raw) t)
-      ((burzay:numeric-address-p raw) t)
-      (cached
-       (eql (cl-pnet-sockets:ipv6-address-p cached)
-            (cl-pnet-sockets:ipv6-address-p remote-address)))
-      (t nil))))
-
-(defun ssh-client-resolve-bind-address (client remote-address done)
-  "Resolve CLIENT's BindAddress for REMOTE-ADDRESS's family, then call DONE."
-  (let* ((family (if (cl-pnet-sockets:ipv6-address-p remote-address)
-                     :inet6
-                     :inet))
-         (name (ssh-client-bind-address client))
-         (resolver (ssh-client-resolver client)))
-    (flet ((succeed (address)
-             (setf (ssh-client-bind-address-resolved client) address)
-             (funcall done))
-           (fail (condition)
-             (ssh-client-fail
-              client
-              (make-condition
-               'ssh-connection-error
-               :detail (format nil "could not resolve BindAddress ~A: ~A"
-                               name condition)))))
-      (handler-case
-          ;; The default resolver can ask the system for one family, which
-          ;; is what makes "BindAddress localhost" match an IPv4 peer.  A
-          ;; caller-supplied resolver keeps its (HOST ON-SUCCESS ON-ERROR)
-          ;; shape; a family mismatch then fails at bind.
-          (if (or (null resolver) (eq resolver :system))
-              (burzay:resolve-host name #'succeed #'fail :family family)
-              (funcall resolver name #'succeed #'fail))
-        (error (condition) (fail condition))))))
+;; SSH-CLIENT-BIND-ADDRESS-RESOLVED-P and SSH-CLIENT-RESOLVE-BIND-ADDRESS
+;; live in CLIENT-POLICY, shared with the libssh backend.
 
 (defun ssh-open-transport (client)
   "Resolve CONNECT-HOST without blocking the loop, then dial it.
@@ -438,31 +345,8 @@ address is known, because it has to be in the same family."
     (:inet6 (cl-pnet-sockets:ipv6-address-p address))
     (t t)))
 
-(defun ssh-client-resolver-function-p (resolver)
-  "Whether RESOLVER is a function rather than a BURZAY resolver spec.
-
-BURZAY's spec is NIL, :SYSTEM, :DNS, (:DNS :ENDPOINT ENDPOINT) or a function.
-A non-keyword symbol may name a function, so it is treated as one."
-  (and resolver
-       (or (functionp resolver)
-           (and (symbolp resolver) (not (keywordp resolver))))))
-
-(defun ssh-client-resolve-host (client host on-success on-error)
-  "Resolve HOST for CLIENT, honouring AddressFamily when it can.
-
-BURZAY's resolver specifications - the default, :SYSTEM, :DNS and
-\(:DNS :ENDPOINT ENDPOINT) - all receive the family, so the system resolver
-asks for IPv4 or IPv6 alone and the DNS resolver asks for A or AAAA.  A
-caller-supplied function keeps its (HOST ON-SUCCESS ON-ERROR) shape and
-chooses the family itself; the address it returns is still checked against
-CLIENT's AddressFamily before dialling.  HOST is left alone when it is
-already a numeric address, just as BURZAY does."
-  (let ((resolver (ssh-client-resolver client)))
-    (if (ssh-client-resolver-function-p resolver)
-        (funcall resolver host on-success on-error)
-        (burzay:resolve-host host on-success on-error
-                             :resolver resolver
-                             :family (ssh-client-address-family client)))))
+;; SSH-CLIENT-RESOLVER-FUNCTION-P and SSH-CLIENT-RESOLVE-HOST live in
+;; CLIENT-POLICY, shared with the libssh backend.
 
 (defun ssh-open-direct-transport (client)
   "Resolve and dial CONNECT-HOST for a connection that is not proxied."
@@ -664,21 +548,6 @@ already a numeric address, just as BURZAY does."
                     :on-forwarded-tcpip on-forwarded-tcpip
                     :on-forwarded-streamlocal on-forwarded-streamlocal))
 
-(defun ssh-filter-signers (signers patterns &key minimum-rsa-size)
-  "SIGNERS whose type matches PATTERNS and whose RSA modulus is large enough.
-
-A NIL PATTERNS list leaves every type eligible.  MINIMUM-RSA-SIZE is
-RequiredRSASize: it only rejects RSA keys below the floor, as ssh does."
-  (remove-if
-   (lambda (signer)
-     (or (and patterns
-              (not (some (lambda (pattern)
-                           (ssh-match-pattern pattern
-                                              (ssh-signer-type signer)))
-                         patterns)))
-         (not (ssh-key-rsa-size-allowed-p (ssh-signer-blob signer)
-                                          minimum-rsa-size))))
-   signers))
 
 (defparameter +ssh-hostbased-default-key-paths+
   '("/etc/ssh/ssh_host_ed25519_key"
