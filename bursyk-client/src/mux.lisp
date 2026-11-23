@@ -76,8 +76,18 @@ as a u32, which is how every mux message is built."
           (cl-pnet-ssh::ssh-write-u32 writer field)))
     (cl-pnet-ssh:ssh-writer-output writer)))
 
-(defun mux-hello-payload ()
-  (mux-payload +mux-msg-hello+ +mux-version+))
+(defun mux-hello-payload (&optional extensions)
+  "HELLO with EXTENSIONS, an alist of (NAME . VALUE).
+
+The client sends none, as ssh(1) does; the master advertises the ones it
+implements.  Both sides skip the pairs they do not recognise."
+  (let ((writer (cl-pnet-ssh:ssh-writer)))
+    (cl-pnet-ssh::ssh-write-u32 writer +mux-msg-hello+)
+    (cl-pnet-ssh::ssh-write-u32 writer +mux-version+)
+    (dolist (extension extensions)
+      (cl-pnet-ssh:ssh-write-text writer (car extension))
+      (cl-pnet-ssh:ssh-write-text writer (cdr extension)))
+    (cl-pnet-ssh:ssh-writer-output writer)))
 
 (defun mux-request-payload (type request-id &rest fields)
   (apply #'mux-payload type request-id fields))
@@ -190,20 +200,28 @@ as a u32, which is how every mux message is built."
 
 #-win32
 (defun mux-handshake (fd)
-  "Exchange HELLO with the master on FD.
+  "Exchange HELLO with the master on FD; return its extension names.
 
-The master speaks first, as OpenSSH's does; its hello may carry extensions
-after the version, which are deliberately ignored."
+The master speaks first, as OpenSSH's does.  Its hello may carry (NAME
+VALUE) pairs after the version; only the names matter to this client, and
+unknown names are ignored exactly as ssh(1) ignores them."
   (let* ((payload (mux-read-packet fd))
          (type (and (>= (length payload) 4) (mux-u32 payload 0))))
     (unless (eql type +mux-msg-hello+)
       (error "the control socket did not answer with a mux hello"))
     (when (< (length payload) 8)
       (error "the control master sent a truncated hello"))
-    (let ((version (mux-u32 payload 4)))
+    (let ((version (mux-u32 payload 4))
+          (extensions '()))
       (unless (= version +mux-version+)
-        (error "unsupported control master version ~D" version)))
-    (mux-write-packet fd (mux-hello-payload))))
+        (error "unsupported control master version ~D" version))
+      (let ((reader (cl-pnet-ssh:ssh-make-reader payload 8)))
+        (loop while (plusp (cl-pnet-ssh:ssh-reader-remaining reader))
+              do (let ((name (cl-pnet-ssh:ssh-read-text reader)))
+                   (cl-pnet-ssh:ssh-read-text reader) ; value
+                   (push name extensions))))
+      (mux-write-packet fd (mux-hello-payload))
+      (nreverse extensions))))
 
 #-win32
 (defun mux-alive (fd)
@@ -431,7 +449,8 @@ through the alive check before the session starts."
            (lambda (watcher)
              (declare (ignore watcher))
              (mux-connection-readable connection))))
-    (mux-connection-send connection (mux-hello-payload))
+    (mux-connection-send connection
+                         (mux-hello-payload '(("info" . "0"))))
     connection))
 
 (defun mux-connection-closed-p (connection)
@@ -810,6 +829,181 @@ opened again just to be handed over as INPUT, while INHERIT works."
                        :input :interactive :output :string :error-output nil))))
     (error () nil)))
 
+(defun mux-local-host-name ()
+  "This machine's hostname, as connection_info_message reports it."
+  (or (ignore-errors (uiop:hostname)) "unknown"))
+
+(defun mux-format-timeframe (seconds)
+  "SECONDS as OpenSSH's fmt_timeframe spells a duration."
+  (let* ((seconds (max 0 (floor (or seconds 0))))
+         (sec (mod seconds 60))
+         (minutes (floor seconds 60))
+         (min (mod minutes 60))
+         (hours (floor minutes 60))
+         (hrs (mod hours 24))
+         (days (floor hours 24))
+         (weeks (floor days 7)))
+    (cond
+      ((plusp weeks)
+       (format nil "~2,'0dw~1,'0dd~2,'0dh" weeks (mod days 7) hrs))
+      ((plusp days)
+       (format nil "~1,'0dd~2,'0dh~2,'0dm" days hrs min))
+      (t
+       (format nil "~2,'0d:~2,'0d:~2,'0d" hrs min sec)))))
+
+(defun mux-format-scaled (bytes)
+  "BYTES as OpenSSH's fmt_scaled spells it, e.g. 3.3K."
+  (let* ((number (or bytes 0))
+         (abval (abs number))
+         (scales (vector 1 1024 1048576 1073741824
+                         1099511627776 1125899906842624))
+         (chars "BKMGTPE")
+         (index 0)
+         (fract 0))
+    (loop for i below (length scales)
+          when (< (floor abval 1024) (aref scales i))
+            do (setf index i
+                     fract (if (zerop i) 0 (mod abval (aref scales i)))
+                     number (floor number (aref scales i)))
+               (when (plusp i)
+                 (setf fract (floor fract (aref scales (1- i)))))
+               (return))
+    (setf fract (floor (+ (* 10 fract) 512) 1024))
+    (when (>= fract 10)
+      (setf number (if (minusp number) (1- number) (1+ number))
+            fract 0))
+    (cond
+      ((zerop number) "0B")
+      ((or (zerop index) (>= number 100) (<= number -100))
+       (when (>= fract 5)
+         (setf number (if (minusp number) (1- number) (1+ number))))
+       (format nil "~D~C" number (char chars index)))
+      (t
+       (format nil "~D.~D~C" number fract (char chars index))))))
+
+(defun mux-dedupe-names (in out)
+  "IN and OUT as one name, or \"IN in, OUT out\" when they differ."
+  (let ((in (or in "<implicit>"))
+        (out (or out "<implicit>")))
+    (if (string= in out)
+        in
+        (format nil "~A in, ~A out" in out))))
+
+(defun mux-implicit-mac-p (cipher)
+  "Whether CIPHER carries its own authentication, leaving no separate MAC."
+  (and cipher
+       (or (string= cipher "chacha20-poly1305@openssh.com")
+           (search "-gcm@" cipher))))
+
+(defun mux-write-crlf (stream)
+  "Write the CRLF that OpenSSH's mux info text uses between lines."
+  (write-char #\Return stream)
+  (write-char #\Newline stream))
+
+(defun mux-connection-info-message (master)
+  "The text -O conninfo returns, matching OpenSSH's connection_info_message.
+
+The parts a transport cannot report are left out rather than guessed."
+  (declare (ignore master))
+  (let* ((info (and *client*
+                    (cl-pnet-ssh::ssh-client-connection-info *client*)))
+         (endpoints (getf info :endpoints))
+         (traffic (getf info :traffic))
+         (cipher-in (getf info :cipher-in))
+         (cipher-out (getf info :cipher-out))
+         (limit (getf info :rekey-limit))
+         (interval (getf info :rekey-interval)))
+    (with-output-to-string (out)
+      (format out "Connection information for ~A pid ~D"
+              (mux-local-host-name) (mux-process-id))
+      (mux-write-crlf out)
+      (format out "  versions ~A -> ~A"
+              (or (getf info :client-version) "unknown")
+              (or (getf info :server-version) "unknown"))
+      (mux-write-crlf out)
+      (when (and (first endpoints) (second endpoints)
+                 (third endpoints) (fourth endpoints))
+        (format out "  tcp ~A:~D -> ~A:~D"
+                (first endpoints) (second endpoints)
+                (third endpoints) (fourth endpoints))
+        (mux-write-crlf out))
+      (format out "  duration ~A"
+              (mux-format-timeframe
+               (if (getf info :connected-at)
+                   (- (get-universal-time) (getf info :connected-at))
+                   0)))
+      (mux-write-crlf out)
+      (format out "  kexalgorithm ~A" (or (getf info :kex) "unknown"))
+      (mux-write-crlf out)
+      (format out "  hostkeyalgorithm ~A"
+              (or (getf info :host-key) "unknown"))
+      (mux-write-crlf out)
+      (format out "  cipher ~A" (mux-dedupe-names cipher-in cipher-out))
+      (mux-write-crlf out)
+      (format out "  mac ~A"
+              (mux-dedupe-names
+               (unless (mux-implicit-mac-p cipher-in) (getf info :mac-in))
+               (unless (mux-implicit-mac-p cipher-out) (getf info :mac-out))))
+      (mux-write-crlf out)
+      (format out "  compression ~A"
+              ;; A transport that cannot report compression still prints the
+              ;; default rather than OpenSSH's <implicit>, which means AEAD MAC.
+              (mux-dedupe-names (or (getf info :compression-in) "none")
+                                (or (getf info :compression-out) "none")))
+      (mux-write-crlf out)
+      (format out "  rekey ~A ~A"
+              (if (and limit (plusp limit))
+                  (format nil "limit blocks ~D" limit)
+                  "limit none")
+              (if (and interval (plusp interval))
+                  (format nil "interval ~A" (mux-format-timeframe interval))
+                  "interval none"))
+      (mux-write-crlf out)
+      (when traffic
+        ;; fmt_scaled already carries its unit; format_traffic_stats appends
+        ;; the "B" that turns "3.3K" into "3.3KB".
+        (format out "  traffic ~D pkts ~D blks ~AB in, ~D pkts ~D blks ~AB out"
+                (getf traffic :received-packets)
+                (getf traffic :received-blocks)
+                (mux-format-scaled (getf traffic :received-bytes))
+                (getf traffic :sent-packets)
+                (getf traffic :sent-blocks)
+                (mux-format-scaled (getf traffic :sent-bytes)))
+        (mux-write-crlf out)))))
+
+(defun mux-channel-open-message (master)
+  "The text -O channels returns: one line per open multiplexed session."
+  (with-output-to-string (out)
+    (format out "The following connections are open:")
+    (mux-write-crlf out)
+    (dolist (session (reverse (mux-master-sessions master)))
+      (unless (mux-session-closed session)
+        (format out "  #~D ~A (~A)"
+                (mux-session-sid session)
+                (mux-session-remote-name session)
+                (if (mux-session-opened session) "open" "opening"))
+        (mux-write-crlf out)))))
+
+(defun mux-master-ext-info (master connection reader)
+  "Answer a MUX_C_EXT_INFO request for the connection or channel list."
+  (let ((request-id (cl-pnet-ssh:ssh-read-u32 reader))
+        (name (cl-pnet-ssh:ssh-read-text reader)))
+    (multiple-value-bind (status message)
+        (cond
+          ((string= name "connection")
+           (values 1 (mux-connection-info-message master)))
+          ((string= name "channels")
+           (values 1 (mux-channel-open-message master)))
+          (t
+           (values 0 "info request type not supported")))
+      (let ((writer (cl-pnet-ssh:ssh-writer)))
+        (cl-pnet-ssh::ssh-write-u32 writer +mux-s-ext-info+)
+        (cl-pnet-ssh::ssh-write-u32 writer request-id)
+        (cl-pnet-ssh::ssh-write-u32 writer status)
+        (cl-pnet-ssh:ssh-write-text writer message)
+        (mux-connection-send connection
+                             (cl-pnet-ssh:ssh-writer-output writer))))))
+
 (defun mux-master-message (master connection type reader payload)
   "Handle one frame from a control client; READER starts after TYPE."
   (declare (ignore payload))
@@ -860,6 +1054,8 @@ opened again just to be handed over as INPUT, while INHERIT works."
      (mux-master-forward master connection reader nil))
     ((eql type +mux-c-close-fwd+)
      (mux-master-forward master connection reader t))
+    ((eql type +mux-c-ext-info+)
+     (mux-master-ext-info master connection reader))
     (t
      (mux-connection-send
       connection
@@ -894,6 +1090,8 @@ opened again just to be handed over as INPUT, while INHERIT works."
   (stderr-buffer (make-array 0 :element-type '(unsigned-byte 8)
                                :adjustable t :fill-pointer 0))
   (want-tty nil)
+  ;; The command, subsystem or "session" shown by -O channels.
+  (remote-name "session")
   (exit-status 255)
   (opened nil)
   (closed nil))
@@ -950,7 +1148,10 @@ opened again just to be handed over as INPUT, while INHERIT works."
                   :sid (prog1 (mux-master-next-session-id master)
                          (incf (mux-master-next-session-id master)))
                   :stdin-fd stdin :stdout-fd stdout :stderr-fd stderr
-                  :want-tty want-tty)))
+                  :want-tty want-tty
+                  :remote-name (if (plusp (length command))
+                                   command
+                                   "session"))))
     (dolist (fd (list stdin stdout stderr))
       (ignore-errors (cl-pnet-sockets:set-nonblocking fd)))
     (setf (mux-connection-session connection) session)
@@ -1772,8 +1973,28 @@ the SSH connection is even attempted."
       (when specs
         (mux-send-forwards fd specs nil)))))
 
-(defun mux-client-control (fd command options)
-  "Run one -O COMMAND against the master on FD and return a status."
+(defun mux-client-info (fd name)
+  "Ask the master on FD for its info NAME and return the text.
+
+NAME is \"connection\" for -O conninfo or \"channels\" for -O channels.  The
+master formats the text, including its CRLF line endings, so it is printed
+unchanged."
+  (mux-write-packet fd (mux-request-payload +mux-c-ext-info+ 0
+                                            (cons "name" name)))
+  (multiple-value-bind (type reader) (mux-read-reply fd 0)
+    (unless (eql type +mux-s-ext-info+)
+      (error "the control master refused the info request: ~A"
+             (cl-pnet-ssh:ssh-read-text reader)))
+    (let ((status (cl-pnet-ssh:ssh-read-u32 reader))
+          (message (cl-pnet-ssh:ssh-read-text reader)))
+      (if (plusp status)
+          message
+          (error "the control master refused the info request: ~A" message)))))
+
+(defun mux-client-control (fd command options &optional extensions)
+  "Run one -O COMMAND against the master on FD and return a status.
+
+EXTENSIONS are the names the master advertised in its hello."
   (cond
     ((or (null command) (string-equal command "check"))
      (format t "Master running (pid=~D)~%" (mux-alive fd))
@@ -1810,6 +2031,17 @@ the SSH connection is even attempted."
                  (mux-forward-plists))
       t)
      0)
+    ((member command '("conninfo" "channels") :test #'string-equal)
+     ;; A master that did not advertise the extension has no info handler;
+     ;; asking anyway would only produce a generic "unsupported request".
+     (unless (member "info" extensions :test #'string-equal)
+       (error "mux server does not support info request"))
+     (princ (mux-client-info
+             fd (if (string-equal command "conninfo")
+                    "connection"
+                    "channels")))
+     (finish-output)
+     0)
     (t
      (error "unsupported control command ~S" command))))
 
@@ -1831,16 +2063,17 @@ is fatal rather than a reason to fall back to an unshared connection."
          (ignore-errors (delete-file path)))
        (values nil (and errno (cl-pnet-sockets:c-strerror errno))))
       (t
-       (let ((alive nil))
+       (let ((alive nil)
+             (extensions nil))
          (handler-case
              (progn
-               (mux-handshake fd)
+               (setf extensions (mux-handshake fd))
                (setf alive t)
                (cond
                  ((getf *options* :control-command)
                   (let ((status (mux-client-control
                                  fd (getf *options* :control-command)
-                                 options)))
+                                 options extensions)))
                     (mux-close fd)
                     (finish status)))
                  ((getf *options* :stdio-forward)

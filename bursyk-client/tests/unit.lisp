@@ -664,6 +664,66 @@ client from falling through to publickey."
     (is (equal "example.org" (cl-pnet-ssh:ssh-read-text reader)))
     (is (= 2222 (cl-pnet-ssh:ssh-read-u32 reader)))))
 
+#-win32
+(test mux-handshake-keeps-the-masters-extension-names
+  "The client records the master's extension names and answers with a bare hello."
+  (multiple-value-bind (client master)
+      (cl-pnet-sockets:make-socketpair)
+    (unwind-protect
+         (progn
+           (burs::mux-write-packet
+            master (burs::mux-hello-payload '(("info" . "0")
+                                              ("other" . "1"))))
+           (is (equal '("info" "other")
+                      (burs::mux-handshake client)))
+           ;; A client hello carries no extensions, so it is just the type and
+           ;; version.
+           (let ((reply (burs::mux-read-packet master)))
+             (is (= burs::+mux-msg-hello+ (burs::mux-u32 reply 0)))
+             (is (= burs::+mux-version+ (burs::mux-u32 reply 4)))
+             (is (= 8 (length reply)))))
+      (ignore-errors (cl-pnet-sockets:close-open-fd client))
+      (ignore-errors (cl-pnet-sockets:close-open-fd master)))))
+
+(test mux-connection-info-message-describes-the-negotiated-connection
+  "The master's -O conninfo text reports what the transport negotiated."
+  (let ((burs::*client*
+          (cl-pnet-ssh::%make-ssh-client
+           :host "example.org" :port 22
+           :server-version "SSH-2.0-OpenSSH_10.6"
+           :negotiated
+           (list :kex "mlkem768x25519-sha256"
+                 :host-key "ssh-ed25519"
+                 :cipher-c2s "chacha20-poly1305@openssh.com"
+                 :cipher-s2c "chacha20-poly1305@openssh.com"
+                 :mac-c2s "hmac-sha2-256"
+                 :mac-s2c "hmac-sha2-256"
+                 :compression-c2s "none"
+                 :compression-s2c "none"))))
+    (let ((text (burs::mux-connection-info-message nil)))
+      (is (not (null (search "Connection information for " text))))
+      (is (not (null (search "  versions cl-pnet-ssh_" text))))
+      (is (not (null (search " -> SSH-2.0-OpenSSH_10.6" text))))
+      (is (not (null (search "  duration " text))))
+      (is (not (null (search "  kexalgorithm mlkem768x25519-sha256" text))))
+      (is (not (null (search "  hostkeyalgorithm ssh-ed25519" text))))
+      (is (not (null (search "  cipher chacha20-poly1305@openssh.com" text))))
+      ;; chacha20-poly1305 authenticates itself, as OpenSSH's <implicit> says.
+      (is (not (null (search "  mac <implicit>" text))))
+      (is (not (null (search "  compression none" text))))
+      (is (not (null (search "  rekey limit none interval none" text))))
+      (is (char= #\Return (char text (- (length text) 2)))))))
+
+(test mux-channel-open-message-lists-open-sessions
+  "The master's -O channels text names each open multiplexed session."
+  (let* ((master (burs::%make-mux-master))
+         (session (burs::%make-mux-session
+                   :sid 1 :remote-name "echo hi" :opened t)))
+    (setf (burs::mux-master-sessions master) (list session))
+    (let ((text (burs::mux-channel-open-message master)))
+      (is (not (null (search "The following connections are open:" text))))
+      (is (not (null (search "  #1 echo hi (open)" text)))))))
+
 (test mux-expands-control-path-tokens
   (is (equal "/tmp/cm-alice@203.0.113.7-2222"
              (burs::mux-expand-control-path

@@ -957,3 +957,67 @@ RequiredRSASize: it only rejects RSA keys below the floor, as ssh does."
                                           minimum-rsa-size))))
    signers))
 
+
+;;; ---- Connection information for mux -O conninfo ----
+
+(defgeneric ssh-client-traffic-stats (client)
+  (:documentation
+   "Packet, block and byte counters for CLIENT, or NIL when the transport
+cannot see them.  OpenSSH reports both directions since the last NEWKEYS.")
+  (:method ((client t)) nil))
+
+(defgeneric ssh-client-connection-endpoints (client)
+  (:documentation
+   "CLIENT's socket endpoints as (VALUES LOCAL-IP LOCAL-PORT REMOTE-IP
+REMOTE-PORT), or NIL when the transport is not a socket.")
+  (:method ((client t)) nil))
+
+(defun ssh-socket-endpoints (fd)
+  "FD's local and remote endpoints as (VALUES LIP LPORT RIP RPORT)."
+  (flet ((endpoint (function)
+           (cffi:with-foreign-objects
+               ((address '(:struct cl-pnet-sockets:sockaddr-in6))
+                (length :unsigned-int))
+             (setf (cffi:mem-ref length :unsigned-int)
+                   cl-pnet-sockets:+sockaddr-in6-size+)
+             (when (>= (funcall function fd address length) 0)
+               (multiple-value-bind (ip port)
+                   (cl-pnet-sockets:sockaddr-to-string address)
+                 (values ip port))))))
+    (multiple-value-bind (local-ip local-port)
+        (endpoint #'cl-pnet-sockets:c-getsockname)
+      (multiple-value-bind (remote-ip remote-port)
+          (endpoint #'cl-pnet-sockets:c-getpeername)
+        (values local-ip local-port remote-ip remote-port)))))
+
+(defun ssh-client-release-string (client)
+  "CLIENT's identification without the SSH-2.0- prefix, as SSH_RELEASE is."
+  (let ((version (ssh-client-version-string client)))
+    (if (and version
+             (>= (length version) 8)
+             (string= version "SSH-2.0-" :end1 8))
+        (subseq version 8)
+        version)))
+
+(defun ssh-client-connection-info (client)
+  "A plist describing CLIENT's connection, as -O conninfo reports it.
+
+The values the transport does not expose are NIL; the caller prints what it
+has rather than inventing numbers."
+  (let ((negotiated (ssh-client-negotiated client)))
+    (list :client-version (ssh-client-release-string client)
+          :server-version (ssh-client-server-version client)
+          :connected-at (ssh-client-connected-at client)
+          :kex (getf negotiated :kex)
+          :host-key (getf negotiated :host-key)
+          :cipher-in (getf negotiated :cipher-s2c)
+          :cipher-out (getf negotiated :cipher-c2s)
+          :mac-in (getf negotiated :mac-s2c)
+          :mac-out (getf negotiated :mac-c2s)
+          :compression-in (getf negotiated :compression-s2c)
+          :compression-out (getf negotiated :compression-c2s)
+          :rekey-limit (or (ssh-client-rekey-limit client) 0)
+          :rekey-interval (or (ssh-client-rekey-interval client) 0)
+          :endpoints (multiple-value-list
+                      (ssh-client-connection-endpoints client))
+          :traffic (ssh-client-traffic-stats client))))

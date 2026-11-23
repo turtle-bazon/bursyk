@@ -177,6 +177,19 @@
   (session ssh-session))
 (cffi:defcfun ("ssh_get_clientbanner" ssh-get-clientbanner) :string
   (session ssh-session))
+;;; The negotiated algorithms, for -O conninfo.  These return libssh's own
+;;; strings, which the caller must not free.  libssh has no host key
+;;; algorithm getter, so that one comes from the host key blob.
+(cffi:defcfun ("ssh_get_kex_algo" ssh-get-kex-algo) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_get_cipher_in" ssh-get-cipher-in) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_get_cipher_out" ssh-get-cipher-out) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_get_hmac_in" ssh-get-hmac-in) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_get_hmac_out" ssh-get-hmac-out) :string
+  (session ssh-session))
 ;;; The authentication banner (USERAUTH_BANNER), not the identification
 ;;; string above.  libssh returns a fresh C string the caller frees.
 (cffi:defcfun ("ssh_get_issue_banner" ssh-get-issue-banner) :pointer

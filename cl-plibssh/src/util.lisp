@@ -27,6 +27,8 @@ beside the readable one on every backend."
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
   connect-host
+  ;; When this client object was made, for -O conninfo's duration line.
+  (connected-at (get-universal-time))
   ;; The name known_hosts is checked and recorded under when it differs from
   ;; HOST, as with "Host gh / HostName github.com": OpenSSH looks up the
   ;; HostName, not the alias the user typed.  NIL means HOST.
@@ -660,3 +662,17 @@ libssh's socket callback clears O_NONBLOCK when it sees the first POLLOUT
 on a socket it did not create, so this is repeated after every pump."
   (cl-pnet-sockets:set-nonblocking fd)
   fd)
+
+;;; ---- Connection information for mux -O conninfo ----
+
+(defmethod ssh-client-connection-endpoints ((client ssh-client))
+  "CLIENT's socket endpoints, when libssh owns a socket."
+  (let ((fd (ssh-client-fd client)))
+    (when (and fd (integerp fd) (not (minusp fd)))
+      (ssh-socket-endpoints fd))))
+
+(defun ssh-plibssh-host-key-algorithm (client)
+  "The algorithm name of CLIENT's host key, or NIL before KEX finishes."
+  (let ((blob (ssh-client-host-key-blob client)))
+    (when blob
+      (nth-value 0 (ssh-public-key-parts blob)))))

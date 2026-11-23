@@ -926,6 +926,17 @@ caller frees, so the record keeps its own string."
 
 (defun ssh-plibssh-client-ready (client)
   "Authenticated: let the application start channels."
+  (let ((session (ssh-client-session client)))
+    ;; Record what libssh negotiated so the shared -O conninfo formatter sees
+    ;; the same plist the pure backend provides.  Compression and traffic are
+    ;; not exposed by libssh 0.10.
+    (setf (ssh-client-negotiated client)
+          (list :kex (ssh-get-kex-algo session)
+                :host-key (ssh-plibssh-host-key-algorithm client)
+                :cipher-s2c (ssh-get-cipher-in session)
+                :cipher-c2s (ssh-get-cipher-out session)
+                :mac-s2c (ssh-get-hmac-in session)
+                :mac-c2s (ssh-get-hmac-out session))))
   (setf (ssh-client-phase client) :ready)
   (ssh-plibssh-client-read-banner client)
   (ssh-plibssh-cancel-connect-timer client)

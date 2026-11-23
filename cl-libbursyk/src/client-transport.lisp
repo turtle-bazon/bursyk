@@ -75,6 +75,7 @@ line, and NIL while the line is still incomplete."
               (let ((cipher (ssh-client-cipher client)))
                 (when cipher
                   (incf (ssh-client-received-packets client))
+                  (incf (ssh-client-received-bytes client) consumed)
                   (incf (ssh-client-received-blocks client)
                         (floor (ssh-packet-counted-length
                                 consumed cipher :receive)

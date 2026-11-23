@@ -6,6 +6,8 @@
 (defstruct (ssh-client (:constructor %make-ssh-client))
   host
   connect-host
+  ;; When this client object was made, for -O conninfo's duration line.
+  (connected-at (get-universal-time))
   ;; The name known_hosts is checked and recorded under when it differs from
   ;; HOST, as with "Host gh / HostName github.com": OpenSSH looks up the
   ;; HostName, not the alias the user typed.  NIL means HOST.
@@ -57,6 +59,9 @@
   (received-packets 0)
   (sent-blocks 0)
   (received-blocks 0)
+  ;; Wire octets in each direction since the last NEWKEYS, for -O conninfo.
+  (sent-bytes 0)
+  (received-bytes 0)
   ;; Payloads held back while a rekey is in progress, oldest first.  They are
   ;; encoded only after NEWKEYS so they use the new keys.
   (outgoing-queue '())
@@ -378,6 +383,21 @@ with ProxyUseFdpass) is a socket stored without a CL-PNET connection."
                    (ssh-proxy-close-fds proxy))
           (ssh-proxy-read-fd proxy)))))
 
+(defmethod ssh-client-connection-endpoints ((client ssh-client))
+  "CLIENT's socket endpoints; a ProxyCommand pipe has none."
+  (let ((fd (ssh-client-transport-fd client)))
+    (when (and fd (integerp fd) (not (minusp fd)))
+      (ssh-socket-endpoints fd))))
+
+(defmethod ssh-client-traffic-stats ((client ssh-client))
+  "OpenSSH's packet, block and byte counters in each direction."
+  (list :received-packets (ssh-client-received-packets client)
+        :received-blocks (ssh-client-received-blocks client)
+        :received-bytes (ssh-client-received-bytes client)
+        :sent-packets (ssh-client-sent-packets client)
+        :sent-blocks (ssh-client-sent-blocks client)
+        :sent-bytes (ssh-client-sent-bytes client)))
+
 ;;; ---- Connect timeout and server-alive keepalives ----
 
 (defun ssh-client-cancel-timer (timer)
@@ -525,6 +545,7 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
          (counted (ssh-packet-counted-length (length octets) cipher :send)))
     (when (ssh-client-send-bytes client octets)
       (incf (ssh-client-sent-packets client))
+      (incf (ssh-client-sent-bytes client) (length octets))
       (incf (ssh-client-sent-blocks client)
             (floor counted (ssh-cipher-state-block-size cipher))))))
 
