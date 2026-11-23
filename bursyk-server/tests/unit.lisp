@@ -569,6 +569,65 @@ session required pam_permit.so
        (progn ,@body)
        (skip "libpam is not available")))
 
+;;; The system PAM modules cannot return PAM_NEW_AUTHTOK_REQD without a real
+;;; expired shadow entry, so the expired-password path is tested with a small
+;;; module compiled from source at test time.  A machine without a C compiler
+;;; skips these tests rather than failing them.
+
+#-win32
+(defun compile-pam-test-module (directory)
+  "Compile tests/pam-expired.c into DIRECTORY and return the module path.
+NIL means no compiler could build it, so the caller can skip."
+  (let ((source (asdf:system-relative-pathname
+                 "bursyk-server" "tests/pam-expired.c"))
+        (output (merge-pathnames "pam-expired.so" directory)))
+    (handler-case
+        (progn
+          (uiop:run-program
+           (list (or (uiop:getenv "CC") "cc")
+                 "-shared" "-fPIC" "-o" (namestring output)
+                 (namestring source))
+           :output :interactive :error-output :interactive)
+          (and (probe-file output) output))
+      (error () nil))))
+
+#-win32
+(defun pam-expired-fixture-directory ()
+  "A fixture service whose account stage reports an expired password.
+
+The password stage accepts only a PAM_CHANGE_EXPIRED_AUTHTOK change, so the
+keyboard-interactive path also proves it asked PAM for the right change."
+  (let ((directory (pam-fixture-directory)))
+    (if (null (compile-pam-test-module directory))
+        (progn
+          (ignore-errors
+            (uiop:delete-directory-tree
+             directory :validate t :if-does-not-exist :ignore))
+          nil)
+        (let ((module (namestring
+                       (merge-pathnames "pam-expired.so" directory))))
+          (with-open-file (out (merge-pathnames "bursyk-expired" directory)
+                               :direction :output
+                               :if-exists :supersede
+                               :external-format :utf-8)
+            (format out "auth required pam_permit.so
+account required ~A
+password required ~A
+session required pam_permit.so
+" module module))
+          directory))))
+
+#-win32
+(defmacro with-pam-expired-fixture ((variable) &body body)
+  `(let ((,variable (pam-expired-fixture-directory)))
+     (if (null ,variable)
+         (skip "no C compiler for the PAM test module")
+         (unwind-protect
+              (progn ,@body)
+           (ignore-errors
+             (uiop:delete-directory-tree ,variable :validate t
+                                         :if-does-not-exist :ignore))))))
+
 #-win32
 (test pam-password-accept-and-refuse
   (with-pam
@@ -658,6 +717,147 @@ session required pam_permit.so
             (is (= 0 (second done))))
           (bursyk-server::pam-attempt-join attempt)
           (bursyk-server::pam-end handle 0))))))
+
+#-win32
+(test pam-password-expiry-restricts-the-session
+  "PAM_NEW_AUTHTOK_REQD admits the login but leaves only a pty."
+  (with-pam
+    (with-pam-expired-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (config (config-from-text
+                      "UsePAM yes
+PAMServiceName bursyk-expired"))
+             (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+             (session (cl-pnet-ssh::%make-ssh-session
+                       :server server :user "tester")))
+        (unwind-protect
+             (progn
+               ;; The password is accepted, and account management marks the
+               ;; login as needing a change.
+               (is (bursyk-server::pam-password-check
+                    session "tester" "secret"))
+               (is (bursyk-server::pam-force-password-change-p session))
+               ;; A key login can carry options too.  sshd merges a blank
+               ;; authorization record into them, so the pty survives, every
+               ;; forwarding feature is gone, and environment= is kept.
+               (setf (cl-pnet-ssh:ssh-session-authorization session)
+                     (nth-value
+                      0
+                      (cl-pnet-ssh:ssh-authorized-key-options-parse
+                       "environment=\"KEPT=yes\"")))
+               (setf (cl-pnet-ssh:ssh-session-key-env session)
+                     '(("KEPT" . "yes")))
+               (bursyk-server::pam-open-session session)
+               (let ((authorization
+                       (cl-pnet-ssh:ssh-session-authorization session)))
+                 (is (not (null authorization)))
+                 (is (cl-pnet-ssh:ssh-authorization-options-restricted
+                      authorization))
+                 (is (cl-pnet-ssh:ssh-authorization-options-permit-pty-p
+                      authorization))
+                 (is (not
+                      (cl-pnet-ssh:ssh-authorization-options-permit-port-forwarding-p
+                       authorization)))
+                 (is (not
+                      (cl-pnet-ssh:ssh-authorization-options-permit-agent-forwarding-p
+                       authorization)))
+                 (is (not
+                      (cl-pnet-ssh:ssh-authorization-options-permit-x11-forwarding
+                       authorization)))
+                 (is (equal '(("KEPT" . "yes"))
+                            (cl-pnet-ssh:ssh-session-key-env session)))))
+          (bursyk-server::pam-close-session session))))))
+
+#-win32
+(test pam-keyboard-interactive-changes-an-expired-password
+  "The PAM keyboard-interactive thread changes an expired password inline."
+  (with-pam
+    (with-pam-expired-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (config (config-from-text
+                      "UsePAM yes
+PAMServiceName bursyk-expired"))
+             (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+             (session (cl-pnet-ssh::%make-ssh-session
+                       :server server :user "tester")))
+        (unwind-protect
+             (progn
+               ;; pam_permit authenticates, account management says the
+               ;; password expired, and pam_chauthtok accepts the change in
+               ;; the same exchange without a conversation.
+               (is (eq :success
+                       (bursyk-server::keyboard-interactive-authentication
+                        session "tester" (list :responses '()))))
+               ;; Changed inline, so no later session restriction is needed.
+               (is (not (bursyk-server::pam-force-password-change-p session))))
+          (bursyk-server::pam-close-session session))))))
+
+#-win32
+(test pam-password-change-runs-instead-of-the-clients-request
+  "An expired password runs passwd for exec, shell and subsystem."
+  (with-pam
+    (with-pam-expired-fixture (dir)
+      (let* ((bursyk-server::*pam-conf-dir* dir)
+             (config (config-from-text
+                      "UsePAM yes
+PAMServiceName bursyk-expired
+ForceCommand echo forced"))
+             (server (cl-pnet-ssh::%make-ssh-server :sshd-config config))
+             (session (cl-pnet-ssh::%make-ssh-session
+                       :server server :user "tester"))
+             (channel (cl-pnet-ssh::%make-ssh-server-channel
+                       :session session :local-id 1 :type "session"
+                       :state :open))
+             (started '()))
+        (unwind-protect
+             (progn
+               (is (bursyk-server::pam-password-check
+                    session "tester" "secret"))
+               (labels ((start (channel program arguments &key chroot)
+                          (declare (ignore channel chroot))
+                          (push (list program arguments) started)
+                          nil))
+                 (let ((original
+                         (symbol-function 'bursyk-server::start-program)))
+                   (unwind-protect
+                        (progn
+                          (setf (symbol-function 'bursyk-server::start-program)
+                                #'start)
+                          (bursyk-server::install-channel-handlers channel)
+                          (funcall (cl-pnet-ssh:ssh-server-channel-on-exec
+                                    channel)
+                                   channel "client-command")
+                          (funcall (funcall
+                                    (cl-pnet-ssh:ssh-server-channel-on-shell
+                                     channel)
+                                    channel))
+                          (funcall (funcall
+                                    (cl-pnet-ssh:ssh-server-channel-on-subsystem
+                                     channel)
+                                    channel "sftp"))
+                          ;; The channel has no pty, so each request gets the
+                          ;; no-tty warning through /bin/sh instead of the
+                          ;; client's command; ForceCommand and
+                          ;; SSH_ORIGINAL_COMMAND are ignored.
+                          (is (equal
+                               (make-list
+                                3
+                                :initial-element
+                                (list
+                                 "/bin/sh"
+                                 (list
+                                  "-c"
+                                  bursyk-server::+password-change-no-tty-command+)))
+                               (nreverse started))))
+                     (setf (symbol-function 'bursyk-server::start-program)
+                           original))))
+               ;; A pty selects the real passwd command.
+               (setf (cl-pnet-ssh:ssh-server-channel-pty-p channel) t)
+               (is (search "passwd"
+                           (bursyk-server::password-change-command channel)))
+               (is (search "WARNING: Your password has expired."
+                           (bursyk-server::password-change-command channel))))
+          (bursyk-server::pam-close-session session))))))
 
 (test sshd-config-reads-algorithm-policy
   (let ((config (config-from-text

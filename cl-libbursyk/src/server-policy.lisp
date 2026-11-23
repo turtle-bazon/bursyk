@@ -209,6 +209,17 @@ the permissive defaults of an authorized_keys line."
    :permit-x11-forwarding nil
    :permit-user-rc nil))
 
+(defun ssh-authorization-options-restricted-session ()
+  "An authorization record that permits a pty and nothing else.
+
+sshd's auth_restrict_session builds this blank sshauthopt for a login that
+must change an expired password: the passwd prompt needs the terminal, and
+every forwarding feature is taken away."
+  (let ((restricted (ssh-certificate-authorization-options-empty)))
+    (setf (ssh-authorization-options-permit-pty restricted) t
+          (ssh-authorization-options-restricted restricted) t)
+    restricted))
+
 (defun ssh-authorization-options-permit-pty-p (options)
   "Whether OPTIONS allow a pty request; NIL options keep sshd's default."
   (or (null options) (ssh-authorization-options-permit-pty options)))

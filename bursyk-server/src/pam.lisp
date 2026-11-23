@@ -839,11 +839,40 @@ flag keeps a module from being asked twice."
                  t)
                 (t nil)))))))
 
+(defun pam-force-password-change-p (session)
+  "Whether PAM requires SESSION's user to change an expired password.
+
+Password and key-based logins set this when pam_acct_mgmt answers
+PAM_NEW_AUTHTOK_REQD; keyboard-interactive changes the password inside the
+exchange and clears the requirement before it returns."
+  (let ((state (gethash session *pam-sessions*)))
+    (and state (pam-session-force-change state))))
+
+(defun pam-restrict-session (session state)
+  "Take away every session feature but a pty when STATE needs a password change.
+
+This is sshd's auth_restrict_session.  It activates a blank record through
+auth_activate_options, which merges it with whatever admitted the login, so
+the permission flags are logical-AND: the passwd prompt keeps the terminal
+only if the key allowed one, and port, agent, X11 and stream-local forwarding
+are refused.  The key's environment= entries survive the merge, as they do in
+sshd."
+  (when (pam-session-force-change state)
+    (let* ((restricted
+             (cl-pnet-ssh:ssh-authorization-options-restricted-session))
+           (current (cl-pnet-ssh:ssh-session-authorization session))
+           (merged (and current
+                        (cl-pnet-ssh:ssh-authorization-options-merge
+                         current restricted))))
+      (setf (cl-pnet-ssh:ssh-session-authorization session)
+            (or merged restricted)))))
+
 (defun pam-open-session (session)
   "Establish credentials and open SESSION's PAM session."
   (when (pam-enabled-p session)
     (let ((state (gethash session *pam-sessions*)))
       (when (and state (pam-session-handle state))
+        (pam-restrict-session session state)
         (let ((handle (pam-session-handle state)))
           ;; Now that every method has succeeded, refresh the authentication
           ;; information sshd exposes to session modules.

@@ -413,6 +413,7 @@
    #:ssh-authorization-options-permit-listen-p
    #:ssh-authorization-options-merge
    #:ssh-certificate-authorization-options-empty
+   #:ssh-authorization-options-restricted-session
    #:ssh-certificate-authorization-options-from-certificate
    #:ssh-principals-line-principal-and-options
    #:ssh-authorization-principals-file-match

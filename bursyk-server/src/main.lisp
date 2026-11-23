@@ -68,7 +68,7 @@ when it is no more talkative than that; QUIET prints nothing at all."
   '(("sftp" . "/usr/lib/openssh/sftp-server"))
   "Subsystem names and programs, unless --subsystem replaces them.")
 
-(defparameter +bursyk-server-version+ "0.0.2.86"
+(defparameter +bursyk-server-version+ "0.0.2.87"
   "The program's own version, also sent in the SSH identification string.
 
 Keep this in step with the :VERSION in BURSYK-SERVER.ASD; the library gets
@@ -1620,6 +1620,38 @@ A non-pty login shell keeps its stdout and stderr separate, as sshd does for
                                  (format nil "Unix socket connect failed (~A)"
                                          errno)))))))))))))))
 
+(defun session-force-password-change-p (session)
+  "Whether PAM requires SESSION's user to change an expired password."
+  #-win32
+  (pam-force-password-change-p session)
+  #+win32
+  (declare (ignore session))
+  #+win32
+  nil)
+
+(defparameter +password-change-command+
+  "printf '%s\n' 'WARNING: Your password has expired.' 'You must change your password now and log in again!' >&2; passwd"
+  "sshd's do_pwchange: warn, run passwd, then let the session end.")
+
+(defparameter +password-change-no-tty-command+
+  "printf '%s\n' 'WARNING: Your password has expired.' 'Password change required but no TTY available.' >&2; exit 1"
+  "sshd runs passwd only on a terminal; without one it says so and exits.")
+
+(defun password-change-command (channel)
+  "The command a forced password change runs on CHANNEL."
+  (if (channel-pty-p channel)
+      +password-change-command+
+      +password-change-no-tty-command+))
+
+(defun session-forced-command (session)
+  "Configured ForceCommand, else the authenticating key's command=, if any."
+  (let ((authorization (cl-pnet-ssh:ssh-session-authorization session)))
+    (or (session-config-setting
+         session #'cl-pnet-ssh:ssh-server-config-force-command)
+        (and authorization
+             (cl-pnet-ssh:ssh-authorization-options-force-command
+              authorization)))))
+
 (defun install-channel-handlers (channel)
   "Attach the session policy and remember the bridge for window changes.
 
@@ -1627,20 +1659,17 @@ A forced command replaces the client's exec, shell or subsystem command, as
 sshd's ForceCommand and the authorized_keys command= option do; ForceCommand
 wins when both are present.  It runs through the same bridge as any other
 command, with SSH_ORIGINAL_COMMAND in its environment holding what the client
-asked for, when it asked for anything."
+asked for, when it asked for anything.  A password PAM says has expired takes
+precedence: sshd's auth_restrict_session takes forwarding away, and do_pwchange
+runs passwd instead of whatever the client asked for."
   #-win32
   (when (string= (cl-pnet-ssh:ssh-server-channel-type channel)
                  "direct-streamlocal@openssh.com")
     (start-streamlocal-bridge channel)
     (return-from install-channel-handlers nil))
   (let* ((session (cl-pnet-ssh:ssh-server-channel-session channel))
-         (authorization (cl-pnet-ssh:ssh-session-authorization session))
-         (forced-command
-           (or (session-config-setting
-                session #'cl-pnet-ssh:ssh-server-config-force-command)
-               (and authorization
-                    (cl-pnet-ssh:ssh-authorization-options-force-command
-                     authorization))))
+         (force-change (session-force-password-change-p session))
+         (forced-command (session-forced-command session))
          (chroot
            (handler-case (session-chroot-directory session)
              (error (condition)
@@ -1659,12 +1688,22 @@ asked for, when it asked for anything."
            (run-forced (original-command)
              (handler-case
                  (remember
-                  (start-command
-                   channel forced-command
-                   :chroot chroot
-                   :extra-environment
-                   (and original-command
-                        (list (cons "SSH_ORIGINAL_COMMAND" original-command)))))
+                  (if force-change
+                      ;; sshd execs passwd directly, not through the user's
+                      ;; login shell, so use /bin/sh for the warning and keep
+                      ;; no SSH_ORIGINAL_COMMAND: do_pwchange never sees the
+                      ;; client's request.
+                      (start-program
+                       channel "/bin/sh"
+                       (list "-c" (password-change-command channel))
+                       :chroot chroot)
+                      (start-command
+                       channel forced-command
+                       :chroot chroot
+                       :extra-environment
+                       (and original-command
+                            (list (cons "SSH_ORIGINAL_COMMAND"
+                                        original-command))))))
                (error (condition) (session-failure channel "~A" condition))))
            (run-shell ()
              (handler-case
@@ -1677,7 +1716,7 @@ asked for, when it asked for anything."
       (setf (cl-pnet-ssh:ssh-server-channel-on-exec channel)
             (lambda (channel command)
               (declare (ignore channel))
-              (if forced-command
+              (if (or forced-command force-change)
                   (run-forced command)
                   (run-command command))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-pty channel)
@@ -1691,19 +1730,22 @@ asked for, when it asked for anything."
               (declare (ignore channel))
               ;; Returning a thunk lets the library send the success reply
               ;; before the shell can write its first prompt.
-              (lambda () (if forced-command
+              (lambda () (if (or forced-command force-change)
                              (run-forced nil)
                              (run-shell)))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-subsystem channel)
             (lambda (channel name)
               (declare (ignore channel))
               ;; sshd still refuses an unknown subsystem before the forced
-              ;; command is considered, so look the name up first.
-              (let ((path (subsystem-path name session)))
-                (and path
-                     (if forced-command
-                         (lambda () (run-forced path))
-                         (lambda () (run-subsystem path)))))))
+              ;; command is considered, so look the name up first.  A forced
+              ;; password change replaces every request, so it needs no lookup.
+              (if force-change
+                  (lambda () (run-forced name))
+                  (let ((path (subsystem-path name session)))
+                    (and path
+                         (if forced-command
+                             (lambda () (run-forced path))
+                             (lambda () (run-subsystem path))))))))
       (setf (cl-pnet-ssh:ssh-server-channel-on-window-change channel)
             (lambda (channel columns rows)
               (declare (ignore channel))
