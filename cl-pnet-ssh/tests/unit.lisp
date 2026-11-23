@@ -1611,7 +1611,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                                 verify-host-key-dns host-key-dns-resolver
                                 bind-address bind-interface
                                 rekey-limit rekey-interval command
-                                compression
+                                compression kex-algorithms
                                 password kbd-interactive
                                 password-authentication
                                 kbd-interactive-authentication
@@ -1672,6 +1672,7 @@ added on first use."
             :rekey-limit rekey-limit
             :rekey-interval rekey-interval
             :compression compression
+            :kex-algorithms kex-algorithms
             ;; Exercise the timer wiring too: both timers must start with
             ;; numeric repeat values or the backend rejects them.
             :connect-timeout 10
@@ -1706,7 +1707,7 @@ added on first use."
 (defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
                                       bind-address bind-interface
                                       sshd-options rekey-limit rekey-interval
-                                      compression command)
+                                      compression command kex-algorithms)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
@@ -1753,6 +1754,7 @@ Returns (VALUES STDOUT STDERR STATUS)."
                           :rekey-limit rekey-limit
                           :rekey-interval rekey-interval
                           :compression compression
+                          :kex-algorithms kex-algorithms
                           :command command)))
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
@@ -1902,6 +1904,46 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+;;; ---- NIST-curve ECDH key exchange ----
+
+(test nist-curve-kex-is-offered-and-negotiated
+  "The NIST-curve methods are offered and each one can be selected."
+  (is (equal '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+               "ecdh-sha2-nistp521")
+             (last cl-pnet-ssh:+ssh-kex-real-algorithms+ 3)))
+  (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+                 "ecdh-sha2-nistp521"))
+    (let ((negotiated
+            (cl-pnet-ssh::ssh-negotiate
+             (list :kex (list kex)
+                   :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
+                   :ciphers-c2s cl-pnet-ssh:+ssh-ciphers+
+                   :ciphers-s2c cl-pnet-ssh:+ssh-ciphers+
+                   :macs-c2s cl-pnet-ssh:+ssh-macs+
+                   :macs-s2c cl-pnet-ssh:+ssh-macs+
+                   :compressions-c2s '("none")
+                   :compressions-s2c '("none"))
+             :kex-algorithms (list kex)
+             :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
+             :ciphers cl-pnet-ssh:+ssh-ciphers+
+             :macs cl-pnet-ssh:+ssh-macs+
+             :compressions '("none"))))
+      (is (string= kex (getf negotiated :kex))))))
+
+(test nist-curve-kex-loopback-exec
+  "Each NIST-curve ECDH method carries a real session on this transport."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+                     "ecdh-sha2-nistp521"))
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-loopback-result
+             :kex-algorithms (list kex)
+             :sshd-options (list (format nil "KexAlgorithms ~A" kex)))
+          (is (equal "hello" stdout))
+          (is (equal "oops" stderr))
+          (is (eql 3 status))))))
 
 (test compression-loopback-exec
   "A compressed session runs a command and returns its output."

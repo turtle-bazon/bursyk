@@ -370,16 +370,25 @@ Compression is chosen separately for each direction, as RFC 4253 requires."
 
 ;;; ---- Exchange hash and key derivation ----
 
+(defun ssh-kex-digest (kex)
+  "The hash KEX uses for the exchange hash and key derivation.
+
+The NIST-curve exchanges name it in their SSH algorithm name; every other
+method this build implements uses SHA-256."
+  (or (nth-value 2 (ssh-ecdh-kex-parameters kex)) :sha256))
+
 (defun ssh-exchange-hash (client-version server-version
                           client-kexinit server-kexinit
                           host-key-blob client-public server-public shared
-                          &key string-shared)
+                          &key string-shared (digest :sha256))
   "The key-exchange hash H, binding both versions, both KEXINITs, the host
 key, both ephemeral public keys and the shared secret.
 
-A plain curve25519 secret is written as an mpint.  OpenSSH's hybrid methods
-put a digest of the concatenated secret in the hash and the KDF as an SSH
-string instead, so STRING-SHARED selects that layout."
+A plain curve25519 or ECDH secret is written as an mpint.  OpenSSH's hybrid
+methods put a digest of the concatenated secret in the hash and the KDF as an
+SSH string instead, so STRING-SHARED selects that layout.  DIGEST is the
+negotiated hash: SHA-256 for most methods, SHA-384/SHA-512 for the larger
+NIST curves."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer client-version)
     (ssh-write-text writer server-version)
@@ -391,16 +400,16 @@ string instead, so STRING-SHARED selects that layout."
     (if string-shared
         (ssh-write-string writer shared)
         (ssh-write-mpint writer (ssh-mpint-integer shared)))
-    (ssh-hash :sha256 (ssh-writer-output writer))))
+    (ssh-hash digest (ssh-writer-output writer))))
 
 (defun ssh-derive-key (shared exchange-hash session-id letter length
-                       &key string-shared)
+                       &key string-shared (digest :sha256))
   "One key from RFC 4253 section 7.2, LENGTH octets long.
 
 SHARED is the key exchange secret as octets; it and H are hashed as the spec
 writes them, with the secret's mpint encoding carrying its length prefix.
 STRING-SHARED writes the secret as an SSH string, as OpenSSH's hybrid methods
-do."
+do.  DIGEST is the hash the key exchange negotiated."
   (let* ((k (if string-shared
                 (let ((writer (ssh-writer)))
                   (ssh-write-string writer shared)
@@ -408,7 +417,7 @@ do."
                 (let ((writer (ssh-writer)))
                   (ssh-write-mpint writer (ssh-mpint-integer shared))
                   (ssh-writer-output writer))))
-         (material (ssh-hash :sha256 k exchange-hash
+         (material (ssh-hash digest k exchange-hash
                              (make-array 1 :element-type '(unsigned-byte 8)
                                            :initial-element (char-code letter))
                              session-id)))
@@ -417,7 +426,7 @@ do."
     (iter (while (< (length material) length))
       (setf material (ssh-concat
                       material
-                      (ssh-hash :sha256 k exchange-hash material))))
+                      (ssh-hash digest k exchange-hash material))))
     (subseq material 0 length)))
 
 (defun ssh-cipher-key-length (cipher)
@@ -442,7 +451,7 @@ do."
     (and name (ssh-hmac-length name))))
 
 (defun ssh-session-keys (negotiated shared exchange-hash session-id
-                         &key server string-shared)
+                         &key server string-shared (digest :sha256))
   "All six derived keys, as a plist keyed by direction and purpose.
 
 SERVER selects the server half: the letters swap, because C/D and E/F name
@@ -457,20 +466,24 @@ the client-to-server and server-to-client directions, not the two ends."
                                    (if server #\D #\C)
                                    (ssh-cipher-key-length
                                     (if server cipher-s2c cipher-c2s))
-                                   :string-shared string-shared)
+                                   :string-shared string-shared
+                                   :digest digest)
           :decrypt (ssh-derive-key shared exchange-hash session-id
                                    (if server #\C #\D)
                                    (ssh-cipher-key-length
                                     (if server cipher-c2s cipher-s2c))
-                                   :string-shared string-shared)
+                                   :string-shared string-shared
+                                   :digest digest)
           :encrypt-mac-key (ssh-derive-key shared exchange-hash session-id
                                            (if server #\F #\E)
                                            (if server mac-s2c mac-c2s)
-                                           :string-shared string-shared)
+                                           :string-shared string-shared
+                                           :digest digest)
           :decrypt-mac-key (ssh-derive-key shared exchange-hash session-id
                                            (if server #\E #\F)
                                            (if server mac-c2s mac-s2c)
-                                           :string-shared string-shared)
+                                           :string-shared string-shared
+                                           :digest digest)
           :encrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-c2s))
           :decrypt-mac (ssh-mac-name-keyword (getf negotiated :mac-s2c))
           :aead t)))

@@ -268,24 +268,28 @@ its KEXINIT when the connection came up."
   "Start the negotiated key exchange with our ephemeral public key.
 
 mlkem768x25519-sha256 sends the ML-KEM encapsulation key followed by the
-X25519 public key; curve25519 sends the bare 32 octets."
-  (let ((kex (getf (ssh-client-negotiated client) :kex)))
-    (if (ssh-mlkem768x25519-p kex)
-        (let ((state (ssh-mlkem768x25519-client-keypair)))
-          (setf (ssh-client-ephemeral-private client) state
-                (ssh-client-ephemeral-public client)
-                (ssh-mlkem768x25519-state-public state))
-          (let ((writer (ssh-writer)))
-            (ssh-write-u8 writer +ssh-msg-kex-ecdh-init+)
-            (ssh-write-string writer (ssh-client-ephemeral-public client))
-            (ssh-client-send-payload client (ssh-writer-output writer))))
-        (multiple-value-bind (private public) (ssh-curve25519-keypair)
-          (setf (ssh-client-ephemeral-private client) private
-                (ssh-client-ephemeral-public client) public)
-          (let ((writer (ssh-writer)))
-            (ssh-write-u8 writer +ssh-msg-kex-ecdh-init+)
-            (ssh-write-string writer public)
-            (ssh-client-send-payload client (ssh-writer-output writer)))))))
+X25519 public key; a NIST-curve ECDH sends one uncompressed SEC1 point; and
+curve25519 sends the bare 32 octets."
+  (let* ((kex (getf (ssh-client-negotiated client) :kex))
+         (ecdh (ssh-ecdh-kex-p kex)))
+    (cond
+      ((ssh-mlkem768x25519-p kex)
+       (let ((state (ssh-mlkem768x25519-client-keypair)))
+         (setf (ssh-client-ephemeral-private client) state
+               (ssh-client-ephemeral-public client)
+               (ssh-mlkem768x25519-state-public state))))
+      (ecdh
+       (multiple-value-bind (private public) (ssh-ecdh-keypair kex)
+         (setf (ssh-client-ephemeral-private client) private
+               (ssh-client-ephemeral-public client) public)))
+      (t
+       (multiple-value-bind (private public) (ssh-curve25519-keypair)
+         (setf (ssh-client-ephemeral-private client) private
+               (ssh-client-ephemeral-public client) public))))
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-kex-ecdh-init+)
+      (ssh-write-string writer (ssh-client-ephemeral-public client))
+      (ssh-client-send-payload client (ssh-writer-output writer)))))
 
 (defun ssh-client-handle-kex-reply (client payload)
   "Check the peer's host key and signature, derive keys, send NEWKEYS."
@@ -293,14 +297,21 @@ X25519 public key; curve25519 sends the bare 32 octets."
          (host-key (progn (ssh-read-u8 reader) (ssh-read-string reader)))
          (server-public (ssh-read-string reader))
          (signature (ssh-read-string reader))
-         (hybrid (ssh-mlkem768x25519-p
-                  (getf (ssh-client-negotiated client) :kex)))
+         (kex (getf (ssh-client-negotiated client) :kex))
+         (hybrid (ssh-mlkem768x25519-p kex))
+         (ecdh (ssh-ecdh-kex-p kex))
          (shared
-           (if hybrid
-               (ssh-mlkem768x25519-client-shared
-                (ssh-client-ephemeral-private client) server-public)
-               (ssh-curve25519-shared
-                (ssh-client-ephemeral-private client) server-public)))
+           (cond
+             (hybrid
+              (ssh-mlkem768x25519-client-shared
+               (ssh-client-ephemeral-private client) server-public))
+             (ecdh
+              (ssh-ecdh-shared
+               (ssh-client-ephemeral-private client) server-public kex))
+             (t
+              (ssh-curve25519-shared
+               (ssh-client-ephemeral-private client) server-public))))
+         (digest (ssh-kex-digest kex))
          (hash (ssh-exchange-hash
                 (ssh-client-version-string client)
                 (ssh-client-server-version client)
@@ -310,7 +321,8 @@ X25519 public key; curve25519 sends the bare 32 octets."
                 (ssh-client-ephemeral-public client)
                 server-public
                 shared
-                :string-shared hybrid)))
+                :string-shared hybrid
+                :digest digest)))
     (ssh-verify-host-signature host-key signature hash)
     (ssh-client-verify-host-key client host-key)
     (setf (ssh-client-session-id client)
@@ -319,7 +331,8 @@ X25519 public key; curve25519 sends the bare 32 octets."
           (ssh-client-derived-keys client)
           (ssh-session-keys (ssh-client-negotiated client)
                             shared hash (ssh-client-session-id client)
-                            :string-shared hybrid))
+                            :string-shared hybrid
+                            :digest digest))
     (ssh-client-send-newkeys client)))
 
 (defun ssh-client-send-newkeys (client)

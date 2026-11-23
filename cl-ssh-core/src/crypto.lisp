@@ -132,6 +132,73 @@ followed by the X25519 public key."
   "Whether NAME is the mlkem768x25519-sha256 key exchange."
   (and (stringp name) (string= name "mlkem768x25519-sha256")))
 
+;;; ---- NIST-curve ECDH (ecdh-sha2-nistp256/384/521) ----
+;;;
+;;; RFC 5656: the public key Q is an uncompressed SEC1 point and the shared
+;;; secret K is the X coordinate written as an mpint.  ironclad-unsafe already
+;;; implements the three curves, so this only lays out the SSH wire form.
+
+(defparameter +ssh-ecdh-curves+
+  '(("ecdh-sha2-nistp256" :curve :secp256r1 :size 32 :digest :sha256)
+    ("ecdh-sha2-nistp384" :curve :secp384r1 :size 48 :digest :sha384)
+    ("ecdh-sha2-nistp521" :curve :secp521r1 :size 66 :digest :sha512))
+  "The NIST-curve key exchanges SSH names, with Ironclad's curve, width and
+digest.  The digest is both the exchange hash and the key-derivation hash.")
+
+(defun ssh-ecdh-kex-parameters (kex)
+  "The (VALUES CURVE SIZE DIGEST) of the NIST-curve key exchange KEX.
+
+Answers NIL when KEX is not one of them."
+  (let ((entry (and (stringp kex)
+                    (assoc kex +ssh-ecdh-curves+ :test #'string=))))
+    (when entry
+      (values (getf (cdr entry) :curve)
+              (getf (cdr entry) :size)
+              (getf (cdr entry) :digest)))))
+
+(defun ssh-ecdh-kex-p (name)
+  "Whether NAME is a NIST-curve ECDH key exchange."
+  (and (ssh-ecdh-kex-parameters name) t))
+
+(defun ssh-ecdh-keypair (kex)
+  "A fresh keypair for KEX as (VALUES PRIVATE-KEY PUBLIC-POINT).
+
+The point is SEC1's uncompressed form, the encoding RFC 5656 puts on the
+wire; the private key object is what DIFFIE-HELLMAN takes later."
+  (let ((curve (nth-value 0 (ssh-ecdh-kex-parameters kex))))
+    (unless curve
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported ECDH key exchange ~A" kex)))
+    (multiple-value-bind (private public)
+        (ironclad-unsafe:generate-key-pair curve)
+      (values private
+              (getf (ironclad-unsafe:destructure-public-key public) :y)))))
+
+(defun ssh-ecdh-shared (private peer-point kex)
+  "The X coordinate of the ECDH shared point for KEX, SIZE octets.
+
+Ironclad's DIFFIE-HELLMAN returns the whole SEC1 point; RFC 5656 uses only
+its X coordinate, zero-padded to the field width.  MAKE-PUBLIC-KEY checks
+that the peer's point is on the curve before it is multiplied."
+  (multiple-value-bind (curve size)
+      (ssh-ecdh-kex-parameters kex)
+    (unless curve
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported ECDH key exchange ~A" kex)))
+    (let ((point
+            (handler-case
+                (ironclad-unsafe:diffie-hellman
+                 private
+                 (ironclad-unsafe:make-public-key curve :y peer-point))
+              (error (condition)
+                (error 'ssh-protocol-error
+                       :detail (format nil "invalid ECDH public key: ~A"
+                                       condition))))))
+      (unless (and (= (length point) (1+ (* 2 size)))
+                   (= (aref point 0) 4))
+        (error 'ssh-protocol-error :detail "malformed ECDH shared point"))
+      (subseq point 1 (1+ size)))))
+
 (defun ssh-ed25519-verify (signature message public-key)
   "Verify SIGNATURE (64 octets) over MESSAGE under PUBLIC-KEY (32 octets)."
   (and (= (length signature) 64)

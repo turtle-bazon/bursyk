@@ -1871,3 +1871,61 @@ server records the full string."
            :macs cl-pnet-ssh:+ssh-macs+
            :compressions '("none"))))
     (is (string= "mlkem768x25519-sha256" (getf negotiated :kex)))))
+
+;;; ---- NIST-curve ECDH key exchange ----
+
+(test nist-curve-ecdh-agrees
+  "Each NIST curve derives one shared secret on both sides."
+  (dolist (entry '(("ecdh-sha2-nistp256" 32 :sha256)
+                   ("ecdh-sha2-nistp384" 48 :sha384)
+                   ("ecdh-sha2-nistp521" 66 :sha512)))
+    (destructuring-bind (kex size digest) entry
+      (multiple-value-bind (curve actual-size actual-digest)
+          (cl-pnet-ssh::ssh-ecdh-kex-parameters kex)
+        (is (not (null curve)))
+        (is (= size actual-size))
+        (is (eq digest actual-digest)))
+      (multiple-value-bind (private-a public-a)
+          (cl-pnet-ssh::ssh-ecdh-keypair kex)
+        (multiple-value-bind (private-b public-b)
+            (cl-pnet-ssh::ssh-ecdh-keypair kex)
+          (let ((ab (cl-pnet-ssh::ssh-ecdh-shared private-a public-b kex))
+                (ba (cl-pnet-ssh::ssh-ecdh-shared private-b public-a kex)))
+            ;; The wire point is uncompressed SEC1; the secret is only X.
+            (is (= (1+ (* 2 size)) (length public-a)))
+            (is (= 4 (aref public-a 0)))
+            (is (= size (length ab)))
+            (is (equalp ab ba)))))))
+  ;; A peer point that is not on the curve is a protocol error, not a crash.
+  (signals cl-pnet-ssh:ssh-protocol-error
+    (cl-pnet-ssh::ssh-ecdh-shared
+     (multiple-value-bind (private public)
+         (cl-pnet-ssh::ssh-ecdh-keypair "ecdh-sha2-nistp256")
+       (declare (ignore public))
+       private)
+     (make-array 65 :element-type '(unsigned-byte 8) :initial-element 0)
+     "ecdh-sha2-nistp256")))
+
+(test nist-curve-kex-is-offered
+  "The three NIST-curve methods follow curve25519 in the default offer."
+  (is (equal '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+               "ecdh-sha2-nistp521")
+             (last cl-pnet-ssh:+ssh-kex-real-algorithms+ 3)))
+  (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+                 "ecdh-sha2-nistp521"))
+    (let ((negotiated
+            (cl-pnet-ssh::ssh-negotiate
+             (list :kex (list kex)
+                   :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
+                   :ciphers-c2s cl-pnet-ssh:+ssh-ciphers+
+                   :ciphers-s2c cl-pnet-ssh:+ssh-ciphers+
+                   :macs-c2s cl-pnet-ssh:+ssh-macs+
+                   :macs-s2c cl-pnet-ssh:+ssh-macs+
+                   :compressions-c2s '("none")
+                   :compressions-s2c '("none"))
+             :kex-algorithms (list kex)
+             :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
+             :ciphers cl-pnet-ssh:+ssh-ciphers+
+             :macs cl-pnet-ssh:+ssh-macs+
+             :compressions '("none"))))
+      (is (string= kex (getf negotiated :kex))))))

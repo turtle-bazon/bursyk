@@ -10,12 +10,17 @@
 (defparameter +ssh-kex-real-algorithms+
   '("mlkem768x25519-sha256"
     "curve25519-sha256"
-    "curve25519-sha256@libssh.org")
+    "curve25519-sha256@libssh.org"
+    "ecdh-sha2-nistp256"
+    "ecdh-sha2-nistp384"
+    "ecdh-sha2-nistp521")
   "The key-exchange methods themselves, without the protocol markers.
 
 mlkem768x25519-sha256 is OpenSSH's default post-quantum hybrid.  It needs
 ML-KEM-768 and X25519, both of which this build has, so it is offered first
-and a peer that does not know it falls back to curve25519.")
+and a peer that does not know it falls back to curve25519.  The NIST-curve
+ECDH methods come last, in OpenSSH's order, so a peer that offers only one
+of them still negotiates.")
 
 (defparameter +ssh-kex-algorithms+
   (append +ssh-kex-real-algorithms+
