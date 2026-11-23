@@ -288,6 +288,67 @@
     (setf (aref wire 10) (logxor 1 (aref wire 10)))
     (signals ssh-protocol-error (ssh-decode-packet wire receive))))
 
+(defun install-test-etm-cipher (state cipher key iv direction)
+  (let ((mac-key (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 9)))
+    (ecase direction
+      (:send (ssh-install-keys state :encrypt key :encrypt-iv iv
+                               :encrypt-cipher cipher
+                               :encrypt-mac-key mac-key :encrypt-mac :sha256
+                               :encrypt-mac-etm t))
+      (:receive (ssh-install-keys state :decrypt key :decrypt-iv iv
+                                  :decrypt-cipher cipher
+                                  :decrypt-mac-key mac-key
+                                  :decrypt-mac :sha256
+                                  :decrypt-mac-etm t)))))
+
+(test etm-mac-names-carry-their-own-framing
+  "The -etm suffix selects framing, not a different hash."
+  (is (cl-pnet-ssh::ssh-mac-etm-p "hmac-sha2-256-etm@openssh.com"))
+  (is (not (cl-pnet-ssh::ssh-mac-etm-p "hmac-sha2-256")))
+  (is (eq :sha256
+          (cl-pnet-ssh::ssh-mac-name-keyword
+           "hmac-sha2-256-etm@openssh.com")))
+  (is (eq :sha1
+          (cl-pnet-ssh::ssh-mac-name-keyword "hmac-sha1-etm@openssh.com"))))
+
+(test etm-ctr-packet-round-trip
+  "Encrypt-then-MAC leaves the length in the clear and tags the ciphertext."
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state)))
+    (install-test-etm-cipher send cipher key iv :send)
+    (install-test-etm-cipher receive cipher key iv :receive)
+    (dotimes (index 3)
+      (let ((payload (concatenated (hex-octets "5e")
+                                   (ssh-random-octets (+ 5 index)))))
+        (let* ((wire (ssh-encode-packet payload send))
+               (length (ssh-octets-uint32 wire)))
+          ;; EtM authenticates the length field instead of encrypting it.
+          (is (zerop (mod length 16)))
+          (is (= (+ 4 length 32) (length wire)))
+          (multiple-value-bind (decoded consumed)
+              (ssh-decode-packet wire receive)
+            (is (equalp payload decoded))
+            (is (= (length wire) consumed))))))))
+
+(test etm-ctr-checks-the-mac-before-decrypting
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state))
+         (wire (progn
+                 (install-test-etm-cipher send cipher key iv :send)
+                 (ssh-encode-packet (concatenated (hex-octets "15")
+                                                  (ssh-random-octets 40))
+                                    send))))
+    (install-test-etm-cipher receive cipher key iv :receive)
+    (setf (aref wire 8) (logxor 1 (aref wire 8)))
+    (signals ssh-protocol-error (ssh-decode-packet wire receive))))
+
 (test gcm-packet-round-trip
   "AES-GCM authenticates the length field and encrypts the body."
   (dolist (cipher '("aes128-gcm@openssh.com" "aes256-gcm@openssh.com"))
@@ -3558,17 +3619,24 @@ path that selects the agent socket to forward."
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("chacha20-poly1305@openssh.com")
               cl-pnet-ssh:+ssh-ciphers+ "Ciphers")))
-  (is (equal '("hmac-sha2-256" "hmac-sha2-512")
+  ;; "+name" leaves the list alone when the build already offers it.
+  (is (equal cl-pnet-ssh:+ssh-macs+
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("+hmac-sha2-256") cl-pnet-ssh:+ssh-macs+ "MACs")))
-  (is (equal '("hmac-sha2-512")
+  (is (equal (remove "hmac-sha2-256" cl-pnet-ssh:+ssh-macs+
+                     :test #'string=)
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("-hmac-sha2-256") cl-pnet-ssh:+ssh-macs+ "MACs")))
-  (is (equal '("hmac-sha2-512" "hmac-sha2-256")
+  (is (equal (cons "hmac-sha2-512"
+                   (remove "hmac-sha2-512" cl-pnet-ssh:+ssh-macs+
+                           :test #'string=))
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("^hmac-sha2-512") cl-pnet-ssh:+ssh-macs+ "MACs")))
   ;; ssh_config allows glob patterns in these lists too.
-  (is (equal '("hmac-sha2-256" "hmac-sha2-512")
+  (is (equal '("hmac-sha2-256-etm@openssh.com"
+               "hmac-sha2-512-etm@openssh.com"
+               "hmac-sha2-256"
+               "hmac-sha2-512")
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("hmac-sha2-*") cl-pnet-ssh:+ssh-macs+ "MACs")))
   (is (equal '("curve25519-sha256")
@@ -3597,7 +3665,7 @@ path that selects the agent socket to forward."
            "alias"
            (facade-options
             (list :ciphers '("chacha20-poly1305@openssh.com")
-                  :macs '("-hmac-sha2-256")
+                  :macs '("hmac-sha2-512")
                   :kex-algorithms '("curve25519-sha256")
                   :host-key-algorithms '("ssh-ed25519")
                   :pubkey-accepted-algorithms '("ssh-ed25519"))))))

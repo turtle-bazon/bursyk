@@ -348,7 +348,8 @@ curve25519 sends the bare 32 octets."
                       :encrypt-iv (getf keys :encrypt-iv)
                       :encrypt-cipher (getf keys :encrypt-cipher)
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
-                      :encrypt-mac (getf keys :encrypt-mac))
+                      :encrypt-mac (getf keys :encrypt-mac)
+                      :encrypt-mac-etm (getf keys :encrypt-mac-etm))
     (ssh-install-send-compression
      (ssh-client-cipher client)
      (getf (ssh-client-negotiated client) :compression-c2s)
@@ -377,7 +378,8 @@ curve25519 sends the bare 32 octets."
                       :decrypt-iv (getf keys :decrypt-iv)
                       :decrypt-cipher (getf keys :decrypt-cipher)
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
-                      :decrypt-mac (getf keys :decrypt-mac))
+                      :decrypt-mac (getf keys :decrypt-mac)
+                      :decrypt-mac-etm (getf keys :decrypt-mac-etm))
     (ssh-install-receive-compression
      (ssh-client-cipher client)
      (getf (ssh-client-negotiated client) :compression-s2c)

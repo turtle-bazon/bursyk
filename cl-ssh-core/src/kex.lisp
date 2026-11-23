@@ -430,11 +430,15 @@ do.  DIGEST is the hash the key exchange negotiated."
     (subseq material 0 length)))
 
 (defun ssh-mac-name-keyword (mac)
-  "The ironclad name for MAC, or NIL when it is not implemented."
-  (cond ((string= mac "hmac-sha2-256") :sha256)
-        ((string= mac "hmac-sha2-512") :sha512)
-        ((string= mac "hmac-sha1") :sha1)
-        (t nil)))
+  "The ironclad name for MAC, or NIL when it is not implemented.
+
+An -etm@openssh.com suffix changes the framing, not the hash, so it is
+stripped before the digest is chosen."
+  (let ((base (ssh-mac-base-name mac)))
+    (cond ((string= base "hmac-sha2-256") :sha256)
+          ((string= base "hmac-sha2-512") :sha512)
+          ((string= base "hmac-sha1") :sha1)
+          (t nil))))
 
 (defun ssh-mac-key-length (mac)
   (let ((name (ssh-mac-name-keyword mac)))
@@ -480,7 +484,13 @@ the right framing for each direction."
                               (getf negotiated :mac-c2s)))
             :decrypt-mac (ssh-mac-name-keyword
                           (if server (getf negotiated :mac-c2s)
-                              (getf negotiated :mac-s2c)))))))
+                              (getf negotiated :mac-s2c)))
+            :encrypt-mac-etm (ssh-mac-etm-p
+                              (if server (getf negotiated :mac-s2c)
+                                  (getf negotiated :mac-c2s)))
+            :decrypt-mac-etm (ssh-mac-etm-p
+                              (if server (getf negotiated :mac-c2s)
+                                  (getf negotiated :mac-s2c)))))))
 
 ;;; ---- Host key and signature ----
 

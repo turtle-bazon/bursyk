@@ -65,6 +65,21 @@
 (defun ssh-cipher-tag-length (cipher)
   (if (ssh-cipher-aead-p cipher) +ssh-aead-tag-length+ 0))
 
+(defparameter +ssh-etm-suffix+ "-etm@openssh.com")
+
+(defun ssh-mac-etm-p (mac)
+  "Whether MAC is an encrypt-then-MAC name."
+  (and mac
+       (let ((start (- (length mac) (length +ssh-etm-suffix+))))
+         (and (not (minusp start))
+              (string= +ssh-etm-suffix+ mac :start2 start)))))
+
+(defun ssh-mac-base-name (mac)
+  "MAC without its -etm@openssh.com suffix."
+  (if (ssh-mac-etm-p mac)
+      (subseq mac 0 (- (length mac) (length +ssh-etm-suffix+)))
+      mac))
+
 (defstruct (ssh-cipher-state (:constructor ssh-make-cipher-state))
   ;; ENCRYPT and DECRYPT hold the key material the cipher routines need:
   ;; the two chacha20 keys for chacha20-poly1305, the AES key otherwise.
@@ -86,6 +101,8 @@
   (decrypt-mac-key nil)
   (encrypt-mac nil)
   (decrypt-mac nil)
+  (encrypt-etm nil)
+  (decrypt-etm nil)
   (send-sequence 0 :type (unsigned-byte 32))
   (receive-sequence 0 :type (unsigned-byte 32))
   (block-size +ssh-block-size+)
@@ -226,28 +243,49 @@ associated data, so the body alone is padded to the 16-octet block size."
     output))
 
 (defun ssh-ctr-encode (payload state)
-  "PAYLOAD as an AES-CTR packet with an hmac appended in the clear."
+  "PAYLOAD as an AES-CTR packet with an hmac appended in the clear.
+
+With an encrypt-then-MAC algorithm the length field stays plaintext and only
+the body enters the cipher stream, so the MAC can be checked before anything
+is decrypted.  A plain MAC is computed over the plaintext packet and the
+whole packet is then encrypted."
   (let* ((sequence (ssh-cipher-state-send-sequence state))
          (block-size (ssh-cipher-state-send-block-size state))
+         (etm (ssh-cipher-state-encrypt-etm state))
          (padding-length (ssh-packet-padding-length
-                          (length payload) 4 block-size))
+                          (length payload) (if etm 0 4) block-size))
          (body (ssh-packet-body payload padding-length))
-         (packet (ssh-concat (ssh-uint32-octets (length body)) body))
+         (length-octets (ssh-uint32-octets (length body)))
+         (plain (ssh-concat length-octets body))
          (mac-key (ssh-cipher-state-encrypt-mac-key state))
          (mac-name (ssh-cipher-state-encrypt-mac state))
-         (mac (and mac-name
-                   (ssh-hmac mac-key
-                             (ssh-concat (ssh-uint32-octets sequence) packet)
-                             mac-name)))
-         (offset (ssh-cipher-state-encrypt-offset state))
-         (encrypted (ssh-aes-ctr-xor
-                     (ssh-cipher-state-encrypt-ecb state)
-                     (ssh-cipher-state-encrypt-iv state)
-                     offset packet)))
-    (setf (ssh-cipher-state-encrypt-offset state) (+ offset (length packet))
-          (ssh-cipher-state-send-sequence state)
-          (mod (1+ sequence) (expt 2 32)))
-    (if mac (ssh-concat encrypted mac) encrypted)))
+         (ecb (ssh-cipher-state-encrypt-ecb state))
+         (iv (ssh-cipher-state-encrypt-iv state))
+         (offset (ssh-cipher-state-encrypt-offset state)))
+    (if etm
+        (let* ((encrypted-body (ssh-aes-ctr-xor ecb iv offset body))
+               (packet (ssh-concat length-octets encrypted-body))
+               (mac (and mac-name
+                         (ssh-hmac mac-key
+                                   (ssh-concat (ssh-uint32-octets sequence)
+                                               packet)
+                                   mac-name))))
+          (setf (ssh-cipher-state-encrypt-offset state)
+                (+ offset (length body))
+                (ssh-cipher-state-send-sequence state)
+                (mod (1+ sequence) (expt 2 32)))
+          (if mac (ssh-concat packet mac) packet))
+        (let* ((mac (and mac-name
+                         (ssh-hmac mac-key
+                                   (ssh-concat (ssh-uint32-octets sequence)
+                                               plain)
+                                   mac-name)))
+               (encrypted (ssh-aes-ctr-xor ecb iv offset plain)))
+          (setf (ssh-cipher-state-encrypt-offset state)
+                (+ offset (length plain))
+                (ssh-cipher-state-send-sequence state)
+                (mod (1+ sequence) (expt 2 32)))
+          (if mac (ssh-concat encrypted mac) encrypted)))))
 
 (defun ssh-encode-packet (payload state)
   "Cycle STATE's sequence and return PAYLOAD as wire octets."
@@ -385,41 +423,77 @@ and padding, against a cipher's block limits.  The tag is not part of it."
 (defun ssh-ctr-decode (buffer state)
   "Decode one AES-CTR packet from BUFFER."
   (let* ((block-size (ssh-cipher-state-receive-block-size state))
+         (etm (ssh-cipher-state-decrypt-etm state))
          (ecb (ssh-cipher-state-decrypt-ecb state))
          (iv (ssh-cipher-state-decrypt-iv state))
-         (offset (ssh-cipher-state-decrypt-offset state)))
-    (when (< (length buffer) block-size)
-      (return-from ssh-ctr-decode (values :incomplete 0)))
-    ;; The length field is encrypted, so decrypt the first block to read it
-    ;; without advancing the stream: SSH-AES-CTR-XOR is a pure function of
-    ;; OFFSET, and the whole packet is decrypted again below.
-    (let* ((first (ssh-aes-ctr-xor ecb iv offset
-                                   (subseq buffer 0 block-size)))
-           (length (ssh-octets-uint32 first))
-           (mac-length (ssh-packet-mac-length state :receive))
-           (needed (+ 4 length mac-length)))
-      (unless (<= 1 length +ssh-max-packet+)
-        (error 'ssh-protocol-error
-               :detail (format nil "packet length ~D outside 1..~D"
-                               length +ssh-max-packet+)))
-      (when (< (length buffer) needed)
-        (return-from ssh-ctr-decode (values :incomplete 0)))
-      (let* ((sequence (ssh-cipher-state-receive-sequence state))
-             (packet (ssh-aes-ctr-xor ecb iv offset
-                                      (subseq buffer 0 (+ 4 length)))))
-        (when (plusp mac-length)
-          (let ((expected (subseq buffer (+ 4 length) needed))
-                (actual (ssh-hmac
-                         (ssh-cipher-state-decrypt-mac-key state)
-                         (ssh-concat (ssh-uint32-octets sequence) packet)
-                         (ssh-cipher-state-decrypt-mac state))))
-            (unless (ssh-octets= expected actual)
-              (error 'ssh-protocol-error :detail "packet MAC does not verify"))))
-        (setf (ssh-cipher-state-decrypt-offset state) (+ offset 4 length)
-              (ssh-cipher-state-receive-sequence state)
-              (mod (1+ sequence) (expt 2 32)))
-        (values (ssh-strip-padding (subseq packet 4) length)
-                needed)))))
+         (offset (ssh-cipher-state-decrypt-offset state))
+         (mac-length (ssh-packet-mac-length state :receive)))
+    (if etm
+        ;; EtM leaves the length in the clear, so the packet is framed and
+        ;; authenticated before a single body octet is decrypted.
+        (progn
+          (when (< (length buffer) 4)
+            (return-from ssh-ctr-decode (values :incomplete 0)))
+          (let* ((length (ssh-octets-uint32 buffer))
+                 (needed (+ 4 length mac-length)))
+            (unless (<= 1 length +ssh-max-packet+)
+              (error 'ssh-protocol-error
+                     :detail (format nil "packet length ~D outside 1..~D"
+                                     length +ssh-max-packet+)))
+            (when (< (length buffer) needed)
+              (return-from ssh-ctr-decode (values :incomplete 0)))
+            (let* ((sequence (ssh-cipher-state-receive-sequence state))
+                   (wire (subseq buffer 0 (+ 4 length))))
+              (when (plusp mac-length)
+                (let ((expected (subseq buffer (+ 4 length) needed))
+                      (actual (ssh-hmac
+                               (ssh-cipher-state-decrypt-mac-key state)
+                               (ssh-concat (ssh-uint32-octets sequence) wire)
+                               (ssh-cipher-state-decrypt-mac state))))
+                  (unless (ssh-octets= expected actual)
+                    (error 'ssh-protocol-error
+                           :detail "packet MAC does not verify"))))
+              (let ((body (ssh-aes-ctr-xor ecb iv offset
+                                           (subseq wire 4))))
+                (setf (ssh-cipher-state-decrypt-offset state)
+                      (+ offset length)
+                      (ssh-cipher-state-receive-sequence state)
+                      (mod (1+ sequence) (expt 2 32)))
+                (values (ssh-strip-padding body length) needed)))))
+        (progn
+          (when (< (length buffer) block-size)
+            (return-from ssh-ctr-decode (values :incomplete 0)))
+          ;; The length field is encrypted, so decrypt the first block to
+          ;; read it without advancing the stream: SSH-AES-CTR-XOR is a pure
+          ;; function of OFFSET, and the packet is decrypted again below.
+          (let* ((first (ssh-aes-ctr-xor ecb iv offset
+                                         (subseq buffer 0 block-size)))
+                 (length (ssh-octets-uint32 first))
+                 (needed (+ 4 length mac-length)))
+            (unless (<= 1 length +ssh-max-packet+)
+              (error 'ssh-protocol-error
+                     :detail (format nil "packet length ~D outside 1..~D"
+                                     length +ssh-max-packet+)))
+            (when (< (length buffer) needed)
+              (return-from ssh-ctr-decode (values :incomplete 0)))
+            (let* ((sequence (ssh-cipher-state-receive-sequence state))
+                   (packet (ssh-aes-ctr-xor ecb iv offset
+                                            (subseq buffer 0 (+ 4 length)))))
+              (when (plusp mac-length)
+                (let ((expected (subseq buffer (+ 4 length) needed))
+                      (actual (ssh-hmac
+                               (ssh-cipher-state-decrypt-mac-key state)
+                               (ssh-concat (ssh-uint32-octets sequence) packet)
+                               (ssh-cipher-state-decrypt-mac state))))
+                  (unless (ssh-octets= expected actual)
+                    (error 'ssh-protocol-error
+                           :detail "packet MAC does not verify"))))
+              (setf (ssh-cipher-state-decrypt-offset state)
+                    (+ offset 4 length)
+                    (ssh-cipher-state-receive-sequence state)
+                    (mod (1+ sequence) (expt 2 32)))
+              (values (ssh-strip-padding (subseq packet 4) length)
+                      needed)))))))
 
 (defun ssh-plain-decode (buffer state)
   "Decode one plain or hmac-tagged packet from BUFFER."
@@ -586,6 +660,8 @@ is left alone, and calling this twice is harmless."
                                    (decrypt-mac-key nil decrypt-mac-key-p)
                                    (encrypt-mac nil encrypt-mac-p)
                                    (decrypt-mac nil decrypt-mac-p)
+                                   (encrypt-mac-etm nil encrypt-mac-etm-p)
+                                   (decrypt-mac-etm nil decrypt-mac-etm-p)
                                    aead)
   "Put negotiated keys into STATE, leaving the sequence numbers alone.
 
@@ -641,6 +717,10 @@ two packet keys here; AES-CTR builds its keystream cipher here as well."
     (setf (ssh-cipher-state-encrypt-mac state) encrypt-mac))
   (when decrypt-mac-p
     (setf (ssh-cipher-state-decrypt-mac state) decrypt-mac))
+  (when encrypt-mac-etm-p
+    (setf (ssh-cipher-state-encrypt-etm state) encrypt-mac-etm))
+  (when decrypt-mac-etm-p
+    (setf (ssh-cipher-state-decrypt-etm state) decrypt-mac-etm))
   state)
 
 (defun ssh-reset-send-sequence (state)

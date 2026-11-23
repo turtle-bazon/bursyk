@@ -1005,7 +1005,8 @@ PermitListen 8080 127.0.0.1:9000")))
     (is (equal cl-pnet-ssh:+ssh-ciphers+
                (cl-pnet-ssh:ssh-server-config-ciphers config)))
     ;; "-name" removes from the build's list and leaves the rest in order.
-    (is (equal '("hmac-sha2-512")
+    (is (equal (remove "hmac-sha2-256" cl-pnet-ssh:+ssh-macs+
+                       :test #'string=)
                (cl-pnet-ssh:ssh-server-config-macs config)))
     (is (equal '("mlkem768x25519-sha256" "curve25519-sha256"
                  "curve25519-sha256@libssh.org" "ecdh-sha2-nistp256"

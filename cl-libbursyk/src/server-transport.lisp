@@ -433,7 +433,8 @@ and refuse the key without ever asking."
                       :encrypt-iv (getf keys :encrypt-iv)
                       :encrypt-cipher (getf keys :encrypt-cipher)
                       :encrypt-mac-key (getf keys :encrypt-mac-key)
-                      :encrypt-mac (getf keys :encrypt-mac))
+                      :encrypt-mac (getf keys :encrypt-mac)
+                      :encrypt-mac-etm (getf keys :encrypt-mac-etm))
     ;; NEWKEYS itself went out under the old stream; EXT_INFO below belongs
     ;; to the new one, as it does in OpenSSH.
     (ssh-install-send-compression
@@ -470,7 +471,8 @@ and refuse the key without ever asking."
                       :decrypt-iv (getf keys :decrypt-iv)
                       :decrypt-cipher (getf keys :decrypt-cipher)
                       :decrypt-mac-key (getf keys :decrypt-mac-key)
-                      :decrypt-mac (getf keys :decrypt-mac))
+                      :decrypt-mac (getf keys :decrypt-mac)
+                      :decrypt-mac-etm (getf keys :decrypt-mac-etm))
     (ssh-install-receive-compression
      cipher
      (getf (ssh-session-negotiated session) :compression-c2s)
