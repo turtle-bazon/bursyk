@@ -1931,6 +1931,14 @@ share the test, so each must dispatch the same channel requests."
              :compressions '("none"))))
       (is (string= kex (getf negotiated :kex))))))
 
+(test signature-default-prefers-certificates
+  "PubkeyAcceptedAlgorithms and HostbasedAcceptedAlgorithms list certs first."
+  (let ((signatures cl-pnet-ssh::+ssh-signature-algorithms+))
+    (is (string= "ssh-ed25519-cert-v01@openssh.com" (first signatures)))
+    (is (string= "rsa-sha2-256" (car (last signatures))))
+    (is (not (null (search "-cert-v01@" (first signatures)))))
+    (is (null (search "-cert-v01@" (car (last signatures)))))))
+
 (test mlkem768nistp256-is-implemented-but-not-default
   "The P-256 ML-KEM hybrid is selectable but absent from the default offer."
   (is (member "mlkem768nistp256-sha256"

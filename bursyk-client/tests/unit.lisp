@@ -94,7 +94,17 @@ CLI's decision and at the plist it filled."
                (not (burs::certificate-algorithm-name-p name)))
              (burs::query-answer "key-plain")))
   (is (every #'burs::certificate-algorithm-name-p
-             (burs::query-answer "key-cert"))))
+             (burs::query-answer "key-cert")))
+  ;; -Q key pairs each key type with its certificate, as ssh does, and names
+  ;; RSA as ssh-rsa, the key format, not the rsa-sha2-* signature names.
+  (let ((key (burs::query-answer "key")))
+    (is (equal "ssh-ed25519" (first key)))
+    (is (equal "ssh-ed25519-cert-v01@openssh.com" (second key)))
+    (is (equal "ssh-rsa" (nth (- (length key) 2) key)))
+    (is (equal "ssh-rsa-cert-v01@openssh.com" (car (last key)))))
+  (is (member "ssh-rsa" (burs::query-answer "key-plain") :test #'string=))
+  (is (not (member "rsa-sha2-256" (burs::query-answer "key-plain")
+                   :test #'string=))))
 
 (test kex-queries-follow-the-transport
   "A transport without ML-KEM neither lists nor accepts the hybrid."
@@ -997,6 +1007,12 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                           "serveraliveinterval 0"
                           "ipqos ef cs0"))
         (is (search line text) line))
+      ;; OpenSSH's default PK_ALG lists certificate names before the plain
+      ;; keys they certify, for both user and hostbased authentication.
+      (is (search "pubkeyacceptedalgorithms ssh-ed25519-cert-v01@openssh.com,"
+                  text))
+      (is (search "hostbasedacceptedalgorithms ssh-ed25519-cert-v01@openssh.com,"
+                  text))
       (is (search "identityfile" text))
       (is (not (search "proxyjump" text)))
       (is (not (search "proxycommand" text))))))

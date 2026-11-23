@@ -774,15 +774,32 @@ session down."
       (and (search "-cert" name)
            (not (search "-cert-v01@" name)))))
 
+(defparameter +query-key-types+
+  '("ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "ssh-rsa")
+  "Plain key types this client can load, in -Q key-plain's order.
+
+RSA appears as ssh-rsa, the key format, not as the rsa-sha2-* signature
+names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
+
+(defparameter +query-certificate-key-types+
+  '("ssh-ed25519-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    "ssh-rsa-cert-v01@openssh.com")
+  "The certificate spelling of each plain key type, in the same order.")
+
 (defun query-plain-key-algorithms ()
   "Key types this client can load, without the certificate spellings."
-  (remove-if #'certificate-algorithm-name-p
-             cl-pnet-ssh:+ssh-host-key-algorithms+))
+  +query-key-types+)
 
 (defun query-certificate-key-algorithms ()
   "Certificate key types this client can present."
-  (remove-if-not #'certificate-algorithm-name-p
-                 cl-pnet-ssh:+ssh-host-key-algorithms+))
+  +query-certificate-key-types+)
 
 (defparameter +query-plain-signature-names+
   '("ssh-ed25519"
@@ -821,8 +838,10 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
                       cl-pnet-ssh:+ssh-kex-real-algorithms+))
       ((string= name "compression") cl-pnet-ssh:+ssh-compressions+)
       ((string= name "key")
-       (append (query-plain-key-algorithms)
-               (query-certificate-key-algorithms)))
+       ;; -Q key pairs each key type with its certificate, as ssh does.
+       (loop for plain in (query-plain-key-algorithms)
+             for certificate in (query-certificate-key-algorithms)
+             append (list plain certificate)))
       ((string= name "key-plain") (query-plain-key-algorithms))
       ((string= name "key-cert") (query-certificate-key-algorithms))
       ((string= name "key-sig") (query-signature-algorithms))

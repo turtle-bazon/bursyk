@@ -178,22 +178,24 @@ An agent signs, so a curve it supports is enough; the client only has to
 name the key type the same way the protocol does.")
 
 (defparameter +ssh-signature-algorithms+
-  '("ssh-ed25519" "rsa-sha2-256"
-    "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521"
-    ;; A certificate authenticates under its certificate type name, so
-    ;; PubkeyAcceptedAlgorithms has to be able to name those as well;
-    ;; OpenSSH's default list carries them beside the plain names.
-    "ssh-ed25519-cert-v01@openssh.com"
-    "rsa-sha2-256-cert-v01@openssh.com"
+  '("ssh-ed25519-cert-v01@openssh.com"
     "ecdsa-sha2-nistp256-cert-v01@openssh.com"
     "ecdsa-sha2-nistp384-cert-v01@openssh.com"
-    "ecdsa-sha2-nistp521-cert-v01@openssh.com")
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-ed25519"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "rsa-sha2-256")
   "Signature algorithms a signer here can name.
 
-RSA signs as rsa-sha2-256 rather than the SHA-1 ssh-rsa, so
-PubkeyAcceptedAlgorithms is resolved against this list; naming ssh-rsa is
-an error rather than a silent downgrade.  Certificate types are here because
-a certificate signs in under its own name, not the plain key's.")
+The certificate spellings come first, as in OpenSSH's KEX_DEFAULT_PK_ALG,
+so a certificate is preferred over the plain key it certifies.  RSA signs as
+rsa-sha2-256 rather than the SHA-1 ssh-rsa, so PubkeyAcceptedAlgorithms is
+resolved against this list; naming ssh-rsa is an error rather than a silent
+downgrade.  Certificate types are here because a certificate signs in under
+its own name, not the plain key's.")
 
 (defun ssh-agent-signer (key-blob path)
   "A signer that has the agent at PATH sign with KEY-BLOB."
