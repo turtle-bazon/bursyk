@@ -1204,6 +1204,75 @@ signal, so the override still works."
     (is (eq t (client-accept-unknown-host-key-for
                client blob (ssh-key-fingerprint blob))))))
 
+(test client-insecure-policy-continues-with-a-changed-key
+  "StrictHostKeyChecking=no warns about a changed key and keeps the connection,
+but turns off everything a man in the middle could exploit."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-changed"))
+         (file (merge-pathnames "known_hosts" directory))
+         (old-blob (ssh-test-known-host-blob))
+         (new-blob (ssh-test-known-host-blob))
+         (warnings '())
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example.org" :port 22
+                  :known-hosts (list file)
+                  :host-key-policy :insecure
+                  :forward-agent t
+                  :forward-x11 t
+                  :update-host-keys :yes)))
+    (ensure-directories-exist file)
+    (unwind-protect
+         (progn
+           (ssh-remember-known-host file "example.org" "ssh-ed25519" old-blob)
+           (let ((cl-pnet-ssh:*ssh-warning-function*
+                   (lambda (line) (push line warnings))))
+             (is (eq t (cl-pnet-ssh::ssh-client-verify-host-key
+                        client new-blob))))
+           (is (cl-pnet-ssh:ssh-client-host-key-untrusted-p client))
+           (is (null (cl-pnet-ssh::ssh-client-password-authentication client)))
+           (is (null (cl-pnet-ssh::ssh-client-kbd-interactive-authentication
+                      client)))
+           (is (null (cl-pnet-ssh::ssh-client-forward-agent client)))
+           (is (null (cl-pnet-ssh::ssh-client-forward-x11 client)))
+           (is (eq :no (cl-pnet-ssh::ssh-client-update-host-keys client)))
+           (is (not (null
+                     (some (lambda (line)
+                             (search "REMOTE HOST IDENTIFICATION HAS CHANGED" line))
+                           warnings))))
+           (is (not (null
+                     (some (lambda (line)
+                             (search "Password authentication is disabled" line))
+                           warnings))))
+           (is (not (null
+                     (some (lambda (line)
+                             (search "Offending ED25519 key in" line))
+                           warnings))))
+           ;; A changed key is never recorded: the old entry stays.
+           (is (eq :mismatch (client-known-host-status-for client new-blob))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test client-changed-host-key-is-refused-by-stricter-policies
+  "Only StrictHostKeyChecking=no continues past a changed host key."
+  (dolist (policy '(:strict :accept-new :ask))
+    (let* ((directory (ssh-test-directory "cl-pnet-ssh-changed-strict"))
+           (file (merge-pathnames "known_hosts" directory))
+           (old-blob (ssh-test-known-host-blob))
+           (new-blob (ssh-test-known-host-blob))
+           (client (cl-pnet-ssh::%make-ssh-client
+                    :host "example.org" :port 22
+                    :known-hosts (list file)
+                    :host-key-policy policy
+                    :host-key-callback (lambda (client fingerprint key)
+                                         (declare (ignore client fingerprint key))
+                                         t))))
+      (ensure-directories-exist file)
+      (unwind-protect
+           (progn
+             (ssh-remember-known-host file "example.org" "ssh-ed25519" old-blob)
+             (signals ssh-host-key-error
+               (cl-pnet-ssh::ssh-client-verify-host-key client new-blob))
+             (is (not (cl-pnet-ssh:ssh-client-host-key-untrusted-p client))))
+        (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test client-known-hosts-defaults-include-the-system-files
   "With nothing configured, both the user and the system files are read.
 

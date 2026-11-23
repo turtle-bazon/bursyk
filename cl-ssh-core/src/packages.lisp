@@ -14,6 +14,7 @@
    #:ssh-client-host-key-fingerprint
    #:ssh-client-host-key-randomart
    #:ssh-client-host-key-known
+   #:ssh-client-host-key-untrusted-p
    #:ssh-client-server-version
    #:ssh-client-banner
    #:ssh-client-connect-host

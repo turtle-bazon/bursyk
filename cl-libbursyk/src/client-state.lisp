@@ -203,6 +203,10 @@
   ;; Whether the host key was already trusted before this connection; ssh
   ;; shows randomart only for a key that was not just added.
   (host-key-known nil)
+  ;; Set when StrictHostKeyChecking=no continued past a changed host key.
+  ;; Password, keyboard-interactive, agent and X11 forwarding are disabled,
+  ;; and the caller refuses to start port forwarding.
+  (host-key-untrusted nil)
   ;; IPQoS: DSCP values for interactive and bulk traffic; :NONE leaves the
   ;; operating system default.
   (ip-qos-interactive #xb8)

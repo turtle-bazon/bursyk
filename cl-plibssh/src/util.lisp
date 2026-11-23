@@ -174,6 +174,7 @@ beside the readable one on every backend."
   (remote-address nil)
   (host-key-ip-checked nil)
   (host-key-known nil)
+  (host-key-untrusted nil)
   (ip-qos-interactive #xb8)
   (ip-qos-bulk #x00)
   (tcp-keep-alive t)

@@ -385,6 +385,86 @@ loopback to sockaddr_is_local and therefore to ssh."
          t)
         (t nil)))))
 
+(defun ssh-client-known-host-mismatch (client host host-key)
+  "The (VALUES ENTRY FILE) that made HOST-KEY a changed key for HOST.
+
+NIL when the mismatch came from KnownHostsCommand rather than a file."
+  (dolist (file (ssh-client-known-hosts-files client))
+    (let ((entry (ssh-known-host-mismatch-entry file host host-key)))
+      (when entry
+        (return-from ssh-client-known-host-mismatch
+          (values entry file)))))
+  nil)
+
+(defun ssh-client-auth-switch-on-p (value)
+  "Whether an authentication switch VALUE leaves its method on."
+  (and value (not (eq value :no))))
+
+(defun ssh-client-warn-changed-host-key (client host-key fingerprint)
+  "Print ssh's warning for a HOST-KEY that does not match known_hosts."
+  (let* ((host (ssh-client-host-spec client))
+         (type (ssh-key-type-name host-key)))
+    (multiple-value-bind (entry file)
+        (ssh-client-known-host-mismatch client host host-key)
+      (ssh-warn "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+      (ssh-warn "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @")
+      (ssh-warn "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+      (ssh-warn "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!")
+      (ssh-warn "Someone could be eavesdropping on you right now (man-in-the-middle attack)!")
+      (ssh-warn "It is also possible that a host key has just been changed.")
+      (ssh-warn "The fingerprint for the ~A key sent by the remote host is~%~A."
+                type fingerprint)
+      (ssh-warn "Please contact your system administrator.")
+      (when file
+        (ssh-warn "Add correct host key in ~A to get rid of this message."
+                  file))
+      (when entry
+        (ssh-warn "Offending ~A key in ~A:~D"
+                  (ssh-key-type-name (ssh-known-host-entry-key-blob entry))
+                  (or file "<unknown>")
+                  (or (ssh-known-host-entry-line-number entry) 0))))))
+
+(defun ssh-client-continue-with-changed-host-key (client)
+  "Keep the connection after a changed key, as StrictHostKeyChecking=no does.
+
+The key is not recorded: the warning asks the user to fix known_hosts.  What
+can be impersonated once the host is untrusted is turned off: the two
+password-style authentications, agent and X11 forwarding, port forwarding
+(the caller checks HOST-KEY-UNTRUSTED before starting one) and UpdateHostKeys."
+  (setf (ssh-client-host-key-untrusted client) t)
+  (when (ssh-client-auth-switch-on-p
+         (ssh-client-password-authentication client))
+    (setf (ssh-client-password-authentication client) nil)
+    (ssh-warn "Password authentication is disabled to avoid man-in-the-middle attacks."))
+  (when (ssh-client-auth-switch-on-p
+         (ssh-client-kbd-interactive-authentication client))
+    (setf (ssh-client-kbd-interactive-authentication client) nil)
+    (ssh-warn "Keyboard-interactive authentication is disabled to avoid man-in-the-middle attacks."))
+  (when (ssh-client-forward-agent client)
+    (setf (ssh-client-forward-agent client) nil)
+    (ssh-warn "Agent forwarding is disabled to avoid man-in-the-middle attacks."))
+  (when (ssh-client-forward-x11 client)
+    (setf (ssh-client-forward-x11 client) nil)
+    (ssh-warn "X11 forwarding is disabled to avoid man-in-the-middle attacks."))
+  (unless (eq (ssh-client-update-host-keys client) :no)
+    (setf (ssh-client-update-host-keys client) :no)
+    (ssh-warn "UpdateHostkeys is disabled because the host key is not trusted."))
+  t)
+
+(defun ssh-client-note-changed-host-key (client host-key fingerprint)
+  "Warn about HOST-KEY's change and apply the host key policy.
+
+StrictHostKeyChecking=no continues with a weakened connection; every other
+policy refuses, as OpenSSH does for a changed key."
+  (ssh-client-warn-changed-host-key client host-key fingerprint)
+  (if (eq (ssh-client-host-key-policy client) :insecure)
+      (ssh-client-continue-with-changed-host-key client)
+      (error 'ssh-host-key-error
+             :detail (format nil
+                             "Host key for ~A has changed and you have requested strict checking."
+                             (ssh-client-host-spec client))
+             :fingerprint fingerprint)))
+
 (defun ssh-client-verify-host-key-main (client host-key)
   "Apply the client's host key policy to HOST-KEY, or signal.
 
@@ -470,9 +550,10 @@ certificate, its plain key or its CA refuses it without that fallback."
               (setf (ssh-client-host-key-known client) t)
               t)
              (:mismatch
-              (error 'ssh-host-key-error
-                     :detail (format nil "the host key for ~A changed" host)
-                     :fingerprint fingerprint))
+              ;; StrictHostKeyChecking=no continues after a changed key, but
+              ;; only after turning off everything a man in the middle could
+              ;; exploit.  Every other policy still refuses.
+              (ssh-client-note-changed-host-key client host-key fingerprint))
              (:unknown
               (setf (ssh-client-host-key-known client) nil)
               (ssh-client-accept-unknown-host-key
@@ -635,8 +716,18 @@ certificate, its plain key or its CA refuses it without that fallback."
 (defun ssh-client-verify-host-key (client host-key)
   "Check HOST-KEY's policy and, when configured, its address entry."
   (prog1 (ssh-client-verify-host-key-main client host-key)
-    (unless (ssh-client-host-key-dns-accepted client)
+    ;; A changed key is already untrusted, and CheckHostIP must not turn the
+    ;; continuation into a second refusal.
+    (unless (or (ssh-client-host-key-dns-accepted client)
+                (ssh-client-host-key-untrusted client))
       (ssh-client-check-host-address client host-key))))
+
+(defun ssh-client-host-key-untrusted-p (client)
+  "Whether CLIENT continued past a changed host key.
+
+StrictHostKeyChecking=no warns and keeps the connection, but the caller must
+not start port forwarding: it is disabled just as ssh disables it."
+  (ssh-client-host-key-untrusted client))
 
 (defun ssh-client-accept-unknown-host-key (client host-key fingerprint)
   "Decide what to do with a host key never seen before."

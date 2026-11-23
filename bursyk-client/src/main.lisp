@@ -2595,6 +2595,21 @@ peer that connected to it; NIL refuses the channel."
 (defun start-forwards (client)
   (when (clear-all-forwardings-p client)
     (return-from start-forwards nil))
+  (let ((forwards (append (configured-local-forwards client)
+                          (getf *options* :local-forward)
+                          (configured-remote-forwards client)
+                          (getf *options* :remote-forward)
+                          (configure-dynamic-forwards client)
+                          (getf *options* :dynamic-forward))))
+    ;; ssh refuses every forward once a changed host key was accepted under
+    ;; StrictHostKeyChecking=no: a forwarded port is exactly what a man in
+    ;; the middle wants.
+    (when (and forwards (cl-pnet-ssh:ssh-client-host-key-untrusted-p client))
+      (cl-pnet-ssh::ssh-warn
+       "Port forwarding is disabled to avoid man-in-the-middle attacks.")
+      (when (exit-on-forward-failure-p client)
+        (fail "Error: forwarding disabled due to host key check failure"))
+      (return-from start-forwards nil)))
   (dolist (forward (append (configured-local-forwards client)
                            (getf *options* :local-forward)))
     (start-local-forward client forward))

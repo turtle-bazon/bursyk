@@ -12,14 +12,18 @@
   (patterns nil)
   (key-type nil)
   (key-blob nil)
-  (line nil))
+  (line nil)
+  ;; The 1-based line the entry came from, so a changed-key warning can name
+  ;; it as OpenSSH's "Offending key in file:line" does.
+  (line-number nil))
 
 (defun ssh-split-host-patterns (field)
   "The comma-separated host patterns in FIELD."
   (uiop:split-string field :separator ","))
 
-(defun ssh-known-host-line-entry (line)
-  "LINE as an SSH-KNOWN-HOST-ENTRY, or NIL when it is blank or a comment."
+(defun ssh-known-host-line-entry (line &optional line-number)
+  "LINE as an SSH-KNOWN-HOST-ENTRY, or NIL when it is blank or a comment.
+LINE-NUMBER, when given, is kept on the entry for diagnostics."
   (let ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
     (when (and (plusp (length trimmed))
                (not (char= (char trimmed 0) #\#)))
@@ -39,7 +43,8 @@
                  :patterns (ssh-split-host-patterns hosts)
                  :key-type key-type
                  :key-blob (ssh-base64-octets encoded)
-                 :line trimmed)
+                 :line trimmed
+                 :line-number line-number)
               (error () nil))))))))
 
 (defun ssh-load-known-hosts (path)
@@ -49,8 +54,9 @@
                                    :if-does-not-exist nil
                                    :external-format :utf-8)
         (iter (for line = (read-line stream nil nil))
+          (for number from 1)
           (while line)
-          (let ((entry (ssh-known-host-line-entry line)))
+          (let ((entry (ssh-known-host-line-entry line number)))
             (when entry (collect entry)))))
       nil))
 
@@ -131,6 +137,19 @@ not a reason to abort the file.  Only the decode failure is caught."
        :match)
       (entries :mismatch)
       (t :unknown))))
+
+(defun ssh-known-host-mismatch-entry (path host key-blob)
+  "The first entry for HOST in PATH whose key differs from KEY-BLOB, or NIL.
+
+A changed-key warning names the entry that made the host key fail, so the
+line, file and type of the offending record can be reported."
+  (let ((blob (ssh-copy-octets key-blob)))
+    (find-if (lambda (entry)
+               (and (ssh-known-host-entry-matches-p entry host)
+                    (not (equal (ssh-known-host-entry-marker entry) "@revoked"))
+                    (not (ssh-octets= blob
+                                      (ssh-known-host-entry-key-blob entry)))))
+             (ssh-load-known-hosts path))))
 
 (defun ssh-known-host-certificate-authority-p (path host certificate)
   "Whether a @cert-authority entry for HOST in PATH names CERTIFICATE's CA."
