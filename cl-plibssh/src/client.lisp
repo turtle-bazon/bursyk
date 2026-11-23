@@ -483,25 +483,120 @@ an agent is configured, and an error only when neither source exists."
   (and (ssh-client-agent client)
        (not (ssh-client-agent-tried client))))
 
-(defun ssh-plibssh-client-drive-auth (client)
-  "Offer the agent first, then each imported key, in non-blocking mode.
+(defparameter +ssh-plibssh-client-auth-method-order+
+  '("publickey" "keyboard-interactive" "password")
+  "Methods this backend can try, in OpenSSH's order.
 
-OpenSSH tries the agent's keys before the identity files, so a Denied from
-the agent is not the end: the keys that were loaded alongside it still get
-their turn.  A connection-level failure from the agent follows the same
-path rather than hiding a usable key."
-  (if (ssh-plibssh-client-agent-pending-p client)
-      (let ((rc (ssh-userauth-agent (ssh-client-session client)
-                                    (ssh-client-user client))))
-        (cond
-          ((zerop rc) (ssh-plibssh-client-ready client))
-          ;; User authentication has its own "try again" code, 4, not the
-          ;; connection-level SSH_AGAIN of -2.
-          ((= rc +ssh-auth-again+) nil)
-          (t
-           (setf (ssh-client-agent-tried client) t)
-           (ssh-plibssh-client-drive-key-auth client))))
-      (ssh-plibssh-client-drive-key-auth client)))
+Hostbased is absent because libssh exposes no userauth API for it; the
+application rejects HostbasedAuthentication instead of silently skipping it.")
+
+(defun ssh-plibssh-auth-option-on-p (value)
+  "Whether an authentication switch VALUE leaves its method on.
+
+Programs pass T/NIL and the configuration layer passes :YES/:NO, so :NO must
+not count as truth."
+  (not (or (null value) (eq value :no))))
+
+(defun ssh-plibssh-client-auth-method-enabled-p (client method)
+  "Whether CLIENT may try METHOD.
+
+BatchMode forbids the interactive methods outright, so their callbacks are
+never called when the user asked not to be asked anything."
+  (cond
+    ((string= method "publickey")
+     (ssh-plibssh-auth-option-on-p (ssh-client-pubkey-authentication client)))
+    ((string= method "keyboard-interactive")
+     (and (ssh-plibssh-auth-option-on-p
+           (ssh-client-kbd-interactive-authentication client))
+          (not (ssh-client-batch-mode client))
+          (ssh-client-kbd-interactive-callback client)))
+    ((string= method "password")
+     (and (ssh-plibssh-auth-option-on-p
+           (ssh-client-password-authentication client))
+          (not (ssh-client-batch-mode client))
+          (ssh-client-password-callback client)))
+    (t nil)))
+
+(defun ssh-plibssh-client-auth-method-order (client)
+  "The methods CLIENT may try, in the order it should try them."
+  (let ((preferred (ssh-client-preferred-authentications client)))
+    (remove-if-not
+     (lambda (method)
+       (ssh-plibssh-client-auth-method-enabled-p client method))
+     (or preferred +ssh-plibssh-client-auth-method-order+))))
+
+(defun ssh-plibssh-client-note-offered-methods (client)
+  "Cache the methods the server's last USERAUTH_FAILURE named.
+
+SSH-USERAUTH-LIST is libssh's view of that same reply, so this costs no
+round trip.  A zero bitmask means the server has not answered yet; :NONE
+records a server that named no method we can use."
+  (let ((bits (ssh-userauth-list (ssh-client-session client)
+                                 (ssh-client-user client))))
+    (when (plusp bits)
+      (let ((methods
+              (remove
+               nil
+               (list (and (logtest bits +ssh-auth-method-publickey+)
+                          "publickey")
+                     (and (logtest bits +ssh-auth-method-interactive+)
+                          "keyboard-interactive")
+                     (and (logtest bits +ssh-auth-method-password+)
+                          "password")))))
+        (setf (ssh-client-auth-offered-methods client)
+              (or methods :none))))))
+
+(defun ssh-plibssh-client-offered-method-p (client method)
+  "Whether the server said it accepts METHOD.
+
+NIL in AUTH-OFFERED-METHODS means it has not said anything yet, so the
+configured order is tried as written."
+  (let ((offered (ssh-client-auth-offered-methods client)))
+    (cond
+      ((null offered) t)
+      ((eq offered :none) nil)
+      (t (member method offered :test #'string=)))))
+
+(defun ssh-plibssh-client-next-auth-method (client)
+  "Make the next untried method the server offered current, and return it."
+  (ssh-plibssh-client-note-offered-methods client)
+  (loop for method in (ssh-plibssh-client-auth-method-order client)
+        unless (member method
+                       (ssh-client-auth-methods-tried client)
+                       :test #'string=)
+        unless (and (ssh-client-auth-offered-methods client)
+                    (not (ssh-plibssh-client-offered-method-p client method)))
+        do (setf (ssh-client-auth-method client) method
+                 (ssh-client-last-auth-method client) method)
+           (push method (ssh-client-auth-methods-tried client))
+           (return method)))
+
+(defun ssh-plibssh-client-abandon-method (client)
+  "Move from the current method to the next one, or fail if none remains."
+  (setf (ssh-client-auth-method client) nil)
+  (ssh-plibssh-client-drive-auth client))
+
+(defun ssh-plibssh-client-drive-auth (client)
+  "Try the configured methods in OpenSSH's order until one logs in.
+
+Publickey keeps its agent-then-keys behaviour; keyboard-interactive answers
+one INFO_REQUEST round per call; password asks the callback for a secret.
+A refusal moves on to the next method the server named."
+  (let ((method (or (ssh-client-auth-method client)
+                    (ssh-plibssh-client-next-auth-method client))))
+    (cond
+      ((null method)
+       (ssh-client-fail
+        client
+        (make-condition 'ssh-authentication-error
+                        :detail "the server refused every authentication method")))
+      ((string= method "publickey")
+       (ssh-plibssh-client-drive-publickey client))
+      ((string= method "keyboard-interactive")
+       (ssh-plibssh-client-drive-kbdint client))
+      ((string= method "password")
+       (ssh-plibssh-client-drive-password client))
+      (t (ssh-plibssh-client-abandon-method client)))))
 
 (defun ssh-plibssh-client-try-current-key (client)
   "Try the current imported key, or report DENIED when there is none."
@@ -513,29 +608,130 @@ path rather than hiding a usable key."
                                 (ssh-client-user client) key)
         +ssh-auth-denied+)))
 
-(defun ssh-plibssh-client-drive-key-auth (client)
-  "Advance through CLIENT's imported keys until one is accepted."
-  (let ((rc (ssh-plibssh-client-try-current-key client)))
-    (cond
-      ((zerop rc) (ssh-plibssh-client-ready client))
-      ((= rc +ssh-auth-again+) nil)
-      ((= rc +ssh-auth-denied+)
-       (if (ssh-plibssh-client-next-key-p client)
-           (ssh-plibssh-client-drive-key-auth client)
-           (ssh-client-fail
-            client
-            (make-condition 'ssh-authentication-error
-                            :detail "the server refused every key offered"))))
-      (t
-       (error 'ssh-authentication-error
-              :detail (format nil "authentication failed: ~A"
-                              (ssh-plibssh-error (ssh-client-session client))))))))
+(defun ssh-plibssh-client-drive-publickey (client)
+  "Offer the agent, then each imported key, in non-blocking mode.
+
+OpenSSH tries the agent's keys before the identity files, so a Denied from
+the agent is not the end: the keys that were loaded alongside it still get
+their turn.  When every key is refused the next method starts."
+  (if (ssh-plibssh-client-agent-pending-p client)
+      (let ((rc (ssh-userauth-agent (ssh-client-session client)
+                                    (ssh-client-user client))))
+        (cond
+          ((zerop rc) (ssh-plibssh-client-ready client))
+          ;; User authentication has its own "try again" code, 4, not the
+          ;; connection-level SSH_AGAIN of -2.
+          ((= rc +ssh-auth-again+) nil)
+          ((= rc +ssh-auth-partial+) (ssh-plibssh-client-abandon-method client))
+          (t
+           (setf (ssh-client-agent-tried client) t)
+           (ssh-plibssh-client-drive-publickey client))))
+      (let ((rc (ssh-plibssh-client-try-current-key client)))
+        (cond
+          ((zerop rc) (ssh-plibssh-client-ready client))
+          ((= rc +ssh-auth-again+) nil)
+          ((= rc +ssh-auth-partial+) (ssh-plibssh-client-abandon-method client))
+          ((= rc +ssh-auth-denied+)
+           (if (ssh-plibssh-client-next-key-p client)
+               (ssh-plibssh-client-drive-publickey client)
+               (ssh-plibssh-client-abandon-method client)))
+          (t
+           (error 'ssh-authentication-error
+                  :detail (format nil "authentication failed: ~A"
+                                  (ssh-plibssh-error
+                                   (ssh-client-session client)))))))))
 
 (defun ssh-plibssh-client-next-key-p (client)
   (let ((next (1+ (ssh-client-key-index client))))
     (when (< next (length (ssh-client-key-handles client)))
       (setf (ssh-client-key-index client) next)
       t)))
+
+(defun ssh-plibssh-client-answer-kbdint (client)
+  "Answer the INFO_REQUEST libssh just reported and continue the exchange."
+  (let* ((session (ssh-client-session client))
+         (count (ssh-userauth-kbdint-getnprompts session))
+         (name (or (ssh-userauth-kbdint-getname session) ""))
+         (instruction (or (ssh-userauth-kbdint-getinstruction session) ""))
+         (prompts '()))
+    (when (minusp count)
+      (error 'ssh-authentication-error
+             :detail (format nil "keyboard-interactive prompts unavailable: ~A"
+                             (ssh-plibssh-error session))))
+    (dotimes (index count)
+      (declare (ignore index))
+      (cffi:with-foreign-object (echo :char)
+        (let ((text (ssh-userauth-kbdint-getprompt session index echo)))
+          (push (list (or text "")
+                      (not (zerop (cffi:mem-ref echo :char))))
+                prompts))))
+    (setf prompts (nreverse prompts))
+    (let ((answers
+            (funcall (ssh-client-kbd-interactive-callback client)
+                     client name instruction prompts)))
+      (cond
+        ;; A zero-prompt INFO_REQUEST only displays a message, so NIL is an
+        ;; empty answer list there, not a cancellation.
+        ((and (null answers) (plusp count))
+         (ssh-client-fail
+          client
+          (make-condition 'ssh-authentication-error
+                          :detail "keyboard-interactive cancelled")))
+        ((/= (length (or answers '())) count)
+         (error 'ssh-protocol-error
+                :detail "keyboard-interactive answer count does not match"))
+        (t
+         (loop for index from 0
+               for answer in answers
+               do (ssh-userauth-kbdint-setanswer session index answer))
+         (ssh-plibssh-client-drive-kbdint client))))))
+
+(defun ssh-plibssh-client-drive-kbdint (client)
+  "Advance one step of the keyboard-interactive exchange."
+  (let ((rc (ssh-userauth-kbdint (ssh-client-session client)
+                                 (ssh-client-user client) "")))
+    (cond
+      ((zerop rc) (ssh-plibssh-client-ready client))
+      ((= rc +ssh-auth-again+) nil)
+      ((= rc +ssh-auth-info+) (ssh-plibssh-client-answer-kbdint client))
+      ((= rc +ssh-auth-partial+) (ssh-plibssh-client-abandon-method client))
+      ((= rc +ssh-auth-denied+) (ssh-plibssh-client-abandon-method client))
+      (t
+       (error 'ssh-authentication-error
+              :detail (format nil "keyboard-interactive failed: ~A"
+                              (ssh-plibssh-error
+                               (ssh-client-session client))))))))
+
+(defun ssh-plibssh-client-drive-password (client)
+  "Ask PASSWORD-CALLBACK for a secret and offer it.
+
+A refusal re-prompts up to NumberOfPasswordPrompts while the server still
+names password; NIL from the callback skips the method, as ssh does."
+  (let* ((prompt (format nil "~A@~A's password: "
+                         (ssh-client-user client) (ssh-client-host client)))
+         (password (funcall (ssh-client-password-callback client)
+                            client prompt)))
+    (when (null password)
+      (return-from ssh-plibssh-client-drive-password
+        (ssh-plibssh-client-abandon-method client)))
+    (incf (ssh-client-password-attempts client))
+    (let ((rc (ssh-userauth-password (ssh-client-session client)
+                                     (ssh-client-user client) password)))
+      (cond
+        ((zerop rc) (ssh-plibssh-client-ready client))
+        ((= rc +ssh-auth-again+) nil)
+        ((= rc +ssh-auth-partial+) (ssh-plibssh-client-abandon-method client))
+        ((= rc +ssh-auth-denied+)
+         (if (and (< (ssh-client-password-attempts client)
+                     (or (ssh-client-number-of-password-prompts client) 3))
+                  (ssh-plibssh-client-offered-method-p client "password"))
+             (ssh-plibssh-client-drive-password client)
+             (ssh-plibssh-client-abandon-method client)))
+        (t
+         (error 'ssh-authentication-error
+                :detail (format nil "password authentication failed: ~A"
+                                (ssh-plibssh-error
+                                 (ssh-client-session client)))))))))
 
 (defun ssh-plibssh-client-read-banner (client)
   "Remember the server's authentication banner, if it sent one.
@@ -711,6 +907,24 @@ helper and hands back a socketpair to watch."
                                                 condition)))))))
     (error (condition) (ssh-client-fail client condition))))
 
+(defun ssh-plibssh-option-meaningful-p (value)
+  "Whether VALUE asks for something, treating :NO as off.
+
+Programs pass NIL or T; ssh_config passes :YES or :NO.  :NO must not read as
+a request just because a symbol is true."
+  (and value (not (eq value :no))))
+
+(defun ssh-plibssh-reject-option (name value)
+  "Refuse VALUE for NAME while this backend cannot honour it.
+
+Silently ignoring a configured feature would make the two backends behave
+differently without saying so, which is exactly what the matrix is meant to
+prevent."
+  (when (ssh-plibssh-option-meaningful-p value)
+    (error 'ssh-connection-error
+           :detail (format nil "the libssh backend does not support ~A"
+                           name))))
+
 (defun make-ssh-client (host
                         &key
                           connect-host
@@ -740,8 +954,29 @@ helper and hands back a socketpair to watch."
                           number-of-password-prompts
                           preferred-authentications
                           (pubkey-authentication t)
+                          (batch-mode nil)
                           password-callback
                           kbd-interactive-callback
+                          ;; The rest of the pure backend's interface is
+                          ;; accepted so callers use one set of arguments.
+                          ;; Anything this backend cannot honour is refused
+                          ;; rather than dropped.
+                          hostbased-authentication
+                          hostbased-keys
+                          certificate-files
+                          no-host-authentication-for-localhost
+                          host-key-alias
+                          canonicalize-hostname
+                          canonical-domains
+                          resolver
+                          verify-host-key-dns
+                          host-key-dns-resolver
+                          bind-address
+                          bind-interface
+                          rekey-limit
+                          rekey-interval
+                          version-addendum
+                          address-family
                           on-open
                           on-error
                           on-close
@@ -756,6 +991,23 @@ alone, and CONNECT-PORT is the port dialled while PORT stays the server's
 logical one.  CONNECT-TIMEOUT and SERVER-ALIVE-INTERVAL work as they do in
 the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
+  (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
+  (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
+  (ssh-plibssh-reject-option "CertificateFile" certificate-files)
+  (ssh-plibssh-reject-option "NoHostAuthenticationForLocalhost"
+                             no-host-authentication-for-localhost)
+  (ssh-plibssh-reject-option "HostKeyAlias" host-key-alias)
+  (ssh-plibssh-reject-option "CanonicalizeHostname" canonicalize-hostname)
+  (ssh-plibssh-reject-option "CanonicalDomains" canonical-domains)
+  (ssh-plibssh-reject-option "Resolver" resolver)
+  (ssh-plibssh-reject-option "VerifyHostKeyDNS" verify-host-key-dns)
+  (ssh-plibssh-reject-option "HostKeyDNSResolver" host-key-dns-resolver)
+  (ssh-plibssh-reject-option "BindAddress" bind-address)
+  (ssh-plibssh-reject-option "BindInterface" bind-interface)
+  (ssh-plibssh-reject-option "RekeyLimit" rekey-limit)
+  (ssh-plibssh-reject-option "RekeyInterval" rekey-interval)
+  (ssh-plibssh-reject-option "VersionAddendum" version-addendum)
+  (ssh-plibssh-reject-option "AddressFamily" address-family)
   (let ((client (%make-ssh-client
                  :host host
                  :connect-host (or connect-host host)
@@ -784,6 +1036,7 @@ stream on its pipes instead of dialling."
                  :number-of-password-prompts number-of-password-prompts
                  :preferred-authentications preferred-authentications
                  :pubkey-authentication pubkey-authentication
+                 :batch-mode batch-mode
                  :password-callback password-callback
                  :kbd-interactive-callback kbd-interactive-callback
                  :on-open on-open

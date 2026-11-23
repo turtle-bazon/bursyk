@@ -111,9 +111,14 @@
 (defconstant +ssh-known-hosts-other+ 3)
 
 (defconstant +ssh-auth-method-none+ #x0001)
+(defconstant +ssh-auth-method-password+ #x0002)
 (defconstant +ssh-auth-method-publickey+ #x0004)
-(defconstant +ssh-auth-denied+ 1)
+(defconstant +ssh-auth-method-hostbased+ #x0008)
+(defconstant +ssh-auth-method-interactive+ #x0010)
 (defconstant +ssh-auth-success+ 0)
+(defconstant +ssh-auth-denied+ 1)
+(defconstant +ssh-auth-partial+ 2)
+(defconstant +ssh-auth-info+ 3)
 (defconstant +ssh-auth-again+ 4)
 (defconstant +ssh-auth-error+ -1)
 
@@ -170,8 +175,31 @@
 
 (cffi:defcfun ("ssh_userauth_agent" ssh-userauth-agent) :int
   (session ssh-session) (username :string))
+(cffi:defcfun ("ssh_userauth_list" ssh-userauth-list) :int
+  (session ssh-session) (username :string))
 (cffi:defcfun ("ssh_userauth_publickey" ssh-userauth-publickey) :int
   (session ssh-session) (username :string) (key ssh-key))
+(cffi:defcfun ("ssh_userauth_password" ssh-userauth-password) :int
+  (session ssh-session) (username :string) (password :string))
+;;; Keyboard-interactive: the first call starts the exchange; SSH_AUTH_INFO
+;;; means prompts are ready, and the same call is repeated after the answers
+;;; are set.  ECHO is a char the caller provides for GETPROMPT.
+(cffi:defcfun ("ssh_userauth_kbdint" ssh-userauth-kbdint) :int
+  (session ssh-session) (username :string) (submethods :string))
+(cffi:defcfun ("ssh_userauth_kbdint_getname" ssh-userauth-kbdint-getname) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_userauth_kbdint_getinstruction"
+          ssh-userauth-kbdint-getinstruction) :string
+  (session ssh-session))
+(cffi:defcfun ("ssh_userauth_kbdint_getnprompts"
+          ssh-userauth-kbdint-getnprompts) :int
+  (session ssh-session))
+(cffi:defcfun ("ssh_userauth_kbdint_getprompt" ssh-userauth-kbdint-getprompt)
+    :string
+  (session ssh-session) (index :uint) (echo (:pointer :char)))
+(cffi:defcfun ("ssh_userauth_kbdint_setanswer" ssh-userauth-kbdint-setanswer)
+    :int
+  (session ssh-session) (index :uint) (answer :string))
 (cffi:defcfun ("ssh_pki_import_privkey_file" ssh-pki-import-privkey-file) :int
   (filename :string) (passphrase :string) (auth-function :pointer)
   (auth-data :pointer) (key (:pointer ssh-key)))
@@ -251,6 +279,26 @@
 (cffi:defcfun ("ssh_message_auth_reply_pk_ok_simple"
           ssh-message-auth-reply-pk-ok-simple) :int
   (message ssh-message))
+(cffi:defcfun ("ssh_message_auth_password" ssh-message-auth-password) :string
+  (message ssh-message))
+;;; Send one keyboard-interactive INFO_REQUEST.  PROMPTS is a (char **) of
+;;; NUM-PROMPTS strings and ECHO a (char *) of the same length.
+(cffi:defcfun ("ssh_message_auth_interactive_request"
+          ssh-message-auth-interactive-request) :int
+  (message ssh-message) (name :string) (instruction :string)
+  (num-prompts :uint) (prompts :pointer) (echo :pointer))
+;;; True on the USERAUTH_INFO_RESPONSE that answers an INFO_REQUEST.  The
+;;; answers are the same session kbdint slots the client getters read, so
+;;; ssh_userauth_kbdint_getnanswers/getanswer serve the server role too.
+(cffi:defcfun ("ssh_message_auth_kbdint_is_response"
+          ssh-message-auth-kbdint-is-response) :int
+  (message ssh-message))
+(cffi:defcfun ("ssh_userauth_kbdint_getnanswers"
+          ssh-userauth-kbdint-getnanswers) :int
+  (session ssh-session))
+(cffi:defcfun ("ssh_userauth_kbdint_getanswer" ssh-userauth-kbdint-getanswer)
+    :string
+  (session ssh-session) (index :uint))
 
 (cffi:defcfun ("ssh_message_channel_request_open_destination"
           ssh-message-open-destination) :string

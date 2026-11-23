@@ -244,10 +244,33 @@ does, so the hook sees the per-connection values."
   "Send the configured Banner, as sshd does on the first auth request."
   (ssh-plibssh-session-send-banner-text session (ssh-session-banner-text session)))
 
-(defun ssh-plibssh-auth-failure (message)
-  "Refuse a request, advertising the one method this server offers."
-  (ssh-message-auth-set-methods message +ssh-auth-method-publickey+)
-  (ssh-message-reply-default message))
+(defun ssh-plibssh-allowed-auth-methods (session)
+  "The methods SESSION may try next, as sshd's authmethods_get reports.
+
+An impossible AuthenticationMethods setting leaves no method, which makes
+every attempt fail rather than quietly falling back to publickey."
+  (let ((lists (ssh-session-auth-method-lists session)))
+    (cond
+      ((eq lists :impossible) '())
+      ((null lists) (ssh-server-enabled-auth-methods session))
+      (t (remove-duplicates (mapcar #'first lists) :test #'string=)))))
+
+(defun ssh-plibssh-auth-method-bit (name)
+  "libssh's bit for the SSH method name NAME, or 0 when it has none."
+  (cond
+    ((string= name "publickey") +ssh-auth-method-publickey+)
+    ((string= name "password") +ssh-auth-method-password+)
+    ((string= name "keyboard-interactive") +ssh-auth-method-interactive+)
+    ((string= name "hostbased") +ssh-auth-method-hostbased+)
+    (t 0)))
+
+(defun ssh-plibssh-auth-failure (session message)
+  "Refuse a request, advertising the methods SESSION can still complete."
+  (let ((bits 0))
+    (dolist (name (ssh-plibssh-allowed-auth-methods session))
+      (setf bits (logior bits (ssh-plibssh-auth-method-bit name))))
+    (ssh-message-auth-set-methods message bits)
+    (ssh-message-reply-default message)))
 
 (defun ssh-plibssh-session-auth-failure (session message &key (count t))
   "Refuse one userauth attempt, counting it toward MaxAuthTries when COUNT.
@@ -261,20 +284,22 @@ the reason is recorded and the pump finishes it after the callback returns."
                    session #'ssh-server-config-max-auth-tries)
                   (ssh-server-max-auth-tries (ssh-session-server session))))
       (setf (ssh-session-pending-close session) :auth-failures)))
-  (ssh-plibssh-auth-failure message))
+  (ssh-plibssh-auth-failure session message))
 
-(defun ssh-plibssh-session-complete-auth (session message user key-blob
-                                          &optional key-env authorization)
+(defun ssh-plibssh-session-complete-auth
+    (session message user method key-blob key-env authorization)
   "Accept USER for SESSION, then let the application run.
 
-KEY-ENV holds the environment= assignments from the authorized_keys line
-that admitted the key, and AUTHORIZATION the rest of that line's options."
+METHOD names the userauth method that completed, KEY-BLOB is its key when
+the method has one, KEY-ENV holds the environment= assignments from the
+authorized_keys line, and AUTHORIZATION the rest of that line's options."
   ;; Record the method first: the pre-success hook sees the same auth-info
   ;; lines the pure backend recorded in SSH-SERVER-AUTH-METHOD-SUCCEEDED.
   (setf (ssh-session-user session) user
         (ssh-session-authorized-key session) key-blob
         (ssh-session-auth-info-lines session)
-        (list (ssh-server-auth-info-line "publickey" key-blob))
+        (let ((line (ssh-server-auth-info-line method key-blob)))
+          (if line (list line) '()))
         (ssh-session-key-env session) key-env
         (ssh-session-authorization session) authorization)
   (let ((hook (ssh-server-authorize-login (ssh-session-server session))))
@@ -303,28 +328,171 @@ that admitted the key, and AUTHORIZATION the rest of that line's options."
   ;; sshd starts UnusedConnectionTimeout once authentication finishes.
   (ssh-session-note-channel-change session))
 
+(defun ssh-plibssh-send-info-request (message name instruction prompts)
+  "Send one keyboard-interactive INFO_REQUEST for PROMPTS.
+
+PROMPTS is a list of (TEXT ECHO-P).  The strings and arrays libssh needs are
+freed as soon as the request is queued."
+  (let* ((count (length prompts))
+         (strings (cffi:foreign-alloc :pointer :count (max count 1)))
+         (echo (cffi:foreign-alloc :char :count (max count 1)))
+         (allocated '()))
+    (unwind-protect
+         (progn
+           (loop for prompt in prompts
+                 for index from 0
+                 do (let ((text (cffi:foreign-string-alloc
+                                 (or (first prompt) ""))))
+                      (push text allocated)
+                      (setf (cffi:mem-aref strings :pointer index) text)
+                      (setf (cffi:mem-aref echo :char index)
+                            (if (second prompt) 1 0))))
+           (not (minusp
+                 (ssh-message-auth-interactive-request
+                  message (or name "") (or instruction "")
+                  count strings echo))))
+      (dolist (text allocated)
+        (cffi:foreign-string-free text))
+      (cffi:foreign-free strings)
+      (cffi:foreign-free echo))))
+
+(defun ssh-plibssh-session-kbdint-result (session message user result)
+  "Act on the keyboard-interactive hook's RESULT for USER."
+  (cond
+    ((or (eq result :success) (eq result t))
+     (setf (ssh-session-kbd-interactive-pending session) nil)
+     (ssh-plibssh-session-complete-auth
+      session message user "keyboard-interactive" nil nil nil))
+    ((or (null result) (eq result :failure))
+     (setf (ssh-session-kbd-interactive-pending session) nil)
+     (ssh-plibssh-session-auth-failure session message))
+    (t
+     (let ((prompts (getf result :prompts))
+           (name (getf result :name))
+           (instruction (getf result :instruction)))
+       ;; A round may carry text and no prompts, which sshd sends for
+       ;; PAM_TEXT_INFO/PAM_ERROR_MSG; the client answers with an empty
+       ;; INFO_RESPONSE.  A round with nothing at all would spin.
+       (unless (or prompts
+                   (and name (plusp (length name)))
+                   (and instruction (plusp (length instruction))))
+         (setf (ssh-session-kbd-interactive-pending session) nil)
+         (ssh-plibssh-session-auth-failure session message)
+         (return-from ssh-plibssh-session-kbdint-result nil))
+       (if (ssh-plibssh-send-info-request message name instruction prompts)
+           (setf (ssh-session-kbd-interactive-pending session) t)
+           (progn
+             (setf (ssh-session-kbd-interactive-pending session) nil)
+             (ssh-plibssh-session-auth-failure session message)))))))
+
+(defun ssh-plibssh-session-handle-kbdint (session message user count)
+  "Start a keyboard-interactive exchange for USER."
+  (let ((hook (ssh-server-authorize-keyboard-interactive
+               (ssh-session-server session))))
+    (if (null hook)
+        (ssh-plibssh-session-auth-failure session message :count count)
+        (progn
+          (setf (ssh-session-kbd-interactive-user session) user
+                (ssh-session-kbd-interactive-pending session) t)
+          (ssh-plibssh-session-kbdint-result
+           session message user
+           (funcall hook session user (list :responses '())))))))
+
+(defun ssh-plibssh-session-handle-kbdint-response (session message)
+  "Feed one keyboard-interactive INFO_RESPONSE back to the hook."
+  (unless (ssh-session-kbd-interactive-pending session)
+    (ssh-plibssh-session-auth-failure session message)
+    (return-from ssh-plibssh-session-handle-kbdint-response nil))
+  (let* ((handle (ssh-session-handle session))
+         (count (ssh-userauth-kbdint-getnanswers handle))
+         (answers '()))
+    (when (minusp count)
+      (setf (ssh-session-kbd-interactive-pending session) nil)
+      (ssh-plibssh-session-auth-failure session message)
+      (return-from ssh-plibssh-session-handle-kbdint-response nil))
+    (dotimes (index count)
+      (declare (ignore index))
+      (let ((answer (ssh-userauth-kbdint-getanswer
+                     handle (length answers))))
+        (push (or answer "") answers)))
+    (let ((hook (ssh-server-authorize-keyboard-interactive
+                 (ssh-session-server session)))
+          (user (ssh-session-kbd-interactive-user session)))
+      (if (null hook)
+          (progn
+            (setf (ssh-session-kbd-interactive-pending session) nil)
+            (ssh-plibssh-session-auth-failure session message))
+          (ssh-plibssh-session-kbdint-result
+           session message user
+           (funcall hook session user (list :responses (nreverse answers))))))))
+
+(defun ssh-plibssh-session-handle-password (session message user count)
+  "Accept one password attempt when the application's hook admits it.
+
+libssh discards the RFC 4252 change-password boolean before handing the
+message over, so a client that asks to change its password is treated as an
+ordinary login attempt; ssh's own client never sets that flag."
+  (let ((hook (ssh-server-authorize-password (ssh-session-server session)))
+        (password (ssh-message-auth-password message)))
+    (if (and hook password (funcall hook session user password))
+        (ssh-plibssh-session-complete-auth
+         session message user "password" nil nil nil)
+        (ssh-plibssh-session-auth-failure session message :count count))))
+
 (defun ssh-plibssh-session-handle-auth (session message)
   "Answer one USER AUTH REQUEST from MESSAGE."
-  (let* ((user (ssh-message-auth-user message))
-         (method (ssh-message-subtype message)))
-    (setf (ssh-session-user session) user)
-    (when (zerop (ssh-session-auth-attempts session))
-      ;; Resolve Match blocks once the account name is known, before the
-      ;; Banner they may choose, as sshd's getpwnamallow does.
-      (ssh-session-resolve-config session user)
-      (ssh-plibssh-session-send-banner session))
-    (incf (ssh-session-auth-attempts session))
-    (let ((count (ssh-server-auth-failure-counts-p
-                  (ssh-session-auth-attempts session)
-                  (if (= method +ssh-auth-method-none+) "none" "other"))))
-      (cond
-        ((not (ssh-server-user-permitted-p session user))
-         (ssh-plibssh-session-auth-failure session message :count count))
-        ((= method +ssh-auth-method-none+)
-         (ssh-plibssh-session-auth-failure session message :count count))
-        ((= method +ssh-auth-method-publickey+)
-         (ssh-plibssh-session-handle-publickey session message user count))
-        (t (ssh-plibssh-session-auth-failure session message :count count))))))
+  (let ((method (ssh-message-subtype message)))
+    ;; An INFO_RESPONSE is the continuation of the exchange, not a new
+    ;; attempt: it carries no username and must not count against MaxAuthTries.
+    (when (and (= method +ssh-auth-method-interactive+)
+               (plusp (ssh-message-auth-kbdint-is-response message)))
+      (return-from ssh-plibssh-session-handle-auth
+        (ssh-plibssh-session-handle-kbdint-response session message)))
+    (let ((user (ssh-message-auth-user message)))
+      (setf (ssh-session-user session) user)
+      (when (zerop (ssh-session-auth-attempts session))
+        ;; Resolve Match blocks once the account name is known, before the
+        ;; Banner they may choose, as sshd's getpwnamallow does.
+        (ssh-session-resolve-config session user)
+        (ssh-plibssh-session-send-banner session))
+      ;; RefuseConnection is checked once the account is known, before any
+      ;; method runs, as sshd's monitor does after getpwnamallow.
+      (when (eq (ssh-session-setting
+                 session #'ssh-server-config-refuse-connection)
+                :yes)
+        (setf (ssh-session-refused-p session) t
+              (ssh-session-pending-close session) :refused)
+        (return-from ssh-plibssh-session-handle-auth nil))
+      (incf (ssh-session-auth-attempts session))
+      ;; A new USER AUTH REQUEST abandons any half-finished kbdint exchange.
+      (setf (ssh-session-kbd-interactive-pending session) nil)
+      (let* ((method-name
+               (cond ((= method +ssh-auth-method-none+) "none")
+                     ((= method +ssh-auth-method-publickey+) "publickey")
+                     ((= method +ssh-auth-method-password+) "password")
+                     ((= method +ssh-auth-method-interactive+)
+                      "keyboard-interactive")
+                     ((= method +ssh-auth-method-hostbased+) "hostbased")
+                     (t "other")))
+             (count (ssh-server-auth-failure-counts-p
+                     (ssh-session-auth-attempts session)
+                     method-name)))
+        (cond
+          ((not (ssh-server-user-permitted-p session user))
+           (ssh-plibssh-session-auth-failure session message :count count))
+          ((not (member method-name
+                        (ssh-plibssh-allowed-auth-methods session)
+                        :test #'string=))
+           (ssh-plibssh-session-auth-failure session message :count count))
+          ((= method +ssh-auth-method-none+)
+           (ssh-plibssh-session-auth-failure session message :count count))
+          ((= method +ssh-auth-method-publickey+)
+           (ssh-plibssh-session-handle-publickey session message user count))
+          ((= method +ssh-auth-method-password+)
+           (ssh-plibssh-session-handle-password session message user count))
+          ((= method +ssh-auth-method-interactive+)
+           (ssh-plibssh-session-handle-kbdint session message user count))
+          (t (ssh-plibssh-session-auth-failure session message :count count)))))))
 
 (defun ssh-plibssh-session-handle-publickey (session message user
                                             &optional (count t))
@@ -350,8 +518,8 @@ authentication attempt."
       ((and authorized (= state +ssh-publickey-state-none+))
        (ssh-message-auth-reply-pk-ok-simple message))
       ((and authorized (= state +ssh-publickey-state-valid+))
-       (ssh-plibssh-session-complete-auth session message user blob
-                                          key-env authorization))
+       (ssh-plibssh-session-complete-auth
+        session message user "publickey" blob key-env authorization))
       (t (ssh-plibssh-session-auth-failure session message :count count)))))
 
 ;;; ---- Channel opens ----
@@ -1001,6 +1169,7 @@ application's ON-CLOSE runs without waiting for the peer's half."
     (setf (ssh-session-closed session) t
           (ssh-session-phase session) :closed
           (ssh-session-close-reason session) reason)
+    (ssh-server-session-penalty session)
     (ssh-session-stop-timers session)
     (let ((server (ssh-session-server session)))
       (when server

@@ -1680,7 +1680,6 @@ MAKE-SSH-CLIENT; :STRICT proves a host certificate was trusted rather than
 added on first use."
   (let ((state (list :none nil))
         (timeout nil))
-    #+ssh-backend-ffi (declare (ignore address-family))
     (unwind-protect
          (progn
            (setf timeout
@@ -1724,7 +1723,6 @@ added on first use."
             :host-key-dns-resolver host-key-dns-resolver
             :bind-address bind-address
             :bind-interface bind-interface
-            #-ssh-backend-ffi
             :address-family address-family
             :rekey-limit rekey-limit
             :rekey-interval rekey-interval
@@ -2511,7 +2509,7 @@ STDOUT STDERR STATUS)."
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(def-pure-test server-loopback-password-authentication
+(test server-loopback-password-authentication
   "A password request completes a login when the application accepts it."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
@@ -2543,7 +2541,7 @@ STDOUT STDERR STATUS)."
                   (error () t))))
           (is (not (null refused)))))))
 
-(def-pure-test server-loopback-keyboard-interactive-authentication
+(test server-loopback-keyboard-interactive-authentication
   "The server asks one prompt, then accepts the answer round."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")

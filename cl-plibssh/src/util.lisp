@@ -52,16 +52,24 @@ beside the readable one on every backend."
   server-version
   ;; The server's authentication banner, once it has sent one.
   banner
-  ;; Password and keyboard-interactive options are accepted for the same
-  ;; interface as the pure backend, but this backend has no libssh binding
-  ;; for either method yet, so they do not affect its authentication.
+  ;; Password and keyboard-interactive options.  The callbacks are the same
+  ;; ones the pure backend calls, so the application does not know which
+  ;; backend prompts it.
   (password-authentication t)
   (kbd-interactive-authentication t)
   number-of-password-prompts
   preferred-authentications
   (pubkey-authentication t)
+  (batch-mode nil)
   password-callback
   kbd-interactive-callback
+  ;; The userauth method being tried and the bookkeeping sshd-style ordering
+  ;; needs, matching the pure backend's slots of the same names.
+  (auth-method nil)
+  (auth-methods-tried '())
+  (auth-offered-methods '())
+  (last-auth-method nil)
+  (password-attempts 0)
   ;; ObscureKeystrokeTiming is owned by the application, which reads and
   ;; writes it through the same accessor in either backend.  libssh itself
   ;; does not act on it.
@@ -234,6 +242,10 @@ beside the readable one on every backend."
   (auth-merged-options nil)
   (auth-merged-key-env '())
   (auth-info-lines '())
+  ;; Keyboard-interactive state: the user the exchange began for, and whether
+  ;; an INFO_REQUEST is waiting for its INFO_RESPONSE.
+  (kbd-interactive-user nil)
+  (kbd-interactive-pending nil)
   ;; Text a pre-success hook such as PAM account management wants the client
   ;; to read; kept for the same accessor the pure backend exports.
   (login-messages '())
