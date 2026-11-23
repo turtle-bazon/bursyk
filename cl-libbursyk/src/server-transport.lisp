@@ -28,7 +28,7 @@ only curve25519 does not turn off either extension."
   (let ((result (copy-list
                  (ssh-session-algorithm-list
                   session #'ssh-server-config-kex-algorithms
-                  +ssh-kex-default-algorithms+))))
+                  +ssh-server-default-kex-algorithms+))))
     (dolist (marker '("kex-strict-s-v00@openssh.com" "ext-info-s")
              result)
       (unless (member marker result :test #'string=)
@@ -307,7 +307,14 @@ came up."
 A private host key signs now.  An agent-backed key sends the sign request
 and returns; the agent's callback finishes the KEX."
   (let* ((reader (ssh-make-reader payload))
-         (client-public (progn (ssh-read-u8 reader) (ssh-read-string reader)))
+         (kex (getf (ssh-session-negotiated session) :kex))
+         (dh (ssh-dh-kex-p kex))
+         (client-public
+           (progn
+             (ssh-read-u8 reader)
+             (if dh
+                 (ssh-read-mpint reader)
+                 (ssh-read-string reader))))
          (algorithm (getf (ssh-session-negotiated session) :host-key))
          (host-key nil)
          (host-key-blob nil)
@@ -326,27 +333,30 @@ and returns; the agent's callback finishes the KEX."
     (unless host-key
       (error 'ssh-protocol-error
              :detail (format nil "no key for host key algorithm ~A" algorithm)))
-    (let ((kex (getf (ssh-session-negotiated session) :kex)))
-      (cond
-        ((ssh-mlkem768-hybrid-p kex)
-         (multiple-value-setq (server-public shared)
-           (ssh-mlkem768-hybrid-server-shared kex client-public)))
-        ((ssh-ecdh-kex-p kex)
-         (multiple-value-setq (private server-public) (ssh-ecdh-keypair kex))
-         (setf shared (ssh-ecdh-shared private client-public kex)))
-        (t
-         (multiple-value-setq (private server-public)
-           (ssh-curve25519-keypair))
-         (setf shared (ssh-curve25519-shared private client-public))))
-      (setf hash (ssh-exchange-hash
-                  (ssh-session-client-version session)
-                  (ssh-session-server-version session)
-                  (ssh-session-client-kexinit session)
-                  (ssh-session-server-kexinit session)
-                  host-key-blob
-                  client-public server-public shared
-                  :string-shared (ssh-mlkem768-hybrid-p kex)
-                  :digest (ssh-kex-digest kex))))
+    (cond
+      (dh
+       (multiple-value-setq (private server-public) (ssh-dh-keypair kex))
+       (setf shared (ssh-dh-shared private client-public kex)))
+      ((ssh-mlkem768-hybrid-p kex)
+       (multiple-value-setq (server-public shared)
+         (ssh-mlkem768-hybrid-server-shared kex client-public)))
+      ((ssh-ecdh-kex-p kex)
+       (multiple-value-setq (private server-public) (ssh-ecdh-keypair kex))
+       (setf shared (ssh-ecdh-shared private client-public kex)))
+      (t
+       (multiple-value-setq (private server-public)
+         (ssh-curve25519-keypair))
+       (setf shared (ssh-curve25519-shared private client-public))))
+    (setf hash (ssh-exchange-hash
+                (ssh-session-client-version session)
+                (ssh-session-server-version session)
+                (ssh-session-client-kexinit session)
+                (ssh-session-server-kexinit session)
+                host-key-blob
+                client-public server-public shared
+                :string-shared (ssh-mlkem768-hybrid-p kex)
+                :integer-public dh
+                :digest (ssh-kex-digest kex)))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
           (ssh-session-ephemeral-private session) private
@@ -376,11 +386,16 @@ and returns; the agent's callback finishes the KEX."
          (ssh-server-host-key-signature host-key algorithm hash)))))
 
 (defun ssh-server-send-kex-reply (session server-public signature)
-  "Send KEX_ECDH_REPLY: our host key, ephemeral key and signature."
+  "Send KEX_ECDH_REPLY: our host key, ephemeral key and signature.
+
+The fixed-group exchanges put their public value on the wire as an mpint;
+ECDH and curve25519 use an SSH string."
   (let ((writer (ssh-writer)))
     (ssh-write-u8 writer +ssh-msg-kex-ecdh-reply+)
     (ssh-write-string writer (ssh-session-host-key-blob session))
-    (ssh-write-string writer server-public)
+    (if (ssh-dh-kex-p (getf (ssh-session-negotiated session) :kex))
+        (ssh-write-mpint writer server-public)
+        (ssh-write-string writer server-public))
     (ssh-write-string writer signature)
     (ssh-session-send-payload session (ssh-writer-output writer))))
 

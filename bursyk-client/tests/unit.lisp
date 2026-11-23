@@ -141,6 +141,20 @@ CLI's decision and at the plist it filled."
             (not (null (member "mlkem768nistp256-sha256"
                                (burs::supported-kex-algorithms)
                                :test #'string=)))))
+    ;; The MODP groups are implemented by both transports and listed by -Q.
+    (dolist (name '("diffie-hellman-group14-sha256"
+                    "diffie-hellman-group16-sha512"
+                    "diffie-hellman-group18-sha512"))
+      (is (member name kex :test #'string=)))
+    ;; -G's default offer includes the SHA-256/512 groups, not the legacy pair.
+    (dolist (name '("diffie-hellman-group14-sha256"
+                    "diffie-hellman-group16-sha512"
+                    "diffie-hellman-group18-sha512"))
+      (is (member name (burs::default-kex-algorithms) :test #'string=)))
+    (dolist (name '("diffie-hellman-group1-sha1"
+                    "diffie-hellman-group14-sha1"))
+      (is (not (member name (burs::default-kex-algorithms)
+                       :test #'string=))))
     ;; -G reports the default offer, which leaves that hybrid out, as ssh does.
     (is (not (member "mlkem768nistp256-sha256"
                      (burs::default-kex-algorithms) :test #'string=)))))

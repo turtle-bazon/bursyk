@@ -1952,10 +1952,12 @@ server records the full string."
      "ecdh-sha2-nistp256")))
 
 (test nist-curve-kex-is-offered
-  "The three NIST-curve methods follow curve25519 in the default offer."
+  "The three NIST-curve methods appear in the implemented set, in order."
   (is (equal '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                "ecdh-sha2-nistp521")
-             (last cl-pnet-ssh:+ssh-kex-real-algorithms+ 3)))
+             (loop for name in cl-pnet-ssh:+ssh-kex-real-algorithms+
+                   when (cl-pnet-ssh::ssh-ecdh-kex-p name)
+                     collect name)))
   (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                  "ecdh-sha2-nistp521"))
     (let ((negotiated
@@ -1974,3 +1976,63 @@ server records the full string."
              :macs cl-pnet-ssh:+ssh-macs+
              :compressions '("none"))))
       (is (string= kex (getf negotiated :kex))))))
+
+;;; ---- Fixed-group MODP Diffie-Hellman ----
+
+(test fixed-group-dh-agrees
+  "Each MODP group derives one shared secret on both sides."
+  (dolist (entry '(("diffie-hellman-group14-sha256" 2048 :sha256)
+                   ("diffie-hellman-group16-sha512" 4096 :sha512)
+                   ("diffie-hellman-group18-sha512" 8192 :sha512)
+                   ("diffie-hellman-group14-sha1" 2048 :sha1)
+                   ("diffie-hellman-group1-sha1" 1024 :sha1)))
+    (destructuring-bind (kex bits digest) entry
+      (multiple-value-bind (prime actual-bits actual-digest)
+          (cl-pnet-ssh::ssh-dh-group-parameters kex)
+        (is (integerp prime))
+        (is (= bits (integer-length prime)))
+        (is (= bits actual-bits))
+        (is (eq digest actual-digest)))
+      (multiple-value-bind (private-a public-a)
+          (cl-pnet-ssh::ssh-dh-keypair kex)
+        (multiple-value-bind (private-b public-b)
+            (cl-pnet-ssh::ssh-dh-keypair kex)
+          (let ((ab (cl-pnet-ssh::ssh-dh-shared private-a public-b kex))
+                (ba (cl-pnet-ssh::ssh-dh-shared private-b public-a kex)))
+            (is (equalp ab ba))
+            (is (plusp (length ab))))))))
+  ;; A peer element outside 1..p-1 is a protocol error, not a crash.
+  (signals cl-pnet-ssh:ssh-protocol-error
+    (cl-pnet-ssh::ssh-dh-shared 12345 1 "diffie-hellman-group14-sha256"))
+  (signals cl-pnet-ssh:ssh-protocol-error
+    (cl-pnet-ssh::ssh-dh-shared 12345 0 "diffie-hellman-group14-sha256")))
+
+(test fixed-group-dh-is-selectable-but-not-server-default
+  "The MODP groups are implemented and in -Q kex, but the server keeps
+OpenSSH's server default."
+  (dolist (kex '("diffie-hellman-group1-sha1"
+                 "diffie-hellman-group14-sha1"
+                 "diffie-hellman-group14-sha256"
+                 "diffie-hellman-group16-sha512"
+                 "diffie-hellman-group18-sha512"))
+    (is (member kex cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+    (is (cl-pnet-ssh::ssh-dh-kex-p kex)))
+  ;; The client offers the SHA-256/512 groups by default, the legacy SHA-1
+  ;; pair only when named.
+  (dolist (kex '("diffie-hellman-group14-sha256"
+                 "diffie-hellman-group16-sha512"
+                 "diffie-hellman-group18-sha512"))
+    (is (member kex cl-pnet-ssh:+ssh-kex-default-algorithms+
+                :test #'string=)))
+  (dolist (kex '("diffie-hellman-group1-sha1"
+                 "diffie-hellman-group14-sha1"))
+    (is (not (member kex cl-pnet-ssh:+ssh-kex-default-algorithms+
+                     :test #'string=))))
+  ;; OpenSSH's server default has no fixed-group exchanges at all.
+  (dolist (kex '("diffie-hellman-group1-sha1"
+                 "diffie-hellman-group14-sha1"
+                 "diffie-hellman-group14-sha256"
+                 "diffie-hellman-group16-sha512"
+                 "diffie-hellman-group18-sha512"))
+    (is (not (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
+                     :test #'string=)))))

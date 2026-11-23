@@ -1084,7 +1084,7 @@ cannot apply per connection."
         ;; list replaces the default, while the pattern set also admits a
         ;; method this build implements but does not offer by default.
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-kex-default-algorithms+ "KexAlgorithms"
+         line arguments +ssh-server-default-kex-algorithms+ "KexAlgorithms"
          :all +ssh-kex-real-algorithms+)))
       ((string= keyword "hostkeyalgorithms")
        (ssh-server-config-set-once

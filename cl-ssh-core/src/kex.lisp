@@ -373,30 +373,40 @@ Compression is chosen separately for each direction, as RFC 4253 requires."
 (defun ssh-kex-digest (kex)
   "The hash KEX uses for the exchange hash and key derivation.
 
-The NIST-curve exchanges name it in their SSH algorithm name; every other
-method this build implements uses SHA-256."
-  (or (nth-value 2 (ssh-ecdh-kex-parameters kex)) :sha256))
+The NIST-curve exchanges name it in their SSH algorithm name; the MODP
+groups name it too (SHA-1 for the legacy pair, SHA-512 for groups 16 and
+18); every other method this build implements uses SHA-256."
+  (or (nth-value 2 (ssh-ecdh-kex-parameters kex))
+      (nth-value 2 (ssh-dh-group-parameters kex))
+      :sha256))
 
 (defun ssh-exchange-hash (client-version server-version
                           client-kexinit server-kexinit
                           host-key-blob client-public server-public shared
-                          &key string-shared (digest :sha256))
+                          &key string-shared integer-public (digest :sha256))
   "The key-exchange hash H, binding both versions, both KEXINITs, the host
 key, both ephemeral public keys and the shared secret.
 
 A plain curve25519 or ECDH secret is written as an mpint.  OpenSSH's hybrid
 methods put a digest of the concatenated secret in the hash and the KDF as an
-SSH string instead, so STRING-SHARED selects that layout.  DIGEST is the
-negotiated hash: SHA-256 for most methods, SHA-384/SHA-512 for the larger
-NIST curves."
+SSH string instead, so STRING-SHARED selects that layout.  INTEGER-PUBLIC
+writes the two public values as mpints rather than SSH strings, which is
+what RFC 4253's fixed-group Diffie-Hellman needs.  DIGEST is the negotiated
+hash: SHA-256 for most methods, SHA-384/SHA-512 for the larger NIST curves,
+groups 16 and 18, and SHA-1 for the legacy MODP groups."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer client-version)
     (ssh-write-text writer server-version)
     (ssh-write-string writer client-kexinit)
     (ssh-write-string writer server-kexinit)
     (ssh-write-string writer host-key-blob)
-    (ssh-write-string writer client-public)
-    (ssh-write-string writer server-public)
+    (if integer-public
+        (progn
+          (ssh-write-mpint writer client-public)
+          (ssh-write-mpint writer server-public))
+        (progn
+          (ssh-write-string writer client-public)
+          (ssh-write-string writer server-public)))
     (if string-shared
         (ssh-write-string writer shared)
         (ssh-write-mpint writer (ssh-mpint-integer shared)))

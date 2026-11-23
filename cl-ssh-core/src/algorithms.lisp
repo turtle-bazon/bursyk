@@ -8,19 +8,24 @@
 ;;;; be validated while it is read instead of when the first peer arrives.
 
 (defparameter +ssh-kex-real-algorithms+
-  '("mlkem768x25519-sha256"
+  '("diffie-hellman-group1-sha1"
+    "diffie-hellman-group14-sha1"
+    "diffie-hellman-group14-sha256"
+    "diffie-hellman-group16-sha512"
+    "diffie-hellman-group18-sha512"
+    "ecdh-sha2-nistp256"
+    "ecdh-sha2-nistp384"
+    "ecdh-sha2-nistp521"
     "mlkem768nistp256-sha256"
     "curve25519-sha256"
     "curve25519-sha256@libssh.org"
-    "ecdh-sha2-nistp256"
-    "ecdh-sha2-nistp384"
-    "ecdh-sha2-nistp521")
+    "mlkem768x25519-sha256")
   "Every key-exchange method this build implements, without the markers.
 
-This is the set KexAlgorithms may name, not the default offer.  In
-particular mlkem768nistp256-sha256 is implemented but, as in OpenSSH, left
-out of the default list; a user who names it can still match a peer that
-offers it.")
+The order is OpenSSH's -Q kex order.  This is the set KexAlgorithms may
+name, not the default offer.  In particular the legacy SHA-1 groups and
+mlkem768nistp256-sha256 are implemented but, as in OpenSSH, left out of the
+default list; a user who names one can still match a peer that offers it.")
 
 (defparameter +ssh-kex-default-algorithms+
   '("mlkem768x25519-sha256"
@@ -28,15 +33,32 @@ offers it.")
     "curve25519-sha256@libssh.org"
     "ecdh-sha2-nistp256"
     "ecdh-sha2-nistp384"
-    "ecdh-sha2-nistp521")
-  "The default key-exchange offer, in OpenSSH's order.
+    "ecdh-sha2-nistp521"
+    "diffie-hellman-group16-sha512"
+    "diffie-hellman-group18-sha512"
+    "diffie-hellman-group14-sha256")
+  "The client's default key-exchange offer, in OpenSSH's order.
 
 mlkem768x25519-sha256 is OpenSSH's default post-quantum hybrid.  It needs
 ML-KEM-768 and X25519, both of which this build has, so it is offered first
-and a peer that does not know it falls back to curve25519.  The NIST-curve
-ECDH methods come last, so a peer that offers only one of them still
-negotiates.  KEXINIT and -G use this list; -Q kex and KexAlgorithms use
-+SSH-KEX-REAL-ALGORITHMS+.")
+and a peer that does not know it falls back to curve25519.  The fixed-group
+Diffie-Hellman methods come last, as in OpenSSH's client, so a peer that
+offers only a MODP group still negotiates.  KEXINIT and -G use this list;
+-Q kex and KexAlgorithms use +SSH-KEX-REAL-ALGORITHMS+.")
+
+(defparameter +ssh-server-default-kex-algorithms+
+  '("mlkem768x25519-sha256"
+    "curve25519-sha256"
+    "curve25519-sha256@libssh.org"
+    "ecdh-sha2-nistp256"
+    "ecdh-sha2-nistp384"
+    "ecdh-sha2-nistp521")
+  "The server's default key-exchange offer, in OpenSSH's order.
+
+OpenSSH's server deliberately omits the fixed-group MODP exchanges from its
+default (only its client offers them), so this list matches KEX_SERVER_KEX.
+Naming one in KexAlgorithms still enables it, because the server resolves
+against +SSH-KEX-REAL-ALGORITHMS+.")
 
 (defparameter +ssh-kex-algorithms+
   (append +ssh-kex-default-algorithms+

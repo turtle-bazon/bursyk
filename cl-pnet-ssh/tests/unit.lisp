@@ -2442,7 +2442,9 @@ share the test, so each must dispatch the same channel requests."
   "The NIST-curve methods are offered and each one can be selected."
   (is (equal '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                "ecdh-sha2-nistp521")
-             (last cl-pnet-ssh:+ssh-kex-real-algorithms+ 3)))
+             (loop for name in cl-pnet-ssh:+ssh-kex-real-algorithms+
+                   when (cl-pnet-ssh::ssh-ecdh-kex-p name)
+                     collect name)))
   (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                  "ecdh-sha2-nistp521"))
     (let ((negotiated
@@ -2484,6 +2486,21 @@ share the test, so each must dispatch the same channel requests."
       (skip "ssh-keygen is not installed")
       (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                      "ecdh-sha2-nistp521"))
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-loopback-result
+             :kex-algorithms (list kex)
+             :sshd-options (list (format nil "KexAlgorithms ~A" kex)))
+          (is (equal "hello" stdout))
+          (is (equal "oops" stderr))
+          (is (eql 3 status))))))
+
+(test fixed-group-dh-loopback-exec
+  "Each MODP group carries a real session on this transport."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (kex '("diffie-hellman-group14-sha256"
+                     "diffie-hellman-group16-sha512"
+                     "diffie-hellman-group18-sha512"))
         (multiple-value-bind (stdout stderr status)
             (ssh-test-loopback-result
              :kex-algorithms (list kex)
