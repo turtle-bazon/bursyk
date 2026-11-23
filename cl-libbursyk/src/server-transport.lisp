@@ -14,7 +14,10 @@
     ;; Markers, never selected: strict KEX and RFC 8308 extensions.
     "kex-strict-s-v00@openssh.com"
     "ext-info-s")
-  "Server KEX offers.  The markers are negotiation signals, not algorithms.")
+  "The server's default KEX offers.
+
+The markers are negotiation signals, not algorithms.  mlkem768nistp256 is
+implemented but, as in OpenSSH, not offered unless KexAlgorithms names it.")
 
 (defun ssh-server-kex-offer (session)
   "The KEX list SESSION advertises, with the server markers appended.
@@ -25,7 +28,7 @@ only curve25519 does not turn off either extension."
   (let ((result (copy-list
                  (ssh-session-algorithm-list
                   session #'ssh-server-config-kex-algorithms
-                  +ssh-kex-real-algorithms+))))
+                  +ssh-kex-default-algorithms+))))
     (dolist (marker '("kex-strict-s-v00@openssh.com" "ext-info-s")
              result)
       (unless (member marker result :test #'string=)
@@ -288,7 +291,7 @@ came up."
             (ssh-session-keys (ssh-session-negotiated session) shared hash
                               (ssh-session-session-id session) :server t
                               :string-shared
-                              (ssh-mlkem768x25519-p kex)
+                              (ssh-mlkem768-hybrid-p kex)
                               :digest (ssh-kex-digest kex))
             (ssh-session-kex-shared session) nil
             (ssh-session-kex-hash session) nil
@@ -325,9 +328,9 @@ and returns; the agent's callback finishes the KEX."
              :detail (format nil "no key for host key algorithm ~A" algorithm)))
     (let ((kex (getf (ssh-session-negotiated session) :kex)))
       (cond
-        ((ssh-mlkem768x25519-p kex)
+        ((ssh-mlkem768-hybrid-p kex)
          (multiple-value-setq (server-public shared)
-           (ssh-mlkem768x25519-server-shared client-public)))
+           (ssh-mlkem768-hybrid-server-shared kex client-public)))
         ((ssh-ecdh-kex-p kex)
          (multiple-value-setq (private server-public) (ssh-ecdh-keypair kex))
          (setf shared (ssh-ecdh-shared private client-public kex)))
@@ -342,7 +345,7 @@ and returns; the agent's callback finishes the KEX."
                   (ssh-session-server-kexinit session)
                   host-key-blob
                   client-public server-public shared
-                  :string-shared (ssh-mlkem768x25519-p kex)
+                  :string-shared (ssh-mlkem768-hybrid-p kex)
                   :digest (ssh-kex-digest kex))))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)

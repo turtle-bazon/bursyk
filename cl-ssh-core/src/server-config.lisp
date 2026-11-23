@@ -1079,9 +1079,12 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'kex-algorithms
         ;; The strict-KEX and EXT_INFO markers are not negotiable methods;
-        ;; they are added to every offer after this list is chosen.
+        ;; they are added to every offer after this list is chosen.  A plain
+        ;; list replaces the default, while the pattern set also admits a
+        ;; method this build implements but does not offer by default.
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-kex-real-algorithms+ "KexAlgorithms")))
+         line arguments +ssh-kex-default-algorithms+ "KexAlgorithms"
+         :all +ssh-kex-real-algorithms+)))
       ((string= keyword "hostkeyalgorithms")
        (ssh-server-config-set-once
         config 'host-key-algorithms

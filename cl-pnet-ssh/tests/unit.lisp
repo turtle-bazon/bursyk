@@ -1931,6 +1931,14 @@ share the test, so each must dispatch the same channel requests."
              :compressions '("none"))))
       (is (string= kex (getf negotiated :kex))))))
 
+(test mlkem768nistp256-is-implemented-but-not-default
+  "The P-256 ML-KEM hybrid is selectable but absent from the default offer."
+  (is (member "mlkem768nistp256-sha256"
+              cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+  (is (not (member "mlkem768nistp256-sha256"
+                   cl-pnet-ssh:+ssh-kex-default-algorithms+
+                   :test #'string=))))
+
 (test nist-curve-kex-loopback-exec
   "Each NIST-curve ECDH method carries a real session on this transport."
   (if (not (ssh-keygen-available-p))

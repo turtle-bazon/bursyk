@@ -188,7 +188,8 @@ MAKE-SSH-CLIENT's own defaults."
         :kex-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-kex-algorithms
-         +ssh-kex-real-algorithms+ "KexAlgorithms")
+         +ssh-kex-default-algorithms+ "KexAlgorithms"
+         :all +ssh-kex-real-algorithms+)
         :host-key-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-host-key-algorithms

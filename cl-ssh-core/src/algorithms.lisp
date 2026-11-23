@@ -9,21 +9,37 @@
 
 (defparameter +ssh-kex-real-algorithms+
   '("mlkem768x25519-sha256"
+    "mlkem768nistp256-sha256"
     "curve25519-sha256"
     "curve25519-sha256@libssh.org"
     "ecdh-sha2-nistp256"
     "ecdh-sha2-nistp384"
     "ecdh-sha2-nistp521")
-  "The key-exchange methods themselves, without the protocol markers.
+  "Every key-exchange method this build implements, without the markers.
+
+This is the set KexAlgorithms may name, not the default offer.  In
+particular mlkem768nistp256-sha256 is implemented but, as in OpenSSH, left
+out of the default list; a user who names it can still match a peer that
+offers it.")
+
+(defparameter +ssh-kex-default-algorithms+
+  '("mlkem768x25519-sha256"
+    "curve25519-sha256"
+    "curve25519-sha256@libssh.org"
+    "ecdh-sha2-nistp256"
+    "ecdh-sha2-nistp384"
+    "ecdh-sha2-nistp521")
+  "The default key-exchange offer, in OpenSSH's order.
 
 mlkem768x25519-sha256 is OpenSSH's default post-quantum hybrid.  It needs
 ML-KEM-768 and X25519, both of which this build has, so it is offered first
 and a peer that does not know it falls back to curve25519.  The NIST-curve
-ECDH methods come last, in OpenSSH's order, so a peer that offers only one
-of them still negotiates.")
+ECDH methods come last, so a peer that offers only one of them still
+negotiates.  KEXINIT and -G use this list; -Q kex and KexAlgorithms use
++SSH-KEX-REAL-ALGORITHMS+.")
 
 (defparameter +ssh-kex-algorithms+
-  (append +ssh-kex-real-algorithms+
+  (append +ssh-kex-default-algorithms+
           ;; Not algorithms: markers asking the peer to answer EXT_INFO and
           ;; to reset packet sequence numbers at NEWKEYS (OpenSSH's strict
           ;; KEX).  They ride along with whatever KexAlgorithms selects.

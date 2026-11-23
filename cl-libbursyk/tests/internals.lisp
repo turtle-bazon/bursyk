@@ -1823,41 +1823,53 @@ server records the full string."
 
 ;;; ---- Post-quantum key exchange ----
 
-(test mlkem768x25519-hybrid-agrees
-  "The two halves of mlkem768x25519-sha256 derive one shared secret."
-  (let* ((state (cl-pnet-ssh::ssh-mlkem768x25519-client-keypair))
-         (client-public
-           (cl-pnet-ssh::ssh-mlkem768x25519-state-public state)))
-    ;; ML-KEM-768 encapsulation key (1184) then X25519 (32).
-    (is (= 1216 (length client-public)))
-    (multiple-value-bind (server-public shared)
-        (cl-pnet-ssh::ssh-mlkem768x25519-server-shared client-public)
-      ;; ML-KEM-768 ciphertext (1088) then X25519 (32).
-      (is (= 1120 (length server-public)))
-      ;; OpenSSH hashes the ML-KEM and X25519 secrets together, so the
-      ;; shared secret both sides use is one SHA-256 digest.
-      (is (= 32 (length shared)))
-      (is (equalp shared
-                  (cl-pnet-ssh::ssh-mlkem768x25519-client-shared
-                   state server-public)))))
-  (signals cl-pnet-ssh:ssh-protocol-error
-    (cl-pnet-ssh::ssh-mlkem768x25519-server-shared
-     (make-array 10 :element-type '(unsigned-byte 8)))))
+(test mlkem768-hybrids-agree
+  "Each ML-KEM-768 hybrid derives one shared secret on both sides."
+  (dolist (entry '(("mlkem768x25519-sha256" 1216 1120)
+                   ("mlkem768nistp256-sha256" 1249 1153)))
+    (destructuring-bind (kex client-size server-size) entry
+      (let* ((state (cl-pnet-ssh::ssh-mlkem768-hybrid-client-keypair kex))
+             (client-public
+               (cl-pnet-ssh::ssh-mlkem768-hybrid-state-public state)))
+        ;; ML-KEM-768 encapsulation key (1184) then the classical key.
+        (is (= client-size (length client-public)))
+        (multiple-value-bind (server-public shared)
+            (cl-pnet-ssh::ssh-mlkem768-hybrid-server-shared
+             kex client-public)
+          ;; ML-KEM-768 ciphertext (1088) then the classical key.
+          (is (= server-size (length server-public)))
+          ;; OpenSSH hashes the ML-KEM and classical secrets together, so the
+          ;; shared secret both sides use is one SHA-256 digest.
+          (is (= 32 (length shared)))
+          (is (equalp shared
+                      (cl-pnet-ssh::ssh-mlkem768-hybrid-client-shared
+                       state server-public)))))))
+  (dolist (kex '("mlkem768x25519-sha256" "mlkem768nistp256-sha256"))
+    (signals cl-pnet-ssh:ssh-protocol-error
+      (cl-pnet-ssh::ssh-mlkem768-hybrid-server-shared
+       kex (make-array 10 :element-type '(unsigned-byte 8))))))
 
-(test post-quantum-kex-is-offered-and-selected
-  "mlkem768x25519-sha256 leads the offer and wins when the peer has it."
-  (is (string= "mlkem768x25519-sha256"
-               (first cl-pnet-ssh:+ssh-kex-real-algorithms+)))
-  (is (cl-pnet-ssh::ssh-kex-post-quantum-p "mlkem768x25519-sha256"))
+(test mlkem768nistp256-is-selectable-but-not-default
+  "mlkem768nistp256-sha256 is implemented yet absent from the default offer."
+  (is (member "mlkem768nistp256-sha256"
+              cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+  (is (not (member "mlkem768nistp256-sha256"
+                   cl-pnet-ssh:+ssh-kex-default-algorithms+ :test #'string=)))
+  (is (cl-pnet-ssh::ssh-kex-post-quantum-p "mlkem768nistp256-sha256"))
+  ;; The default KEXINIT leaves it out; naming it puts it in.
+  (let ((offers (cl-pnet-ssh::ssh-parse-kexinit-payload
+                 (cl-pnet-ssh::ssh-make-kexinit-payload))))
+    (is (not (member "mlkem768nistp256-sha256" (getf offers :kex)
+                     :test #'string=))))
   (let ((offers (cl-pnet-ssh::ssh-parse-kexinit-payload
                  (cl-pnet-ssh::ssh-make-kexinit-payload
-                  :kex '("mlkem768x25519-sha256")))))
-    (is (member "mlkem768x25519-sha256"
-                (getf offers :kex) :test #'string=)))
-  ;; A peer that offers only the new method is matched.
+                  :kex '("mlkem768nistp256-sha256")))))
+    (is (member "mlkem768nistp256-sha256" (getf offers :kex)
+                :test #'string=)))
+  ;; A peer that offers only the new method is matched when it is named.
   (let ((negotiated
           (cl-pnet-ssh::ssh-negotiate
-           (list :kex '("mlkem768x25519-sha256")
+           (list :kex '("mlkem768nistp256-sha256")
                  :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
                  :ciphers-c2s cl-pnet-ssh:+ssh-ciphers+
                  :ciphers-s2c cl-pnet-ssh:+ssh-ciphers+
@@ -1865,12 +1877,12 @@ server records the full string."
                  :macs-s2c cl-pnet-ssh:+ssh-macs+
                  :compressions-c2s '("none")
                  :compressions-s2c '("none"))
-           :kex-algorithms cl-pnet-ssh:+ssh-kex-real-algorithms+
+           :kex-algorithms '("mlkem768nistp256-sha256")
            :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
            :ciphers cl-pnet-ssh:+ssh-ciphers+
            :macs cl-pnet-ssh:+ssh-macs+
            :compressions '("none"))))
-    (is (string= "mlkem768x25519-sha256" (getf negotiated :kex)))))
+    (is (string= "mlkem768nistp256-sha256" (getf negotiated :kex)))))
 
 ;;; ---- NIST-curve ECDH key exchange ----
 

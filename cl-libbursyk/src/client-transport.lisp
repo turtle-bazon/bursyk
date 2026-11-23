@@ -273,11 +273,11 @@ curve25519 sends the bare 32 octets."
   (let* ((kex (getf (ssh-client-negotiated client) :kex))
          (ecdh (ssh-ecdh-kex-p kex)))
     (cond
-      ((ssh-mlkem768x25519-p kex)
-       (let ((state (ssh-mlkem768x25519-client-keypair)))
+      ((ssh-mlkem768-hybrid-p kex)
+       (let ((state (ssh-mlkem768-hybrid-client-keypair kex)))
          (setf (ssh-client-ephemeral-private client) state
                (ssh-client-ephemeral-public client)
-               (ssh-mlkem768x25519-state-public state))))
+               (ssh-mlkem768-hybrid-state-public state))))
       (ecdh
        (multiple-value-bind (private public) (ssh-ecdh-keypair kex)
          (setf (ssh-client-ephemeral-private client) private
@@ -298,12 +298,12 @@ curve25519 sends the bare 32 octets."
          (server-public (ssh-read-string reader))
          (signature (ssh-read-string reader))
          (kex (getf (ssh-client-negotiated client) :kex))
-         (hybrid (ssh-mlkem768x25519-p kex))
+         (hybrid (ssh-mlkem768-hybrid-p kex))
          (ecdh (ssh-ecdh-kex-p kex))
          (shared
            (cond
              (hybrid
-              (ssh-mlkem768x25519-client-shared
+              (ssh-mlkem768-hybrid-client-shared
                (ssh-client-ephemeral-private client) server-public))
              (ecdh
               (ssh-ecdh-shared

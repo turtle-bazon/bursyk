@@ -588,6 +588,7 @@
    ;; check a choice before connecting.
    #:+ssh-kex-algorithms+
    #:+ssh-kex-real-algorithms+
+   #:+ssh-kex-default-algorithms+
    #:+ssh-host-key-algorithms+
    #:+ssh-ciphers+
    #:+ssh-macs+

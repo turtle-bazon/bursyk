@@ -52,86 +52,6 @@
         (public-key (ironclad-unsafe:make-public-key :curve25519 :y peer-public)))
     (ironclad-unsafe:diffie-hellman private-key public-key)))
 
-;;; ---- ML-KEM-768 hybrid (mlkem768x25519-sha256) ----
-;;;
-;;; OpenSSH's post-quantum key exchange concatenates an ML-KEM-768
-;;; encapsulation key with an X25519 public key.  The server answers with the
-;;; ML-KEM ciphertext followed by its X25519 public key.  The two secrets are
-;;; concatenated and SHA-256 hashed, and that digest is the shared secret the
-;;; exchange hash and key derivation both use.  ironclad-unsafe provides the
-;;; FIPS 203 primitive; this file only lays the two halves out the way the SSH
-;;; method does.
-
-(defconstant +ssh-mlkem768-public-bytes+ 1184)
-(defconstant +ssh-mlkem768-ciphertext-bytes+ 1088)
-
-(defstruct (ssh-mlkem768x25519-state (:constructor %make-ssh-mlkem768x25519-state))
-  "A client's ML-KEM and X25519 private halves plus the public blob to send."
-  (mlkem-private nil)
-  (x25519-private nil)
-  (public nil))
-
-(defun ssh-mlkem768x25519-client-keypair ()
-  "A fresh client keypair for mlkem768x25519-sha256.
-
-Returns an SSH-MLKEM768X25519-STATE whose PUBLIC is the encapsulation key
-followed by the X25519 public key."
-  (multiple-value-bind (mlkem-private mlkem-public)
-      (ironclad-unsafe:generate-key-pair :ml-kem-768)
-    (multiple-value-bind (x25519-private x25519-public)
-        (ssh-curve25519-keypair)
-      (%make-ssh-mlkem768x25519-state
-       :mlkem-private mlkem-private
-       :x25519-private x25519-private
-       :public (ssh-concat
-                (ironclad-unsafe:ml-kem-key-bytes mlkem-public)
-                x25519-public)))))
-
-(defun ssh-mlkem768x25519-client-shared (state server-blob)
-  "The hybrid shared secret of STATE with the server's SERVER-BLOB."
-  (unless (= (length server-blob)
-             (+ +ssh-mlkem768-ciphertext-bytes+ 32))
-    (error 'ssh-protocol-error
-           :detail "malformed mlkem768x25519 server key exchange"))
-  (let ((mlkem-shared
-          (ironclad-unsafe:decapsulate-key
-           (ssh-mlkem768x25519-state-mlkem-private state)
-           (subseq server-blob 0 +ssh-mlkem768-ciphertext-bytes+)))
-        (x25519-shared
-          (ssh-curve25519-shared
-           (ssh-mlkem768x25519-state-x25519-private state)
-           (subseq server-blob +ssh-mlkem768-ciphertext-bytes+))))
-    ;; OpenSSH hashes the concatenation and uses that digest as the shared
-    ;; secret, so both the exchange hash and the key derivation see 32 octets
-    ;; rather than the 64-octet concatenation.
-    (ssh-hash :sha256 (ssh-concat mlkem-shared x25519-shared))))
-
-(defun ssh-mlkem768x25519-server-shared (client-blob)
-  "Answer CLIENT-BLOB with (VALUES SERVER-BLOB SHARED-SECRET)."
-  (unless (= (length client-blob)
-             (+ +ssh-mlkem768-public-bytes+ 32))
-    (error 'ssh-protocol-error
-           :detail "malformed mlkem768x25519 client key exchange"))
-  (let* ((mlkem-public
-           (ironclad-unsafe:make-public-key
-            :ml-kem-768
-            :bytes (subseq client-blob 0 +ssh-mlkem768-public-bytes+)))
-         (x25519-peer (subseq client-blob +ssh-mlkem768-public-bytes+)))
-    (multiple-value-bind (ciphertext mlkem-shared)
-        (ironclad-unsafe:encapsulate-key mlkem-public)
-      (multiple-value-bind (x25519-private x25519-public)
-          (ssh-curve25519-keypair)
-        (values (ssh-concat ciphertext x25519-public)
-                (ssh-hash :sha256
-                          (ssh-concat
-                           mlkem-shared
-                           (ssh-curve25519-shared
-                            x25519-private x25519-peer))))))))
-
-(defun ssh-mlkem768x25519-p (name)
-  "Whether NAME is the mlkem768x25519-sha256 key exchange."
-  (and (stringp name) (string= name "mlkem768x25519-sha256")))
-
 ;;; ---- NIST-curve ECDH (ecdh-sha2-nistp256/384/521) ----
 ;;;
 ;;; RFC 5656: the public key Q is an uncompressed SEC1 point and the shared
@@ -160,44 +80,174 @@ Answers NIL when KEX is not one of them."
   "Whether NAME is a NIST-curve ECDH key exchange."
   (and (ssh-ecdh-kex-parameters name) t))
 
-(defun ssh-ecdh-keypair (kex)
-  "A fresh keypair for KEX as (VALUES PRIVATE-KEY PUBLIC-POINT).
+(defun ssh-ecdh-keypair-for-curve (curve)
+  "A fresh keypair on CURVE as (VALUES PRIVATE-KEY PUBLIC-POINT).
 
 The point is SEC1's uncompressed form, the encoding RFC 5656 puts on the
 wire; the private key object is what DIFFIE-HELLMAN takes later."
+  (multiple-value-bind (private public)
+      (ironclad-unsafe:generate-key-pair curve)
+    (values private
+            (getf (ironclad-unsafe:destructure-public-key public) :y))))
+
+(defun ssh-ecdh-keypair (kex)
+  "A fresh keypair for KEX as (VALUES PRIVATE-KEY PUBLIC-POINT)."
   (let ((curve (nth-value 0 (ssh-ecdh-kex-parameters kex))))
     (unless curve
       (error 'ssh-protocol-error
              :detail (format nil "unsupported ECDH key exchange ~A" kex)))
-    (multiple-value-bind (private public)
-        (ironclad-unsafe:generate-key-pair curve)
-      (values private
-              (getf (ironclad-unsafe:destructure-public-key public) :y)))))
+    (ssh-ecdh-keypair-for-curve curve)))
 
-(defun ssh-ecdh-shared (private peer-point kex)
-  "The X coordinate of the ECDH shared point for KEX, SIZE octets.
+(defun ssh-ecdh-shared-for-curve (private peer-point curve size)
+  "The X coordinate of the ECDH shared point on CURVE, SIZE octets.
 
 Ironclad's DIFFIE-HELLMAN returns the whole SEC1 point; RFC 5656 uses only
 its X coordinate, zero-padded to the field width.  MAKE-PUBLIC-KEY checks
 that the peer's point is on the curve before it is multiplied."
+  (let ((point
+          (handler-case
+              (ironclad-unsafe:diffie-hellman
+               private
+               (ironclad-unsafe:make-public-key curve :y peer-point))
+            (error (condition)
+              (error 'ssh-protocol-error
+                     :detail (format nil "invalid ECDH public key: ~A"
+                                     condition))))))
+    (unless (and (= (length point) (1+ (* 2 size)))
+                 (= (aref point 0) 4))
+      (error 'ssh-protocol-error :detail "malformed ECDH shared point"))
+    (subseq point 1 (1+ size))))
+
+(defun ssh-ecdh-shared (private peer-point kex)
+  "The X coordinate of the ECDH shared point for KEX, SIZE octets."
   (multiple-value-bind (curve size)
       (ssh-ecdh-kex-parameters kex)
     (unless curve
       (error 'ssh-protocol-error
              :detail (format nil "unsupported ECDH key exchange ~A" kex)))
-    (let ((point
-            (handler-case
-                (ironclad-unsafe:diffie-hellman
-                 private
-                 (ironclad-unsafe:make-public-key curve :y peer-point))
-              (error (condition)
-                (error 'ssh-protocol-error
-                       :detail (format nil "invalid ECDH public key: ~A"
-                                       condition))))))
-      (unless (and (= (length point) (1+ (* 2 size)))
-                   (= (aref point 0) 4))
-        (error 'ssh-protocol-error :detail "malformed ECDH shared point"))
-      (subseq point 1 (1+ size)))))
+    (ssh-ecdh-shared-for-curve private peer-point curve size)))
+
+;;; ---- ML-KEM-768 hybrids ----
+;;;
+;;; OpenSSH's post-quantum key exchanges concatenate an ML-KEM-768
+;;; encapsulation key with a classical public key (X25519 or NIST P-256).
+;;; The server answers with the ML-KEM ciphertext followed by its classical
+;;; public key.  The two secrets are concatenated and SHA-256 hashed, and that
+;;; digest is the shared secret the exchange hash and key derivation both use.
+;;; ironclad-unsafe provides the FIPS 203 primitive; this file only lays the
+;;; two halves out the way the SSH methods do.
+
+(defconstant +ssh-mlkem768-public-bytes+ 1184)
+(defconstant +ssh-mlkem768-ciphertext-bytes+ 1088)
+
+(defparameter +ssh-mlkem768-hybrids+
+  '(("mlkem768x25519-sha256" :curve :x25519 :point-bytes 32)
+    ("mlkem768nistp256-sha256" :curve :secp256r1 :point-bytes 65))
+  "OpenSSH's ML-KEM-768 hybrids, with the classical curve and its wire width.")
+
+(defun ssh-mlkem768-hybrid-parameters (kex)
+  "The (VALUES CURVE POINT-BYTES) of the ML-KEM hybrid KEX, or NIL."
+  (let ((entry (and (stringp kex)
+                    (assoc kex +ssh-mlkem768-hybrids+ :test #'string=))))
+    (when entry
+      (values (getf (cdr entry) :curve)
+              (getf (cdr entry) :point-bytes)))))
+
+(defun ssh-mlkem768-hybrid-p (name)
+  "Whether NAME is one of OpenSSH's ML-KEM-768 hybrids."
+  (and (ssh-mlkem768-hybrid-parameters name) t))
+
+(defun ssh-mlkem768-hybrid-classical-keypair (curve)
+  "A fresh classical half for an ML-KEM hybrid as (VALUES PRIVATE PUBLIC)."
+  (if (eq curve :x25519)
+      (ssh-curve25519-keypair)
+      (ssh-ecdh-keypair-for-curve curve)))
+
+(defun ssh-mlkem768-hybrid-classical-shared (private peer curve point-bytes)
+  "The classical shared secret of PRIVATE with PEER."
+  (if (eq curve :x25519)
+      (ssh-curve25519-shared private peer)
+      (ssh-ecdh-shared-for-curve private peer curve (/ (1- point-bytes) 2))))
+
+(defstruct (ssh-mlkem768-hybrid-state
+             (:constructor %make-ssh-mlkem768-hybrid-state))
+  "A client's ML-KEM and classical private halves plus the blob to send."
+  (kex nil)
+  (mlkem-private nil)
+  (classical-private nil)
+  (public nil))
+
+(defun ssh-mlkem768-hybrid-client-keypair (kex)
+  "A fresh client keypair for the ML-KEM hybrid KEX.
+
+Returns an SSH-MLKEM768-HYBRID-STATE whose PUBLIC is the encapsulation key
+followed by the classical public key."
+  (multiple-value-bind (curve)
+      (ssh-mlkem768-hybrid-parameters kex)
+    (unless curve
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported ML-KEM key exchange ~A" kex)))
+    (multiple-value-bind (mlkem-private mlkem-public)
+        (ironclad-unsafe:generate-key-pair :ml-kem-768)
+      (multiple-value-bind (classical-private classical-public)
+          (ssh-mlkem768-hybrid-classical-keypair curve)
+        (%make-ssh-mlkem768-hybrid-state
+         :kex kex
+         :mlkem-private mlkem-private
+         :classical-private classical-private
+         :public (ssh-concat
+                  (ironclad-unsafe:ml-kem-key-bytes mlkem-public)
+                  classical-public))))))
+
+(defun ssh-mlkem768-hybrid-client-shared (state server-blob)
+  "The hybrid shared secret of STATE with the server's SERVER-BLOB."
+  (multiple-value-bind (curve point-bytes)
+      (ssh-mlkem768-hybrid-parameters (ssh-mlkem768-hybrid-state-kex state))
+    (unless (= (length server-blob)
+               (+ +ssh-mlkem768-ciphertext-bytes+ point-bytes))
+      (error 'ssh-protocol-error
+             :detail "malformed ML-KEM hybrid server key exchange"))
+    (let ((mlkem-shared
+            (ironclad-unsafe:decapsulate-key
+             (ssh-mlkem768-hybrid-state-mlkem-private state)
+             (subseq server-blob 0 +ssh-mlkem768-ciphertext-bytes+)))
+          (classical-shared
+            (ssh-mlkem768-hybrid-classical-shared
+             (ssh-mlkem768-hybrid-state-classical-private state)
+             (subseq server-blob +ssh-mlkem768-ciphertext-bytes+)
+             curve point-bytes)))
+      ;; OpenSSH hashes the concatenation and uses that digest as the shared
+      ;; secret, so the exchange hash and the key derivation see 32 octets
+      ;; rather than the concatenation itself.
+      (ssh-hash :sha256 (ssh-concat mlkem-shared classical-shared)))))
+
+(defun ssh-mlkem768-hybrid-server-shared (kex client-blob)
+  "Answer CLIENT-BLOB with (VALUES SERVER-BLOB SHARED-SECRET)."
+  (multiple-value-bind (curve point-bytes)
+      (ssh-mlkem768-hybrid-parameters kex)
+    (unless curve
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported ML-KEM key exchange ~A" kex)))
+    (unless (= (length client-blob)
+               (+ +ssh-mlkem768-public-bytes+ point-bytes))
+      (error 'ssh-protocol-error
+             :detail "malformed ML-KEM hybrid client key exchange"))
+    (let* ((mlkem-public
+             (ironclad-unsafe:make-public-key
+              :ml-kem-768
+              :bytes (subseq client-blob 0 +ssh-mlkem768-public-bytes+)))
+           (classical-peer (subseq client-blob +ssh-mlkem768-public-bytes+)))
+      (multiple-value-bind (ciphertext mlkem-shared)
+          (ironclad-unsafe:encapsulate-key mlkem-public)
+        (multiple-value-bind (classical-private classical-public)
+            (ssh-mlkem768-hybrid-classical-keypair curve)
+          (values (ssh-concat ciphertext classical-public)
+                  (ssh-hash :sha256
+                            (ssh-concat
+                             mlkem-shared
+                             (ssh-mlkem768-hybrid-classical-shared
+                              classical-private classical-peer
+                              curve point-bytes)))))))))
 
 (defun ssh-ed25519-verify (signature message public-key)
   "Verify SIGNATURE (64 octets) over MESSAGE under PUBLIC-KEY (32 octets)."

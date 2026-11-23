@@ -409,16 +409,26 @@ model: after the destination everything belongs to the remote command."
         do (setf start (1+ comma))))
 
 (defun supported-kex-algorithms ()
-  "The key exchanges this build's transport can actually negotiate.
+  "Every key exchange this build's transport can actually negotiate.
 
-The pure transport offers OpenSSH's post-quantum hybrid; libssh 0.10 has no
-ML-KEM, so it advertises and accepts only the classical methods.  -Q kex,
--G and KexAlgorithms all answer from this list, so a name the transport
+The pure transport implements OpenSSH's post-quantum hybrids; libssh 0.10
+has no ML-KEM, so it advertises and accepts only the classical methods.
+-Q kex and KexAlgorithms answer from this list, so a name the transport
 cannot use is refused before the connection instead of after it."
   (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
       cl-pnet-ssh:+ssh-kex-real-algorithms+
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
                  cl-pnet-ssh:+ssh-kex-real-algorithms+)))
+
+(defun default-kex-algorithms ()
+  "The key exchanges this build offers when KexAlgorithms is not set.
+
+This is OpenSSH's default order, which leaves mlkem768nistp256-sha256 out
+even though it is implemented; -G reports this list, as ssh does."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
+      cl-pnet-ssh:+ssh-kex-default-algorithms+
+      (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
+                 cl-pnet-ssh:+ssh-kex-default-algorithms+)))
 
 (defun check-algorithm-list (option value supported)
   "Reject an algorithm choice this build cannot offer.
@@ -805,12 +815,10 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
       ((member name '("mac" "macs") :test #'string=)
        cl-pnet-ssh:+ssh-macs+)
       ((member name '("kex" "kexalgorithms") :test #'string=)
-       (remove-if (lambda (algorithm)
-                    (or (search "ext-info" algorithm)
-                        (search "kex-strict" algorithm)
-                        (not (member algorithm (supported-kex-algorithms)
-                                     :test #'string=))))
-                  cl-pnet-ssh:+ssh-kex-algorithms+))
+       (remove-if-not (lambda (algorithm)
+                        (member algorithm (supported-kex-algorithms)
+                                :test #'string=))
+                      cl-pnet-ssh:+ssh-kex-real-algorithms+))
       ((string= name "compression") cl-pnet-ssh:+ssh-compressions+)
       ((string= name "key")
        (append (query-plain-key-algorithms)
@@ -3222,7 +3230,8 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "kexalgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-kex-algorithms
-               (supported-kex-algorithms) "KexAlgorithms"))
+               (default-kex-algorithms) "KexAlgorithms"
+               (supported-kex-algorithms)))
       (format t "casignaturealgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms

@@ -108,7 +108,19 @@ CLI's decision and at the plist it filled."
     (is (eq supported
             (not (null (member "mlkem768x25519-sha256"
                                (burs::supported-kex-algorithms)
-                               :test #'string=)))))))
+                               :test #'string=)))))
+    ;; The P-256 ML-KEM hybrid is implemented too, and -Q lists every method
+    ;; the transport can negotiate, not just the default offer.
+    (is (eq supported
+            (not (null (member "mlkem768nistp256-sha256" kex
+                               :test #'string=)))))
+    (is (eq supported
+            (not (null (member "mlkem768nistp256-sha256"
+                               (burs::supported-kex-algorithms)
+                               :test #'string=)))))
+    ;; -G reports the default offer, which leaves that hybrid out, as ssh does.
+    (is (not (member "mlkem768nistp256-sha256"
+                     (burs::default-kex-algorithms) :test #'string=)))))
 
 (test double-dash-ends-option-parsing
   (multiple-value-bind (destination command options)
