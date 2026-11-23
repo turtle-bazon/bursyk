@@ -86,6 +86,10 @@
   ;; version 0 the client may use PING packets as chaff while hiding
   ;; keystroke timing.
   (ping-supported nil)
+  ;; EXT_INFO's server-sig-algs: the signature algorithm names the server
+  ;; verifies for publickey authentication.  An RSA key picks rsa-sha2-512 or
+  ;; rsa-sha2-256 from this list, and a name it omits is not offered.
+  (server-sig-algs nil)
   ;; EXT_INFO's agent-forward extension.  Version 0 selects RFC 9987's
   ;; agent-req request and agent-connect channel instead of OpenSSH's
   ;; auth-agent-req@openssh.com names.

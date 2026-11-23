@@ -1164,6 +1164,118 @@ refuses to pair a certificate with a different key."
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 
+(test rsa-key-offers-both-sha2-names
+  "An RSA key answers as rsa-sha2-512 or rsa-sha2-256, chosen by policy."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa-sigalg"))
+             (path (merge-pathnames "id_rsa" directory)))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring path)))
+               (let ((signer (ssh-private-key-signer
+                              (ssh-load-private-key path))))
+                 ;; OpenSSH's order puts SHA-512 first.
+                 (is (equal '("rsa-sha2-512" "rsa-sha2-256")
+                            (cl-pnet-ssh::ssh-signer-signature-algorithms
+                             signer)))
+                 (is (string= "rsa-sha2-512"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer nil)))
+                 ;; A configured list is tried in its own order.
+                 (is (string= "rsa-sha2-256"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer '("rsa-sha2-256"))))
+                 ;; server-sig-algs names signatures, so an old server that
+                 ;; only verifies SHA-256 still gets rsa-sha2-256.
+                 (is (string= "rsa-sha2-256"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer nil
+                               :server-algorithms '("rsa-sha2-256"))))
+                 ;; No overlap means no name at all, so the caller skips it.
+                 (is (null (cl-pnet-ssh::ssh-signer-signature-algorithm
+                            signer nil
+                            :server-algorithms '("ssh-ed25519"))))
+                 ;; The retyped signer names and signs with the chosen digest.
+                 (let ((sha512 (cl-pnet-ssh::ssh-signer-for-algorithm
+                                signer "rsa-sha2-512"))
+                       (sha256 (cl-pnet-ssh::ssh-signer-for-algorithm
+                                signer "rsa-sha2-256")))
+                   (is (string= "rsa-sha2-512"
+                                (cl-pnet-ssh::ssh-signer-type sha512)))
+                   (is (string= "rsa-sha2-256"
+                                (cl-pnet-ssh::ssh-signer-type sha256)))
+                   (is (equalp (cl-pnet-ssh::ssh-signer-blob signer)
+                               (cl-pnet-ssh::ssh-signer-blob sha512)))
+                   (dolist (spec (list (cons sha512 "rsa-sha2-512")
+                                       (cons sha256 "rsa-sha2-256")))
+                     (funcall (cl-pnet-ssh::ssh-signer-sign (car spec))
+                              (octets-ascii "rsa signer data")
+                              (lambda (signature)
+                                (is (string= (cdr spec)
+                                             (nth-value
+                                              0 (ssh-parse-signature-blob
+                                                 signature)))))
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (is nil)))))
+                 ;; A single allowed name keeps the key.
+                 (is (= 1 (length (cl-pnet-ssh::ssh-filter-signers
+                                   (list signer) '("rsa-sha2-512")))))
+                 (is (= 1 (length (cl-pnet-ssh::ssh-filter-signers
+                                   (list signer) '("rsa-sha2-256")))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test rsa-certificate-offers-both-spellings
+  "An RSA certificate is named with SHA-512 or SHA-256, as the peer allows."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa-cert-sigalg"))
+             (ca (merge-pathnames "ca" directory))
+             (user (merge-pathnames "user" directory)))
+        (ensure-directories-exist ca)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring ca)))
+               (ssh-keygen (list "-q" "-t" "rsa" "-b" "2048" "-N" ""
+                                 "-f" (namestring user)))
+               (ssh-keygen (list "-q" "-s" (namestring ca) "-I" "rsa-id"
+                                 "-n" "turtle" "-V" "-1m:+52w"
+                                 (namestring
+                                  (merge-pathnames "user.pub" directory))))
+               (let ((signer (ssh-private-key-signer
+                              (ssh-load-private-key user))))
+                 (is (string= "rsa-sha2-512-cert-v01@openssh.com"
+                              (cl-pnet-ssh::ssh-signer-type signer)))
+                 (is (equal '("rsa-sha2-512-cert-v01@openssh.com"
+                              "rsa-sha2-256-cert-v01@openssh.com")
+                            (cl-pnet-ssh::ssh-signer-signature-algorithms
+                             signer)))
+                 ;; server-sig-algs lists the signature, not the certificate
+                 ;; key type, so SHA-256 alone still allows the certificate.
+                 (is (string= "rsa-sha2-256-cert-v01@openssh.com"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer nil
+                               :server-algorithms '("rsa-sha2-256"))))
+                 (let ((sha512 (cl-pnet-ssh::ssh-signer-for-algorithm
+                                signer "rsa-sha2-512-cert-v01@openssh.com")))
+                   (is (string= "rsa-sha2-512-cert-v01@openssh.com"
+                                (cl-pnet-ssh::ssh-signer-type sha512)))
+                   (funcall (cl-pnet-ssh::ssh-signer-sign sha512)
+                            (octets-ascii "cert signer data")
+                            (lambda (signature)
+                              (is (string= "rsa-sha2-512"
+                                           (nth-value
+                                            0 (ssh-parse-signature-blob
+                                               signature)))))
+                            (lambda (condition)
+                              (declare (ignore condition))
+                              (is nil))))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (defun ssh-test-known-host-blob ()
   (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
 
@@ -3457,19 +3569,22 @@ newline")))
 (test facade-client-agent-understands-none-and-the-environment
   (is (eq t (cl-pnet-ssh::ssh-config-client-agent
              (facade-options '(:identity-agent :environment)) nil)))
-  (is (null (cl-pnet-ssh::ssh-config-client-agent
-             (facade-options '(:identity-agent :none)) nil)))
+  ;; :NONE is "no agent at all", distinct from NIL, which lets a transport
+  ;; fall back to SSH_AUTH_SOCK.
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-agent
+                 (facade-options '(:identity-agent :none)) nil)))
   ;; An explicit command-line answer wins over the file.
   (is (string= "/tmp/explicit.sock"
                (cl-pnet-ssh::ssh-config-client-agent
                 (facade-options '(:identity-agent "/tmp/config.sock"))
                 "/tmp/explicit.sock")))
   ;; "none" and SSH_AUTH_SOCK from -o mean what they do in the file.
-  (is (null (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "none")))
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-agent
+                 (facade-options nil) "none")))
   (is (eq t (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "SSH_AUTH_SOCK")))
   ;; IdentitiesOnly turns the environment's agent off.
-  (is (null (cl-pnet-ssh::ssh-config-client-agent
-             (facade-options '(:identities-only t)) nil))))
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-agent
+                 (facade-options '(:identities-only t)) nil))))
 
 (test facade-client-identities-keep-the-file-order
   (let ((options (facade-options
@@ -3558,7 +3673,7 @@ newline")))
     (is (= 2200 (getf parameters :port)))
     (is (equal "file-user" (getf parameters :user)))
     (is (equal '("first" "second") (getf parameters :private-key)))
-    (is (null (getf parameters :agent)))
+    (is (eq :none (getf parameters :agent)))
     (is (equal '("/u/known")
                (mapcar #'namestring (getf parameters :known-hosts))))
     (is (equal '("/e/known")

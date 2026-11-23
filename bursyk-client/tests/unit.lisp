@@ -1021,6 +1021,13 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                   text))
       (is (search "hostbasedacceptedalgorithms ssh-ed25519-cert-v01@openssh.com,"
                   text))
+      ;; RSA appears under both RFC 8332 names, SHA-512 first, for the
+      ;; certificate and the plain key alike.
+      (is (search (concatenate 'string
+                               "rsa-sha2-512-cert-v01@openssh.com,"
+                               "rsa-sha2-256-cert-v01@openssh.com,")
+                  text))
+      (is (search "rsa-sha2-512,rsa-sha2-256" text))
       (is (search "identityfile" text))
       (is (not (search "proxyjump" text)))
       (is (not (search "proxycommand" text))))))

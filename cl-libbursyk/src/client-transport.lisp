@@ -155,9 +155,10 @@ line, and NIL while the line is still incomplete."
 (defun ssh-client-handle-ext-info (client payload)
   "Read RFC 8308 extensions and remember the ones this client can use.
 
-Only ping@openssh.com matters here: version 0 lets the client send PING as
-chaff while it hides keystroke timing.  A malformed announcement is a protocol
-error rather than something to guess past, as OpenSSH treats it."
+ping@openssh.com lets the client send PING as chaff while it hides keystroke
+timing, and server-sig-algs limits publickey to the signature algorithms the
+server verifies.  A malformed announcement is a protocol error rather than
+something to guess past, as OpenSSH treats it."
   (let ((reader (ssh-make-reader payload)))
     (ssh-read-u8 reader)
     (let ((count (ssh-read-u32 reader)))
@@ -175,6 +176,14 @@ error rather than something to guess past, as OpenSSH treats it."
              (when (and (= (length value) 1) (= (aref value 0) 48))
                (setf (ssh-client-ping-supported client) t)
                (ssh-log "server supports ping@openssh.com")))
+            ((string= name "server-sig-algs")
+             ;; The value is a comma-separated name-list, not an SSH
+             ;; name-list field, so it arrives as one string.
+             (setf (ssh-client-server-sig-algs client)
+                   (uiop:split-string (ssh-octets-string value)
+                                      :separator ","))
+             (ssh-log "server signature algorithms: ~A"
+                      (ssh-octets-string value)))
             ((string= name "agent-forward")
              ;; Version 0 selects RFC 9987's agent-req and agent-connect.
              (when (and (= (length value) 1) (= (aref value 0) 48))
@@ -556,8 +565,20 @@ another exchange, exactly as OpenSSH's queue drain does."
   "Keys to offer before giving up, matching OpenSSH's default.")
 
 (defun ssh-client-current-signer (client)
-  "The signer the next publickey request uses."
-  (nth (ssh-client-auth-index client) (ssh-client-signers client)))
+  "The signer the next publickey request uses, named as the peer allows.
+
+An RSA key answers as rsa-sha2-512 or rsa-sha2-256; PubkeyAcceptedAlgorithms
+and the server's server-sig-algs decide which name the request carries.  NIL
+means no name both sides allow, and the caller skips to the next key."
+  (let ((signer (nth (ssh-client-auth-index client)
+                     (ssh-client-signers client))))
+    (when signer
+      (let ((algorithm
+              (ssh-signer-signature-algorithm
+               signer
+               (ssh-client-pubkey-accepted-algorithms client)
+               :server-algorithms (ssh-client-server-sig-algs client))))
+        (and algorithm (ssh-signer-for-algorithm signer algorithm))))))
 
 (defun ssh-client-auth-request-unsigned (client)
   "The publickey request without its signature."
@@ -613,8 +634,11 @@ request goes out from the callback rather than from this function's tail."
         name
         (concatenate 'string name "."))))
 
-(defun ssh-client-hostbased-request-unsigned (client)
-  "The hostbased request without its signature."
+(defun ssh-client-hostbased-request-unsigned (client &optional algorithm)
+  "The hostbased request without its signature, naming ALGORITHM.
+
+Without ALGORITHM the key's best name under HostbasedAcceptedAlgorithms is
+used, which is what a caller that has not chosen one wants."
   (let ((writer (ssh-writer))
         (key (ssh-client-hostbased-key client)))
     (unless key
@@ -624,7 +648,10 @@ request goes out from the callback rather than from this function's tail."
     (ssh-write-text writer (ssh-client-user client))
     (ssh-write-text writer "ssh-connection")
     (ssh-write-text writer "hostbased")
-    (ssh-write-text writer (ssh-private-key-algorithm key))
+    (ssh-write-text writer
+                    (or algorithm
+                        (ssh-private-key-algorithm
+                         key (ssh-client-hostbased-accepted-algorithms client))))
     (ssh-write-string writer (ssh-public-key-blob-of key))
     (ssh-write-text writer (ssh-client-local-host-name))
     (ssh-write-text writer (ssh-default-user))
@@ -634,12 +661,16 @@ request goes out from the callback rather than from this function's tail."
   "Offer the host key, signing the session id and the hostbased request."
   (handler-case
       (let* ((key (ssh-client-hostbased-key client))
-             (unsigned (ssh-client-hostbased-request-unsigned client))
+             (algorithm
+               (ssh-private-key-algorithm
+                key (ssh-client-hostbased-accepted-algorithms client)))
+             (unsigned (ssh-client-hostbased-request-unsigned client algorithm))
              (data (let ((writer (ssh-writer)))
                      (ssh-write-string writer (ssh-client-session-id client))
                      (ssh-write-octets writer unsigned)
                      (ssh-writer-output writer)))
-             (signature (ssh-private-key-signature-blob key data)))
+             (signature (ssh-private-key-signature-blob
+                         key data :algorithm algorithm)))
         (setf (ssh-client-last-auth-method client) "hostbased")
         (let ((writer (ssh-writer)))
           (ssh-write-octets writer unsigned)
@@ -808,13 +839,22 @@ the client prompt for a method the server refused."
       ((string= method "hostbased")
        (ssh-client-send-hostbased-request client))
       ((string= method "publickey")
-       (if (ssh-client-current-signer client)
-           (ssh-client-send-publickey-request client)
-           (ssh-client-send-next-auth-method client)))
+       (ssh-client-offer-next-signer client))
       ((string= method "keyboard-interactive")
        (ssh-client-send-kbd-interactive-request client))
       ((string= method "password")
        (ssh-client-send-password-request client)))))
+
+(defun ssh-client-offer-next-signer (client)
+  "Offer the next signer the peer can verify, or move on to another method.
+
+A key with no algorithm both sides allow is skipped rather than ending
+publickey, because a later key may still match."
+  (loop
+    (if (ssh-client-current-signer client)
+        (return (ssh-client-send-publickey-request client))
+        (unless (ssh-client-next-signer-p client)
+          (return (ssh-client-send-next-auth-method client))))))
 
 (defun ssh-client-handle-banner (client payload)
   "Store a USER AUTH BANNER, which the program shows as it likes.

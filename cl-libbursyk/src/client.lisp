@@ -114,18 +114,22 @@ The agent's ssh-ed25519 keys are offered first, then the key files, which
 is the order OpenSSH uses.  PRIVATE-KEY may be one key or a list, and the
 default ~/.ssh/id_ed25519 fills in when no file is named.  AGENT is T for
 SSH_AUTH_SOCK or a socket path; without an explicit key the environment's
-agent is used when SSH_AUTH_SOCK is set.  A failing agent does not hide
-working key files, and vice versa.  ON-ERROR receives an
+agent is used when SSH_AUTH_SOCK is set.  AGENT may also be :NONE, which
+turns the agent off outright, as IdentityAgent none does.  A failing agent
+does not hide working key files, and vice versa.  ON-ERROR receives an
 ssh-authentication-error only when nothing is left to try.
 
 CERTIFICATE-FILES are CertificateFile paths.  Each certificate is attached
 to the signer whose key it certifies, file or agent, and the automatic
 KEY-cert.pub lookup is disabled, as in ssh."
   (let* ((keys (ssh-default-key-sources private-key))
-         (agent (or agent
-                    (and (null private-key)
-                         (uiop:getenv "SSH_AUTH_SOCK")
-                         t)))
+         ;; :NONE is the configuration layer's way of saying the agent is
+         ;; off, which is not the same as NIL, "the caller named no agent".
+         (agent (cond ((eq agent :none) nil)
+                      (agent agent)
+                      ((null private-key)
+                       (and (uiop:getenv "SSH_AUTH_SOCK") t))
+                      (t nil)))
          (certificates (ssh-load-certificate-files certificate-files))
          (certificate-files-specified (not (null certificates)))
          (deliver
@@ -561,20 +565,25 @@ address is known, because it has to be in the same family."
     "/etc/ssh/ssh_host_rsa_key")
   "Where ssh looks for a hostbased client host key.")
 
-(defun ssh-private-key-algorithm (key)
-  "The hostbased algorithm name for private KEY."
+(defun ssh-private-key-signature-algorithms (key)
+  "The signature algorithm names private KEY can answer, most preferred first."
   (let ((type (ssh-private-key-type key)))
     (if (string= type "ssh-rsa")
-        "rsa-sha2-256"
-        type)))
+        '("rsa-sha2-512" "rsa-sha2-256")
+        (list type))))
+
+(defun ssh-private-key-algorithm (key &optional patterns)
+  "The hostbased algorithm name for private KEY, or NIL when none is allowed.
+
+PATTERNS is HostbasedAcceptedAlgorithms, tried in its order; NIL leaves every
+name eligible."
+  (ssh-select-signature-algorithm (ssh-private-key-signature-algorithms key)
+                                  patterns nil))
 
 (defun ssh-hostbased-key-allowed-p (client key)
-  "Whether KEY's type matches HostbasedAcceptedAlgorithms."
-  (let ((algorithm (ssh-private-key-algorithm key))
-        (patterns (ssh-client-hostbased-accepted-algorithms client)))
-    (or (null patterns)
-        (some (lambda (pattern) (ssh-match-pattern pattern algorithm))
-              patterns))))
+  "Whether KEY has an algorithm HostbasedAcceptedAlgorithms allows."
+  (not (null (ssh-private-key-algorithm
+              key (ssh-client-hostbased-accepted-algorithms client)))))
 
 (defun ssh-load-hostbased-key (client)
   "The first readable host key that HostbasedAcceptedAlgorithms permits."
@@ -756,6 +765,7 @@ protected file.  With no PRIVATE-KEY every default identity file that exists
 (~/.ssh/id_ed25519, id_ecdsa, then ~/.ssh/id_rsa) is added.  AGENT (T for
 SSH_AUTH_SOCK, or a socket path) offers every key the agent can sign with;
 when both are available the agent's keys are tried first, as OpenSSH does.
+AGENT :NONE turns the agent off, as IdentityAgent none does.
 CERTIFICATE-FILES lists user certificate files; each is offered with the
 private key it certifies, and naming one stops the KEY-cert.pub automatic
 lookup, as in ssh.

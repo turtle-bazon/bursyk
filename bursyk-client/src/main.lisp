@@ -2896,7 +2896,7 @@ drops it."
               (agent-only '()))
           (setf certs (dump-sort-identities certs))
           (let ((agent (cl-pnet-ssh::ssh-config-client-agent options nil)))
-            (when agent
+            (when (and agent (not (eq agent :none)))
               (handler-case
                   (dolist (entry
                            (cl-pnet-ssh:ssh-agent-identities-blocking

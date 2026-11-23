@@ -414,8 +414,12 @@ as two mpints, the layout RFC 5656 names."
         (ssh-write-string outer (ssh-writer-output inner))
         (ssh-writer-output outer)))))
 
-(defun ssh-private-key-signature-blob (key message)
-  "A signature blob of MESSAGE under a loaded private KEY, or signal."
+(defun ssh-private-key-signature-blob (key message &key algorithm)
+  "A signature blob of MESSAGE under a loaded private KEY, or signal.
+
+ALGORITHM names the signature algorithm the request asked for; an RSA key
+uses it to pick SHA-256 or SHA-512.  Without it RSA signs as rsa-sha2-256,
+the form every OpenSSH since 7.2 understands."
   (let ((type (ssh-private-key-type key)))
     (cond
       ((string= type "ssh-ed25519")
@@ -425,11 +429,9 @@ as two mpints, the layout RFC 5656 names."
                      :end2 (length "ecdsa-sha2-")))
        (ssh-ecdsa-signature-blob key message))
       ((string= type "ssh-rsa")
-       ;; rsa-sha2-256 is supported by every OpenSSH since 7.2, which is the
-       ;; same floor that already requires rsa-sha2 for host keys.  Old
-       ;; servers that only know ssh-rsa are rare and can still use the
-       ;; agent or an explicit legacy path later.
-       (ssh-rsa-signature-blob key message :sha256))
+       (ssh-rsa-signature-blob
+        key message
+        (or (and algorithm (ssh-rsa-digest-keyword algorithm)) :sha256)))
       (t
        (error 'ssh-authentication-error
               :detail (format nil "unsupported private key type ~A" type))))))

@@ -239,6 +239,39 @@ BURZAY (which now asks for AAAA under :INET6) instead of being funcalled."
            (is (= 2 (second (first result)))))
       (when server (ignore-errors (cl-pnet:udp-close server))))))
 
+(test none-agent-is-not-the-environment-agent
+  "AGENT :NONE disables the agent even when SSH_AUTH_SOCK is set, which is
+what IdentityAgent none and IdentitiesOnly ask for."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-no-agent"))
+             (path (merge-pathnames "id_ed25519" directory))
+             (delivered '())
+             (failure nil))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring path)))
+               (cl-pnet-ssh::ssh-resolve-signers
+                (list (ssh-load-private-key path)) :none nil
+                (lambda (signers) (setf delivered signers))
+                (lambda (condition) (setf failure condition)))
+               (is (null failure))
+               (is (= 1 (length delivered)))
+               (is (string= "ssh-ed25519"
+                            (cl-pnet-ssh::ssh-signer-type (first delivered))))
+               ;; With no key file the agent would be the only source; :NONE
+               ;; must leave nothing to try instead of consulting the socket.
+               (setf delivered nil failure nil)
+               (cl-pnet-ssh::ssh-resolve-signers
+                nil :none nil
+                (lambda (signers) (setf delivered signers))
+                (lambda (condition) (setf failure condition)))
+               (is (null delivered))
+               (is (typep failure 'ssh-authentication-error)))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test client-builds-a-hostbased-request
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")

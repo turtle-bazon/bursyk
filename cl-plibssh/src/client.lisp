@@ -1236,7 +1236,9 @@ stream on its pipes instead of dialling."
                  :host-key-policy (or host-key-policy :ask)
                  :host-key-callback host-key-callback
                  :private-key private-key
-                 :agent agent
+                 ;; :NONE is the configuration layer's "no agent"; libssh
+                 ;; only consults the agent when this slot is set.
+                 :agent (if (eq agent :none) nil agent)
                  :passphrase passphrase
                  :connect-timeout connect-timeout
                  :server-alive-interval server-alive-interval

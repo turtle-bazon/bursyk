@@ -941,17 +941,65 @@ keep the server's key blob, so the picture is built the same way."
 
 ;;; ---- Signer filtering ----
 
-(defun ssh-filter-signers (signers patterns &key minimum-rsa-size)
-  "SIGNERS whose type matches PATTERNS and whose RSA modulus is large enough.
+(defparameter +ssh-certificate-suffix+ "-cert-v01@openssh.com")
 
-A NIL PATTERNS list leaves every type eligible.  MINIMUM-RSA-SIZE is
+(defun ssh-signature-algorithm-base (name)
+  "NAME without its certificate suffix, the signature it is made with."
+  (let ((start (- (length name) (length +ssh-certificate-suffix+))))
+    (if (and (not (minusp start))
+             (string= +ssh-certificate-suffix+ name :start2 start))
+        (subseq name 0 start)
+        name)))
+
+(defun ssh-select-signature-algorithm (names patterns server-algorithms)
+  "The first of NAMES that PATTERNS and SERVER-ALGORITHMS allow, or NIL.
+
+NAMES is in the signer's own preference order.  PATTERNS is the configured
+PubkeyAcceptedAlgorithms or HostbasedAcceptedAlgorithms list, tried in its
+order so an explicit ordering wins; NIL leaves every name eligible.
+SERVER-ALGORITHMS is RFC 8308's server-sig-algs, which limits publickey to
+the names the server says it verifies; NIL means the server said nothing.
+A certificate name is checked by the signature it carries, because
+server-sig-algs lists signatures, not certificate key types, and only RSA
+has more than one signature spelling to choose between."
+  (let ((candidates names))
+    (when server-algorithms
+      (setf candidates
+            (remove-if-not
+             (lambda (name)
+               (let ((base (ssh-signature-algorithm-base name)))
+                 (or (null (ssh-rsa-digest-keyword base))
+                     (member base server-algorithms :test #'string=))))
+             candidates)))
+    (when candidates
+      (if (null patterns)
+          (first candidates)
+          (block select
+            (dolist (pattern patterns)
+              (let ((match (find-if (lambda (name)
+                                      (ssh-match-pattern pattern name))
+                                    candidates)))
+                (when match (return-from select match)))))))))
+
+(defun ssh-signer-signature-algorithm (signer patterns &key server-algorithms)
+  "The algorithm name SIGNER should use, or NIL when none is allowed."
+  (ssh-select-signature-algorithm (ssh-signer-signature-algorithms signer)
+                                  patterns server-algorithms))
+
+(defun ssh-filter-signers (signers patterns &key minimum-rsa-size)
+  "SIGNERS that PATTERNS allow and whose RSA modulus is large enough.
+
+A signer matches when any algorithm it can answer matches a pattern, so an
+RSA key is kept for PubkeyAcceptedAlgorithms rsa-sha2-512 alone.  A NIL
+PATTERNS list leaves every type eligible.  MINIMUM-RSA-SIZE is
 RequiredRSASize: it only rejects RSA keys below the floor, as ssh does."
   (remove-if
    (lambda (signer)
      (or (and patterns
               (not (some (lambda (pattern)
-                           (ssh-match-pattern pattern
-                                              (ssh-signer-type signer)))
+                           (some (lambda (algorithm)
+                                   (ssh-match-pattern pattern algorithm))
+                                 (ssh-signer-signature-algorithms signer)))
                          patterns)))
          (not (ssh-key-rsa-size-allowed-p (ssh-signer-blob signer)
                                           minimum-rsa-size))))

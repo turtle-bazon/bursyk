@@ -79,19 +79,21 @@ would."
   "The agent to use: EXPLICIT, or the one the config and environment select.
 
 OpenSSH uses SSH_AUTH_SOCK unless IdentityAgent or IdentitiesOnly says
-otherwise, so an identity file alone does not disable the agent."
+otherwise, so an identity file alone does not disable the agent.  The
+returned :NONE means no agent at all; it is distinct from NIL, which a
+transport reads as "ask the environment when no key was named"."
   (cond
     ((null explicit)
      (if (ssh-config-options-identities-only options)
-         nil
+         :none
          (let ((value (ssh-config-options-identity-agent options)))
            (case value
-             (:none nil)
+             (:none :none)
              (:environment t)
-             ((nil) (and (uiop:getenv "SSH_AUTH_SOCK") t))
+             ((nil) (or (and (uiop:getenv "SSH_AUTH_SOCK") t) :none))
              (t value)))))
-    ((eq explicit :none) nil)
-    ((and (stringp explicit) (string-equal explicit "none")) nil)
+    ((eq explicit :none) :none)
+    ((and (stringp explicit) (string-equal explicit "none")) :none)
     ((and (stringp explicit) (string-equal explicit "SSH_AUTH_SOCK")) t)
     (t explicit)))
 

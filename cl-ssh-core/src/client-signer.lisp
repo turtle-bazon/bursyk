@@ -12,7 +12,33 @@
 (defstruct (ssh-signer (:constructor %make-ssh-signer))
   (type nil)
   (blob nil)
-  (sign nil))
+  (sign nil)
+  ;; Other public key algorithm names this key can answer, with the function
+  ;; that signs under each.  An RSA key answers as rsa-sha2-512 or
+  ;; rsa-sha2-256 depending on what the peer accepts; a key with one spelling
+  ;; leaves this empty.
+  (alternates nil))
+
+(defun ssh-signer-signature-algorithms (signer)
+  "The public key algorithm names SIGNER can answer, most preferred first."
+  (cons (ssh-signer-type signer)
+        (mapcar #'car (ssh-signer-alternates signer))))
+
+(defun ssh-signer-for-algorithm (signer algorithm)
+  "SIGNER retyped as ALGORITHM, or NIL when it cannot answer ALGORITHM.
+
+The returned signer names ALGORITHM in its requests and signs with the digest
+that name implies; the public key blob is unchanged."
+  (cond
+    ((string= algorithm (ssh-signer-type signer)) signer)
+    (t
+     (let ((alternate (assoc algorithm (ssh-signer-alternates signer)
+                             :test #'string=)))
+       (when alternate
+         (let ((copy (copy-ssh-signer signer)))
+           (setf (ssh-signer-type copy) algorithm
+                 (ssh-signer-sign copy) (cdr alternate))
+           copy))))))
 
 (defun ssh-public-key-file-blob (path)
   "The key blob on the first non-blank line of PATH, or NIL.
@@ -55,14 +81,16 @@ pair them; silently offering the wrong identity would be worse."
                       certificate-path path))
               (t (values certificate blob)))))))))
 
-(defun ssh-certificate-signer-type (certificate)
+(defun ssh-certificate-signer-type (certificate &optional (algorithm nil))
   "The userauth algorithm name for CERTIFICATE.
 
 An RSA certificate is offered under an RFC 8332 certificate name so that the
-signature inside it, which this client makes with SHA-256, is the algorithm
-that name implies.  The other key types use their own certificate name."
+signature inside it, which this client makes with the named digest, is the
+algorithm that name implies.  ALGORITHM is the plain name to spell as a
+certificate name, rsa-sha2-512 by default, matching OpenSSH's preference.  The
+other key types use their own certificate name."
   (if (string= (ssh-certificate-plain-key-type certificate) "ssh-rsa")
-      "rsa-sha2-256-cert-v01@openssh.com"
+      (format nil "~A-cert-v01@openssh.com" (or algorithm "rsa-sha2-512"))
       (ssh-certificate-key-type certificate)))
 
 (defun ssh-private-key-signer (key &key certificate-files-specified)
@@ -79,21 +107,32 @@ CERT.pub beside a key only when no CertificateFile was configured."
       (if certificate-files-specified
           (values nil nil)
           (ssh-private-key-certificate key))
-    (let ((type (ssh-private-key-type key)))
-      (when (and (null certificate) (string= type "ssh-rsa"))
-        ;; The request names the signature algorithm, not the key type, so an
-        ;; RSA key signs as rsa-sha2-256 while its blob stays ssh-rsa.
-        (setf type (ssh-rsa-signature-algorithm :sha256)))
-      (%make-ssh-signer
-       :type (if certificate
-                 (ssh-certificate-signer-type certificate)
-                 type)
-       :blob (or certificate-blob (ssh-public-key-blob-of key))
-       :sign (lambda (data on-signature on-error)
-               (handler-case
-                   (funcall on-signature
-                            (ssh-private-key-signature-blob key data))
-                 (error (condition) (funcall on-error condition))))))))
+    (let* ((type (ssh-private-key-type key))
+           (rsa (string= type "ssh-rsa"))
+           ;; The request names the signature algorithm, not the key type, so
+           ;; an RSA key signs as rsa-sha2-512 while its blob stays ssh-rsa.
+           (plain-algorithm
+             (if rsa (ssh-rsa-signature-algorithm :sha512) type)))
+      (flet ((make-sign (algorithm)
+               (lambda (data on-signature on-error)
+                 (handler-case
+                     (funcall on-signature
+                              (ssh-private-key-signature-blob
+                               key data :algorithm algorithm))
+                   (error (condition) (funcall on-error condition))))))
+        (let ((signer
+                (%make-ssh-signer
+                 :type plain-algorithm
+                 :blob (ssh-public-key-blob-of key)
+                 :alternates
+                 (when rsa
+                   (list (cons "rsa-sha2-256" (make-sign "rsa-sha2-256"))))
+                 :sign (make-sign plain-algorithm))))
+          ;; A certificate beside the key is offered instead of the plain
+          ;; key, with both of an RSA certificate's RFC 8332 spellings.
+          (if certificate
+              (ssh-signer-with-certificate signer certificate certificate-blob)
+              signer))))))
 
 (defun ssh-load-certificate-files (paths)
   "Load the certificates named by PATHS, as (CERT-BLOB . CERTIFICATE) pairs.
@@ -136,11 +175,20 @@ certifies is available as SSH-CERTIFICATE-PLAIN-BLOB."
   "SIGNER offering CERTIFICATE, whose wire blob is BLOB.
 
 The private key is still SIGNER's, so its signing function is reused; only
-the advertised type and public blob change."
-  (%make-ssh-signer
-   :type (ssh-certificate-signer-type certificate)
-   :blob blob
-   :sign (ssh-signer-sign signer)))
+the advertised type and public blob change.  An RSA certificate has two RFC
+8332 spellings, so both are offered and the request uses whichever the peer
+accepts."
+  (let ((rsa (string= (ssh-certificate-plain-key-type certificate) "ssh-rsa")))
+    (%make-ssh-signer
+     :type (ssh-certificate-signer-type certificate)
+     :blob blob
+     :sign (ssh-signer-sign signer)
+     :alternates
+     (when rsa
+       (let ((sha256 (ssh-signer-for-algorithm signer "rsa-sha2-256")))
+         (when sha256
+           (list (cons "rsa-sha2-256-cert-v01@openssh.com"
+                       (ssh-signer-sign sha256)))))))))
 
 (defun ssh-signers-with-certificates (signers certificates)
   "SIGNERS with each matching certificate in CERTIFICATES offered instead.
@@ -182,40 +230,45 @@ name the key type the same way the protocol does.")
     "ecdsa-sha2-nistp256-cert-v01@openssh.com"
     "ecdsa-sha2-nistp384-cert-v01@openssh.com"
     "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    "rsa-sha2-512-cert-v01@openssh.com"
     "rsa-sha2-256-cert-v01@openssh.com"
     "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
+    "rsa-sha2-512"
     "rsa-sha2-256")
   "Signature algorithms a signer here can name.
 
 The certificate spellings come first, as in OpenSSH's KEX_DEFAULT_PK_ALG,
 so a certificate is preferred over the plain key it certifies.  RSA signs as
-rsa-sha2-256 rather than the SHA-1 ssh-rsa, so PubkeyAcceptedAlgorithms is
-resolved against this list; naming ssh-rsa is an error rather than a silent
-downgrade.  Certificate types are here because a certificate signs in under
-its own name, not the plain key's.")
+rsa-sha2-512 or rsa-sha2-256 rather than the SHA-1 ssh-rsa, so
+PubkeyAcceptedAlgorithms is resolved against this list; naming ssh-rsa is an
+error rather than a silent downgrade.  Certificate types are here because a
+certificate signs in under its own name, not the plain key's.")
 
 (defun ssh-agent-signer (key-blob path)
   "A signer that has the agent at PATH sign with KEY-BLOB."
   (multiple-value-bind (type data) (ssh-public-key-parts key-blob)
     (declare (ignore data))
-    (let ((algorithm (if (string= type "ssh-rsa")
-                         (ssh-rsa-signature-algorithm :sha256)
-                         type))
-          ;; ssh-agent flag 2 asks an RSA key for rsa-sha2-256; the other
-          ;; key types ignore the flags.
-          (flags (if (string= type "ssh-rsa") 2 0)))
-      (%make-ssh-signer
-       :type algorithm
-       :blob key-blob
-       :sign (lambda (data on-signature on-error)
-               (ssh-agent-sign key-blob data
-                               :path path
-                               :flags flags
-                               :on-signature on-signature
-                               :on-error on-error))))))
+    (let* ((rsa (string= type "ssh-rsa"))
+           (algorithm (if rsa (ssh-rsa-signature-algorithm :sha512) type))
+           ;; ssh-agent flags 2 and 4 ask an RSA key for rsa-sha2-256 and
+           ;; rsa-sha2-512; the other key types ignore the flags.
+           (flags (if rsa 4 0)))
+      (flet ((make-sign (flags)
+               (lambda (data on-signature on-error)
+                 (ssh-agent-sign key-blob data
+                                 :path path
+                                 :flags flags
+                                 :on-signature on-signature
+                                 :on-error on-error))))
+        (%make-ssh-signer
+         :type algorithm
+         :blob key-blob
+         :alternates (when rsa
+                       (list (cons "rsa-sha2-256" (make-sign 2))))
+         :sign (make-sign flags))))))
 
 (defun ssh-agent-signers (&key path on-signers on-error)
   "The agent's usable signers, delivered to ON-SIGNERS without blocking.
