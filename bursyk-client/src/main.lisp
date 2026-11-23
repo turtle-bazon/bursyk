@@ -7,8 +7,11 @@
 ;;;; The option surface follows ssh(1): the same short flags, clustered where
 ;;;; they are flags and with an attached value where they take one.  Features
 ;;;; the selected transport cannot honour (X11 forwarding, remote forwarding,
-;;;; compression, PKCS#11, GSSAPI, TUN devices) are refused with a diagnostic
-;;;; instead of being silently ignored.
+;;;; compression, PKCS#11, TUN devices) are refused with a diagnostic instead
+;;;; of being silently ignored.  GSSAPIAuthentication is only a switch for a
+;;;; method this build lacks, so a config that sets it is ignored as OpenSSH
+;;;; without GSSAPI ignores it; -K, which asks for that method outright, is
+;;;; still refused.
 
 ;;; ---- Command line ----
 
@@ -477,12 +480,19 @@ refusal."
                        :x11-forward)))
         (unsupported "ForwardX11"
                      "X11 forwarding is not implemented by this transport"))
+      ;; GSSAPIAuthentication only toggles a method this build does not
+      ;; implement; it does not demand that the connection use it.  OpenSSH
+      ;; without GSSAPI reports the option as unsupported and carries on, and
+      ;; a distribution's stock ssh_config commonly sets it under "Host *".
+      ;; Refusing the connection there would make publickey unusable, so the
+      ;; toggle is ignored.  A PreferredAuthentications list that names only
+      ;; GSSAPI is still refused below.
+      (when (cl-pnet-ssh:ssh-config-options-gssapi-authentication options)
+        (cl-pnet-ssh:ssh-log
+         "GSSAPIAuthentication ignored; GSSAPI is not implemented"))
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
-      (when (cl-pnet-ssh:ssh-config-options-gssapi-authentication options)
-        (unsupported "GSSAPIAuthentication"
-                     "GSSAPI authentication is not implemented"))
       (let ((provider
               (cl-pnet-ssh:ssh-config-options-pkcs11-provider options)))
         (when (and provider (not (eq provider :none)))

@@ -338,6 +338,16 @@ CLI's decision and at the plist it filled."
            :exit-on-forward-failure t))
     (is (burs::exit-on-forward-failure-p client))))
 
+(test gssapi-config-does-not-block-other-methods
+  "A distribution's stock ssh_config sets GSSAPIAuthentication yes.  The
+directive only toggles a method this build lacks, so it must not stop the
+client from falling through to publickey."
+  (let ((client (cl-pnet-ssh::%make-ssh-client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options
+           :gssapi-authentication t))
+    (is (null (burs::check-config-supported client)))))
+
 (test stream-local-forwarding-specifications-parse
   ;; -L local_socket:remote_socket
   (let ((forward
