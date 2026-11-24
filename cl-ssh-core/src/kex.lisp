@@ -16,6 +16,14 @@
 (defconstant +ssh-msg-newkeys+ 21)
 (defconstant +ssh-msg-kex-ecdh-init+ 30)
 (defconstant +ssh-msg-kex-ecdh-reply+ 31)
+;; RFC 4419 reuses 30 and 31 for its old request and group messages, and
+;; adds 32/33 for the client and server key-exchange values.  The current
+;; request that names min/preferred/max is 34; OpenSSH 10.6 only sends that.
+(defconstant +ssh-msg-kex-dh-gex-request-old+ 30)
+(defconstant +ssh-msg-kex-dh-gex-group+ 31)
+(defconstant +ssh-msg-kex-dh-gex-init+ 32)
+(defconstant +ssh-msg-kex-dh-gex-reply+ 33)
+(defconstant +ssh-msg-kex-dh-gex-request+ 34)
 (defconstant +ssh-msg-userauth-request+ 50)
 (defconstant +ssh-msg-userauth-failure+ 51)
 (defconstant +ssh-msg-userauth-success+ 52)
@@ -378,12 +386,14 @@ groups name it too (SHA-1 for the legacy pair, SHA-512 for groups 16 and
 18); every other method this build implements uses SHA-256."
   (or (nth-value 2 (ssh-ecdh-kex-parameters kex))
       (nth-value 2 (ssh-dh-group-parameters kex))
+      (ssh-gex-kex-parameters kex)
       :sha256))
 
 (defun ssh-exchange-hash (client-version server-version
                           client-kexinit server-kexinit
                           host-key-blob client-public server-public shared
-                          &key string-shared integer-public (digest :sha256))
+                          &key string-shared integer-public gex
+                            (digest :sha256))
   "The key-exchange hash H, binding both versions, both KEXINITs, the host
 key, both ephemeral public keys and the shared secret.
 
@@ -391,15 +401,23 @@ A plain curve25519 or ECDH secret is written as an mpint.  OpenSSH's hybrid
 methods put a digest of the concatenated secret in the hash and the KDF as an
 SSH string instead, so STRING-SHARED selects that layout.  INTEGER-PUBLIC
 writes the two public values as mpints rather than SSH strings, which is
-what RFC 4253's fixed-group Diffie-Hellman needs.  DIGEST is the negotiated
+what RFC 4253's fixed-group Diffie-Hellman needs.  GEX, when non-NIL, is a
+plist with :MIN, :PREFERRED, :MAX, :PRIME and :GENERATOR; RFC 4419 writes
+those between the host key and the ephemeral keys.  DIGEST is the negotiated
 hash: SHA-256 for most methods, SHA-384/SHA-512 for the larger NIST curves,
-groups 16 and 18, and SHA-1 for the legacy MODP groups."
+groups 16 and 18, and SHA-1 for the legacy MODP and group-exchange methods."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer client-version)
     (ssh-write-text writer server-version)
     (ssh-write-string writer client-kexinit)
     (ssh-write-string writer server-kexinit)
     (ssh-write-string writer host-key-blob)
+    (when gex
+      (ssh-write-u32 writer (getf gex :min))
+      (ssh-write-u32 writer (getf gex :preferred))
+      (ssh-write-u32 writer (getf gex :max))
+      (ssh-write-mpint writer (getf gex :prime))
+      (ssh-write-mpint writer (getf gex :generator)))
     (if integer-public
         (progn
           (ssh-write-mpint writer client-public)

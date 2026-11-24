@@ -2036,3 +2036,79 @@ OpenSSH's server default."
                  "diffie-hellman-group18-sha512"))
     (is (not (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
                      :test #'string=)))))
+
+;;; ---- Group-exchange Diffie-Hellman (RFC 4419) ----
+
+(test gex-kex-parameters
+  "The group-exchange methods name their digest and nothing else matches."
+  (is (eq :sha256 (cl-pnet-ssh::ssh-gex-kex-parameters
+                   "diffie-hellman-group-exchange-sha256")))
+  (is (eq :sha1 (cl-pnet-ssh::ssh-gex-kex-parameters
+                 "diffie-hellman-group-exchange-sha1")))
+  (dolist (name '("curve25519-sha256" "diffie-hellman-group14-sha256" nil))
+    (is (null (cl-pnet-ssh::ssh-gex-kex-parameters name)))
+    (is (not (cl-pnet-ssh::ssh-gex-kex-p name))))
+  (is (cl-pnet-ssh::ssh-gex-kex-p "diffie-hellman-group-exchange-sha256")))
+
+(test gex-group-choice
+  "The server picks the smallest group that meets the client's preference."
+  (multiple-value-bind (prime bits)
+      (cl-pnet-ssh::ssh-gex-choose-group 2048 2048 8192)
+    (is (= 2048 bits))
+    (is (= 2048 (integer-length prime))))
+  (multiple-value-bind (prime bits)
+      (cl-pnet-ssh::ssh-gex-choose-group 2048 4096 8192)
+    (is (= 4096 bits))
+    (is (= 4096 (integer-length prime))))
+  (multiple-value-bind (prime bits)
+      (cl-pnet-ssh::ssh-gex-choose-group 2048 8192 8192)
+    (is (= 8192 bits))
+    (is (= 8192 (integer-length prime))))
+  ;; When the preference is above every group in range, the largest one
+  ;; below it answers rather than nothing.
+  (multiple-value-bind (prime bits)
+      (cl-pnet-ssh::ssh-gex-choose-group 2048 8192 4096)
+    (is (= 4096 bits))
+    (is (= 4096 (integer-length prime))))
+  ;; No group inside the range is a refusal, not a silently weak choice.
+  (multiple-value-bind (prime bits)
+      (cl-pnet-ssh::ssh-gex-choose-group 2049 3072 4095)
+    (is (null prime))
+    (is (null bits))))
+
+(test gex-keypair-uses-the-group-generator
+  "A moduli group may name generator 5; the public value must use it."
+  (multiple-value-bind (prime)
+      (cl-pnet-ssh::ssh-dh-group-parameters "diffie-hellman-group14-sha256")
+    (dolist (generator '(2 5))
+      (multiple-value-bind (private public)
+          (cl-pnet-ssh::ssh-gex-keypair prime generator)
+        (is (= (ironclad-unsafe:expt-mod generator private prime) public))
+        ;; The same group on the other side derives the same secret.
+        (multiple-value-bind (other-private other-public)
+            (cl-pnet-ssh::ssh-gex-keypair prime generator)
+          (is (equalp (cl-pnet-ssh::ssh-gex-shared private other-public prime)
+                      (cl-pnet-ssh::ssh-gex-shared other-private public prime)))))))
+  ;; A peer element outside 1..p-1 is a protocol error.
+  (multiple-value-bind (prime)
+      (cl-pnet-ssh::ssh-dh-group-parameters "diffie-hellman-group14-sha256")
+    (signals cl-pnet-ssh:ssh-protocol-error
+      (cl-pnet-ssh::ssh-gex-shared 12345 1 prime))
+    (signals cl-pnet-ssh:ssh-protocol-error
+      (cl-pnet-ssh::ssh-gex-shared 12345 0 prime))))
+
+(test gex-is-selectable-but-not-server-default
+  "Both group-exchange methods are implemented and in the client offer."
+  (dolist (kex '("diffie-hellman-group-exchange-sha1"
+                 "diffie-hellman-group-exchange-sha256"))
+    (is (member kex cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+    (is (cl-pnet-ssh::ssh-gex-kex-p kex)))
+  (is (member "diffie-hellman-group-exchange-sha256"
+              cl-pnet-ssh:+ssh-kex-default-algorithms+ :test #'string=))
+  (is (not (member "diffie-hellman-group-exchange-sha1"
+                   cl-pnet-ssh:+ssh-kex-default-algorithms+ :test #'string=)))
+  ;; OpenSSH's server default leaves group exchange out, like the fixed groups.
+  (dolist (kex '("diffie-hellman-group-exchange-sha1"
+                 "diffie-hellman-group-exchange-sha256"))
+    (is (not (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
+                     :test #'string=)))))

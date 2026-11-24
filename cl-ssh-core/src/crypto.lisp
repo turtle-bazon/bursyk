@@ -194,6 +194,29 @@ that range without making every exchange expensive."
          (value (ssh-mpint-integer (ssh-random-octets (ceiling width 8)))))
     (logior value (ash 1 (1- width)))))
 
+(defun ssh-dh-keypair-for-group (prime bits &optional (generator 2))
+  "A fresh keypair for PRIME as (VALUES PRIVATE-EXPONENT PUBLIC-ELEMENT).
+
+GENERATOR is the group's generator, which RFC 4419 lets a server choose
+freely; the RFC 3526 groups this build carries use 2, but a moduli file may
+name 5."
+  (loop
+    (let* ((exponent (ssh-dh-random-exponent bits))
+           (public (ironclad-unsafe:expt-mod generator exponent prime)))
+      ;; RFC 4253 requires 1 < e < p-1; the generator can in principle
+      ;; land on a small subgroup, so a fresh exponent is the safe answer.
+      (when (and (< 1 public) (< public (1- prime)))
+        (return (values exponent public))))))
+
+(defun ssh-dh-shared-for-group (private peer-public prime)
+  "The shared secret K = PEER-PUBLIC^PRIVATE mod PRIME, as mpint octets."
+  (unless (and (integerp peer-public)
+               (< 1 peer-public)
+               (< peer-public (1- prime)))
+    (error 'ssh-protocol-error
+           :detail "invalid Diffie-Hellman public key"))
+  (ssh-mpint-octets (ironclad-unsafe:expt-mod peer-public private prime)))
+
 (defun ssh-dh-keypair (kex)
   "A fresh fixed-group keypair as (VALUES PRIVATE-EXPONENT PUBLIC-ELEMENT).
 
@@ -205,13 +228,7 @@ mpint."
       (error 'ssh-protocol-error
              :detail (format nil "unsupported Diffie-Hellman key exchange ~A"
                              kex)))
-    (loop
-      (let* ((exponent (ssh-dh-random-exponent bits))
-             (public (ironclad-unsafe:expt-mod 2 exponent prime)))
-        ;; RFC 4253 requires 1 < e < p-1; the generator can in principle
-        ;; land on a small subgroup, so a fresh exponent is the safe answer.
-        (when (and (< 1 public) (< public (1- prime)))
-          (return (values exponent public)))))))
+    (ssh-dh-keypair-for-group prime bits)))
 
 (defun ssh-dh-shared (private peer-public kex)
   "The shared secret K = PEER-PUBLIC^PRIVATE mod p, as mpint octets."
@@ -221,12 +238,68 @@ mpint."
       (error 'ssh-protocol-error
              :detail (format nil "unsupported Diffie-Hellman key exchange ~A"
                              kex)))
-    (unless (and (integerp peer-public)
-                 (< 1 peer-public)
-                 (< peer-public (1- prime)))
-      (error 'ssh-protocol-error
-             :detail "invalid Diffie-Hellman public key"))
-    (ssh-mpint-octets (ironclad-unsafe:expt-mod peer-public private prime))))
+    (ssh-dh-shared-for-group private peer-public prime)))
+
+;;; ---- Group-exchange Diffie-Hellman (diffie-hellman-group-exchange-sha*) ----
+;;;
+;;; RFC 4419 lets the client ask for a group size rather than naming a fixed
+;;; group.  The server answers with a safe prime and generator from its own
+;;; set, and the exchange then runs exactly like a fixed-group one.  This
+;;; build offers the RFC 3526 groups it already carries, so no moduli file is
+;;; needed.
+
+(defparameter +ssh-gex-min-bits+ 2048)
+(defparameter +ssh-gex-preferred-bits+ 4096)
+(defparameter +ssh-gex-max-bits+ 8192)
+
+(defparameter +ssh-gex-groups+
+  (list (list +ssh-dh-group14-prime+ 2048)
+        (list +ssh-dh-group16-prime+ 4096)
+        (list +ssh-dh-group18-prime+ 8192))
+  "The safe-prime groups offered for RFC 4419 group exchange.")
+
+(defun ssh-gex-kex-parameters (kex)
+  "The digest of the group-exchange KEX, or NIL when KEX is not one."
+  (cond ((and (stringp kex)
+              (string= kex "diffie-hellman-group-exchange-sha256"))
+         :sha256)
+        ((and (stringp kex)
+              (string= kex "diffie-hellman-group-exchange-sha1"))
+         :sha1)
+        (t nil)))
+
+(defun ssh-gex-kex-p (name)
+  "Whether NAME is a group-exchange key exchange."
+  (and (stringp name) (ssh-gex-kex-parameters name) t))
+
+(defun ssh-gex-choose-group (min preferred max)
+  "The (VALUES PRIME BITS) closest to PREFERRED within MIN..MAX.
+
+The smallest group at least as large as PREFERRED wins, so a client that
+asks for a stronger group never gets a weaker one; only when none is large
+enough does the largest available group answer.  Answers NIL when no group
+fits."
+  (let ((above nil)
+        (below nil))
+    (dolist (entry +ssh-gex-groups+)
+      (let ((bits (second entry)))
+        (when (and (<= min bits) (<= bits max))
+          (cond ((>= bits preferred)
+                 (when (or (null above) (< bits (second above)))
+                   (setf above entry)))
+                (t
+                 (when (or (null below) (> bits (second below)))
+                   (setf below entry)))))))
+    (let ((best (or above below)))
+      (values (first best) (second best)))))
+
+(defun ssh-gex-keypair (prime generator)
+  "A fresh group-exchange keypair for PRIME and GENERATOR."
+  (ssh-dh-keypair-for-group prime (integer-length prime) generator))
+
+(defun ssh-gex-shared (private peer-public prime)
+  "The group-exchange shared secret, as mpint octets."
+  (ssh-dh-shared-for-group private peer-public prime))
 
 ;;; ---- ML-KEM-768 hybrids ----
 ;;;

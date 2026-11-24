@@ -155,6 +155,14 @@ CLI's decision and at the plist it filled."
                     "diffie-hellman-group14-sha1"))
       (is (not (member name (burs::default-kex-algorithms)
                        :test #'string=))))
+    ;; RFC 4419 group exchange is implemented by both transports and listed.
+    (dolist (name '("diffie-hellman-group-exchange-sha256"
+                    "diffie-hellman-group-exchange-sha1"))
+      (is (member name kex :test #'string=)))
+    (is (member "diffie-hellman-group-exchange-sha256"
+                (burs::default-kex-algorithms) :test #'string=))
+    (is (not (member "diffie-hellman-group-exchange-sha1"
+                     (burs::default-kex-algorithms) :test #'string=)))
     ;; -G reports the default offer, which leaves that hybrid out, as ssh does.
     (is (not (member "mlkem768nistp256-sha256"
                      (burs::default-kex-algorithms) :test #'string=)))))

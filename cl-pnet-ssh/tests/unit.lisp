@@ -2509,6 +2509,20 @@ share the test, so each must dispatch the same channel requests."
           (is (equal "oops" stderr))
           (is (eql 3 status))))))
 
+(test gex-loopback-exec
+  "Each RFC 4419 group-exchange method carries a real session."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (dolist (kex '("diffie-hellman-group-exchange-sha256"
+                     "diffie-hellman-group-exchange-sha1"))
+        (multiple-value-bind (stdout stderr status)
+            (ssh-test-loopback-result
+             :kex-algorithms (list kex)
+             :sshd-options (list (format nil "KexAlgorithms ~A" kex)))
+          (is (equal "hello" stdout))
+          (is (equal "oops" stderr))
+          (is (eql 3 status))))))
+
 (test compression-loopback-exec
   "A compressed session runs a command and returns its output."
   (if (not (ssh-keygen-available-p))

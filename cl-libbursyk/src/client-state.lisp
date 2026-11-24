@@ -37,6 +37,13 @@
   (negotiated nil)
   (ephemeral-private nil)
   (ephemeral-public nil)
+  ;; RFC 4419 group exchange: the sizes we asked for, and the group the
+  ;; server chose, kept until the reply computes the exchange hash.
+  (gex-min nil)
+  (gex-preferred nil)
+  (gex-max nil)
+  (gex-prime nil)
+  (gex-generator nil)
   (host-key-blob nil)
   (derived-keys nil)
   (strict-kex nil)

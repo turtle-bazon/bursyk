@@ -142,7 +142,7 @@ and NIL while the line is still incomplete."
   (when (ssh-session-ignore-next-kex-packet session)
     (setf (ssh-session-ignore-next-kex-packet session) nil)
     (when (<= +ssh-msg-kex-ecdh-init+ (aref payload 0)
-              +ssh-msg-kex-ecdh-reply+)
+              +ssh-msg-kex-dh-gex-request+)
       (return-from ssh-server-handle-payload nil)))
   (let ((type (aref payload 0)))
     (cond
@@ -159,6 +159,10 @@ and NIL while the line is still incomplete."
       ((= type +ssh-msg-kexinit+)
        (ssh-server-handle-kexinit session payload))
       ((= type +ssh-msg-kex-ecdh-init+)
+       (ssh-server-handle-kex-init session payload))
+      ((= type +ssh-msg-kex-dh-gex-request+)
+       (ssh-server-handle-gex-request session payload))
+      ((= type +ssh-msg-kex-dh-gex-init+)
        (ssh-server-handle-kex-init session payload))
       ((= type +ssh-msg-newkeys+)
        (ssh-server-handle-newkeys session))
@@ -301,6 +305,41 @@ came up."
                                  signature)
       (ssh-server-send-newkeys session))))
 
+(defun ssh-server-handle-gex-request (session payload)
+  "Answer RFC 4419's GEX_REQUEST with a group from this server's set.
+
+The exchange hash binds the sizes the client asked for, so they are kept as
+sent even when the choice clamps them to the groups this build carries."
+  (let* ((reader (ssh-make-reader payload))
+         (min (progn (ssh-read-u8 reader) (ssh-read-u32 reader)))
+         (preferred (ssh-read-u32 reader))
+         (max (ssh-read-u32 reader)))
+    ;; OpenSSH rejects an inverted or too-small request before clamping.
+    (when (or (< max min) (< preferred min) (< max preferred)
+              (< max +ssh-gex-min-bits+))
+      (error 'ssh-protocol-error
+             :detail (format nil "invalid group-exchange request ~D<~D<~D"
+                             min preferred max)))
+    (let ((lo (max +ssh-gex-min-bits+ min))
+          (want (min +ssh-gex-max-bits+
+                     (max +ssh-gex-min-bits+ preferred)))
+          (hi (min +ssh-gex-max-bits+ max)))
+      (multiple-value-bind (prime)
+          (ssh-gex-choose-group lo want hi)
+        (unless prime
+          (error 'ssh-protocol-error
+                 :detail "no matching Diffie-Hellman group"))
+        (setf (ssh-session-gex-min session) min
+              (ssh-session-gex-preferred session) preferred
+              (ssh-session-gex-max session) max
+              (ssh-session-gex-prime session) prime
+              (ssh-session-gex-generator session) 2)
+        (let ((writer (ssh-writer)))
+          (ssh-write-u8 writer +ssh-msg-kex-dh-gex-group+)
+          (ssh-write-mpint writer prime)
+          (ssh-write-mpint writer 2)
+          (ssh-session-send-payload session (ssh-writer-output writer)))))))
+
 (defun ssh-server-handle-kex-init (session payload)
   "Answer the client's key-exchange offer: host key, ephemeral key, signature.
 
@@ -308,11 +347,12 @@ A private host key signs now.  An agent-backed key sends the sign request
 and returns; the agent's callback finishes the KEX."
   (let* ((reader (ssh-make-reader payload))
          (kex (getf (ssh-session-negotiated session) :kex))
+         (gex (ssh-gex-kex-p kex))
          (dh (ssh-dh-kex-p kex))
          (client-public
            (progn
              (ssh-read-u8 reader)
-             (if dh
+             (if (or dh gex)
                  (ssh-read-mpint reader)
                  (ssh-read-string reader))))
          (algorithm (getf (ssh-session-negotiated session) :host-key))
@@ -334,6 +374,14 @@ and returns; the agent's callback finishes the KEX."
       (error 'ssh-protocol-error
              :detail (format nil "no key for host key algorithm ~A" algorithm)))
     (cond
+      (gex
+       (let ((prime (ssh-session-gex-prime session)))
+         (unless prime
+           (error 'ssh-protocol-error
+                  :detail "GEX_INIT before GEX_REQUEST"))
+         (multiple-value-setq (private server-public)
+           (ssh-gex-keypair prime (ssh-session-gex-generator session)))
+         (setf shared (ssh-gex-shared private client-public prime))))
       (dh
        (multiple-value-setq (private server-public) (ssh-dh-keypair kex))
        (setf shared (ssh-dh-shared private client-public kex)))
@@ -355,7 +403,13 @@ and returns; the agent's callback finishes the KEX."
                 host-key-blob
                 client-public server-public shared
                 :string-shared (ssh-mlkem768-hybrid-p kex)
-                :integer-public dh
+                :integer-public (or dh gex)
+                :gex (when gex
+                       (list :min (ssh-session-gex-min session)
+                             :preferred (ssh-session-gex-preferred session)
+                             :max (ssh-session-gex-max session)
+                             :prime (ssh-session-gex-prime session)
+                             :generator (ssh-session-gex-generator session)))
                 :digest (ssh-kex-digest kex)))
     (setf (ssh-session-session-id session)
           (or (ssh-session-session-id session) hash)
@@ -389,11 +443,16 @@ and returns; the agent's callback finishes the KEX."
   "Send KEX_ECDH_REPLY: our host key, ephemeral key and signature.
 
 The fixed-group exchanges put their public value on the wire as an mpint;
-ECDH and curve25519 use an SSH string."
-  (let ((writer (ssh-writer)))
-    (ssh-write-u8 writer +ssh-msg-kex-ecdh-reply+)
+ECDH and curve25519 use an SSH string.  A group exchange answers with
+RFC 4419's KEX_DH_GEX_REPLY instead."
+  (let* ((kex (getf (ssh-session-negotiated session) :kex))
+         (gex (ssh-gex-kex-p kex))
+         (writer (ssh-writer)))
+    (ssh-write-u8 writer (if gex
+                             +ssh-msg-kex-dh-gex-reply+
+                             +ssh-msg-kex-ecdh-reply+))
     (ssh-write-string writer (ssh-session-host-key-blob session))
-    (if (ssh-dh-kex-p (getf (ssh-session-negotiated session) :kex))
+    (if (or gex (ssh-dh-kex-p kex))
         (ssh-write-mpint writer server-public)
         (ssh-write-string writer server-public))
     (ssh-write-string writer signature)

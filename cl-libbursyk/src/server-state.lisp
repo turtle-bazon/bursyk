@@ -148,6 +148,13 @@ present after RequiredRSASize, for callers that only want to describe it."
   (negotiated nil)
   (ephemeral-private nil)
   (ephemeral-public nil)
+  ;; RFC 4419 group exchange: the client's requested sizes and the group
+  ;; this server chose, kept until GEX_INIT arrives.
+  (gex-min nil)
+  (gex-preferred nil)
+  (gex-max nil)
+  (gex-prime nil)
+  (gex-generator nil)
   (host-key-blob nil)
   ;; A KEX waiting for an agent-backed host key's signature.
   (kex-shared nil)

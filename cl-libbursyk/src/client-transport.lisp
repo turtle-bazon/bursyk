@@ -102,7 +102,7 @@ line, and NIL while the line is still incomplete."
   (when (ssh-client-ignore-next-kex-packet client)
     (setf (ssh-client-ignore-next-kex-packet client) nil)
     (when (<= +ssh-msg-kex-ecdh-init+ (aref payload 0)
-              +ssh-msg-kex-ecdh-reply+)
+              +ssh-msg-kex-dh-gex-request+)
       (return-from ssh-client-handle-payload nil)))
   (let ((type (aref payload 0)))
     (cond
@@ -111,7 +111,11 @@ line, and NIL while the line is still incomplete."
       ((= type +ssh-msg-kexinit+)
        (ssh-client-handle-kexinit client payload))
       ((= type +ssh-msg-kex-ecdh-reply+)
-       (ssh-client-handle-kex-reply client payload))
+       (if (ssh-gex-kex-p (getf (ssh-client-negotiated client) :kex))
+           (ssh-client-handle-gex-group client payload)
+           (ssh-client-handle-kex-reply client payload)))
+      ((= type +ssh-msg-kex-dh-gex-reply+)
+       (ssh-client-handle-gex-reply client payload))
       ((= type +ssh-msg-newkeys+)
        (ssh-client-handle-newkeys client))
       ((= type +ssh-msg-ext-info+)
@@ -274,39 +278,68 @@ its KEXINIT when the connection came up."
     (ssh-client-send-kex-init client)))
 
 (defun ssh-client-send-kex-init (client)
-  "Start the negotiated key exchange with our ephemeral public key.
+  "Start the negotiated key exchange.
 
-mlkem768x25519-sha256 sends the ML-KEM encapsulation key followed by the
-X25519 public key; a NIST-curve ECDH sends one uncompressed SEC1 point; a
-fixed-group Diffie-Hellman sends e = g^x mod p as an mpint; and curve25519
-sends the bare 32 octets."
+A group-exchange method first sends RFC 4419's size request; the server's
+GROUP message then names the prime.  mlkem768x25519-sha256 sends the ML-KEM
+encapsulation key followed by the X25519 public key; a NIST-curve ECDH sends
+one uncompressed SEC1 point; a fixed-group Diffie-Hellman sends e = g^x mod p
+as an mpint; and curve25519 sends the bare 32 octets."
   (let* ((kex (getf (ssh-client-negotiated client) :kex))
          (dh (ssh-dh-kex-p kex))
+         (gex (ssh-gex-kex-p kex))
          (ecdh (ssh-ecdh-kex-p kex)))
-    (cond
-      (dh
-       (multiple-value-bind (private public) (ssh-dh-keypair kex)
-         (setf (ssh-client-ephemeral-private client) private
-               (ssh-client-ephemeral-public client) public)))
-      ((ssh-mlkem768-hybrid-p kex)
-       (let ((state (ssh-mlkem768-hybrid-client-keypair kex)))
-         (setf (ssh-client-ephemeral-private client) state
-               (ssh-client-ephemeral-public client)
-               (ssh-mlkem768-hybrid-state-public state))))
-      (ecdh
-       (multiple-value-bind (private public) (ssh-ecdh-keypair kex)
-         (setf (ssh-client-ephemeral-private client) private
-               (ssh-client-ephemeral-public client) public)))
-      (t
-       (multiple-value-bind (private public) (ssh-curve25519-keypair)
-         (setf (ssh-client-ephemeral-private client) private
-               (ssh-client-ephemeral-public client) public))))
-    (let ((writer (ssh-writer)))
-      (ssh-write-u8 writer +ssh-msg-kex-ecdh-init+)
-      (if dh
-          (ssh-write-mpint writer (ssh-client-ephemeral-public client))
-          (ssh-write-string writer (ssh-client-ephemeral-public client)))
-      (ssh-client-send-payload client (ssh-writer-output writer)))))
+    (if gex
+        (progn
+          (setf (ssh-client-gex-min client) +ssh-gex-min-bits+
+                (ssh-client-gex-preferred client) +ssh-gex-preferred-bits+
+                (ssh-client-gex-max client) +ssh-gex-max-bits+)
+          (let ((writer (ssh-writer)))
+            (ssh-write-u8 writer +ssh-msg-kex-dh-gex-request+)
+            (ssh-write-u32 writer (ssh-client-gex-min client))
+            (ssh-write-u32 writer (ssh-client-gex-preferred client))
+            (ssh-write-u32 writer (ssh-client-gex-max client))
+            (ssh-client-send-payload client (ssh-writer-output writer))))
+        (progn
+          (cond
+            (dh
+             (multiple-value-bind (private public) (ssh-dh-keypair kex)
+               (setf (ssh-client-ephemeral-private client) private
+                     (ssh-client-ephemeral-public client) public)))
+            ((ssh-mlkem768-hybrid-p kex)
+             (let ((state (ssh-mlkem768-hybrid-client-keypair kex)))
+               (setf (ssh-client-ephemeral-private client) state
+                     (ssh-client-ephemeral-public client)
+                     (ssh-mlkem768-hybrid-state-public state))))
+            (ecdh
+             (multiple-value-bind (private public) (ssh-ecdh-keypair kex)
+               (setf (ssh-client-ephemeral-private client) private
+                     (ssh-client-ephemeral-public client) public)))
+            (t
+             (multiple-value-bind (private public) (ssh-curve25519-keypair)
+               (setf (ssh-client-ephemeral-private client) private
+                     (ssh-client-ephemeral-public client) public))))
+          (let ((writer (ssh-writer)))
+            (ssh-write-u8 writer +ssh-msg-kex-ecdh-init+)
+            (if dh
+                (ssh-write-mpint writer (ssh-client-ephemeral-public client))
+                (ssh-write-string writer (ssh-client-ephemeral-public client)))
+            (ssh-client-send-payload client (ssh-writer-output writer)))))))
+
+(defun ssh-client-complete-kex (client host-key signature shared hash)
+  "Verify the host signature and key, derive keys, and send NEWKEYS."
+  (let ((kex (getf (ssh-client-negotiated client) :kex)))
+    (ssh-verify-host-signature host-key signature hash)
+    (ssh-client-verify-host-key client host-key)
+    (setf (ssh-client-session-id client)
+          (or (ssh-client-session-id client) hash)
+          (ssh-client-host-key-blob client) host-key
+          (ssh-client-derived-keys client)
+          (ssh-session-keys (ssh-client-negotiated client)
+                            shared hash (ssh-client-session-id client)
+                            :string-shared (ssh-mlkem768-hybrid-p kex)
+                            :digest (ssh-kex-digest kex)))
+    (ssh-client-send-newkeys client)))
 
 (defun ssh-client-handle-kex-reply (client payload)
   "Check the peer's host key and signature, derive keys, send NEWKEYS."
@@ -334,7 +367,6 @@ sends the bare 32 octets."
              (t
               (ssh-curve25519-shared
                (ssh-client-ephemeral-private client) server-public))))
-         (digest (ssh-kex-digest kex))
          (hash (ssh-exchange-hash
                 (ssh-client-version-string client)
                 (ssh-client-server-version client)
@@ -346,18 +378,62 @@ sends the bare 32 octets."
                 shared
                 :string-shared hybrid
                 :integer-public dh
-                :digest digest)))
-    (ssh-verify-host-signature host-key signature hash)
-    (ssh-client-verify-host-key client host-key)
-    (setf (ssh-client-session-id client)
-          (or (ssh-client-session-id client) hash)
-          (ssh-client-host-key-blob client) host-key
-          (ssh-client-derived-keys client)
-          (ssh-session-keys (ssh-client-negotiated client)
-                            shared hash (ssh-client-session-id client)
-                            :string-shared hybrid
-                            :digest digest))
-    (ssh-client-send-newkeys client)))
+                :digest (ssh-kex-digest kex))))
+    (ssh-client-complete-kex client host-key signature shared hash)))
+
+(defun ssh-client-handle-gex-group (client payload)
+  "The server's RFC 4419 GROUP: choose our exponent and send GEX_INIT."
+  (let* ((reader (ssh-make-reader payload))
+         (prime (progn (ssh-read-u8 reader) (ssh-read-mpint reader)))
+         (generator (ssh-read-mpint reader))
+         (bits (integer-length prime)))
+    (unless (and (<= (ssh-client-gex-min client) bits)
+                 (<= bits (ssh-client-gex-max client)))
+      (error 'ssh-protocol-error
+             :detail (format nil "group-exchange prime is ~D bits, outside ~D..~D"
+                             bits (ssh-client-gex-min client)
+                             (ssh-client-gex-max client))))
+    (unless (and (> generator 1) (< generator prime))
+      (error 'ssh-protocol-error
+             :detail "invalid group-exchange generator"))
+    (multiple-value-bind (private public) (ssh-gex-keypair prime generator)
+      (setf (ssh-client-ephemeral-private client) private
+            (ssh-client-ephemeral-public client) public
+            (ssh-client-gex-prime client) prime
+            (ssh-client-gex-generator client) generator))
+    (let ((writer (ssh-writer)))
+      (ssh-write-u8 writer +ssh-msg-kex-dh-gex-init+)
+      (ssh-write-mpint writer (ssh-client-ephemeral-public client))
+      (ssh-client-send-payload client (ssh-writer-output writer)))))
+
+(defun ssh-client-handle-gex-reply (client payload)
+  "The server's RFC 4419 REPLY: verify it and finish the exchange."
+  (let* ((reader (ssh-make-reader payload))
+         (host-key (progn (ssh-read-u8 reader) (ssh-read-string reader)))
+         (server-public (ssh-read-mpint reader))
+         (signature (ssh-read-string reader))
+         (kex (getf (ssh-client-negotiated client) :kex))
+         (prime (ssh-client-gex-prime client))
+         (generator (ssh-client-gex-generator client))
+         (shared (ssh-gex-shared (ssh-client-ephemeral-private client)
+                                 server-public prime))
+         (hash (ssh-exchange-hash
+                (ssh-client-version-string client)
+                (ssh-client-server-version client)
+                (ssh-client-client-kexinit client)
+                (ssh-client-server-kexinit client)
+                host-key
+                (ssh-client-ephemeral-public client)
+                server-public
+                shared
+                :integer-public t
+                :gex (list :min (ssh-client-gex-min client)
+                           :preferred (ssh-client-gex-preferred client)
+                           :max (ssh-client-gex-max client)
+                           :prime prime
+                           :generator generator)
+                :digest (ssh-kex-digest kex))))
+    (ssh-client-complete-kex client host-key signature shared hash)))
 
 (defun ssh-client-send-newkeys (client)
   "Send NEWKEYS, then switch our sending half to the negotiated keys."
