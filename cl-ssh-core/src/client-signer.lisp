@@ -93,46 +93,56 @@ other key types use their own certificate name."
       (format nil "~A-cert-v01@openssh.com" (or algorithm "rsa-sha2-512"))
       (ssh-certificate-key-type certificate)))
 
-(defun ssh-private-key-signer (key &key certificate-files-specified)
-  "A signer backed by a loaded private KEY.
+(defun ssh-private-key-plain-signer (key)
+  "A signer that offers KEY itself, without any certificate."
+  (let* ((type (ssh-private-key-type key))
+         (rsa (string= type "ssh-rsa"))
+         ;; The request names the signature algorithm, not the key type, so
+         ;; an RSA key signs as rsa-sha2-512 while its blob stays ssh-rsa.
+         (plain-algorithm
+           (if rsa (ssh-rsa-signature-algorithm :sha512) type)))
+    (flet ((make-sign (algorithm)
+             (lambda (data on-signature on-error)
+               (handler-case
+                   (funcall on-signature
+                            (ssh-private-key-signature-blob
+                             key data :algorithm algorithm))
+                 (error (condition) (funcall on-error condition))))))
+      (%make-ssh-signer
+       :type plain-algorithm
+       :blob (ssh-public-key-blob-of key)
+       :alternates
+       (when rsa
+         (list (cons "rsa-sha2-256" (make-sign "rsa-sha2-256"))))
+       :sign (make-sign plain-algorithm)))))
 
-The signature needs no I/O, so ON-SIGNATURE runs before SIGN returns.
-ed25519, RSA and ECDSA keys all sign locally.  When KEY's file has a
-matching CERT.pub beside it, the signer offers the certificate and names its
-certificate type, while the signature is still made by the private key.
+(defun ssh-private-key-signers (key &key certificate-files-specified)
+  "The signers backed by KEY, in the order ssh tries them.
 
-CERTIFICATE-FILES-SPECIFIED suppresses that automatic lookup: ssh uses the
+The plain key comes first and the matching CERT.pub beside it follows, so a
+certificate the server refuses still leaves the key itself to try.  OpenSSH
+loads both identities for the same file.
+
+CERTIFICATE-FILES-SPECIFIED suppresses the automatic lookup: ssh uses the
 CERT.pub beside a key only when no CertificateFile was configured."
-  (multiple-value-bind (certificate certificate-blob)
-      (if certificate-files-specified
-          (values nil nil)
-          (ssh-private-key-certificate key))
-    (let* ((type (ssh-private-key-type key))
-           (rsa (string= type "ssh-rsa"))
-           ;; The request names the signature algorithm, not the key type, so
-           ;; an RSA key signs as rsa-sha2-512 while its blob stays ssh-rsa.
-           (plain-algorithm
-             (if rsa (ssh-rsa-signature-algorithm :sha512) type)))
-      (flet ((make-sign (algorithm)
-               (lambda (data on-signature on-error)
-                 (handler-case
-                     (funcall on-signature
-                              (ssh-private-key-signature-blob
-                               key data :algorithm algorithm))
-                   (error (condition) (funcall on-error condition))))))
-        (let ((signer
-                (%make-ssh-signer
-                 :type plain-algorithm
-                 :blob (ssh-public-key-blob-of key)
-                 :alternates
-                 (when rsa
-                   (list (cons "rsa-sha2-256" (make-sign "rsa-sha2-256"))))
-                 :sign (make-sign plain-algorithm))))
-          ;; A certificate beside the key is offered instead of the plain
-          ;; key, with both of an RSA certificate's RFC 8332 spellings.
-          (if certificate
-              (ssh-signer-with-certificate signer certificate certificate-blob)
-              signer))))))
+  (let ((plain (ssh-private-key-plain-signer key)))
+    (multiple-value-bind (certificate certificate-blob)
+        (if certificate-files-specified
+            (values nil nil)
+            (ssh-private-key-certificate key))
+      (if certificate
+          (list plain
+                (ssh-signer-with-certificate
+                 plain certificate certificate-blob))
+          (list plain)))))
+
+(defun ssh-private-key-signer (key &key certificate-files-specified)
+  "The last signer for KEY: its certificate when it has one.
+
+Kept for callers that name a single key; SSH-PRIVATE-KEY-SIGNERS gives the
+whole identity list ssh would offer."
+  (car (last (ssh-private-key-signers
+              key :certificate-files-specified certificate-files-specified))))
 
 (defun ssh-load-certificate-files (paths)
   "Load the certificates named by PATHS, as (CERT-BLOB . CERTIFICATE) pairs.
@@ -191,13 +201,15 @@ accepts."
                        (ssh-signer-sign sha256)))))))))
 
 (defun ssh-signers-with-certificates (signers certificates)
-  "SIGNERS with each matching certificate in CERTIFICATES offered instead.
+  "SIGNERS with each matching certificate added in front of its key.
 
 A certificate applies to the signer whose plain public key it certifies,
 whether that key came from a file or an agent, which is what ssh does when it
 pairs a certificate with the private key that can complete its signature.
 Certified signers move to the front, because ssh tries certificates listed in
-the configuration before uncertified keys."
+the configuration before uncertified keys, but each plain key stays in the
+list so it can still authenticate when the server does not trust the
+certificate."
   (if (null certificates)
       signers
       (let ((certified '())
@@ -211,14 +223,16 @@ the configuration before uncertified keys."
                                (ssh-certificate-plain-blob (cdr candidate))))
                             certificates)))
             (if pair
-                (push (ssh-signer-with-certificate
-                       signer (cdr pair) (car pair))
-                      certified)
+                (progn
+                  (push (ssh-signer-with-certificate
+                         signer (cdr pair) (car pair))
+                        certified)
+                  (push signer rest))
                 (push signer rest))))
         (append (nreverse certified) (nreverse rest)))))
 
 (defparameter +ssh-agent-key-types+
-  '("ssh-ed25519" "ssh-rsa"
+  '("ssh-ed25519" "ssh-rsa" "ssh-mldsa44-ed25519"
     "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521")
   "Key types this client can offer through an agent.
 
@@ -232,12 +246,14 @@ name the key type the same way the protocol does.")
     "ecdsa-sha2-nistp521-cert-v01@openssh.com"
     "rsa-sha2-512-cert-v01@openssh.com"
     "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-mldsa44-ed25519-cert"
     "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
     "rsa-sha2-512"
-    "rsa-sha2-256")
+    "rsa-sha2-256"
+    "ssh-mldsa44-ed25519")
   "Signature algorithms a signer here can name.
 
 The certificate spellings come first, as in OpenSSH's KEX_DEFAULT_PK_ALG,

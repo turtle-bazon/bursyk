@@ -167,6 +167,35 @@ CLI's decision and at the plist it filled."
     (is (not (member "mlkem768nistp256-sha256"
                      (burs::default-kex-algorithms) :test #'string=)))))
 
+(test mldsa-queries-follow-the-transport
+  "A transport without ML-DSA neither lists nor accepts the composite key."
+  (let ((supported (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)))
+    (dolist (name '("ssh-mldsa44-ed25519" "ssh-mldsa44-ed25519-cert"))
+      (is (eq supported
+              (not (null (member name (burs::query-answer "key")
+                                 :test #'string=))))))
+    (is (eq supported
+            (not (null (member "ssh-mldsa44-ed25519"
+                               (burs::query-answer "sig")
+                               :test #'string=)))))
+    (is (eq supported
+            (not (null (member "ssh-mldsa44-ed25519-cert"
+                               (burs::query-answer "key-sig")
+                               :test #'string=)))))
+    ;; OpenSSH spells this certificate with the short -cert suffix, so the
+    ;; long -cert-v01@ form must never appear.
+    (is (not (member "ssh-mldsa44-ed25519-cert-v01@openssh.com"
+                     (burs::query-answer "key-sig") :test #'string=)))
+    ;; The default CA list follows sshd and leaves ML-DSA out, while -Q
+    ;; key-ca-sign names every signature the build can check.
+    (is (not (member "ssh-mldsa44-ed25519"
+                     (burs::supported-ca-signature-algorithms)
+                     :test #'string=)))
+    (is (eq supported
+            (not (null (member "ssh-mldsa44-ed25519"
+                               (burs::query-answer "key-ca-sign")
+                               :test #'string=)))))))
+
 (test double-dash-ends-option-parsing
   (multiple-value-bind (destination command options)
       (parse '("--" "host.example" "-p" "not-a-port"))
@@ -1055,6 +1084,14 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                                "rsa-sha2-256-cert-v01@openssh.com,")
                   text))
       (is (search "rsa-sha2-512,rsa-sha2-256" text))
+      ;; The composite ML-DSA key follows the RSA names in the signature
+      ;; lists, and only a transport that implements it advertises it.
+      (let ((mldsa (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)))
+        (is (eq mldsa
+                (not (null (search "ssh-mldsa44-ed25519-cert" text)))))
+        (is (eq mldsa
+                (not (null (search "rsa-sha2-256,ssh-mldsa44-ed25519"
+                                   text))))))
       (is (search "identityfile" text))
       (is (not (search "proxyjump" text)))
       (is (not (search "proxycommand" text))))))

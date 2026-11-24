@@ -263,6 +263,21 @@ meant to prevent."
                                (ssh-plibssh-error session))))))
   session)
 
+(defun ssh-plibssh-reject-mldsa-algorithms (names option)
+  "Refuse NAMES when they ask for a composite ML-DSA key.
+
+libssh 0.10 has no ML-DSA, so a configured name must be reported as an
+unsupported feature rather than handed to libssh, which would reject it as a
+generic algorithm mismatch."
+  (when (some (lambda (name)
+                (member name '("ssh-mldsa44-ed25519"
+                               "ssh-mldsa44-ed25519-cert")
+                        :test #'string=))
+              names)
+    (error 'ssh-unsupported-feature
+           :feature :mldsa
+           :detail (format nil "~A by the libssh transport" option))))
+
 (defun ssh-plibssh-client-new-session (client &key fd proxy-command)
   "Make CLIENT's libssh session.
 
@@ -326,6 +341,10 @@ host is named but no descriptor is passed: libssh dials nothing itself."
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-key-exchange+ (ssh-client-kex-algorithms client)
      "KexAlgorithms")
+    (ssh-plibssh-reject-mldsa-algorithms
+     (ssh-client-host-key-algorithms client) "HostKeyAlgorithms")
+    (ssh-plibssh-reject-mldsa-algorithms
+     (ssh-client-pubkey-accepted-algorithms client) "PubkeyAcceptedAlgorithms")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hostkeys+ (ssh-client-host-key-algorithms client)
      "HostKeyAlgorithms")
@@ -552,8 +571,24 @@ than a quiet fallback to the plain key, matching ssh."
         (ssh-plibssh-copy-certificate key certificate-path)))
     key))
 
+(defun ssh-plibssh-mldsa-key-path-p (path passphrase)
+  "Whether the private key at PATH is a composite ML-DSA key.
+
+libssh 0.10 has no ML-DSA and would only report a generic import failure,
+so the transport names the real reason.  A key this parser cannot read is
+left to libssh, which may still understand a format it does not."
+  (handler-case
+      (string= "ssh-mldsa44-ed25519"
+               (ssh-private-key-type
+                (ssh-load-private-key path :passphrase passphrase)))
+    (error () nil)))
+
 (defun ssh-plibssh-import-key (path passphrase)
   "Import the private key at PATH, using PASSPHRASE when it is encrypted."
+  (when (ssh-plibssh-mldsa-key-path-p path passphrase)
+    (error 'ssh-unsupported-feature
+           :feature :mldsa
+           :detail "by the libssh transport"))
   (cffi:with-foreign-object (pointer :pointer)
     (let ((rc (if passphrase
                   (cffi:with-foreign-string (secret passphrase)

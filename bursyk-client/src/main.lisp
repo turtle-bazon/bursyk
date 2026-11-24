@@ -440,6 +440,45 @@ even though it is implemented; -G reports this list, as ssh does."
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
                  cl-pnet-ssh:+ssh-kex-default-algorithms+)))
 
+(defun mldsa-algorithm-name-p (name)
+  "Whether NAME is the composite ML-DSA-44 + Ed25519 key or its certificate."
+  (or (string= name "ssh-mldsa44-ed25519")
+      (string= name "ssh-mldsa44-ed25519-cert")))
+
+(defun supported-host-key-algorithms ()
+  "Host key algorithms this build's transport can actually present.
+
+The pure transport implements OpenSSH's composite ML-DSA key; libssh 0.10
+has no ML-DSA, so it is left out of -Q key, -G and the default offer."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-host-key-algorithms+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-host-key-algorithms+)))
+
+(defun supported-signature-algorithms ()
+  "Signature algorithms this build's transport can actually use.
+
+This is OpenSSH's PubkeyAcceptedAlgorithms order, without names the linked
+libssh cannot verify."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-signature-algorithms+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-signature-algorithms+)))
+
+(defun supported-ca-signature-algorithms ()
+  "CA signature algorithms this build's transport can actually check."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-server-ca-signature-algorithms+)))
+
+(defun supported-ca-signature-algorithm-names ()
+  "Every CA signature algorithm this build's transport can name."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+)))
+
 (defun check-algorithm-list (option value supported &optional all)
   "Reject an algorithm choice this build cannot offer.
 
@@ -790,6 +829,7 @@ session down."
 
 (defparameter +query-key-types+
   '("ssh-ed25519"
+    "ssh-mldsa44-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
@@ -801,6 +841,7 @@ names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
 
 (defparameter +query-certificate-key-types+
   '("ssh-ed25519-cert-v01@openssh.com"
+    "ssh-mldsa44-ed25519-cert"
     "ecdsa-sha2-nistp256-cert-v01@openssh.com"
     "ecdsa-sha2-nistp384-cert-v01@openssh.com"
     "ecdsa-sha2-nistp521-cert-v01@openssh.com"
@@ -809,14 +850,19 @@ names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
 
 (defun query-plain-key-algorithms ()
   "Key types this client can load, without the certificate spellings."
-  +query-key-types+)
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      +query-key-types+
+      (remove-if #'mldsa-algorithm-name-p +query-key-types+)))
 
 (defun query-certificate-key-algorithms ()
   "Certificate key types this client can present."
-  +query-certificate-key-types+)
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      +query-certificate-key-types+
+      (remove-if #'mldsa-algorithm-name-p +query-certificate-key-types+)))
 
 (defparameter +query-plain-signature-names+
   '("ssh-ed25519"
+    "ssh-mldsa44-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
@@ -824,16 +870,30 @@ names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
     "rsa-sha2-256")
   "Signature names this client can make or check, without certificates.")
 
+(defun query-certificate-name (name)
+  "The certificate spelling of signature NAME.
+
+OpenSSH writes most certificate types with the -cert-v01@openssh.com
+suffix, but the composite ML-DSA key uses a plain -cert."
+  (if (string= name "ssh-mldsa44-ed25519")
+      "ssh-mldsa44-ed25519-cert"
+      (concatenate 'string name "-cert-v01@openssh.com")))
+
+(defun query-plain-signature-names ()
+  "Signature names this client can make or check, without certificates."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      +query-plain-signature-names+
+      (remove-if #'mldsa-algorithm-name-p +query-plain-signature-names+)))
+
 (defun query-signature-algorithms (&key plain-only)
   "Signature names this client can verify, certificate forms included.
 
 PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
-  (if plain-only
-      +query-plain-signature-names+
-      (loop for name in +query-plain-signature-names+
-            append (list name
-                         (concatenate 'string name
-                                      "-cert-v01@openssh.com")))))
+  (let ((names (query-plain-signature-names)))
+    (if plain-only
+        names
+        (loop for name in names
+              append (list name (query-certificate-name name))))))
 
 (defun query-answer (what)
   (let ((name (string-downcase what)))
@@ -3237,14 +3297,14 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "hostkeyalgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-host-key-algorithms
-               cl-pnet-ssh::+ssh-host-key-algorithms+ "HostKeyAlgorithms"))
+               (supported-host-key-algorithms) "HostKeyAlgorithms"))
       (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
         (when alias
           (format t "hostkeyalias ~A~%" alias)))
       (format t "hostbasedacceptedalgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
-               cl-pnet-ssh::+ssh-signature-algorithms+
+               (supported-signature-algorithms)
                "HostbasedAcceptedAlgorithms"))
       (let ((value (or (getf *options* :agent)
                        (cl-pnet-ssh:ssh-config-options-identity-agent
@@ -3271,9 +3331,9 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "casignaturealgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms
-               cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+               (supported-ca-signature-algorithms)
                "CASignatureAlgorithms"
-               cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+))
+               (supported-ca-signature-algorithm-names)))
       (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
         (when local
           (format t "localcommand ~A~%" local)))
@@ -3307,7 +3367,7 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "pubkeyacceptedalgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-pubkey-accepted-algorithms
-               cl-pnet-ssh::+ssh-signature-algorithms+
+               (supported-signature-algorithms)
                "PubkeyAcceptedAlgorithms"))
       (format t "xauthlocation ~A~%"
               (or (cl-pnet-ssh:ssh-config-options-xauth-location options)

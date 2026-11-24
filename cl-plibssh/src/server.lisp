@@ -1671,6 +1671,11 @@ list, applied by the same inactivity accounting as the pure backend."
                   (ssh-key-rsa-size-allowed-p
                    (ssh-public-key-blob-of key) required-rsa-size))
                 keys))
+         (mldsa-host-key
+           (find-if (lambda (key)
+                      (string= (ssh-private-key-type key)
+                               "ssh-mldsa44-ed25519"))
+                    keys))
          (version (if server-version
                       (check-server-version server-version)
                       (subseq +ssh-server-version+
@@ -1797,6 +1802,11 @@ list, applied by the same inactivity accounting as the pure backend."
             (error 'ssh-connection-error
                    :detail (format nil "libssh rejected RequiredRSASize: ~A"
                                    detail))))))
+    (when mldsa-host-key
+      (ssh-bind-free bind)
+      (error 'ssh-unsupported-feature
+             :feature :mldsa
+             :detail "host keys by the libssh transport"))
     (unless keys
       (ssh-bind-free bind)
       (error 'ssh-connection-error

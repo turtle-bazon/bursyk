@@ -941,14 +941,19 @@ keep the server's key blob, so the picture is built the same way."
 
 ;;; ---- Signer filtering ----
 
-(defparameter +ssh-certificate-suffix+ "-cert-v01@openssh.com")
-
 (defun ssh-signature-algorithm-base (name)
-  "NAME without its certificate suffix, the signature it is made with."
-  (let ((start (- (length name) (length +ssh-certificate-suffix+))))
-    (if (and (not (minusp start))
-             (string= +ssh-certificate-suffix+ name :start2 start))
-        (subseq name 0 start)
+  "NAME without its certificate suffix, the signature it is made with.
+
+The suffix is removed by spelling, not by looking the remainder up in the
+plain key types: an RSA certificate is named rsa-sha2-512-cert-v01@openssh.com
+even though rsa-sha2-512 is a signature name rather than a key type."
+  (flet ((strip (suffix)
+           (let ((start (- (length name) (length suffix))))
+             (when (and (not (minusp start))
+                        (string= suffix name :start2 start))
+               (subseq name 0 start)))))
+    (or (strip +ssh-certificate-suffix+)
+        (strip +ssh-mldsa-certificate-suffix+)
         name)))
 
 (defun ssh-select-signature-algorithm (names patterns server-algorithms)

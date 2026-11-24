@@ -65,9 +65,9 @@
               (collect (ssh-read-text reader))))))
 
 (test certificate-files-pair-with-their-private-key
-  "CertificateFile attaches the listed certificate to the key it certifies
-and suppresses the automatic KEY-cert.pub lookup, while a certificate for
-another key is not attached."
+  "CertificateFile attaches the listed certificate in front of the key it
+certifies and suppresses the automatic KEY-cert.pub lookup, while a
+certificate for another key is not attached."
   (if (not (ssh-keygen-available-p))
       (skip "ssh-keygen is not installed")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-certfile"))
@@ -102,13 +102,19 @@ another key is not attached."
                       (signers
                         (ssh-test-resolved-signers
                          user :certificate-files (list explicit))))
-                 (is (= 1 (length signers)))
+                 ;; ssh keeps the plain key too: the certificate is tried
+                 ;; first, but a server that does not trust its CA can still
+                 ;; authenticate the key itself.
+                 (is (= 2 (length signers)))
                  (is (string= "ssh-ed25519-cert-v01@openssh.com"
                               (cl-pnet-ssh::ssh-signer-type
                                (first signers))))
                  (is (equalp cert-blob
                              (cl-pnet-ssh::ssh-signer-blob
                               (first signers))))
+                 (is (string= "ssh-ed25519"
+                              (cl-pnet-ssh::ssh-signer-type
+                               (second signers))))
                  ;; Without CertificateFile the moved cert is invisible and
                  ;; the key is offered plain, not certified.
                  (let ((plain (ssh-test-resolved-signers user)))
@@ -1916,6 +1922,182 @@ server records the full string."
            :macs cl-pnet-ssh:+ssh-macs+
            :compressions '("none"))))
     (is (string= "mlkem768nistp256-sha256" (getf negotiated :kex)))))
+
+
+;;; ---- Composite ML-DSA-44 + Ed25519 signatures ----
+
+(defun mldsa44-test-material ()
+  "VALUES PUBLIC PRIVATE for a deterministic composite key.
+
+PUBLIC is the 1344-octet ML-DSA then Ed25519 key; PRIVATE is the two seeds
+OpenSSH stores in a private key file."
+  (let ((mldsa-seed (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 7))
+        (ed-seed (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 11)))
+    (multiple-value-bind (public secret)
+        (ironclad-unsafe::ml-dsa-keygen-from-coins
+         (cl-pnet-ssh::ssh-copy-octets mldsa-seed)
+         (ironclad-unsafe::ml-dsa-params-for-kind :ml-dsa-44))
+      (declare (ignore secret))
+      (values (cl-pnet-ssh::ssh-concat
+               public
+               (ironclad-unsafe:ed25519-public-key
+                (cl-pnet-ssh::ssh-copy-octets ed-seed)))
+              (cl-pnet-ssh::ssh-concat mldsa-seed ed-seed)))))
+
+(defun mldsa44-test-key-file (directory)
+  "An armored openssh-key-v1 file holding a deterministic ML-DSA key."
+  (multiple-value-bind (public private)
+      (mldsa44-test-material)
+    (let* ((public-blob
+             (cl-pnet-ssh::ssh-make-public-key-blob
+              "ssh-mldsa44-ed25519" public))
+           (section (cl-pnet-ssh::ssh-writer)))
+      (cl-pnet-ssh::ssh-write-u32 section 0)
+      (cl-pnet-ssh::ssh-write-u32 section 0)
+      (cl-pnet-ssh::ssh-write-text section "ssh-mldsa44-ed25519")
+      (cl-pnet-ssh::ssh-write-string section public)
+      (cl-pnet-ssh::ssh-write-string section private)
+      (cl-pnet-ssh::ssh-write-text section "mldsa test")
+      (let ((padding
+              (mod (- 8 (mod (length (cl-pnet-ssh::ssh-writer-octets
+                                      section))
+                             8))
+                   8)))
+        (loop for index from 1 to padding
+              do (cl-pnet-ssh::ssh-write-u8 section index)))
+      (let* ((body (cl-pnet-ssh::ssh-writer)))
+        (cl-pnet-ssh::ssh-write-octets
+         body (map 'vector #'char-code "openssh-key-v1"))
+        (cl-pnet-ssh::ssh-write-u8 body 0)
+        (cl-pnet-ssh::ssh-write-text body "none")
+        (cl-pnet-ssh::ssh-write-text body "none")
+        (cl-pnet-ssh::ssh-write-string
+         body (make-array 0 :element-type '(unsigned-byte 8)))
+        (cl-pnet-ssh::ssh-write-u32 body 1)
+        (cl-pnet-ssh::ssh-write-string body public-blob)
+        (cl-pnet-ssh::ssh-write-string
+         body (cl-pnet-ssh::ssh-writer-output section))
+        (let ((path (merge-pathnames "mldsa-test-key" directory)))
+          (ensure-directories-exist path)
+          (with-open-file (stream path :direction :output
+                                       :if-exists :supersede)
+            (format stream "-----BEGIN OPENSSH PRIVATE KEY-----~%")
+            (let ((encoded
+                    (cl-pnet-ssh::ssh-octets-base64
+                     (cl-pnet-ssh::ssh-writer-output body))))
+              (loop for start from 0 below (length encoded) by 70
+                    do (format stream "~A~%"
+                               (subseq encoded start
+                                       (min (length encoded)
+                                            (+ start 70))))))
+            (format stream "-----END OPENSSH PRIVATE KEY-----~%"))
+          path)))))
+
+(defun mldsa44-test-certificate (public)
+  "A parseable user certificate wrapping PUBLIC, with a dummy signature."
+  (flet ((string-of (octets)
+           (let ((writer (cl-pnet-ssh::ssh-writer)))
+             (cl-pnet-ssh::ssh-write-string writer octets)
+             (cl-pnet-ssh::ssh-writer-output writer))))
+    (let ((writer (cl-pnet-ssh::ssh-writer)))
+      (cl-pnet-ssh::ssh-write-text writer "ssh-mldsa44-ed25519-cert")
+      (cl-pnet-ssh::ssh-write-string
+       writer (make-array 32 :element-type '(unsigned-byte 8)))
+      (cl-pnet-ssh::ssh-write-string writer public)
+      (cl-pnet-ssh::ssh-write-u64 writer 1)
+      (cl-pnet-ssh::ssh-write-u32 writer 1)
+      (cl-pnet-ssh::ssh-write-text writer "test")
+      (cl-pnet-ssh::ssh-write-string
+       writer (string-of (map 'vector #'char-code "turtle")))
+      (cl-pnet-ssh::ssh-write-u64 writer 0)
+      (cl-pnet-ssh::ssh-write-u64 writer 4294967295)
+      (cl-pnet-ssh::ssh-write-string
+       writer (make-array 0 :element-type '(unsigned-byte 8)))
+      (cl-pnet-ssh::ssh-write-string
+       writer (make-array 0 :element-type '(unsigned-byte 8)))
+      (cl-pnet-ssh::ssh-write-text writer "")
+      (cl-pnet-ssh::ssh-write-string
+       writer (make-array 0 :element-type '(unsigned-byte 8)))
+      (let ((signature (cl-pnet-ssh::ssh-writer)))
+        (cl-pnet-ssh::ssh-write-text signature "ssh-ed25519")
+        (cl-pnet-ssh::ssh-write-string
+         signature (make-array 64 :element-type '(unsigned-byte 8)))
+        (cl-pnet-ssh::ssh-write-string
+         writer (cl-pnet-ssh::ssh-writer-output signature)))
+      (cl-pnet-ssh::ssh-writer-output writer))))
+
+(test mldsa44-composite-signatures
+  "The composite key signs and verifies with OpenSSH's message recipe."
+  (let* ((directory (ssh-test-directory "bursyk-mldsa"))
+         (path (mldsa44-test-key-file directory)))
+    (unwind-protect
+         (let* ((key (cl-pnet-ssh:ssh-load-private-key path))
+                (blob (cl-pnet-ssh:ssh-public-key-blob-of key))
+                (message (map 'vector #'char-code "composite hello"))
+                (signature
+                  (cl-pnet-ssh::ssh-private-key-signature-blob key message)))
+           (is (string= "ssh-mldsa44-ed25519"
+                        (cl-pnet-ssh:ssh-private-key-type key)))
+           (is (= 1371 (length blob)))
+           (is (= 2511 (length signature)))
+           (is (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                blob signature message))
+           (is (not (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                     blob signature (map 'vector #'char-code "other"))))
+           (multiple-value-bind (type data)
+               (cl-pnet-ssh:ssh-public-key-parts blob)
+             (is (string= "ssh-mldsa44-ed25519" type))
+             (is (= 1344 (length data))))
+           (let* ((prefix
+                    (cl-pnet-ssh::ssh-string-octets
+                     cl-pnet-ssh::+ssh-mldsa44-ed25519-prefix+))
+                  (label
+                    (cl-pnet-ssh::ssh-string-octets
+                     cl-pnet-ssh::+ssh-mldsa44-ed25519-label+))
+                  (mprime
+                    (cl-pnet-ssh::ssh-mldsa44-ed25519-mprime message))
+                  (zero (+ (length prefix) (length label))))
+             (is (= (+ zero 1 64) (length mprime)))
+             (is (equalp (subseq mprime 0 (length prefix)) prefix))
+             (is (equalp (subseq mprime (length prefix) zero) label))
+             (is (zerop (aref mprime zero)))
+             (is (equalp (subseq mprime (1+ zero))
+                         (cl-pnet-ssh::ssh-hash :sha512 message)))))
+      (ignore-errors
+        (uiop:delete-directory-tree directory :validate t)))))
+
+(test mldsa44-certificate-names
+  "The composite certificate uses the short -cert suffix."
+  (multiple-value-bind (public private)
+      (mldsa44-test-material)
+    (declare (ignore private))
+    (let* ((cert-blob (mldsa44-test-certificate public))
+           (cert (cl-pnet-ssh:ssh-certificate-parse cert-blob)))
+      (is (cl-pnet-ssh:ssh-certificate-type-name-p
+           "ssh-mldsa44-ed25519-cert"))
+      (is (not (cl-pnet-ssh:ssh-certificate-type-name-p
+                "ssh-mldsa44-ed25519-cert-v01@openssh.com")))
+      (is (string= "ssh-mldsa44-ed25519"
+                   (cl-pnet-ssh:ssh-certificate-plain-type
+                    "ssh-mldsa44-ed25519-cert")))
+      (is (string= "ssh-mldsa44-ed25519-cert"
+                   (cl-pnet-ssh:ssh-certificate-name
+                    "ssh-mldsa44-ed25519")))
+      (is (not (null cert)))
+      (is (string= "ssh-mldsa44-ed25519-cert"
+                   (cl-pnet-ssh:ssh-certificate-key-type cert)))
+      (is (string= "ssh-mldsa44-ed25519"
+                   (cl-pnet-ssh:ssh-certificate-plain-key-type cert)))
+      (is (= 1371 (length (cl-pnet-ssh:ssh-certificate-plain-blob cert))))
+      (is (string= "MLDSA44-ED25519-CERT"
+                   (cl-pnet-ssh:ssh-key-type-name cert-blob)))
+      (is (cl-pnet-ssh::ssh-server-user-key-algorithm-p
+           cert-blob "ssh-mldsa44-ed25519-cert"))
+      (is (cl-pnet-ssh::ssh-server-user-key-algorithm-p
+           (cl-pnet-ssh:ssh-certificate-plain-blob cert)
+           "ssh-mldsa44-ed25519")))))
 
 ;;; ---- NIST-curve ECDH key exchange ----
 

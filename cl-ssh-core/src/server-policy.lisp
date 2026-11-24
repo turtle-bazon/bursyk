@@ -41,8 +41,12 @@ half and could mistake part of it for the key type."
 
 (defparameter +ssh-authorized-key-types+
   '("ssh-ed25519" "ssh-rsa"
-    "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521")
-  "The key types an authorized_keys line may name.")
+    "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521"
+    "ssh-mldsa44-ed25519")
+  "The key types an authorized_keys line may name.
+
+Certificates are not here: sshd matches an authorized_keys line against the
+plain key and checks the certificate separately.")
 
 (defun ssh-authorized-key-line-options-and-rest (line)
   "VALUES OPTIONS REST for one LINE.
@@ -781,13 +785,7 @@ principal comparison is exact, as sshd's auth_check_principals_line."
 A certificate names itself with its certificate key type in the request, but
 the signature it carries is made by the certified key and named for the plain
 algorithm.  OpenSSH's RSA certificates also use rsa-sha2-256/512 names."
-  (if (and (> (length algorithm) (length +ssh-certificate-type-suffix+))
-           (string= +ssh-certificate-type-suffix+ algorithm
-                    :start2 (- (length algorithm)
-                               (length +ssh-certificate-type-suffix+))))
-      (subseq algorithm 0 (- (length algorithm)
-                             (length +ssh-certificate-type-suffix+)))
-      algorithm))
+  (or (ssh-certificate-plain-type algorithm) algorithm))
 
 (defun ssh-server-user-key-algorithm-p (key-blob algorithm)
   "Whether KEY-BLOB may sign as ALGORITHM in a userauth request.
@@ -812,6 +810,9 @@ certified key.  A blob that does not parse is never acceptable."
                      ((string= plain "ssh-ed25519")
                       (string= algorithm
                                "ssh-ed25519-cert-v01@openssh.com"))
+                     ((string= plain "ssh-mldsa44-ed25519")
+                      (string= algorithm
+                               "ssh-mldsa44-ed25519-cert"))
                      ((member plain '("ecdsa-sha2-nistp256"
                                       "ecdsa-sha2-nistp384"
                                       "ecdsa-sha2-nistp521")
@@ -825,6 +826,8 @@ certified key.  A blob that does not parse is never acceptable."
             (cond
               ((string= type "ssh-ed25519")
                (string= algorithm "ssh-ed25519"))
+              ((string= type "ssh-mldsa44-ed25519")
+               (string= algorithm "ssh-mldsa44-ed25519"))
               ((string= type "ssh-rsa")
                (not (null (ssh-rsa-digest-keyword algorithm))))
               ((member type '("ecdsa-sha2-nistp256"

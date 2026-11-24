@@ -461,6 +461,7 @@
    #:ssh-certificate-key-type
    #:ssh-certificate-parse
    #:ssh-certificate-plain-type
+   #:ssh-certificate-name
    #:ssh-certificate-plain-key-type
    #:ssh-certificate-plain-key-blob
    #:ssh-certificate-plain-blob
@@ -490,6 +491,7 @@
    #:ssh-ed25519-sign
    #:ssh-ed25519-signature-blob
    #:ssh-private-key-signer
+   #:ssh-private-key-signers
    ;; ssh-agent
    #:ssh-agent-identities
    #:ssh-agent-identities-blocking

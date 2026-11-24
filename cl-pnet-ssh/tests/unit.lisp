@@ -2101,6 +2101,72 @@ key on the line."
               prefix
               (string-trim '(#\Space #\Return #\Newline) (read-line input))))))
 
+(defun ssh-test-write-mldsa-key (path)
+  "Write a fresh ML-DSA-44+Ed25519 private key at PATH and its .pub.
+
+Returns PATH.  OpenSSH stores the two 32-octet seeds, so the public half is
+rebuilt here exactly as SSH-LOAD-PRIVATE-KEY will later read it."
+  (let* ((mldsa-seed (ironclad-unsafe:random-data 32))
+         (ed-seed (ironclad-unsafe:random-data 32)))
+    (multiple-value-bind (mldsa-public secret)
+        (ironclad-unsafe::ml-dsa-keygen-from-coins
+         (cl-pnet-ssh::ssh-copy-octets mldsa-seed)
+         (ironclad-unsafe::ml-dsa-params-for-kind :ml-dsa-44))
+      (declare (ignore secret))
+      (let* ((public
+               (cl-pnet-ssh::ssh-concat
+                mldsa-public
+                (ironclad-unsafe:ed25519-public-key
+                 (cl-pnet-ssh::ssh-copy-octets ed-seed))))
+             (private (cl-pnet-ssh::ssh-concat mldsa-seed ed-seed))
+             (blob (cl-pnet-ssh::ssh-make-public-key-blob
+                    "ssh-mldsa44-ed25519" public))
+             (section (cl-pnet-ssh::ssh-writer)))
+        (cl-pnet-ssh::ssh-write-u32 section 0)
+        (cl-pnet-ssh::ssh-write-u32 section 0)
+        (cl-pnet-ssh::ssh-write-text section "ssh-mldsa44-ed25519")
+        (cl-pnet-ssh::ssh-write-string section public)
+        (cl-pnet-ssh::ssh-write-string section private)
+        (cl-pnet-ssh::ssh-write-text section "mldsa test")
+        (let ((padding
+                (mod (- 8 (mod (length (cl-pnet-ssh::ssh-writer-octets
+                                        section))
+                               8))
+                     8)))
+          (loop for index from 1 to padding
+                do (cl-pnet-ssh::ssh-write-u8 section index)))
+        (let ((body (cl-pnet-ssh::ssh-writer)))
+          (cl-pnet-ssh::ssh-write-octets
+           body (map 'vector #'char-code "openssh-key-v1"))
+          (cl-pnet-ssh::ssh-write-u8 body 0)
+          (cl-pnet-ssh::ssh-write-text body "none")
+          (cl-pnet-ssh::ssh-write-text body "none")
+          (cl-pnet-ssh::ssh-write-string
+           body (make-array 0 :element-type '(unsigned-byte 8)))
+          (cl-pnet-ssh::ssh-write-u32 body 1)
+          (cl-pnet-ssh::ssh-write-string body blob)
+          (cl-pnet-ssh::ssh-write-string
+           body (cl-pnet-ssh::ssh-writer-output section))
+          (ensure-directories-exist path)
+          (with-open-file (stream path :direction :output
+                                       :if-exists :supersede)
+            (format stream "-----BEGIN OPENSSH PRIVATE KEY-----~%")
+            (let ((encoded
+                    (cl-pnet-ssh::ssh-octets-base64
+                     (cl-pnet-ssh::ssh-writer-output body))))
+              (loop for start from 0 below (length encoded) by 70
+                    do (format stream "~A~%"
+                               (subseq encoded start
+                                       (min (length encoded)
+                                            (+ start 70))))))
+            (format stream "-----END OPENSSH PRIVATE KEY-----~%"))
+          (with-open-file (stream
+                           (concatenate 'string (namestring path) ".pub")
+                           :direction :output :if-exists :supersede)
+            (format stream "ssh-mldsa44-ed25519 ~A mldsa test~%"
+                    (cl-pnet-ssh::ssh-octets-base64 blob)))
+          path)))))
+
 (defun ssh-test-loopback-handle-data (stdout stderr)
   "A channel data callback that splits stdout from stderr."
   (lambda (channel data kind)
@@ -2132,7 +2198,7 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                           "printf hello; printf oops >&2; exit 3"))))
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
-                              &key (host "127.0.0.1")
+                              &key capture-error (host "127.0.0.1")
                                 address-family
                                 (host-key-policy :accept-new)
                                 hostbased-key canonicalize-hostname
@@ -2229,16 +2295,28 @@ added on first use."
            ;; client below never starts.
            (when (fboundp '(setf cl-pnet::puma-stop-requested-p))
              (setf (cl-pnet::puma-stop-requested-p) nil))
+           ;; A backend may report the failure while MAKE-SSH-CLIENT is still
+           ;; running, before this loop starts; its stop request is one of the
+           ;; stale ones just cleared, so consult STATE first.
+           (when (second state)
+             (if capture-error
+                 (return-from ssh-test-loopback-run
+                   (values nil (second state)))
+                 (error "loopback: ~A" (second state))))
            (cl-pnet:event-loop-run)
            (when (second state)
-             (error "loopback: ~A" (second state)))
+             (if capture-error
+                 (return-from ssh-test-loopback-run
+                   (values nil (second state)))
+                 (error "loopback: ~A" (second state))))
            (first state))
       (when timeout (cl-pnet:timer-stop timeout)))))
 
 (defun ssh-test-loopback-result (&key (host-key-arguments '("-t" "ed25519"))
                                       bind-address bind-interface
                                       sshd-options rekey-limit rekey-interval
-                                      compression command kex-algorithms)
+                                      compression command kex-algorithms
+                                      client-key capture-error)
   "Run one exec through a server and client in this process.
 
 HOST-KEY-ARGUMENTS choose the server's key type, so the same loopback can
@@ -2246,10 +2324,15 @@ prove an RSA or ECDSA host key is negotiated and its signature verified.
 BIND-ADDRESS and BIND-INTERFACE are passed to the client's source binding.
 SSHD-OPTIONS are -o style directives for the server's sshd_config, while
 REKEY-LIMIT and REKEY-INTERVAL configure the client's own RekeyLimit.
-Returns (VALUES STDOUT STDERR STATUS)."
+CLIENT-KEY, when given, is a ready private key whose .pub is authorized;
+otherwise an ed25519 key is generated.  CAPTURE-ERROR returns the client's
+condition as a fourth value instead of raising it.
+Returns (VALUES STDOUT STDERR STATUS [ERROR])."
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-loop"))
          (server-key (merge-pathnames "host_key" directory))
-         (client-key (merge-pathnames "client_key" directory))
+         (given-client-key client-key)
+         (client-key (or client-key
+                         (merge-pathnames "client_key" directory)))
          (authorized (merge-pathnames "authorized_keys" directory))
          (known-hosts (merge-pathnames "known_hosts" directory))
          (stdout (make-string-output-stream))
@@ -2261,10 +2344,12 @@ Returns (VALUES STDOUT STDERR STATUS)."
            (ssh-keygen (append (list "-q" "-N" "")
                                host-key-arguments
                                (list "-f" (namestring server-key))))
-           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
-                             "-f" (namestring client-key)))
+           (unless given-client-key
+             (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                               "-f" (namestring client-key))))
            (ssh-test-write-authorized-keys
-            (merge-pathnames "client_key.pub" directory) authorized)
+            (concatenate 'string (namestring client-key) ".pub")
+            authorized)
            (setf server
                  (make-ssh-server
                   "127.0.0.1" 0
@@ -2278,18 +2363,20 @@ Returns (VALUES STDOUT STDERR STATUS)."
                     (setf (cl-pnet-ssh::ssh-server-channel-on-exec channel)
                           (lambda (channel command)
                             (ssh-test-run-command channel command))))))
-           (let ((status (ssh-test-loopback-run
-                          server client-key known-hosts stdout stderr
-                          :bind-address bind-address
-                          :bind-interface bind-interface
-                          :rekey-limit rekey-limit
-                          :rekey-interval rekey-interval
-                          :compression compression
-                          :kex-algorithms kex-algorithms
-                          :command command)))
+           (multiple-value-bind (status error)
+               (ssh-test-loopback-run
+                server client-key known-hosts stdout stderr
+                :capture-error capture-error
+                :bind-address bind-address
+                :bind-interface bind-interface
+                :rekey-limit rekey-limit
+                :rekey-interval rekey-interval
+                :compression compression
+                :kex-algorithms kex-algorithms
+                :command command)
              (values (get-output-stream-string stdout)
                      (get-output-stream-string stderr)
-                     status)))
+                     status error)))
       (when server (ssh-server-close server))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
@@ -2468,9 +2555,19 @@ share the test, so each must dispatch the same channel requests."
   "PubkeyAcceptedAlgorithms and HostbasedAcceptedAlgorithms list certs first."
   (let ((signatures cl-pnet-ssh::+ssh-signature-algorithms+))
     (is (string= "ssh-ed25519-cert-v01@openssh.com" (first signatures)))
-    (is (string= "rsa-sha2-256" (car (last signatures))))
+    (is (string= "ssh-mldsa44-ed25519" (car (last signatures))))
     (is (not (null (search "-cert-v01@" (first signatures)))))
-    (is (null (search "-cert-v01@" (car (last signatures)))))))
+    (is (null (search "-cert-v01@" (car (last signatures)))))
+    ;; The composite ML-DSA certificate uses the short -cert suffix and
+    ;; follows the RSA certificate names, as in OpenSSH's default order.
+    (let ((position (position "ssh-mldsa44-ed25519-cert" signatures
+                              :test #'string=)))
+      (is (not (null position)))
+      (is (< (position "rsa-sha2-256-cert-v01@openssh.com" signatures
+                       :test #'string=)
+             position))
+      (is (< position
+             (position "ssh-ed25519" signatures :test #'string=))))))
 
 (test mlkem768nistp256-is-implemented-but-not-default
   "The P-256 ML-KEM hybrid is selectable but absent from the default offer."
@@ -2522,6 +2619,54 @@ share the test, so each must dispatch the same channel requests."
           (is (equal "hello" stdout))
           (is (equal "oops" stderr))
           (is (eql 3 status))))))
+
+(test mldsa-client-loopback-exec
+  "A composite ML-DSA key authenticates where the transport implements it."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-mldsa-client"))
+         (key (ssh-test-write-mldsa-key
+               (merge-pathnames "client_key" directory)))
+         (supported (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)))
+    (unwind-protect
+         (multiple-value-bind (stdout stderr status error)
+             (ssh-test-loopback-result
+              :client-key key :capture-error (not supported))
+           (if supported
+               (progn
+                 (is (equal "hello" stdout))
+                 (is (equal "oops" stderr))
+                 (is (eql 3 status)))
+               ;; libssh has no ML-DSA, so a configured key must name the
+               ;; missing feature instead of reporting a generic load error.
+               (progn
+                 (is (typep error 'cl-pnet-ssh:ssh-unsupported-feature))
+                 (when (typep error 'cl-pnet-ssh:ssh-unsupported-feature)
+                   (is (eq :mldsa
+                           (cl-pnet-ssh:ssh-unsupported-feature-name
+                            error)))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test mldsa-server-host-key-capability
+  "A composite host key starts a server where the transport implements it."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-mldsa-host"))
+         (key (ssh-test-write-mldsa-key
+               (merge-pathnames "host_key" directory)))
+         (supported (cl-pnet-ssh:ssh-server-feature-supported-p :mldsa))
+         (server nil))
+    (unwind-protect
+         (if supported
+             (progn
+               (setf server (make-ssh-server "127.0.0.1" 0 :host-key key))
+               (is (not (null server)))
+               (is (plusp (ssh-server-port server))))
+             (is (eq :mldsa
+                     (handler-case
+                         (progn (make-ssh-server "127.0.0.1" 0 :host-key key)
+                                nil)
+                       (cl-pnet-ssh:ssh-unsupported-feature (condition)
+                         (cl-pnet-ssh:ssh-unsupported-feature-name
+                          condition))))))
+      (when server (ssh-server-close server))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test compression-loopback-exec
   "A compressed session runs a command and returns its output."
@@ -6406,9 +6551,22 @@ refuse a session's agent request, and the defaults allow it."
   ;; try an RSA key; the modern names must be there.
   (dolist (algorithm '("ssh-ed25519" "ecdsa-sha2-nistp256"
                        "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521"
-                       "rsa-sha2-512" "rsa-sha2-256"))
+                       "rsa-sha2-512" "rsa-sha2-256"
+                       "ssh-mldsa44-ed25519"))
     (is (member algorithm cl-pnet-ssh::+ssh-server-user-key-algorithms+
                 :test #'string=)))
+  ;; The certificate name uses the short -cert suffix, not -cert-v01@.
+  (is (member "ssh-mldsa44-ed25519-cert"
+              cl-pnet-ssh::+ssh-server-user-key-all-algorithms+
+              :test #'string=))
+  ;; CA signatures default to OpenSSH's list, which leaves ML-DSA out even
+  ;; though a configuration may name it.
+  (is (not (member "ssh-mldsa44-ed25519"
+                   cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+                   :test #'string=)))
+  (is (member "ssh-mldsa44-ed25519"
+              cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+
+              :test #'string=))
   (is (not (member "ssh-rsa" cl-pnet-ssh::+ssh-server-user-key-algorithms+
                    :test #'string=))))
 

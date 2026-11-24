@@ -15,35 +15,44 @@
   "The first default identity file that exists, or NIL."
   (first (ssh-default-private-keys)))
 
-(defun ssh-load-key-signer (private-key passphrase &key add-to-agent
-                                                      certificate-files-specified)
-  "PRIVATE-KEY, already loaded or a path, as a signer.
+(defun ssh-load-key-signers (private-keys passphrase &key add-to-agent
+                                                         certificate-files-specified)
+  "Signers for PRIVATE-KEYS, each already loaded or a path, in order.
 
-ADD-TO-AGENT, when given, is the agent path (or T for SSH_AUTH_SOCK); the
+A key with a matching CERT.pub beside it contributes two signers, the plain
+key and then its certificate, as ssh loads both identities for one file.
+ADD-TO-AGENT, when given, is the agent path (or T for SSH_AUTH_SOCK); each
 loaded key is offered to it before being used, as AddKeysToAgent does.
 CERTIFICATE-FILES-SPECIFIED suppresses the KEY-cert.pub lookup, because an
 explicit CertificateFile takes its place."
-  (let ((key (if (typep private-key 'ssh-private-key)
-                 private-key
-                 (ssh-load-private-key private-key :passphrase passphrase))))
-    (when add-to-agent
-      (ssh-agent-add-identity
-       key :path add-to-agent
-       :on-error (lambda (condition)
-                   (ssh-log "could not add a key to the agent: ~A"
-                            condition))))
-    (ssh-private-key-signer
-     key :certificate-files-specified certificate-files-specified)))
+  (loop for private-key in (if (listp private-keys)
+                               private-keys
+                               (list private-keys))
+        nconc (let ((key (if (typep private-key 'ssh-private-key)
+                             private-key
+                             (ssh-load-private-key
+                              private-key :passphrase passphrase))))
+                (when add-to-agent
+                  (ssh-agent-add-identity
+                   key :path add-to-agent
+                   :on-error (lambda (condition)
+                               (ssh-log
+                                "could not add a key to the agent: ~A"
+                                condition))))
+                (ssh-private-key-signers
+                 key :certificate-files-specified
+                 certificate-files-specified))))
 
-(defun ssh-load-key-signers (private-keys passphrase &key add-to-agent
-                                                        certificate-files-specified)
-  "Signers for PRIVATE-KEYS, each already loaded or a path, in order."
-  (mapcar (lambda (key)
-            (ssh-load-key-signer
-             key passphrase
-             :add-to-agent add-to-agent
-             :certificate-files-specified certificate-files-specified))
-          (if (listp private-keys) private-keys (list private-keys))))
+(defun ssh-load-key-signer (private-key passphrase &key add-to-agent
+                                                      certificate-files-specified)
+  "PRIVATE-KEY, already loaded or a path, as one signer.
+
+The certificate beside the key wins when there is one; SSH-LOAD-KEY-SIGNERS
+returns the whole identity list, plain key first."
+  (car (last (ssh-load-key-signers
+              private-key passphrase
+              :add-to-agent add-to-agent
+              :certificate-files-specified certificate-files-specified))))
 
 (defun ssh-default-key-sources (private-key)
   "PRIVATE-KEY when given, else every default identity file that exists."
@@ -915,7 +924,8 @@ was built, so the same client code runs unchanged against either transport."
   (not (null (member feature '(:remote-forward :streamlocal-forward
                                :x11-forward :hostbased-authentication
                                :version-addendum :agent-forward
-                               :compression :post-quantum-kex :umac)))))
+                               :compression :post-quantum-kex :umac
+                               :mldsa)))))
 
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the pure transport implements."

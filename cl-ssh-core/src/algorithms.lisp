@@ -97,6 +97,7 @@ of the list it resolves KexAlgorithms against.")
     "ecdsa-sha2-nistp521-cert-v01@openssh.com"
     "rsa-sha2-512-cert-v01@openssh.com"
     "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-mldsa44-ed25519-cert"
     "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
@@ -106,6 +107,7 @@ of the list it resolves KexAlgorithms against.")
     ;; the newer names.
     "rsa-sha2-512"
     "rsa-sha2-256"
+    "ssh-mldsa44-ed25519"
     "ssh-rsa")
   "Host key algorithms offered to a server, in preference order.
 
@@ -119,12 +121,14 @@ when it actually has the matching certificate.")
     "ecdsa-sha2-nistp521-cert-v01@openssh.com"
     "rsa-sha2-512-cert-v01@openssh.com"
     "rsa-sha2-256-cert-v01@openssh.com"
+    "ssh-mldsa44-ed25519-cert"
     "ssh-ed25519"
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
     "rsa-sha2-512"
     "rsa-sha2-256"
+    "ssh-mldsa44-ed25519"
     "ssh-rsa")
   "Host key algorithms a server can present, in preference order.
 
@@ -146,7 +150,8 @@ certificate for the key, and then it outranks the plain key, as in sshd.")
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
     "rsa-sha2-512"
-    "rsa-sha2-256")
+    "rsa-sha2-256"
+    "ssh-mldsa44-ed25519")
   "Public-key signature algorithms the server accepts for user auth.
 
 This is what EXT_INFO's server-sig-algs names.  SHA-1 ssh-rsa is accepted
@@ -167,7 +172,8 @@ ALGORITHMS+ is the set such a name resolves against.")
             "ecdsa-sha2-nistp521-cert-v01@openssh.com"
             "ssh-rsa-cert-v01@openssh.com"
             "rsa-sha2-256-cert-v01@openssh.com"
-            "rsa-sha2-512-cert-v01@openssh.com"))
+            "rsa-sha2-512-cert-v01@openssh.com"
+            "ssh-mldsa44-ed25519-cert"))
   "Every user public-key algorithm this server can enforce a choice from.")
 
 (defparameter +ssh-server-ca-signature-algorithms+
@@ -178,10 +184,12 @@ ALGORITHMS+ is the set such a name resolves against.")
     "rsa-sha2-512"
     "rsa-sha2-256")
   "CASignatureAlgorithms' default, without the security-key names this
-build cannot verify.  SHA-1 ssh-rsa is deliberately absent, as in sshd.")
+build cannot verify.  SHA-1 ssh-rsa and ssh-mldsa44-ed25519 are deliberately
+absent from the default, as in sshd, though a configuration may name them.")
 
 (defparameter +ssh-server-ca-signature-algorithm-names+
-  (append +ssh-server-ca-signature-algorithms+ '("ssh-rsa"))
+  (append +ssh-server-ca-signature-algorithms+
+          '("ssh-rsa" "ssh-mldsa44-ed25519"))
   "Every CA signature name a config may select.
 
 This is sshd's all-signatures set minus the security-key names: ssh-rsa is

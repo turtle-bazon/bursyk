@@ -278,6 +278,8 @@ An agent-backed key cannot sign synchronously; the KEX path asks the agent."
       (digest (ssh-rsa-signature-blob key message digest))
       ((string= algorithm "ssh-ed25519")
        (ssh-ed25519-signature-blob key message))
+      ((string= algorithm "ssh-mldsa44-ed25519")
+       (ssh-mldsa44-ed25519-signature-blob key message))
       (t (ssh-ecdsa-signature-blob key message)))))
 
 
@@ -565,6 +567,10 @@ A malformed or mismatched blob is simply not a valid signature."
             ((string= type "ssh-ed25519")
              (and (string= algorithm "ssh-ed25519")
                   (ssh-ed25519-verify signature message key-bytes)))
+            ((string= type "ssh-mldsa44-ed25519")
+             (and (string= algorithm "ssh-mldsa44-ed25519")
+                  (ssh-mldsa44-ed25519-verify
+                   key-bytes signature message)))
             ((string= type "ssh-rsa")
              (let ((digest (ssh-rsa-digest-keyword algorithm)))
                (and digest

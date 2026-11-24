@@ -60,6 +60,7 @@ as OpenSSH's sshkey_fingerprint does with force_plain."
     (declare (ignore data))
     (let ((name (cond
                   ((string= type "ssh-ed25519") "ED25519")
+                  ((string= type "ssh-mldsa44-ed25519") "MLDSA44-ED25519")
                   ((string= type "ssh-rsa") "RSA")
                   ((member type '("ecdsa-sha2-nistp256"
                                   "ecdsa-sha2-nistp384"
@@ -69,6 +70,7 @@ as OpenSSH's sshkey_fingerprint does with force_plain."
                   (t (string-upcase type))))
           (size (cond
                   ((string= type "ssh-ed25519") 256)
+                  ((string= type "ssh-mldsa44-ed25519") 512)
                   ((string= type "ssh-rsa")
                    (ssh-rsa-public-key-bits key-blob))
                   ((string= type "ecdsa-sha2-nistp256") 256)
@@ -107,8 +109,11 @@ as OpenSSH's sshkey_fingerprint does with force_plain."
           (hash-title (format nil "[~A]"
                               (string-upcase (symbol-name hash)))))
       (flet ((border (label)
-               (let* ((label (if (> (length label) width)
-                                 (subseq label 0 width)
+               (let* ((label (if (>= (length label) width)
+                                 ;; OpenSSH's title buffer holds WIDTH - 1
+                                 ;; characters plus the terminating NUL, so a
+                                 ;; long type name loses its last character.
+                                 (subseq label 0 (1- width))
                                  label))
                       (left (floor (- width (length label)) 2)))
                  (concatenate 'string
@@ -140,7 +145,8 @@ reads them as the protocol lays them out."
   (let* ((reader (ssh-make-reader key-blob))
          (type (ssh-read-text reader)))
     (values type
-            (if (string= type "ssh-ed25519")
+            (if (member type '("ssh-ed25519" "ssh-mldsa44-ed25519")
+                        :test #'string=)
                 (ssh-read-string reader)
                 (ssh-read-octets reader (ssh-reader-remaining reader))))))
 
@@ -174,12 +180,13 @@ passes, as sshkey_check_rsa_length does."
 (defun ssh-make-public-key-blob (type data)
   "A public key blob from TYPE and its type-specific DATA.
 
-DATA is the decoded ed25519 key; for RSA it is the e and n mpints and for
-ECDSA the curve name and point strings, already encoded as the wire has
-them.  Only ed25519 needs the extra string wrapper."
+DATA is the decoded ed25519 or composite ML-DSA key; for RSA it is the e and
+n mpints and for ECDSA the curve name and point strings, already encoded as
+the wire has them.  Ed25519 and ssh-mldsa44-ed25519 need the extra string
+wrapper."
   (let ((writer (ssh-writer)))
     (ssh-write-text writer type)
-    (if (string= type "ssh-ed25519")
+    (if (member type '("ssh-ed25519" "ssh-mldsa44-ed25519") :test #'string=)
         (ssh-write-string writer data)
         (ssh-write-octets writer data))
     (ssh-writer-output writer)))
@@ -213,6 +220,123 @@ them.  Only ed25519 needs the extra string wrapper."
     (ssh-write-text writer "ssh-ed25519")
     (ssh-write-string writer (ssh-ed25519-sign private-key message))
     (ssh-writer-output writer)))
+
+;;; ---- Composite ML-DSA-44 + Ed25519 signatures ----
+;;;;
+;;;; OpenSSH's ssh-mldsa44-ed25519 follows
+;;;; draft-miller-sshm-mldsa44-ed25519: the public key is
+;;;; mldsaPK || ed25519PK, the private key is mldsaSeed || ed25519Seed, and
+;;;; a signature is mldsaSig || edSig.  Both halves sign
+;;;; m' = PREFIX || LABEL || 0 || SHA-512(message); the ML-DSA half uses
+;;;; LABEL as its FIPS 204 context.  OpenSSH's sshkey integration calls the
+;;;; composite primitive with a zero context length, so m' carries a zero
+;;;; octet where the general composite scheme would carry the label.
+
+(defparameter +ssh-mldsa44-public-key-bytes+ 1312
+  "The ML-DSA-44 public key length inside the composite key.")
+
+(defparameter +ssh-mldsa44-ed25519-public-key-bytes+ 1344
+  "The composite public key length: ML-DSA-44 then Ed25519.")
+
+(defparameter +ssh-mldsa44-ed25519-private-key-bytes+ 64
+  "The composite private key length: ML-DSA seed then Ed25519 seed.")
+
+(defparameter +ssh-mldsa44-signature-bytes+ 2420
+  "The ML-DSA-44 signature length inside the composite signature.")
+
+(defparameter +ssh-mldsa44-ed25519-signature-bytes+ 2484
+  "The composite signature length: ML-DSA-44 then Ed25519.")
+
+(defparameter +ssh-mldsa44-ed25519-prefix+
+  "CompositeAlgorithmSignatures2025"
+  "The domain-separation prefix of the composite signature scheme.")
+
+(defparameter +ssh-mldsa44-ed25519-label+
+  "COMPSIG-MLDSA44-Ed25519-SHA512"
+  "The composite label, also used as ML-DSA's FIPS 204 context.")
+
+(defun ssh-mldsa44-ed25519-mprime (message)
+  "The composite message representative m' over MESSAGE.
+
+OpenSSH calls the composite primitive with a zero context length, so m' is
+PREFIX || LABEL || #x00 || SHA-512(MESSAGE).  The ML-DSA half still signs m'
+under the LABEL context."
+  (ssh-concat (ssh-string-octets +ssh-mldsa44-ed25519-prefix+)
+              (ssh-string-octets +ssh-mldsa44-ed25519-label+)
+              (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-element 0)
+              (ssh-hash :sha512 message)))
+
+(defun ssh-mldsa44-ed25519-expand-private (material)
+  "VALUES ML-DSA-PRIVATE ED25519-PRIVATE from a composite seed MATERIAL.
+
+OpenSSH stores the two 32-octet seeds, not the expanded ML-DSA secret key.
+Ironclad-unsafe has no public seeded constructor, so the deterministic
+keygen is called directly; the result is exactly OpenSSH's expanded key."
+  (unless (= (length material) +ssh-mldsa44-ed25519-private-key-bytes+)
+    (error 'ssh-protocol-error
+           :detail "an ssh-mldsa44-ed25519 private key is 64 octets"))
+  (multiple-value-bind (public secret)
+      (ironclad-unsafe::ml-dsa-keygen-from-coins
+       (ssh-copy-octets (subseq material 0 32))
+       (ironclad-unsafe::ml-dsa-params-for-kind :ml-dsa-44))
+    (declare (ignore public))
+    (values (ironclad-unsafe:make-private-key
+             :ml-dsa-44 :bytes (ssh-copy-octets secret))
+            (ironclad-unsafe:make-private-key
+             :ed25519 :x (ssh-copy-octets (subseq material 32 64))))))
+
+(defun ssh-mldsa44-ed25519-sign (private-key message)
+  "A composite signature of MESSAGE by PRIVATE-KEY."
+  (unless (string= (ssh-private-key-type private-key)
+                   "ssh-mldsa44-ed25519")
+    (error 'ssh-protocol-error
+           :detail "only ssh-mldsa44-ed25519 keys sign here"))
+  (multiple-value-bind (mldsa ed25519)
+      (ssh-mldsa44-ed25519-expand-private
+       (ssh-private-key-private private-key))
+    (let ((mprime (ssh-mldsa44-ed25519-mprime message)))
+      (ssh-concat
+       (ironclad-unsafe:sign-message
+        mldsa mprime :ctx (ssh-string-octets +ssh-mldsa44-ed25519-label+))
+       (ironclad-unsafe:sign-message ed25519 mprime)))))
+
+(defun ssh-mldsa44-ed25519-signature-blob (private-key message)
+  "The SSH signature blob (algorithm name and signature) of MESSAGE."
+  (let ((writer (ssh-writer)))
+    (ssh-write-text writer "ssh-mldsa44-ed25519")
+    (ssh-write-string writer
+                      (ssh-mldsa44-ed25519-sign private-key message))
+    (ssh-writer-output writer)))
+
+(defun ssh-mldsa44-ed25519-verify (key-data signature message)
+  "Whether SIGNATURE over MESSAGE verifies under composite KEY-DATA.
+
+Both halves must verify: ML-DSA-44 under the LABEL context and Ed25519
+plainly, exactly as OpenSSH's crypto_sign_mldsa44_ed25519_verify requires."
+  (unless (= (length key-data) +ssh-mldsa44-ed25519-public-key-bytes+)
+    (error 'ssh-protocol-error
+           :detail "an ssh-mldsa44-ed25519 public key is 1344 octets"))
+  (unless (= (length signature) +ssh-mldsa44-ed25519-signature-bytes+)
+    (error 'ssh-protocol-error
+           :detail "an ssh-mldsa44-ed25519 signature is 2484 octets"))
+  (let* ((mprime (ssh-mldsa44-ed25519-mprime message))
+         (mldsa-key
+           (ironclad-unsafe:make-public-key
+            :ml-dsa-44
+            :bytes (subseq key-data 0 +ssh-mldsa44-public-key-bytes+)))
+         (ed25519-key
+           (ironclad-unsafe:make-public-key
+            :ed25519 :y (subseq key-data +ssh-mldsa44-public-key-bytes+)))
+         (mldsa-signature
+           (subseq signature 0 +ssh-mldsa44-signature-bytes+))
+         (ed25519-signature
+           (subseq signature +ssh-mldsa44-signature-bytes+)))
+    (and (ironclad-unsafe:verify-signature
+          mldsa-key mprime mldsa-signature
+          :ctx (ssh-string-octets +ssh-mldsa44-ed25519-label+))
+         (ironclad-unsafe:verify-signature
+          ed25519-key mprime ed25519-signature))))
 
 ;;; ---- Integers, RSA signatures ----
 
@@ -424,6 +548,8 @@ the form every OpenSSH since 7.2 understands."
     (cond
       ((string= type "ssh-ed25519")
        (ssh-ed25519-signature-blob key message))
+      ((string= type "ssh-mldsa44-ed25519")
+       (ssh-mldsa44-ed25519-signature-blob key message))
       ((and (> (length type) (length "ecdsa-sha2-"))
             (string= "ecdsa-sha2-" type
                      :end2 (length "ecdsa-sha2-")))
@@ -530,6 +656,24 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
             :public (ssh-writer-output public-writer)
             :private (ssh-writer-output private-writer)
             :comment comment)))
+        ((string= key-type "ssh-mldsa44-ed25519")
+         ;; OpenSSH writes the composite public key (ML-DSA then Ed25519)
+         ;; followed by the two 32-octet seeds.  The rest of this file keeps
+         ;; the public half as the raw 1344 octets and the private half as
+         ;; the 64-octet seed pair.
+         (let ((public (ssh-read-string reader))
+               (private (ssh-read-string reader))
+               (comment (ssh-read-text reader)))
+           (unless (= (length public)
+                      +ssh-mldsa44-ed25519-public-key-bytes+)
+             (error 'ssh-protocol-error
+                    :detail "an ssh-mldsa44-ed25519 public key is 1344 octets"))
+           (unless (= (length private)
+                      +ssh-mldsa44-ed25519-private-key-bytes+)
+             (error 'ssh-protocol-error
+                    :detail "an ssh-mldsa44-ed25519 private key is 64 octets"))
+           (%make-ssh-private-key :type key-type :public public
+                                  :private private :comment comment)))
         ((and (> (length key-type) (length "ecdsa-sha2-"))
               (string= "ecdsa-sha2-" key-type
                        :end2 (length "ecdsa-sha2-")))
@@ -664,6 +808,9 @@ hold one key."
 
 (defparameter +ssh-certificate-suffix+ "-cert-v01@openssh.com")
 
+(defparameter +ssh-mldsa-certificate-suffix+ "-cert"
+  "The shorter certificate suffix OpenSSH uses for ssh-mldsa44-ed25519-cert.")
+
 (defparameter +ssh-unix-epoch+ 2208988800
   "The universal time of 1970-01-01, which certificate times count from.")
 
@@ -672,17 +819,50 @@ hold one key."
   (- universal +ssh-unix-epoch+))
 
 (defparameter +ssh-certificate-plain-types+
-  '("ssh-ed25519" "ssh-rsa"
+  '("ssh-ed25519" "ssh-rsa" "ssh-mldsa44-ed25519"
     "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384" "ecdsa-sha2-nistp521")
   "The plain key types OpenSSH can certify and this build understands.")
 
+(defparameter +ssh-short-certificate-plain-types+
+  '("ssh-mldsa44-ed25519")
+  "The plain key types whose certificate name uses the short -cert suffix.")
+
+(defun ssh-certificate-plain-type (name)
+  "The plain key type of certificate type NAME, or NIL.
+
+Most certificates use the -cert-v01@openssh.com suffix, but the composite
+ML-DSA key uses a plain -cert, so the long suffix must not also accept it."
+  (flet ((strip (suffix plain-types)
+           (let ((start (- (length name) (length suffix))))
+             (when (and (not (minusp start))
+                        (string= suffix name :start2 start))
+               (let ((plain (subseq name 0 start)))
+                 (when (member plain plain-types :test #'string=)
+                   plain))))))
+    (or (let ((plain (strip +ssh-certificate-suffix+
+                            +ssh-certificate-plain-types+)))
+          (and plain
+               (not (member plain +ssh-short-certificate-plain-types+
+                            :test #'string=))
+               plain))
+        (strip +ssh-mldsa-certificate-suffix+
+               +ssh-short-certificate-plain-types+))))
+
 (defun ssh-certificate-type-name-p (name)
   "Whether NAME is a certificate key type this build understands."
-  (let ((suffix +ssh-certificate-suffix+))
-    (and (> (length name) (length suffix))
-         (string= suffix name :start2 (- (length name) (length suffix)))
-         (member (subseq name 0 (- (length name) (length suffix)))
-                 +ssh-certificate-plain-types+ :test #'string=))))
+  (not (null (ssh-certificate-plain-type name))))
+
+(defun ssh-certificate-name (plain-type)
+  "The certificate type name for PLAIN-TYPE."
+  (if (member plain-type +ssh-short-certificate-plain-types+
+              :test #'string=)
+      (concatenate 'string plain-type +ssh-mldsa-certificate-suffix+)
+      (concatenate 'string plain-type +ssh-certificate-suffix+)))
+
+(defun ssh-mldsa44-ed25519-algorithm-p (name)
+  "Whether NAME is the composite ML-DSA-44 + Ed25519 key or its certificate."
+  (or (string= name "ssh-mldsa44-ed25519")
+      (string= name "ssh-mldsa44-ed25519-cert")))
 
 (defun ssh-certificate-type (key-blob)
   "The certificate type name in KEY-BLOB, or NIL when it is not a cert."
@@ -694,11 +874,6 @@ hold one key."
 (defun ssh-certificate-blob-p (key-blob)
   "Whether KEY-BLOB is an OpenSSH certificate this build understands."
   (not (null (ssh-certificate-type key-blob))))
-
-(defun ssh-certificate-plain-type (name)
-  "The plain key type of certificate type NAME, or NIL."
-  (and (ssh-certificate-type-name-p name)
-       (subseq name 0 (- (length name) (length +ssh-certificate-suffix+)))))
 
 (defstruct (ssh-certificate (:constructor %make-ssh-certificate))
   (key-type nil :type (or null string))
@@ -747,6 +922,7 @@ that way), while a flag option's data is empty."
   "How many length-prefixed fields PLAIN-TYPE's public key has."
   (cond
     ((string= plain-type "ssh-ed25519") 1)
+    ((string= plain-type "ssh-mldsa44-ed25519") 1)
     ((string= plain-type "ssh-rsa") 2)
     ((member plain-type
              '("ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384"
@@ -841,6 +1017,7 @@ certificate is ED25519-CERT and an RSA one is RSA-CERT."
     (let ((name
             (cond
               ((string= plain "ssh-ed25519") "ED25519")
+              ((string= plain "ssh-mldsa44-ed25519") "MLDSA44-ED25519")
               ((string= plain "ssh-rsa") "RSA")
               ((member plain '("ecdsa-sha2-nistp256"
                                "ecdsa-sha2-nistp384"
