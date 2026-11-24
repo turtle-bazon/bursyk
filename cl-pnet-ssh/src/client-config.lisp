@@ -209,7 +209,8 @@ MAKE-SSH-CLIENT's own defaults."
         :pubkey-accepted-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-pubkey-accepted-algorithms
-         +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms")
+         +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms"
+         :all +ssh-signature-all-algorithms+)
         :revoked-host-keys
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
@@ -227,7 +228,8 @@ MAKE-SSH-CLIENT's own defaults."
         :hostbased-accepted-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-hostbased-accepted-algorithms
-         +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms")
+         +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms"
+         :all +ssh-signature-all-algorithms+)
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
         :password-authentication

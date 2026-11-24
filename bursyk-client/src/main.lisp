@@ -475,6 +475,16 @@ has no ML-DSA, so it is left out of -Q key, -G and the default offer."
       (remove-if #'mldsa-algorithm-name-p
                  cl-pnet-ssh::+ssh-host-key-algorithms+)))
 
+(defun supported-host-key-all-algorithms ()
+  "Every host key algorithm HostKeyAlgorithms may name.
+
+The SHA-1 ssh-rsa forms are implemented but outside the default offer, as in
+OpenSSH; a configuration may still name them."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-host-key-all-algorithms+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-host-key-all-algorithms+)))
+
 (defun supported-signature-algorithms ()
   "Signature algorithms this build's transport can actually use.
 
@@ -484,6 +494,16 @@ libssh cannot verify."
       cl-pnet-ssh::+ssh-signature-algorithms+
       (remove-if #'mldsa-algorithm-name-p
                  cl-pnet-ssh::+ssh-signature-algorithms+)))
+
+(defun supported-signature-all-algorithms ()
+  "Every signature name PubkeyAcceptedAlgorithms may select.
+
+The SHA-1 ssh-rsa forms are implemented but outside the default offer, as in
+OpenSSH; a configuration may still name them."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+      cl-pnet-ssh::+ssh-signature-all-algorithms+
+      (remove-if #'mldsa-algorithm-name-p
+                 cl-pnet-ssh::+ssh-signature-all-algorithms+)))
 
 (defun supported-ca-signature-algorithms ()
   "CA signature algorithms this build's transport can actually check."
@@ -3322,7 +3342,8 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "hostkeyalgorithms ~{~A~^,~}~%"
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-host-key-algorithms
-               (supported-host-key-algorithms) "HostKeyAlgorithms"))
+               (supported-host-key-algorithms) "HostKeyAlgorithms"
+               (supported-host-key-all-algorithms)))
       (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
         (when alias
           (format t "hostkeyalias ~A~%" alias)))
@@ -3330,7 +3351,8 @@ and known-hosts files) are printed as this client will actually use them."
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
                (supported-signature-algorithms)
-               "HostbasedAcceptedAlgorithms"))
+               "HostbasedAcceptedAlgorithms"
+               (supported-signature-all-algorithms)))
       (let ((value (or (getf *options* :agent)
                        (cl-pnet-ssh:ssh-config-options-identity-agent
                         options))))
@@ -3393,7 +3415,8 @@ and known-hosts files) are printed as this client will actually use them."
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-pubkey-accepted-algorithms
                (supported-signature-algorithms)
-               "PubkeyAcceptedAlgorithms"))
+               "PubkeyAcceptedAlgorithms"
+               (supported-signature-all-algorithms)))
       (format t "xauthlocation ~A~%"
               (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
                   "/usr/bin/xauth"))

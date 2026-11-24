@@ -578,16 +578,19 @@ address is known, because it has to be in the same family."
   "The signature algorithm names private KEY can answer, most preferred first."
   (let ((type (ssh-private-key-type key)))
     (if (string= type "ssh-rsa")
-        '("rsa-sha2-512" "rsa-sha2-256")
+        ;; SHA-1 ssh-rsa is implemented but not offered by default, as in
+        ;; OpenSSH; HostbasedAcceptedAlgorithms may still name it.
+        '("rsa-sha2-512" "rsa-sha2-256" "ssh-rsa")
         (list type))))
 
 (defun ssh-private-key-algorithm (key &optional patterns)
   "The hostbased algorithm name for private KEY, or NIL when none is allowed.
 
-PATTERNS is HostbasedAcceptedAlgorithms, tried in its order; NIL leaves every
-name eligible."
+PATTERNS is HostbasedAcceptedAlgorithms, tried in its order; NIL uses this
+build's default offer, which leaves SHA-1 ssh-rsa out."
   (ssh-select-signature-algorithm (ssh-private-key-signature-algorithms key)
-                                  patterns nil))
+                                  (or patterns +ssh-signature-algorithms+)
+                                  nil))
 
 (defun ssh-hostbased-key-allowed-p (client key)
   "Whether KEY has an algorithm HostbasedAcceptedAlgorithms allows."

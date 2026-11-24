@@ -1198,6 +1198,40 @@ and ProxyJump/ProxyCommand stay off the output when unset."
                       "updatehostkeys ask"))
         (is (search line text) line)))))
 
+(test print-config-accepts-sha1-rsa-names
+  "HostKeyAlgorithms and the accepted-key lists may name SHA-1 ssh-rsa."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HostKeyAlgorithms ssh-rsa")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "PubkeyAcceptedAlgorithms ssh-rsa-cert-v01@openssh.com")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostbasedAcceptedAlgorithms ssh-rsa"))))
+         (options nil))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "alias.example"
+     :on-options (lambda (value) (setf options value)))
+    (let ((burs::*options* (empty-options))
+          (text (with-output-to-string (*standard-output*)
+                  (burs::print-config-options
+                   "alias.example" options nil))))
+      (flet ((line (value)
+               (search (format nil "~A~%" value) text)))
+        (is (line "hostkeyalgorithms ssh-rsa"))
+        (is (line "pubkeyacceptedalgorithms ssh-rsa-cert-v01@openssh.com"))
+        (is (line "hostbasedacceptedalgorithms ssh-rsa")))))
+  ;; The default offer keeps them out; only a configuration names them.
+  (is (not (member "ssh-rsa" (burs::supported-signature-algorithms)
+                   :test #'string=)))
+  (is (member "ssh-rsa" (burs::supported-signature-all-algorithms)
+              :test #'string=))
+  (is (not (member "ssh-rsa" (burs::supported-host-key-algorithms)
+                   :test #'string=)))
+  (is (member "ssh-rsa" (burs::supported-host-key-all-algorithms)
+              :test #'string=)))
+
 ;;; ---- ssh -Z ----
 
 (defun dump-key-blob (&optional (fill 7))

@@ -113,7 +113,10 @@ other key types use their own certificate name."
        :blob (ssh-public-key-blob-of key)
        :alternates
        (when rsa
-         (list (cons "rsa-sha2-256" (make-sign "rsa-sha2-256"))))
+         ;; SHA-1 ssh-rsa is implemented but, as in OpenSSH, not preferred; a
+         ;; PubkeyAcceptedAlgorithms directive may still select it.
+         (list (cons "rsa-sha2-256" (make-sign "rsa-sha2-256"))
+               (cons "ssh-rsa" (make-sign "ssh-rsa"))))
        :sign (make-sign plain-algorithm)))))
 
 (defun ssh-private-key-signers (key &key certificate-files-specified)
@@ -195,10 +198,15 @@ accepts."
      :sign (ssh-signer-sign signer)
      :alternates
      (when rsa
-       (let ((sha256 (ssh-signer-for-algorithm signer "rsa-sha2-256")))
-         (when sha256
-           (list (cons "rsa-sha2-256-cert-v01@openssh.com"
-                       (ssh-signer-sign sha256)))))))))
+       (let ((sha256 (ssh-signer-for-algorithm signer "rsa-sha2-256"))
+             (sha1 (ssh-signer-for-algorithm signer "ssh-rsa")))
+         (append
+          (when sha256
+            (list (cons "rsa-sha2-256-cert-v01@openssh.com"
+                        (ssh-signer-sign sha256))))
+          (when sha1
+            (list (cons "ssh-rsa-cert-v01@openssh.com"
+                        (ssh-signer-sign sha1))))))))))
 
 (defun ssh-signers-with-certificates (signers certificates)
   "SIGNERS with each matching certificate added in front of its key.
@@ -254,14 +262,22 @@ name the key type the same way the protocol does.")
     "rsa-sha2-512"
     "rsa-sha2-256"
     "ssh-mldsa44-ed25519")
-  "Signature algorithms a signer here can name.
+  "Signature algorithms a signer here offers by default.
 
 The certificate spellings come first, as in OpenSSH's KEX_DEFAULT_PK_ALG,
 so a certificate is preferred over the plain key it certifies.  RSA signs as
-rsa-sha2-512 or rsa-sha2-256 rather than the SHA-1 ssh-rsa, so
-PubkeyAcceptedAlgorithms is resolved against this list; naming ssh-rsa is an
-error rather than a silent downgrade.  Certificate types are here because a
-certificate signs in under its own name, not the plain key's.")
+rsa-sha2-512 or rsa-sha2-256 rather than the SHA-1 ssh-rsa, which is
+implemented but left out of this default; +SSH-SIGNATURE-ALL-ALGORITHMS+ is
+the set a PubkeyAcceptedAlgorithms directive may name.  Certificate types are
+here because a certificate signs in under its own name, not the plain key's.")
+
+(defparameter +ssh-signature-all-algorithms+
+  (append +ssh-signature-algorithms+
+          '("ssh-rsa" "ssh-rsa-cert-v01@openssh.com"))
+  "Every user signature name PubkeyAcceptedAlgorithms may select.
+
+OpenSSH's sshkey_alg_list still holds the SHA-1 forms it stopped offering by
+default, so a configuration may opt back into them explicitly.")
 
 (defun ssh-agent-signer (key-blob path)
   "A signer that has the agent at PATH sign with KEY-BLOB."
@@ -283,7 +299,8 @@ certificate signs in under its own name, not the plain key's.")
          :type algorithm
          :blob key-blob
          :alternates (when rsa
-                       (list (cons "rsa-sha2-256" (make-sign 2))))
+                       (list (cons "rsa-sha2-256" (make-sign 2))
+                             (cons "ssh-rsa" (make-sign 0))))
          :sign (make-sign flags))))))
 
 (defun ssh-agent-signers (&key path on-signers on-error)

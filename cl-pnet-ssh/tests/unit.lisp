@@ -1436,8 +1436,9 @@ refuses to pair a certificate with a different key."
                                  "-f" (namestring path)))
                (let ((signer (ssh-private-key-signer
                               (ssh-load-private-key path))))
-                 ;; OpenSSH's order puts SHA-512 first.
-                 (is (equal '("rsa-sha2-512" "rsa-sha2-256")
+                 ;; OpenSSH's order puts SHA-512 first; the SHA-1 form is
+                 ;; implemented but last, outside the default offer.
+                 (is (equal '("rsa-sha2-512" "rsa-sha2-256" "ssh-rsa")
                             (cl-pnet-ssh::ssh-signer-signature-algorithms
                              signer)))
                  (is (string= "rsa-sha2-512"
@@ -1453,6 +1454,14 @@ refuses to pair a certificate with a different key."
                               (cl-pnet-ssh::ssh-signer-signature-algorithm
                                signer nil
                                :server-algorithms '("rsa-sha2-256"))))
+                 ;; A configured SHA-1 choice is honored rather than refused.
+                 (is (string= "ssh-rsa"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer '("ssh-rsa"))))
+                 (is (string= "ssh-rsa"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer nil
+                               :server-algorithms '("ssh-rsa"))))
                  ;; No overlap means no name at all, so the caller skips it.
                  (is (null (cl-pnet-ssh::ssh-signer-signature-algorithm
                             signer nil
@@ -1461,7 +1470,9 @@ refuses to pair a certificate with a different key."
                  (let ((sha512 (cl-pnet-ssh::ssh-signer-for-algorithm
                                 signer "rsa-sha2-512"))
                        (sha256 (cl-pnet-ssh::ssh-signer-for-algorithm
-                                signer "rsa-sha2-256")))
+                                signer "rsa-sha2-256"))
+                       (sha1 (cl-pnet-ssh::ssh-signer-for-algorithm
+                              signer "ssh-rsa")))
                    (is (string= "rsa-sha2-512"
                                 (cl-pnet-ssh::ssh-signer-type sha512)))
                    (is (string= "rsa-sha2-256"
@@ -1469,7 +1480,8 @@ refuses to pair a certificate with a different key."
                    (is (equalp (cl-pnet-ssh::ssh-signer-blob signer)
                                (cl-pnet-ssh::ssh-signer-blob sha512)))
                    (dolist (spec (list (cons sha512 "rsa-sha2-512")
-                                       (cons sha256 "rsa-sha2-256")))
+                                       (cons sha256 "rsa-sha2-256")
+                                       (cons sha1 "ssh-rsa")))
                      (funcall (cl-pnet-ssh::ssh-signer-sign (car spec))
                               (octets-ascii "rsa signer data")
                               (lambda (signature)
@@ -1484,7 +1496,9 @@ refuses to pair a certificate with a different key."
                  (is (= 1 (length (cl-pnet-ssh::ssh-filter-signers
                                    (list signer) '("rsa-sha2-512")))))
                  (is (= 1 (length (cl-pnet-ssh::ssh-filter-signers
-                                   (list signer) '("rsa-sha2-256")))))))
+                                   (list signer) '("rsa-sha2-256")))))
+                 (is (= 1 (length (cl-pnet-ssh::ssh-filter-signers
+                                   (list signer) '("ssh-rsa")))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test rsa-certificate-offers-both-spellings
@@ -1510,7 +1524,8 @@ refuses to pair a certificate with a different key."
                  (is (string= "rsa-sha2-512-cert-v01@openssh.com"
                               (cl-pnet-ssh::ssh-signer-type signer)))
                  (is (equal '("rsa-sha2-512-cert-v01@openssh.com"
-                              "rsa-sha2-256-cert-v01@openssh.com")
+                              "rsa-sha2-256-cert-v01@openssh.com"
+                              "ssh-rsa-cert-v01@openssh.com")
                             (cl-pnet-ssh::ssh-signer-signature-algorithms
                              signer)))
                  ;; server-sig-algs lists the signature, not the certificate
@@ -1519,6 +1534,25 @@ refuses to pair a certificate with a different key."
                               (cl-pnet-ssh::ssh-signer-signature-algorithm
                                signer nil
                                :server-algorithms '("rsa-sha2-256"))))
+                 ;; The SHA-1 certificate spelling is selectable too.
+                 (is (string= "ssh-rsa-cert-v01@openssh.com"
+                              (cl-pnet-ssh::ssh-signer-signature-algorithm
+                               signer '("ssh-rsa-cert-v01@openssh.com"))))
+                 (let ((sha1
+                         (cl-pnet-ssh::ssh-signer-for-algorithm
+                          signer "ssh-rsa-cert-v01@openssh.com")))
+                   (is (string= "ssh-rsa-cert-v01@openssh.com"
+                                (cl-pnet-ssh::ssh-signer-type sha1)))
+                   (funcall (cl-pnet-ssh::ssh-signer-sign sha1)
+                            (octets-ascii "cert sha1 data")
+                            (lambda (signature)
+                              (is (string= "ssh-rsa"
+                                           (nth-value
+                                            0 (ssh-parse-signature-blob
+                                               signature)))))
+                            (lambda (condition)
+                              (declare (ignore condition))
+                              (is nil))))
                  (let ((sha512 (cl-pnet-ssh::ssh-signer-for-algorithm
                                 signer "rsa-sha2-512-cert-v01@openssh.com")))
                    (is (string= "rsa-sha2-512-cert-v01@openssh.com"
@@ -2607,6 +2641,18 @@ share the test, so each must dispatch the same channel requests."
              position))
       (is (< position
              (position "ssh-ed25519" signatures :test #'string=))))))
+
+(test sha1-rsa-names-are-selectable-but-not-default
+  "A configuration may name the SHA-1 ssh-rsa forms the default offer omits."
+  (dolist (name '("ssh-rsa" "ssh-rsa-cert-v01@openssh.com"))
+    (is (not (member name cl-pnet-ssh::+ssh-signature-algorithms+
+                     :test #'string=)))
+    (is (member name cl-pnet-ssh::+ssh-signature-all-algorithms+
+                :test #'string=))
+    (is (not (member name cl-pnet-ssh::+ssh-host-key-algorithms+
+                     :test #'string=)))
+    (is (member name cl-pnet-ssh:+ssh-host-key-all-algorithms+
+                :test #'string=))))
 
 (test mlkem768nistp256-is-implemented-but-not-default
   "The P-256 ML-KEM hybrid is selectable but absent from the default offer."
@@ -4280,6 +4326,23 @@ path that selects the agent socket to forward."
     (is (equal '("ssh-ed25519") (getf parameters :host-key-algorithms)))
     (is (equal '("ssh-ed25519")
                (getf parameters :pubkey-accepted-algorithms))))
+  ;; The SHA-1 signatures are implemented but outside the default offer;
+  ;; HostKeyAlgorithms, PubkeyAcceptedAlgorithms and
+  ;; HostbasedAcceptedAlgorithms may all name them.
+  (let ((parameters
+          (cl-pnet-ssh::ssh-config-client-parameters
+           "alias"
+           (facade-options
+            (list :pubkey-accepted-algorithms '("ssh-rsa")
+                  :hostbased-accepted-algorithms
+                  '("ssh-rsa-cert-v01@openssh.com")
+                  :host-key-algorithms '("ssh-rsa"))))))
+    (is (equal '("ssh-rsa")
+               (getf parameters :pubkey-accepted-algorithms)))
+    (is (equal '("ssh-rsa-cert-v01@openssh.com")
+               (getf parameters :hostbased-accepted-algorithms)))
+    (is (equal '("ssh-rsa")
+               (getf parameters :host-key-algorithms))))
   ;; Absent choices leave the client on this build's own lists.
   (let ((parameters
           (cl-pnet-ssh::ssh-config-client-parameters

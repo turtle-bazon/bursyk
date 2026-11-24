@@ -667,7 +667,11 @@ means no name both sides allow, and the caller skips to the next key."
       (let ((algorithm
               (ssh-signer-signature-algorithm
                signer
-               (ssh-client-pubkey-accepted-algorithms client)
+               ;; An unconfigured list is this build's default offer, not
+               ;; "anything the key can do": that keeps SHA-1 ssh-rsa out
+               ;; unless PubkeyAcceptedAlgorithms names it.
+               (or (ssh-client-pubkey-accepted-algorithms client)
+                   +ssh-signature-algorithms+)
                :server-algorithms (ssh-client-server-sig-algs client))))
         (and algorithm (ssh-signer-for-algorithm signer algorithm))))))
 
