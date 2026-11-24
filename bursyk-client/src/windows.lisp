@@ -375,6 +375,16 @@ bytes the user typed."
 (cffi:defcfun ("LocalFree" c-local-free) :pointer (memory :pointer))
 (cffi:defcfun ("ConvertStringSidToSidW" c-convert-string-sid-to-sid) :int
   (string :pointer) (sid :pointer))
+(cffi:defcfun ("ConvertSidToStringSidW" c-convert-sid-to-string-sid) :int
+  (sid :pointer) (string :pointer))
+(cffi:defcfun ("ConvertStringSecurityDescriptorToSecurityDescriptorW"
+               c-convert-string-security-descriptor) :int
+  (string :pointer) (revision :unsigned-long) (descriptor :pointer)
+  (size :pointer))
+(cffi:defcfun ("SetFileSecurityW" c-set-file-security) :int
+  (file :pointer) (security-information :unsigned-long) (descriptor :pointer))
+(cffi:defcfun ("GetComputerNameW" c-get-computer-name) :int
+  (buffer :pointer) (size :pointer))
 (cffi:defcfun ("LookupAccountSidW" c-lookup-account-sid) :int
   (system :pointer) (sid :pointer) (name :pointer) (name-length :pointer)
   (domain :pointer) (domain-length :pointer) (use :pointer))
@@ -424,6 +434,13 @@ bytes the user typed."
               string))
     (coerce string 'string)))
 
+(defun windows-utf16-c-string (pointer)
+  "The null-terminated UTF-16 string at POINTER as a Lisp string."
+  (let ((length 0))
+    (loop while (plusp (cffi:mem-aref pointer :unsigned-short length))
+          do (incf length))
+    (windows-utf16-string pointer length)))
+
 (defun windows-current-user-sid (buffer)
   "The SID of the process user, stored in BUFFER, or NIL."
   (cffi:with-foreign-objects ((token :pointer)
@@ -438,6 +455,52 @@ bytes the user typed."
              ;; is a pointer to the SID.
              (cffi:mem-ref buffer :pointer))
         (c-close-handle (cffi:mem-ref token :pointer))))))
+
+(defun windows-current-user-sid-string ()
+  "The current user's SID as the S-1-... text SDDL wants, or NIL."
+  (let ((buffer (cffi:foreign-alloc :unsigned-char :count 256)))
+    (unwind-protect
+         (let ((sid (windows-current-user-sid buffer)))
+           (when sid
+             (cffi:with-foreign-object (string :pointer)
+               (when (plusp (c-convert-sid-to-string-sid sid string))
+                 (unwind-protect
+                      (windows-utf16-c-string
+                       (cffi:mem-ref string :pointer))
+                   (c-local-free (cffi:mem-ref string :pointer)))))))
+      (cffi:foreign-free buffer))))
+
+(defun windows-secure-private-file (path)
+  "Give PATH the protected DACL Win32-OpenSSH gives a new private key.
+
+Its createFile_flags_setup() builds the SDDL
+  O:<user>D:PAI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;<user>)
+so a fresh key grants full control only to Administrators, SYSTEM and its
+owner, and inherits nothing from the directory.  SBCL's OPEN cannot pass a
+security descriptor, so apply the equivalent DACL once the file is written.
+Best effort: if the ACL cannot be set, the inherited one stays, and the
+permission check that runs before every load judges it on its own."
+  (let ((sid (windows-current-user-sid-string)))
+    (when sid
+      (multiple-value-bind (sddl sddl-length)
+          (windows-utf16-pointer
+           (format nil "D:PAI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;~A)" sid))
+        (declare (ignore sddl-length))
+        (multiple-value-bind (path-pointer path-length)
+            (windows-utf16-pointer (uiop:native-namestring path))
+          (declare (ignore path-length))
+          (cffi:with-foreign-object (descriptor :pointer)
+            (unwind-protect
+                 (when (plusp
+                        (c-convert-string-security-descriptor
+                         sddl 1 descriptor (cffi:null-pointer)))
+                   (unwind-protect
+                        (c-set-file-security
+                         path-pointer +windows-dacl-security-information+
+                         (cffi:mem-ref descriptor :pointer))
+                     (c-local-free (cffi:mem-ref descriptor :pointer))))
+              (cffi:foreign-free path-pointer)
+              (cffi:foreign-free sddl))))))))
 
 (defun windows-trusted-installer-sid ()
   "The TrustedInstaller SID, which the caller frees with LocalFree."
@@ -467,6 +530,35 @@ bytes the user typed."
               (windows-utf16-string
                domain (cffi:mem-ref domain-length :unsigned-long))
               (cffi:mem-ref use :int)))))
+
+(defun windows-computer-name ()
+  "This machine's NetBIOS name, as GetComputerNameW reports it."
+  (cffi:with-foreign-objects ((buffer :unsigned-short 32768)
+                              (size :unsigned-long))
+    (setf (cffi:mem-ref size :unsigned-long) 32767)
+    (when (plusp (c-get-computer-name buffer size))
+      (windows-utf16-string buffer (cffi:mem-ref size :unsigned-long)))))
+
+(defun windows-current-user-name ()
+  "The current account as Win32 getpwuid() spells it, or NIL.
+
+A local account is just its name; a domain account is DOMAIN\\name, and
+Win32-OpenSSH lowercases both before using the result as the default
+comment's user part."
+  (let ((buffer (cffi:foreign-alloc :unsigned-char :count 256)))
+    (unwind-protect
+         (let ((sid (windows-current-user-sid buffer)))
+           (when sid
+             (multiple-value-bind (name domain type)
+                 (windows-sid-account sid)
+               (declare (ignore type))
+               (when name
+                 (let ((computer (windows-computer-name)))
+                   (string-downcase
+                    (if (and domain computer (not (string-equal domain computer)))
+                        (format nil "~A\\~A" domain name)
+                        name)))))))
+      (cffi:foreign-free buffer))))
 
 (defun windows-acl-denies-private-access-p (owner-sid acl)
   "Whether OWNER-SID and ACL let anyone but the trusted accounts in."

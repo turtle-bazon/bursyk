@@ -199,8 +199,13 @@ non-option arguments, so one before an option does not stop the parse."
 SBCL turns the empty string into the current directory, but open(\"\") fails
 with ENOENT, so ssh-keygen reports an empty name as missing.  Every lookup
 of a user-supplied path goes through KEYGEN-PROBE-FILE to get that wrong
-answer right."
-  (zerop (length (uiop:native-namestring path))))
+answer right.  A pathname with no component at all is the empty name on
+every platform, whatever NATIVE-NAMESTRING prints for it."
+  (or (zerop (length (uiop:native-namestring path)))
+      (and (null (pathname-name path))
+           (null (pathname-type path))
+           (null (pathname-directory path))
+           (null (pathname-device path)))))
 
 (defun keygen-probe-file (path)
   "The truename of PATH, or NIL when it does not exist.
@@ -244,16 +249,33 @@ standard output, so keep it out of the passphrase chatter on stderr."
 (defun keygen-public-path (path)
   (keygen-pathname (concatenate 'string (uiop:native-namestring path) ".pub")))
 
+(defun keygen-default-user ()
+  "The user part of the default comment.
+
+Win32-OpenSSH takes it from getpwuid(), which lowercases the account and
+qualifies a domain account with its domain; USERNAME alone loses that.  A
+POSIX host keeps ssh-keygen's plain $USER."
+  #+win32
+  (or (windows-current-user-name)
+      (uiop:getenv "USERNAME") (uiop:getenv "USER") "user")
+  #-win32
+  (or (uiop:getenv "USER") (uiop:getenv "USERNAME") "user"))
+
 (defun keygen-default-comment ()
   (format nil "~A@~A"
-          (or (uiop:getenv "USER") (uiop:getenv "USERNAME") "user")
+          (keygen-default-user)
           (or (machine-instance) "localhost")))
 
 (defun keygen-set-permissions (path mode)
-  ;; Windows has no POSIX mode bits; the file is private by directory ACL.
+  ;; Windows has no POSIX mode bits.  A private key gets the protected ACL
+  ;; Win32-OpenSSH creates it with; the public file and ~/.ssh keep the ACL
+  ;; they inherit, as they do there.
+  #+win32
+  (when (eql mode #o600)
+    (ignore-errors (windows-secure-private-file path)))
   #+(and sbcl (not win32))
   (ignore-errors (sb-posix:chmod (uiop:native-namestring path) mode))
-  #-(and sbcl (not win32))
+  #-(or win32 (and sbcl (not win32)))
   (declare (ignore path mode))
   (values))
 
