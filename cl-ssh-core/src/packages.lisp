@@ -593,6 +593,7 @@
    #:+ssh-kex-default-algorithms+
    #:+ssh-server-default-kex-algorithms+
    #:+ssh-host-key-algorithms+
+   #:+ssh-host-key-all-algorithms+
    #:+ssh-ciphers+
    #:+ssh-all-ciphers+
    #:+ssh-all-macs+

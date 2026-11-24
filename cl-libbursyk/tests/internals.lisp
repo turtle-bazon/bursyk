@@ -1265,8 +1265,7 @@ flag at a rekey would make the two sides count packets differently."
                    (is (member long-key keys :test #'eq))
                    (is (member ed-key keys :test #'eq))
                    ;; Only the remaining keys' algorithms are advertised.
-                   (is (equal '("ssh-ed25519" "rsa-sha2-512" "rsa-sha2-256"
-                                "ssh-rsa")
+                   (is (equal '("ssh-ed25519" "rsa-sha2-512" "rsa-sha2-256")
                               (cl-pnet-ssh::ssh-server-host-key-algorithms-for
                                (funcall session-for restricted)))))
                  ;; Without the directive sshd still enforces its own 1024-bit

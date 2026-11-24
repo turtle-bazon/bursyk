@@ -195,7 +195,8 @@ MAKE-SSH-CLIENT's own defaults."
         :host-key-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-host-key-algorithms
-         +ssh-host-key-algorithms+ "HostKeyAlgorithms")
+         +ssh-host-key-algorithms+ "HostKeyAlgorithms"
+         :all +ssh-host-key-all-algorithms+)
         :ciphers
         (ssh-config-client-algorithms
          options #'ssh-config-options-ciphers

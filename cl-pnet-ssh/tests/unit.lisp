@@ -3387,12 +3387,16 @@ certificate, its plain key or its CA refuses it."
                                   (ssh-load-private-key rsa)))
                       (advertised
                         (cl-pnet-ssh::ssh-server-host-key-algorithms keys)))
+                 ;; SHA-1 ssh-rsa is implemented but, as in OpenSSH, not
+                 ;; offered by default.
                  (is (equal '("ssh-ed25519"
                               "ecdsa-sha2-nistp256"
                               "rsa-sha2-512"
-                              "rsa-sha2-256"
-                              "ssh-rsa")
+                              "rsa-sha2-256")
                             advertised))
+                 (is (equal '("ssh-rsa")
+                            (cl-pnet-ssh::ssh-server-host-key-algorithms
+                             keys '("ssh-rsa"))))
                  (is (eq (first keys)
                          (cl-pnet-ssh::ssh-server-host-key-for
                           keys "ssh-ed25519")))
@@ -4161,6 +4165,32 @@ path that selects the agent socket to forward."
     (is (eq t (getf parameters :forward-agent)))
     (is (equal "/tmp/agent.sock"
                (getf parameters :forward-agent-sock-path)))))
+
+(test sha1-ssh-rsa-is-not-offered-by-default
+  "ssh-rsa stays implemented but, as in OpenSSH, outside the default offers."
+  (is (not (member "ssh-rsa" cl-pnet-ssh:+ssh-host-key-algorithms+
+                   :test #'string=)))
+  (is (member "ssh-rsa" cl-pnet-ssh:+ssh-host-key-all-algorithms+
+              :test #'string=))
+  (is (member "ssh-rsa-cert-v01@openssh.com"
+              cl-pnet-ssh:+ssh-host-key-all-algorithms+ :test #'string=))
+  ;; HostKeyAlgorithms may still opt back into either SHA-1 spelling, as
+  ;; sshkey_alg_list allows.
+  (is (equal '("ssh-rsa")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("ssh-rsa") cl-pnet-ssh:+ssh-host-key-algorithms+
+              "HostKeyAlgorithms"
+              :all cl-pnet-ssh:+ssh-host-key-all-algorithms+)))
+  (is (equal '("ssh-rsa-cert-v01@openssh.com")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("ssh-rsa-cert-v01@openssh.com")
+              cl-pnet-ssh:+ssh-host-key-algorithms+
+              "HostKeyAlgorithms"
+              :all cl-pnet-ssh:+ssh-host-key-all-algorithms+)))
+  (signals cl-pnet-ssh:ssh-config-error
+    (cl-pnet-ssh:ssh-resolve-algorithm-list
+     '("ssh-rsa") cl-pnet-ssh:+ssh-host-key-algorithms+
+     "HostKeyAlgorithms")))
 
 (test algorithm-selection-follows-ssh-prefixes
   ;; ssh_config's +, - and ^ prefixes edit this build's list; a name it does

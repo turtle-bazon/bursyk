@@ -107,12 +107,21 @@ of the list it resolves KexAlgorithms against.")
     ;; the newer names.
     "rsa-sha2-512"
     "rsa-sha2-256"
-    "ssh-mldsa44-ed25519"
-    "ssh-rsa")
+    "ssh-mldsa44-ed25519")
   "Host key algorithms offered to a server, in preference order.
 
 Certificate names come first, as in OpenSSH, but a server only selects one
-when it actually has the matching certificate.")
+when it actually has the matching certificate.  SHA-1 ssh-rsa is implemented
+but, as in OpenSSH, left out of the default offer; +SSH-HOST-KEY-ALL-
+ALGORITHMS+ is the set a HostKeyAlgorithms directive may name.")
+
+(defparameter +ssh-host-key-all-algorithms+
+  (append +ssh-host-key-algorithms+
+          '("ssh-rsa" "ssh-rsa-cert-v01@openssh.com"))
+  "Every host key algorithm a HostKeyAlgorithms directive may name.
+
+OpenSSH's sshkey_alg_list still holds the SHA-1 forms it stopped offering by
+default, so a configuration may opt back into them explicitly.")
 
 (defparameter +ssh-server-host-key-preference+
   '("ssh-ed25519-cert-v01@openssh.com"
@@ -128,8 +137,7 @@ when it actually has the matching certificate.")
     "ecdsa-sha2-nistp521"
     "rsa-sha2-512"
     "rsa-sha2-256"
-    "ssh-mldsa44-ed25519"
-    "ssh-rsa")
+    "ssh-mldsa44-ed25519")
   "Host key algorithms a server can present, in preference order.
 
 A server advertises only those its loaded keys can actually sign with, so a
@@ -140,8 +148,8 @@ certificate for the key, and then it outranks the plain key, as in sshd.")
 (defparameter +ssh-server-host-key-all-algorithms+
   (append +ssh-server-host-key-preference+
           ;; Not offered by default, but an administrator may still name the
-          ;; SHA-1 certificate form, as OpenSSH's own list allows.
-          '("ssh-rsa-cert-v01@openssh.com"))
+          ;; SHA-1 forms, as OpenSSH's own list allows.
+          '("ssh-rsa" "ssh-rsa-cert-v01@openssh.com"))
   "Every host key algorithm a HostKeyAlgorithms directive may name.")
 
 (defparameter +ssh-server-user-key-algorithms+
