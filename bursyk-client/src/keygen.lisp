@@ -345,7 +345,11 @@ as bad permissions; this only covers the paths that get past it."
   "Print ssh-keygen's warning and return T when PATH is too permissive.
 
 OpenSSH checks the mode only for files the current user owns, and only on
-systems with POSIX mode bits, so the check does nothing on Windows."
+systems with POSIX mode bits.  Windows has ACLs instead: Win32-OpenSSH
+refuses a key whose DACL admits anyone but its owner, Administrators,
+SYSTEM or TrustedInstaller, even read-only."
+  #+win32
+  (windows-private-key-permissions-too-open-p path)
   #+(and sbcl (not win32))
   (let ((stat (ignore-errors
                (sb-posix:stat (uiop:native-namestring path)))))
@@ -362,7 +366,7 @@ systems with POSIX mode bits, so the check does nothing on Windows."
               "It is required that your private key files are NOT accessible by others."
               "This private key will be ignored.")
       t))
-  #-(and sbcl (not win32))
+  #-(or win32 (and sbcl (not win32)))
   nil)
 
 (defun keygen-load-key (path &key passphrase (prompt "Enter passphrase: ")

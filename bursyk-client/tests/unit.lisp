@@ -1678,6 +1678,52 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
              (is (search "ssh-ed25519" output))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test keygen-refuses-a-too-open-windows-acl
+  ;; Windows checks ACLs rather than mode bits: Win32-OpenSSH refuses a
+  ;; private key whose DACL admits anyone but its owner, Administrators,
+  ;; SYSTEM and TrustedInstaller.  A key keygen just wrote must pass, and
+  ;; granting Everyone write access must make -y refuse it.
+  #-win32 (skip "Windows ACLs only")
+  #+win32
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (native (namestring path)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" native "-N" "" "-q")))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" native))
+             (declare (ignore output))
+             (is (eql 0 status))
+             (is (not (search "WARNING: UNPROTECTED PRIVATE KEY FILE!" error))))
+           ;; The well-known SID keeps icacls working on localized Windows.
+           (uiop:run-program (list "icacls" native "/grant" "*S-1-1-0:(W)")
+                             :output nil :error-output nil)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" native))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "WARNING: UNPROTECTED PRIVATE KEY FILE!" error))
+             (is (search "Permissions for '" error))
+             (is (search "are too open." error))
+             (is (search "This private key will be ignored." error))
+             (is (search (format nil "Load key \"~A\": bad permissions"
+                                 native)
+                         error)))
+           ;; -l still fingerprints the .pub without the warning.
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" native))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "ED25519" output))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test keygen-reports-unreadable-and-malformed-keys
   ;; ssh-keygen says "invalid format" for garbage and the OS message for a
   ;; directory or an unreadable key, without asking for a passphrase.

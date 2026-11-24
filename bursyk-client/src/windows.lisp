@@ -335,3 +335,238 @@ bytes the user typed."
   (write-line "BURS-AUTH-OK" *standard-output*)
   (finish-output *standard-output*)
   (setf *background-child* nil))
+
+;;;; ---- private-key ACL checks ----
+;;;;
+;;;; ssh-keygen on Windows cannot look at POSIX mode bits, so it asks the
+;;;; security subsystem instead.  The rules come from
+;;;; check_secure_file_permission() in Win32-OpenSSH's sshfileperm.c: the
+;;;; owner must be the current user, Administrators, SYSTEM or
+;;;; TrustedInstaller, and no other trustee may appear in an allowing ACE at
+;;;; all, even with read-only access.  A SID history entry that resolves to
+;;;; the current user is the exception.
+;;;;
+;;;; Getting this wrong in either direction is visible to users: a key that
+;;;; ssh-keygen accepts must not be refused here, and one ssh-keygen refuses
+;;;; (a file copied from a shared folder, say) must not be used.
+
+(cffi:define-foreign-library burs-client-advapi32
+  (:windows "advapi32.dll"))
+(cffi:use-foreign-library burs-client-advapi32)
+
+(cffi:defcfun ("GetCurrentProcess" c-get-current-process) :pointer)
+(cffi:defcfun ("OpenProcessToken" c-open-process-token) :int
+  (process :pointer) (access :unsigned-long) (token :pointer))
+(cffi:defcfun ("GetTokenInformation" c-get-token-information) :int
+  (token :pointer) (class :int) (information :pointer)
+  (length :unsigned-long) (returned :pointer))
+(cffi:defcfun ("CloseHandle" c-close-handle) :int (handle :pointer))
+(cffi:defcfun ("GetNamedSecurityInfoW" c-get-named-security-info) :unsigned-long
+  (object :pointer) (object-type :int) (information :unsigned-long)
+  (owner :pointer) (group :pointer) (dacl :pointer) (sacl :pointer)
+  (descriptor :pointer))
+(cffi:defcfun ("GetAce" c-get-ace) :int
+  (acl :pointer) (index :unsigned-long) (ace :pointer))
+(cffi:defcfun ("IsValidSid" c-is-valid-sid) :int (sid :pointer))
+(cffi:defcfun ("IsValidAcl" c-is-valid-acl) :int (acl :pointer))
+(cffi:defcfun ("IsWellKnownSid" c-is-well-known-sid) :int
+  (sid :pointer) (type :int))
+(cffi:defcfun ("EqualSid" c-equal-sid) :int (a :pointer) (b :pointer))
+(cffi:defcfun ("LocalFree" c-local-free) :pointer (memory :pointer))
+(cffi:defcfun ("ConvertStringSidToSidW" c-convert-string-sid-to-sid) :int
+  (string :pointer) (sid :pointer))
+(cffi:defcfun ("LookupAccountSidW" c-lookup-account-sid) :int
+  (system :pointer) (sid :pointer) (name :pointer) (name-length :pointer)
+  (domain :pointer) (domain-length :pointer) (use :pointer))
+
+(defconstant +windows-se-file-object+ 1)
+(defconstant +windows-owner-security-information+ #x1)
+(defconstant +windows-dacl-security-information+ #x4)
+(defconstant +windows-token-query+ #x8)
+(defconstant +windows-token-user+ 1)
+(defconstant +windows-access-allowed-ace-type+ 0)
+(defconstant +windows-win-local-system-sid+ 22)
+(defconstant +windows-win-builtin-administrators-sid+ 26)
+(defparameter *windows-trusted-installer-sid*
+  "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+
+(defun windows-utf16-units (string)
+  "STRING as UTF-16 code units, without a terminator."
+  (let ((units (make-array (length string) :element-type '(unsigned-byte 16)
+                                           :adjustable t :fill-pointer 0)))
+    (loop for character across string
+          for code = (char-code character)
+          do (if (> code #xFFFF)
+                 (let ((value (- code #x10000)))
+                   (vector-push-extend (+ #xD800 (ldb (byte 10 10) value)) units)
+                   (vector-push-extend (+ #xDC00 (ldb (byte 10 0) value)) units))
+                 (vector-push-extend code units)))
+    units))
+
+(defun windows-utf16-pointer (string)
+  "VALUES POINTER LENGTH for a null-terminated UTF-16 copy of STRING."
+  (let* ((units (windows-utf16-units string))
+         (length (1+ (length units)))
+         (pointer (cffi:foreign-alloc :unsigned-short :count length)))
+    (loop for index below (length units)
+          do (setf (cffi:mem-aref pointer :unsigned-short index)
+                   (aref units index)))
+    (setf (cffi:mem-aref pointer :unsigned-short (length units)) 0)
+    (values pointer length)))
+
+(defun windows-utf16-string (pointer length)
+  "The Lisp string in the first LENGTH UTF-16 units at POINTER."
+  (let ((string (make-array length :element-type 'character
+                                   :adjustable t :fill-pointer 0)))
+    (loop for index below length
+          do (vector-push-extend
+              (code-char (cffi:mem-aref pointer :unsigned-short index))
+              string))
+    (coerce string 'string)))
+
+(defun windows-current-user-sid (buffer)
+  "The SID of the process user, stored in BUFFER, or NIL."
+  (cffi:with-foreign-objects ((token :pointer)
+                              (returned :unsigned-long))
+    (when (plusp (c-open-process-token (c-get-current-process)
+                                       +windows-token-query+ token))
+      (unwind-protect
+           (when (plusp (c-get-token-information
+                         (cffi:mem-ref token :pointer) +windows-token-user+
+                         buffer 256 returned))
+             ;; The token buffer starts with TOKEN_USER, whose first field
+             ;; is a pointer to the SID.
+             (cffi:mem-ref buffer :pointer))
+        (c-close-handle (cffi:mem-ref token :pointer))))))
+
+(defun windows-trusted-installer-sid ()
+  "The TrustedInstaller SID, which the caller frees with LocalFree."
+  (multiple-value-bind (string length)
+      (windows-utf16-pointer *windows-trusted-installer-sid*)
+    (declare (ignore length))
+    (unwind-protect
+         (cffi:with-foreign-object (sid :pointer)
+           (when (plusp (c-convert-string-sid-to-sid string sid))
+             (cffi:mem-ref sid :pointer)))
+      (cffi:foreign-free string))))
+
+(defun windows-sid-account (sid)
+  "VALUES NAME DOMAIN TYPE for SID, or NIL when it has no account."
+  (cffi:with-foreign-objects ((name :unsigned-short 257)
+                              (domain :unsigned-short 257)
+                              (name-length :unsigned-long)
+                              (domain-length :unsigned-long)
+                              (use :int))
+    (setf (cffi:mem-ref name-length :unsigned-long) 256
+          (cffi:mem-ref domain-length :unsigned-long) 256)
+    (when (plusp (c-lookup-account-sid (cffi:null-pointer) sid
+                                       name name-length
+                                       domain domain-length use))
+      (values (windows-utf16-string
+               name (cffi:mem-ref name-length :unsigned-long))
+              (windows-utf16-string
+               domain (cffi:mem-ref domain-length :unsigned-long))
+              (cffi:mem-ref use :int)))))
+
+(defun windows-acl-denies-private-access-p (owner-sid acl)
+  "Whether OWNER-SID and ACL let anyone but the trusted accounts in."
+  (let ((user-buffer (cffi:foreign-alloc :unsigned-char :count 256))
+        (trusted-installer nil))
+    (unwind-protect
+         (let ((user-sid (windows-current-user-sid user-buffer)))
+           (setf trusted-installer (windows-trusted-installer-sid))
+           (block check
+             (when (null user-sid)
+               (return-from check t))
+             (unless (or (plusp (c-is-well-known-sid
+                                 owner-sid
+                                 +windows-win-builtin-administrators-sid+))
+                         (plusp (c-is-well-known-sid
+                                 owner-sid +windows-win-local-system-sid+))
+                         (plusp (c-equal-sid owner-sid user-sid))
+                         (and trusted-installer
+                              (plusp (c-equal-sid
+                                      owner-sid trusted-installer))))
+               (return-from check t))
+             (multiple-value-bind (user-name user-domain user-type)
+                 (windows-sid-account user-sid)
+               (cffi:with-foreign-object (ace :pointer)
+                 (dotimes (index
+                           (cffi:mem-ref (cffi:inc-pointer acl 4)
+                                         :unsigned-short))
+                   (unless (plusp (c-get-ace acl index ace))
+                     (return-from check t))
+                   (let* ((entry (cffi:mem-ref ace :pointer))
+                          (ace-type (cffi:mem-ref entry :unsigned-char))
+                          ;; The trustee SID follows the ACE header: type,
+                          ;; flags, size and mask.
+                          (trustee (cffi:inc-pointer entry 8)))
+                     (when (= ace-type +windows-access-allowed-ace-type+)
+                       (unless
+                           (or (plusp (c-is-well-known-sid
+                                       trustee
+                                       +windows-win-builtin-administrators-sid+))
+                               (plusp (c-is-well-known-sid
+                                       trustee +windows-win-local-system-sid+))
+                               (plusp (c-equal-sid trustee user-sid))
+                               (and trusted-installer
+                                    (plusp (c-equal-sid
+                                            trustee trusted-installer))))
+                         ;; A SID history entry may name the same user
+                         ;; under another SID, so compare resolved names.
+                         (multiple-value-bind (name domain type)
+                             (windows-sid-account trustee)
+                           (unless (and user-name name
+                                        (string-equal name user-name)
+                                        (string-equal domain user-domain)
+                                        (eql type user-type))
+                             (return-from check t))))))))
+               nil)))
+      (when trusted-installer
+        (c-local-free trusted-installer))
+      (cffi:foreign-free user-buffer))))
+
+(defun windows-acl-too-open-p (path)
+  "Whether PATH's DACL breaks Win32-OpenSSH's private-file rules."
+  (multiple-value-bind (path-pointer length)
+      (windows-utf16-pointer (uiop:native-namestring path))
+    (declare (ignore length))
+    (unwind-protect
+         (cffi:with-foreign-objects ((owner :pointer)
+                                     (dacl :pointer)
+                                     (descriptor :pointer))
+           (setf (cffi:mem-ref owner :pointer) (cffi:null-pointer)
+                 (cffi:mem-ref dacl :pointer) (cffi:null-pointer)
+                 (cffi:mem-ref descriptor :pointer) (cffi:null-pointer))
+           (if (plusp (c-get-named-security-info
+                       path-pointer +windows-se-file-object+
+                       (logior +windows-owner-security-information+
+                               +windows-dacl-security-information+)
+                       owner (cffi:null-pointer) dacl (cffi:null-pointer)
+                       descriptor))
+               ;; check_secure_file_permission() fails closed when it
+               ;; cannot read the descriptor.
+               t
+               (unwind-protect
+                    (let ((owner-sid (cffi:mem-ref owner :pointer))
+                          (acl (cffi:mem-ref dacl :pointer)))
+                      (or (zerop (c-is-valid-sid owner-sid))
+                          (zerop (c-is-valid-acl acl))
+                          (windows-acl-denies-private-access-p
+                           owner-sid acl)))
+                 (c-local-free (cffi:mem-ref descriptor :pointer)))))
+      (cffi:foreign-free path-pointer))))
+
+(defun windows-private-key-permissions-too-open-p (path)
+  "Print ssh-keygen's warning and return T when PATH's ACL is too open."
+  (when (handler-case (windows-acl-too-open-p path)
+          (error () t))
+    (format *error-output*
+            "~A~%~A~%~A~%Permissions for '~A' are too open.~%~A~%~A~%"
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+            "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @"
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+            (uiop:native-namestring path)
+            "It is required that your private key files are NOT accessible by others."
+            "This private key will be ignored.")
+    t))
