@@ -203,7 +203,7 @@ MAKE-SSH-CLIENT's own defaults."
         :macs
         (ssh-config-client-algorithms
          options #'ssh-config-options-macs
-         +ssh-macs+ "MACs")
+         +ssh-macs+ "MACs" :all +ssh-all-macs+)
         :compression (ssh-config-options-compression options)
         :pubkey-accepted-algorithms
         (ssh-config-client-algorithms

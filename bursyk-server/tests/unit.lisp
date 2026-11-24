@@ -1039,6 +1039,11 @@ PubkeyAcceptedKeyTypes rsa-sha2-512")))
   (is (equal '("aes128-cbc")
              (config-value #'cl-pnet-ssh:ssh-server-config-ciphers
                            "Ciphers aes128-cbc")))
+  ;; The legacy MD5 and 96-bit truncated HMACs are implemented but outside
+  ;; the default offer, so a configuration may name them.
+  (is (equal '("hmac-md5" "hmac-sha1-96")
+             (config-value #'cl-pnet-ssh:ssh-server-config-macs
+                           "MACs hmac-md5,hmac-sha1-96")))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Ciphers aes128-nope"))
   (signals cl-pnet-ssh:ssh-server-config-error

@@ -83,10 +83,37 @@ CLI's decision and at the plist it filled."
     (is (member "rsa-sha2-512" plain :test #'string=))
     (is (not (member "ssh-ed25519-cert-v01@openssh.com" plain
                      :test #'string=)))
-    (is (member "ssh-ed25519-cert-v01@openssh.com" all :test #'string=)))
+    (is (member "ssh-ed25519-cert-v01@openssh.com" all :test #'string=))
+    ;; sshkey_alg_list order, with the implemented SHA-1 ssh-rsa signature
+    ;; that -Q lists even though the default offer disables it.
+    (is (equal (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
+                   '("ssh-ed25519"
+                     "ssh-mldsa44-ed25519"
+                     "ecdsa-sha2-nistp256"
+                     "ecdsa-sha2-nistp384"
+                     "ecdsa-sha2-nistp521"
+                     "ssh-rsa"
+                     "rsa-sha2-256"
+                     "rsa-sha2-512")
+                   '("ssh-ed25519"
+                     "ecdsa-sha2-nistp256"
+                     "ecdsa-sha2-nistp384"
+                     "ecdsa-sha2-nistp521"
+                     "ssh-rsa"
+                     "rsa-sha2-256"
+                     "rsa-sha2-512"))
+               plain))
+    (is (equal (mapcan (lambda (name)
+                         (list name (burs::query-certificate-name name)))
+                       plain)
+               all)))
   (is (equal '("none" "zlib@openssh.com")
              (burs::query-answer "compression")))
   (is (equal '("2") (burs::query-answer "protocol-version")))
+  ;; ssh 10.6's -Q help names exactly these queries.
+  (is (equal '("cipher" "cipher-auth" "compression" "kex" "key" "key-cert"
+               "key-plain" "key-sig" "mac" "protocol-version" "sig")
+             (burs::query-answer "help")))
   (is (equal (burs::query-answer "cipher")
              (burs::query-answer "Ciphers")))
   ;; -Q cipher-auth lists only the AEAD constructions; the CTR and CBC
@@ -166,6 +193,30 @@ CLI's decision and at the plist it filled."
     ;; -G reports the default offer, which leaves that hybrid out, as ssh does.
     (is (not (member "mlkem768nistp256-sha256"
                      (burs::default-kex-algorithms) :test #'string=)))))
+
+(test mac-queries-cover-the-transport
+  "The default offer stays OpenSSH's while -Q mac lists every implementation."
+  (let ((all (burs::query-answer "mac"))
+        (default (burs::default-mac-algorithms))
+        (umac (cl-pnet-ssh:ssh-client-feature-supported-p :umac))
+        (legacy (cl-pnet-ssh:ssh-client-feature-supported-p :legacy-macs)))
+    (is (eq legacy
+            (not (null (member "hmac-sha1-96" all :test #'string=)))))
+    (is (eq legacy
+            (not (null (member "hmac-md5" all :test #'string=)))))
+    (is (eq umac
+            (not (null (member "umac-64@openssh.com" all
+                               :test #'string=)))))
+    ;; The legacy MACs are implemented but neither offered by default nor
+    ;; present in the default list -G prints.
+    (is (not (member "hmac-md5" default :test #'string=)))
+    (is (not (member "hmac-sha1-96" default :test #'string=)))
+    ;; -Q mac follows ssh's macs[] order, not the default preference order.
+    (is (equal (if legacy
+                   '("hmac-sha1" "hmac-sha1-96" "hmac-sha2-256"
+                     "hmac-sha2-512" "hmac-md5" "hmac-md5-96")
+                   '("hmac-sha1" "hmac-sha2-256" "hmac-sha2-512"))
+               (subseq all 0 (if legacy 6 3))))))
 
 (test mldsa-queries-follow-the-transport
   "A transport without ML-DSA neither lists nor accepts the composite key."

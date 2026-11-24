@@ -925,7 +925,7 @@ was built, so the same client code runs unchanged against either transport."
                                :x11-forward :hostbased-authentication
                                :version-addendum :agent-forward
                                :compression :post-quantum-kex :umac
-                               :mldsa)))))
+                               :legacy-macs :mldsa)))))
 
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the pure transport implements."

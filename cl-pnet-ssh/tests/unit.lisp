@@ -312,6 +312,45 @@
   (is (eq :sha1
           (cl-pnet-ssh::ssh-mac-name-keyword "hmac-sha1-etm@openssh.com"))))
 
+(test legacy-and-truncated-mac-names-map-to-their-digests
+  "MD5 and the 96-bit truncated HMACs keep the digest's full key but send a
+shorter tag, as RFC 6668 defines for the truncated forms."
+  (dolist (case '(("hmac-md5" :md5 16 16)
+                  ("hmac-md5-96" :md5-96 16 12)
+                  ("hmac-sha1" :sha1 20 20)
+                  ("hmac-sha1-96" :sha1-96 20 12)))
+    (destructuring-bind (name keyword key-length tag-length) case
+      (is (eq keyword (cl-pnet-ssh::ssh-mac-name-keyword name)))
+      (is (= key-length (cl-pnet-ssh::ssh-mac-key-length name)))
+      (is (= tag-length (cl-pnet-ssh::ssh-hmac-length keyword)))))
+  (is (eq :md5
+          (cl-pnet-ssh::ssh-mac-name-keyword "hmac-md5-etm@openssh.com")))
+  (is (cl-pnet-ssh::ssh-mac-truncated-p "hmac-sha1-96-etm@openssh.com"))
+  (is (not (cl-pnet-ssh::ssh-mac-truncated-p "hmac-sha1"))))
+
+(test truncated-mac-packet-round-trip
+  "A 96-bit MAC packet carries a twelve-octet tag and still round-trips."
+  (let* ((cipher "aes128-ctr")
+         (key (ssh-random-octets 16))
+         (iv (ssh-random-octets 16))
+         (mac-key (ssh-random-octets 16))
+         (send (ssh-make-cipher-state))
+         (receive (ssh-make-cipher-state)))
+    (ssh-install-keys send :encrypt key :encrypt-iv iv
+                      :encrypt-cipher cipher
+                      :encrypt-mac-key mac-key :encrypt-mac :md5-96)
+    (ssh-install-keys receive :decrypt key :decrypt-iv iv
+                      :decrypt-cipher cipher
+                      :decrypt-mac-key mac-key :decrypt-mac :md5-96)
+    (is (= 12 (cl-pnet-ssh::ssh-packet-mac-length send :send)))
+    (let* ((payload (concatenated (hex-octets "5e")
+                                  (ssh-random-octets 9)))
+           (wire (ssh-encode-packet payload send)))
+      (multiple-value-bind (decoded consumed)
+          (ssh-decode-packet wire receive)
+        (is (equalp payload decoded))
+        (is (= (length wire) consumed))))))
+
 (test umac-matches-the-rfc-vectors
   "UMAC-64 and UMAC-96 match RFC 4418's appendix vectors.
 
@@ -4150,6 +4189,20 @@ path that selects the agent socket to forward."
                "hmac-sha2-512")
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("hmac-sha2-*") cl-pnet-ssh:+ssh-macs+ "MACs")))
+  ;; The legacy MD5 and 96-bit truncated HMACs are implemented but outside
+  ;; the default offer, so they resolve only against the wider set.
+  (is (equal '("hmac-md5")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("hmac-md5") cl-pnet-ssh:+ssh-macs+ "MACs"
+              :all cl-pnet-ssh:+ssh-all-macs+)))
+  (is (equal '("hmac-sha1-96-etm@openssh.com")
+             (cl-pnet-ssh:ssh-resolve-algorithm-list
+              '("hmac-sha1-96-etm@openssh.com")
+              cl-pnet-ssh:+ssh-macs+ "MACs"
+              :all cl-pnet-ssh:+ssh-all-macs+)))
+  (signals cl-pnet-ssh:ssh-config-error
+    (cl-pnet-ssh:ssh-resolve-algorithm-list
+     '("hmac-md5") cl-pnet-ssh:+ssh-macs+ "MACs"))
   (is (equal '("curve25519-sha256")
              (cl-pnet-ssh:ssh-resolve-algorithm-list
               '("curve25519-sha256")

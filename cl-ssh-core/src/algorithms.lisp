@@ -239,12 +239,39 @@ or -c.")
     "hmac-sha2-256"
     "hmac-sha2-512"
     "hmac-sha1")
-  "The MACs this build implements, in OpenSSH's default order.
+  "The MACs this build offers by default, in OpenSSH's default order.
 
 The UMAC constructions come first, as OpenSSH lists them, and each is
 followed later by its plain (non-encrypt-then-MAC) spelling.  The pure
 transport implements all of them; libssh has no UMAC, so it filters them
-out before offering anything.")
+out before offering anything.  The legacy MD5 and 96-bit truncated HMACs
+are implemented but, as in OpenSSH, left out of this default offer;
++SSH-ALL-MACS+ is the set -Q mac and a configured MACs list may name.")
+
+(defparameter +ssh-all-macs+
+  '("hmac-sha1"
+    "hmac-sha1-96"
+    "hmac-sha2-256"
+    "hmac-sha2-512"
+    "hmac-md5"
+    "hmac-md5-96"
+    "umac-64@openssh.com"
+    "umac-128@openssh.com"
+    "hmac-sha1-etm@openssh.com"
+    "hmac-sha1-96-etm@openssh.com"
+    "hmac-sha2-256-etm@openssh.com"
+    "hmac-sha2-512-etm@openssh.com"
+    "hmac-md5-etm@openssh.com"
+    "hmac-md5-96-etm@openssh.com"
+    "umac-64-etm@openssh.com"
+    "umac-128-etm@openssh.com")
+  "Every MAC this build implements, in ssh's macs[] order.
+
+This is the order -Q mac prints: the encrypt-and-MAC constructions first,
+then their encrypt-then-MAC variants, as OpenSSH's table holds them.  It is
+not the default offer; +SSH-MACS+ is.  The pure transport implements all of
+these, while libssh 0.10 has no UMAC and none of the legacy MD5 or truncated
+HMACs.")
 
 (defparameter +ssh-compressions+ '("none" "zlib@openssh.com")
   "The compression methods this build understands, in the order OpenSSH

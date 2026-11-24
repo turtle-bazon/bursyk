@@ -24,14 +24,30 @@
 (defun ssh-hmac-length (digest)
   "The tag length of the named MAC DIGEST.
 
+A truncated MAC (hmac-sha1-96, hmac-md5-96) keeps its digest's key but sends
+only the first twelve octets, so the tag length and the key length differ.
 UMAC names ride along here so callers that only need the tag size do not
 have to know which construction produced it."
   (ecase digest
     (:sha1 20)
+    (:sha1-96 12)
     (:sha256 32)
     (:sha512 64)
+    (:md5 16)
+    (:md5-96 12)
     (:umac-64 8)
     (:umac-128 16)))
+
+(defun ssh-hmac-key-length (digest)
+  "The key length the named HMAC DIGEST takes.
+
+A truncated MAC still derives the digest's full key; only its tag is
+shortened."
+  (ecase digest
+    ((:sha1 :sha1-96) 20)
+    (:sha256 32)
+    (:sha512 64)
+    ((:md5 :md5-96) 16)))
 
 (defun ssh-poly1305 (key data)
   "The Poly1305 one-time tag of DATA under KEY (32 octets)."

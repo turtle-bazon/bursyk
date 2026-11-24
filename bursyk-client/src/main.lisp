@@ -420,15 +420,35 @@ cannot use is refused before the connection instead of after it."
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
                  cl-pnet-ssh:+ssh-kex-real-algorithms+)))
 
-(defun supported-mac-algorithms ()
-  "Every MAC this build's transport can actually negotiate.
+(defun default-mac-algorithms ()
+  "The MACs this build offers when MACs is not configured, in ssh's order.
 
-The pure transport implements OpenSSH's UMAC constructions; libssh 0.10 has
-none, so -Q mac, -G macs and -m answer from the same list and a name the
-transport cannot use is refused before the connection."
+The pure transport implements OpenSSH's UMAC constructions; libssh 0.10 does
+not, so they are filtered out of the default offer there."
   (if (cl-pnet-ssh:ssh-client-feature-supported-p :umac)
       cl-pnet-ssh:+ssh-macs+
       (remove-if #'cl-pnet-ssh::ssh-mac-umac-p cl-pnet-ssh:+ssh-macs+)))
+
+(defun supported-mac-algorithms ()
+  "Every MAC this build's transport can actually negotiate.
+
+The pure transport implements the whole OpenSSH table, including the legacy
+MD5 and 96-bit truncated HMACs its default offer leaves out.  libssh 0.10
+implements only the HMACs in OpenSSH's default offer, so the UMAC and legacy
+names are dropped there."
+  (if (cl-pnet-ssh:ssh-client-feature-supported-p :legacy-macs)
+      cl-pnet-ssh:+ssh-all-macs+
+      (remove-if #'cl-pnet-ssh::ssh-mac-umac-p cl-pnet-ssh:+ssh-macs+)))
+
+(defun query-mac-algorithms ()
+  "Every MAC the transport can negotiate, in -Q mac's macs[] order.
+
+OpenSSH lists its whole table in that order, which is not the default
+preference order."
+  (let ((supported (supported-mac-algorithms)))
+    (remove-if-not (lambda (name)
+                     (member name supported :test #'string=))
+                   cl-pnet-ssh:+ssh-all-macs+)))
 
 (defun default-kex-algorithms ()
   "The key exchanges this build offers when KexAlgorithms is not set.
@@ -866,9 +886,15 @@ names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
     "ecdsa-sha2-nistp256"
     "ecdsa-sha2-nistp384"
     "ecdsa-sha2-nistp521"
-    "rsa-sha2-512"
-    "rsa-sha2-256")
-  "Signature names this client can make or check, without certificates.")
+    "ssh-rsa"
+    "rsa-sha2-256"
+    "rsa-sha2-512")
+  "Signature names this client can make or check, without certificates.
+
+This is sshkey_alg_list's order, the order ssh -Q sig and -Q key-sig use:
+it names every implementation, including the SHA-1 ssh-rsa signature that
+is implemented but left out of the default PubkeyAcceptedAlgorithms.  The
+security-key names are omitted because this build cannot use them.")
 
 (defun query-certificate-name (name)
   "The certificate spelling of signature NAME.
@@ -906,7 +932,7 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
        (remove-if-not #'cl-pnet-ssh::ssh-cipher-aead-p
                       cl-pnet-ssh:+ssh-all-ciphers+))
       ((member name '("mac" "macs") :test #'string=)
-       (supported-mac-algorithms))
+       (query-mac-algorithms))
       ((member name '("kex" "kexalgorithms") :test #'string=)
        (remove-if-not (lambda (algorithm)
                         (member algorithm (supported-kex-algorithms)
@@ -931,9 +957,8 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
                :test #'string=)
        (query-signature-algorithms))
       ((string= name "protocol-version") '("2"))
-      ((string= name "addressfamily") '("any" "inet" "inet6"))
       ((string= name "help")
-       '("addressfamily" "cipher" "cipher-auth" "compression" "kex"
+       '("cipher" "cipher-auth" "compression" "kex"
          "key" "key-cert" "key-plain" "key-sig" "mac" "protocol-version"
          "sig"))
       (t (fail "unknown query option ~A (try -Q help)" what)))))
@@ -3346,7 +3371,7 @@ and known-hosts files) are printed as this client will actually use them."
                    "info")))
       (format t "macs ~{~A~^,~}~%"
               (algorithms #'cl-pnet-ssh:ssh-config-options-macs
-                          (supported-mac-algorithms) "MACs"))
+                          (default-mac-algorithms) "MACs"))
       (let ((provider (or (getf *options* :pkcs11)
                           (cl-pnet-ssh:ssh-config-options-pkcs11-provider
                            options))))

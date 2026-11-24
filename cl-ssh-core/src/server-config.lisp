@@ -1075,7 +1075,7 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'macs
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-macs+ "MACs")))
+         line arguments +ssh-macs+ "MACs" :all +ssh-all-macs+)))
       ((string= keyword "kexalgorithms")
        (ssh-server-config-set-once
         config 'kex-algorithms

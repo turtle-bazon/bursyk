@@ -468,6 +468,9 @@ stripped before the digest is chosen."
     (cond ((string= base "hmac-sha2-256") :sha256)
           ((string= base "hmac-sha2-512") :sha512)
           ((string= base "hmac-sha1") :sha1)
+          ((string= base "hmac-sha1-96") :sha1-96)
+          ((string= base "hmac-md5") :md5)
+          ((string= base "hmac-md5-96") :md5-96)
           ((string= base "umac-64") :umac-64)
           ((string= base "umac-128") :umac-128)
           (t nil))))
@@ -475,12 +478,13 @@ stripped before the digest is chosen."
 (defun ssh-mac-key-length (mac)
   "The key length MAC takes, or NIL when it is not implemented.
 
+A truncated MAC derives the digest's full key but sends a shorter tag.
 UMAC always takes sixteen octets even when its tag is shorter, so this is
 not simply the tag length."
   (let ((name (ssh-mac-name-keyword mac)))
     (case name
       ((:umac-64 :umac-128) +ssh-umac-key-length+)
-      (t (and name (ssh-hmac-length name))))))
+      (t (and name (ssh-hmac-key-length name))))))
 
 (defun ssh-session-keys (negotiated shared exchange-hash session-id
                          &key server string-shared (digest :sha256))

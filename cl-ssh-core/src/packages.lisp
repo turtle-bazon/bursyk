@@ -595,6 +595,7 @@
    #:+ssh-host-key-algorithms+
    #:+ssh-ciphers+
    #:+ssh-all-ciphers+
+   #:+ssh-all-macs+
    #:+ssh-macs+
    #:+ssh-compressions+
    #:+ssh-keystroke-default-interval-ms+))

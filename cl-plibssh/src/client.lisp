@@ -322,6 +322,10 @@ host is named but no descriptor is passed: libssh dials nothing itself."
       (error 'ssh-unsupported-feature
              :feature :umac
              :detail "by the libssh transport"))
+    (when (some #'ssh-mac-legacy-p (ssh-client-macs client))
+      (error 'ssh-unsupported-feature
+             :feature :legacy-macs
+             :detail "by the libssh transport"))
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hmac-c-s+ (ssh-client-macs client) "MACs")
     (ssh-plibssh-apply-algorithm-option

@@ -117,11 +117,37 @@ to reach the construction's name."
   (member (ssh-mac-base-name mac) '("umac-64" "umac-128")
           :test #'string=))
 
+(defun ssh-mac-truncated-p (mac)
+  "Whether MAC is one of the 96-bit truncated HMAC constructions."
+  (member (ssh-mac-base-name mac) '("hmac-sha1-96" "hmac-md5-96")
+          :test #'string=))
+
+(defun ssh-mac-legacy-p (mac)
+  "Whether MAC is one of the MD5 or 96-bit truncated HMACs.
+
+OpenSSH implements these but leaves them out of its default offer, and
+libssh 0.10 does not implement them at all."
+  (member (ssh-mac-base-name mac)
+          '("hmac-md5" "hmac-md5-96" "hmac-sha1-96")
+          :test #'string=))
+
+(defun ssh-mac-hmac-digest (mac)
+  "The HMAC digest behind the MAC keyword MAC.
+
+A truncated MAC shares its digest with the full-length name; the keyword
+remembers the truncation so the tag length need not be negotiated
+separately."
+  (case mac
+    ((:sha1 :sha1-96) :sha1)
+    ((:md5 :md5-96) :md5)
+    (t mac)))
+
 (defun ssh-mac-tag (state direction data)
   "The MAC over DATA for DIRECTION, or NIL when none is negotiated.
 
 HMAC prefixes the sequence number to DATA; UMAC takes it as the nonce, so
-the two constructions cannot share one call."
+the two constructions cannot share one call.  A truncated HMAC is cut to
+its first SSH-HMAC-LENGTH octets after the full digest is computed."
   (let* ((receive (eq direction :receive))
          (name (if receive
                    (ssh-cipher-state-decrypt-mac state)
@@ -138,8 +164,13 @@ the two constructions cannot share one call."
     (when name
       (if umac
           (ssh-umac-digest umac data sequence)
-          (ssh-hmac key (ssh-concat (ssh-uint32-octets sequence) data)
-                    name)))))
+          (let* ((tag (ssh-hmac key
+                                (ssh-concat (ssh-uint32-octets sequence) data)
+                                (ssh-mac-hmac-digest name)))
+                 (length (ssh-hmac-length name)))
+            (if (< length (length tag))
+                (subseq tag 0 length)
+                tag))))))
 
 (defstruct (ssh-cipher-state (:constructor ssh-make-cipher-state))
   ;; ENCRYPT and DECRYPT hold the key material the cipher routines need:
