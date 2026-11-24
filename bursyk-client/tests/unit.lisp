@@ -1724,6 +1724,38 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
              (is (search "ED25519" output))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test keygen-reports-a-missing-or-empty-key-path
+  ;; open("") fails with ENOENT, so ssh-keygen reports an empty -f as a
+  ;; missing name.  SBCL's pathname layer would instead turn "" into the
+  ;; current directory, which is why every mode must check before reading.
+  ;; -p and -c used to read the format before loading, so a missing path
+  ;; escaped as a raw stream error there.
+  (let ((missing (namestring
+                  (merge-pathnames
+                   (format nil "burs-keygen-missing-~D"
+                           (random 1000000))
+                   (uiop:temporary-directory)))))
+    (flet ((call (arguments)
+             (keygen-call arguments)))
+      (dolist (path (list "" missing))
+        (dolist (arguments (list (list "-l" "-f" path)
+                                 (list "-y" "-f" path)
+                                 (list "-p" "-N" "" "-f" path)
+                                 (list "-c" "-C" "x" "-f" path)))
+          (multiple-value-bind (status output error)
+              (call arguments)
+            (declare (ignore output))
+            (is (eql 255 status))
+            (is (search ": No such file or directory" error))
+            (is (not (search "is not a public key file." error)))
+            (is (not (search "is not a key file." error)))))
+      (multiple-value-bind (status output error)
+          (call (list "-q" "-t" "ed25519" "-N" "" "-f" ""))
+        (is (eql 1 status))
+        (is (search "Saving key \"\" failed: No such file or directory"
+                    error))
+        (is (not (search "Overwrite" output))))))))
+
 (test keygen-reports-unreadable-and-malformed-keys
   ;; ssh-keygen says "invalid format" for garbage and the OS message for a
   ;; directory or an unreadable key, without asking for a passphrase.

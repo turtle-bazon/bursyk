@@ -193,6 +193,22 @@ non-option arguments, so one before an option does not stop the parse."
 (defun keygen-pathname (name)
   (uiop:parse-native-namestring name))
 
+(defun keygen-empty-path-p (path)
+  "Whether PATH names nothing, as -f \"\" does.
+
+SBCL turns the empty string into the current directory, but open(\"\") fails
+with ENOENT, so ssh-keygen reports an empty name as missing.  Every lookup
+of a user-supplied path goes through KEYGEN-PROBE-FILE to get that wrong
+answer right."
+  (zerop (length (uiop:native-namestring path))))
+
+(defun keygen-probe-file (path)
+  "The truename of PATH, or NIL when it does not exist.
+
+Unlike PROBE-FILE this does not turn the empty string into a directory."
+  (unless (keygen-empty-path-p path)
+    (probe-file path)))
+
 (defun keygen-path (options &key (default-type "ed25519"))
   "The private key file the options select.
 
@@ -286,9 +302,10 @@ newline the terminal is not echoing."
 ;;; ---- reading existing keys ----
 
 (defun keygen-first-line (path)
-  (with-open-file (stream path :direction :input
-                               :if-does-not-exist nil)
-    (and stream (read-line stream nil nil))))
+  (unless (keygen-empty-path-p path)
+    (with-open-file (stream path :direction :input
+                                 :if-does-not-exist nil)
+      (and stream (read-line stream nil nil)))))
 
 (defun keygen-private-file-p (path)
   "Whether PATH's first line announces a private key.
@@ -306,13 +323,13 @@ look for public keys instead, exactly as it does there."
 
 (defun keygen-require-file (path)
   "Signal ssh-keygen's message when PATH does not exist."
-  (unless (probe-file path)
+  (unless (keygen-probe-file path)
     (keygen-fail "~A: No such file or directory"
                  (uiop:native-namestring path)))
   path)
 
 (defun keygen-directory-p (path)
-  (let ((truename (probe-file path)))
+  (let ((truename (keygen-probe-file path)))
     (and truename (uiop:directory-pathname-p truename))))
 
 (defun keygen-file-readable-p (path)
@@ -510,7 +527,7 @@ Returns :YES or :NO.  The question goes to standard output and is asked
 even when standard input is not a terminal; ssh-keygen treats both end of
 input and any non-yes answer as a refusal and exits 1, so :NO covers both.
 Only the private path matters: a stray .pub alone is simply rewritten."
-  (let ((existing (probe-file path)))
+  (let ((existing (keygen-probe-file path)))
     (if (not existing)
         :yes
         (progn
@@ -542,6 +559,9 @@ creates no other missing directory, so saving elsewhere fails; the
           (uiop:ensure-directory-pathname
            (merge-pathnames ".ssh/" (user-homedir-pathname)))))
     (cond
+      ;; An empty -f names no file at all, so its directory is not the
+      ;; current one; ssh-keygen fails at open() with ENOENT.
+      ((keygen-empty-path-p path) nil)
       ((probe-file directory) t)
       ((uiop:pathname-equal directory ssh-directory)
        (ensure-directories-exist ssh-directory)
@@ -789,7 +809,7 @@ The \"# Host ... found\" line is left out under -q."
          (native (uiop:native-namestring path))
          (host (getf options :find-host))
          (found nil))
-    (unless (probe-file path)
+    (unless (keygen-probe-file path)
       (keygen-fail "Cannot stat ~A: No such file or directory" native))
     (dolist (entry (cl-pnet-ssh:ssh-load-known-hosts path))
       (when (cl-pnet-ssh::ssh-known-host-entry-matches-p entry host)
@@ -821,17 +841,18 @@ The \"# Host ... found\" line is left out under -q."
     (if found 0 1)))
 
 (defun keygen-change-passphrase (options)
-  (let* ((path (or (keygen-ask-path options)
-                   (return-from keygen-change-passphrase 1)))
-         (openssh (cl-pnet-ssh:ssh-private-key-file-openssh-p path)))
+  (let ((path (or (keygen-ask-path options)
+                  (return-from keygen-change-passphrase 1))))
     (multiple-value-bind (key passphrase-used)
         (keygen-load-key path :passphrase (getf options :old-passphrase)
                               :prompt "Enter old passphrase: "
                               :failure :failed)
       (declare (ignore passphrase-used))
-      ;; ssh-keygen prints this line even under -q, but only when the
-      ;; format carried a comment; a PEM key has none.
-      (when openssh
+      ;; ssh-keygen prints this line even under -q, but only when the format
+      ;; carried a comment; a PEM key has none.  The format is read only
+      ;; after the key loaded, so a missing or unreadable file keeps
+      ;; ssh-keygen's own error instead of a raw stream error.
+      (when (cl-pnet-ssh:ssh-private-key-file-openssh-p path)
         (format t "Key has comment '~A'~%"
                 (or (cl-pnet-ssh:ssh-private-key-comment key) "")))
       (let ((new (keygen-new-passphrase options)))
@@ -849,10 +870,8 @@ The \"# Host ... found\" line is left out under -q."
     nil))
 
 (defun keygen-change-comment (options)
-  (let* ((path (or (keygen-ask-path options)
-                   (return-from keygen-change-comment 1)))
-         (public (keygen-public-path path))
-         (openssh (cl-pnet-ssh:ssh-private-key-file-openssh-p path)))
+  (let ((path (or (keygen-ask-path options)
+                  (return-from keygen-change-comment 1))))
     ;; Like ssh-keygen, -N can name the passphrase that opens the key when
     ;; -P is absent (the first attempt is always with an empty passphrase).
     (multiple-value-bind (key passphrase-used)
@@ -861,7 +880,12 @@ The \"# Host ... found\" line is left out under -q."
          :passphrase (or (getf options :old-passphrase)
                          (getf options :new-passphrase))
          :failure :cannot)
-      (let* ((old (or (cl-pnet-ssh:ssh-private-key-comment key) ""))
+      ;; Only a key that loaded can be inspected for its format; reading the
+      ;; file first would hide a missing or unreadable path behind a stream
+      ;; error instead of ssh-keygen's message.
+      (let* ((public (keygen-public-path path))
+             (openssh (cl-pnet-ssh:ssh-private-key-file-openssh-p path))
+             (old (or (cl-pnet-ssh:ssh-private-key-comment key) ""))
              (given (getf options :comment))
              (comment
                (keygen-clamp-comment
