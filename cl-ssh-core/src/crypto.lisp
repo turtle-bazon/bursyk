@@ -439,6 +439,109 @@ followed by the classical public key."
                               classical-private classical-peer
                               curve point-bytes)))))))))
 
+;;; ---- sntrup761x25519 hybrids ----
+;;;
+;;; OpenSSH's sntrup761 key exchange has the same shape as the ML-KEM one: a
+;;; sntrup761 encapsulation key followed by an X25519 public key.  The server
+;;; answers with a sntrup761 ciphertext followed by its own X25519 public key.
+;;; The two secrets are concatenated and hashed with the method's digest,
+;;; SHA-512, and that digest is carried through the exchange hash and key
+;;; derivation as an SSH string.  The two spellings are one method.
+
+(defconstant +ssh-sntrup761-public-bytes+ 1158)
+(defconstant +ssh-sntrup761-ciphertext-bytes+ 1039)
+(defconstant +ssh-sntrup761-x25519-bytes+ 32)
+
+(defparameter +ssh-sntrup761-hybrids+
+  '("sntrup761x25519-sha512"
+    "sntrup761x25519-sha512@openssh.com")
+  "OpenSSH's sntrup761 + X25519 hybrid key exchange names.")
+
+(defun ssh-sntrup761-hybrid-p (name)
+  "Whether NAME is one of OpenSSH's sntrup761 hybrids."
+  (and (stringp name)
+       (member name +ssh-sntrup761-hybrids+ :test #'string=)
+       t))
+
+(defun ssh-sntrup761-hybrid-check-name (kex)
+  "Signal unless KEX names a sntrup761 hybrid."
+  (unless (ssh-sntrup761-hybrid-p kex)
+    (error 'ssh-protocol-error
+           :detail (format nil "unsupported sntrup761 key exchange ~A" kex))))
+
+(defun ssh-kem-hybrid-p (name)
+  "Whether NAME is a KEM hybrid whose shared secret is a hashed SSH string."
+  (or (ssh-mlkem768-hybrid-p name)
+      (ssh-sntrup761-hybrid-p name)))
+
+(defstruct (ssh-sntrup761-hybrid-state
+             (:constructor %make-ssh-sntrup761-hybrid-state))
+  "A client's sntrup761 and X25519 private halves plus the blob to send."
+  (kex nil)
+  (kem-private nil)
+  (classical-private nil)
+  (public nil))
+
+(defun ssh-sntrup761-hybrid-client-keypair (kex)
+  "A fresh client keypair for the sntrup761 hybrid KEX.
+
+Returns an SSH-SNTRUP761-HYBRID-STATE whose PUBLIC is the sntrup761
+encapsulation key followed by the X25519 public key."
+  (ssh-sntrup761-hybrid-check-name kex)
+  (multiple-value-bind (kem-private kem-public)
+      (ironclad-unsafe:generate-key-pair :sntrup761)
+    (multiple-value-bind (classical-private classical-public)
+        (ssh-curve25519-keypair)
+      (%make-ssh-sntrup761-hybrid-state
+       :kex kex
+       :kem-private kem-private
+       :classical-private classical-private
+       :public (ssh-concat
+                (ironclad-unsafe:sntrup761-key-bytes kem-public)
+                classical-public)))))
+
+(defun ssh-sntrup761-hybrid-client-shared (state server-blob)
+  "The hybrid shared secret of STATE with the server's SERVER-BLOB."
+  (unless (= (length server-blob)
+             (+ +ssh-sntrup761-ciphertext-bytes+ +ssh-sntrup761-x25519-bytes+))
+    (error 'ssh-protocol-error
+           :detail "malformed sntrup761 hybrid server key exchange"))
+  (let ((kem-shared
+          (ironclad-unsafe:decapsulate-key
+           (ssh-sntrup761-hybrid-state-kem-private state)
+           (subseq server-blob 0 +ssh-sntrup761-ciphertext-bytes+)))
+        (classical-shared
+          (ssh-curve25519-shared
+           (ssh-sntrup761-hybrid-state-classical-private state)
+           (subseq server-blob +ssh-sntrup761-ciphertext-bytes+))))
+    ;; The concatenation is hashed with the KEX digest, SHA-512, so both the
+    ;; exchange hash and the KDF see a 64-octet secret that the caller writes
+    ;; as an SSH string.
+    (ssh-hash :sha512 (ssh-concat kem-shared classical-shared))))
+
+(defun ssh-sntrup761-hybrid-server-shared (kex client-blob)
+  "Answer CLIENT-BLOB with (VALUES SERVER-BLOB SHARED-SECRET)."
+  (ssh-sntrup761-hybrid-check-name kex)
+  (unless (= (length client-blob)
+             (+ +ssh-sntrup761-public-bytes+ +ssh-sntrup761-x25519-bytes+))
+    (error 'ssh-protocol-error
+           :detail "malformed sntrup761 hybrid client key exchange"))
+  (let* ((kem-public
+           (ironclad-unsafe:make-public-key
+            :sntrup761
+            :bytes (subseq client-blob 0 +ssh-sntrup761-public-bytes+)))
+         (classical-peer (subseq client-blob +ssh-sntrup761-public-bytes+)))
+    (multiple-value-bind (ciphertext kem-shared)
+        (ironclad-unsafe:encapsulate-key kem-public)
+      (multiple-value-bind (classical-private classical-public)
+          (ssh-curve25519-keypair)
+        (values (ssh-concat ciphertext classical-public)
+                (ssh-hash :sha512
+                          (ssh-concat
+                           kem-shared
+                           (ssh-curve25519-shared
+                            classical-private classical-peer))))))))
+
 (defun ssh-ed25519-verify (signature message public-key)
   "Verify SIGNATURE (64 octets) over MESSAGE under PUBLIC-KEY (32 octets)."
   (and (= (length signature) 64)

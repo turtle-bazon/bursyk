@@ -379,6 +379,7 @@ listener and sets DISPLAY in the session's environment."
 This is the server-side counterpart of SSH-CLIENT-FEATURE-SUPPORTED-P and
 keeps backend selection out of the server application."
   (not (null (member feature '(:remote-forward :streamlocal-forward
-                               :x11-forward :agent-forward :mldsa)))))
+                               :x11-forward :agent-forward :mldsa
+                               :post-quantum-kex :sntrup)))))
 
 

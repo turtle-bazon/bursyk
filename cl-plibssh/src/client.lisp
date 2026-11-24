@@ -263,6 +263,24 @@ meant to prevent."
                                (ssh-plibssh-error session))))))
   session)
 
+(defun ssh-plibssh-reject-pq-kex-algorithms (names option)
+  "Refuse NAMES when they ask for a post-quantum key exchange.
+
+libssh 0.10 has neither ML-KEM nor sntrup761, so a configured name must be
+reported as an unsupported feature rather than handed to libssh, which would
+reject it as a generic algorithm mismatch.  The two primitives are kept
+apart, because a later libssh may learn one without the other."
+  (when names
+    (cond
+      ((some #'ssh-sntrup761-hybrid-p names)
+       (error 'ssh-unsupported-feature
+              :feature :sntrup
+              :detail (format nil "~A by the libssh transport" option)))
+      ((some #'ssh-kex-post-quantum-p names)
+       (error 'ssh-unsupported-feature
+              :feature :post-quantum-kex
+              :detail (format nil "~A by the libssh transport" option))))))
+
 (defun ssh-plibssh-reject-mldsa-algorithms (names option)
   "Refuse NAMES when they ask for a composite ML-DSA key.
 
@@ -1261,6 +1279,10 @@ the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
   (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
   (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
+  ;; Refuse a post-quantum KEX before the event loop starts.  libssh would
+  ;; otherwise reject the option from a descriptor callback, where the error
+  ;; is logged and the connection simply stalls.
+  (ssh-plibssh-reject-pq-kex-algorithms kex-algorithms "KexAlgorithms")
   ;; libssh owns its banner and hashes it into the exchange hash, so a
   ;; VersionAddendum cannot be applied by this transport.
   (ssh-plibssh-reject-option "VersionAddendum" version-addendum)

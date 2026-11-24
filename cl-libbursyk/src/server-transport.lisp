@@ -295,7 +295,7 @@ came up."
             (ssh-session-keys (ssh-session-negotiated session) shared hash
                               (ssh-session-session-id session) :server t
                               :string-shared
-                              (ssh-mlkem768-hybrid-p kex)
+                              (ssh-kem-hybrid-p kex)
                               :digest (ssh-kex-digest kex))
             (ssh-session-kex-shared session) nil
             (ssh-session-kex-hash session) nil
@@ -385,6 +385,9 @@ and returns; the agent's callback finishes the KEX."
       (dh
        (multiple-value-setq (private server-public) (ssh-dh-keypair kex))
        (setf shared (ssh-dh-shared private client-public kex)))
+      ((ssh-sntrup761-hybrid-p kex)
+       (multiple-value-setq (server-public shared)
+         (ssh-sntrup761-hybrid-server-shared kex client-public)))
       ((ssh-mlkem768-hybrid-p kex)
        (multiple-value-setq (server-public shared)
          (ssh-mlkem768-hybrid-server-shared kex client-public)))
@@ -402,7 +405,7 @@ and returns; the agent's callback finishes the KEX."
                 (ssh-session-server-kexinit session)
                 host-key-blob
                 client-public server-public shared
-                :string-shared (ssh-mlkem768-hybrid-p kex)
+                :string-shared (ssh-kem-hybrid-p kex)
                 :integer-public (or dh gex)
                 :gex (when gex
                        (list :min (ssh-session-gex-min session)

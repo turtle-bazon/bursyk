@@ -21,6 +21,8 @@
     "mlkem768nistp256-sha256"
     "curve25519-sha256"
     "curve25519-sha256@libssh.org"
+    "sntrup761x25519-sha512"
+    "sntrup761x25519-sha512@openssh.com"
     "mlkem768x25519-sha256")
   "Every key-exchange method this build implements, without the markers.
 
@@ -32,6 +34,8 @@ names one can still match a peer that offers it.")
 
 (defparameter +ssh-kex-default-algorithms+
   '("mlkem768x25519-sha256"
+    "sntrup761x25519-sha512"
+    "sntrup761x25519-sha512@openssh.com"
     "curve25519-sha256"
     "curve25519-sha256@libssh.org"
     "ecdh-sha2-nistp256"
@@ -43,15 +47,18 @@ names one can still match a peer that offers it.")
     "diffie-hellman-group14-sha256")
   "The client's default key-exchange offer, in OpenSSH's order.
 
-mlkem768x25519-sha256 is OpenSSH's default post-quantum hybrid.  It needs
-ML-KEM-768 and X25519, both of which this build has, so it is offered first
-and a peer that does not know it falls back to curve25519.  Group exchange
-and the fixed-group Diffie-Hellman methods come last, as in OpenSSH's client,
-so a peer that offers only one of those still negotiates.  KEXINIT and -G
-use this list; -Q kex and KexAlgorithms use +SSH-KEX-REAL-ALGORITHMS+.")
+mlkem768x25519-sha256 and the two sntrup761 spellings are OpenSSH's default
+post-quantum hybrids.  They need only primitives this build has, so they are
+offered first and a peer that does not know them falls back to curve25519.
+Group exchange and the fixed-group Diffie-Hellman methods come last, as in
+OpenSSH's client, so a peer that offers only one of those still negotiates.
+KEXINIT and -G use this list; -Q kex and KexAlgorithms use
++SSH-KEX-REAL-ALGORITHMS+.")
 
 (defparameter +ssh-server-default-kex-algorithms+
   '("mlkem768x25519-sha256"
+    "sntrup761x25519-sha512"
+    "sntrup761x25519-sha512@openssh.com"
     "curve25519-sha256"
     "curve25519-sha256@libssh.org"
     "ecdh-sha2-nistp256"
@@ -79,10 +86,9 @@ because the server resolves against +SSH-KEX-REAL-ALGORITHMS+.")
     "sntrup761x25519-sha512@openssh.com")
   "OpenSSH's post-quantum key exchanges.
 
-mlkem768x25519-sha256 is offered by the pure transport; the others are
-listed so WarnWeakCrypto recognises them and so a later implementation needs
-only to add the method to the offer.  A transport without one leaves it out
-of the list it resolves KexAlgorithms against.")
+All of them are offered by the pure transport; a transport without one
+leaves it out of the list it resolves KexAlgorithms against, so the libssh
+backend advertises none of them.")
 
 (defun ssh-kex-post-quantum-p (name)
   "Whether NAME is one of OpenSSH's post-quantum key exchanges."

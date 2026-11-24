@@ -1008,9 +1008,12 @@ PermitListen 8080 127.0.0.1:9000")))
     (is (equal (remove "hmac-sha2-256" cl-pnet-ssh:+ssh-macs+
                        :test #'string=)
                (cl-pnet-ssh:ssh-server-config-macs config)))
-    (is (equal '("mlkem768x25519-sha256" "curve25519-sha256"
-                 "curve25519-sha256@libssh.org" "ecdh-sha2-nistp256"
-                 "ecdh-sha2-nistp384" "ecdh-sha2-nistp521")
+    (is (equal '("mlkem768x25519-sha256"
+                 "sntrup761x25519-sha512"
+                 "sntrup761x25519-sha512@openssh.com"
+                 "curve25519-sha256" "curve25519-sha256@libssh.org"
+                 "ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
+                 "ecdh-sha2-nistp521")
                (cl-pnet-ssh:ssh-server-config-kex-algorithms config)))
     ;; A plain list replaces the default outright.
     (is (equal '("ssh-ed25519")

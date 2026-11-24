@@ -2676,6 +2676,46 @@ share the test, so each must dispatch the same channel requests."
           (is (equal "oops" stderr))
           (is (eql 3 status))))))
 
+(test sntrup761-kex-loopback-exec
+  "The sntrup761 hybrids carry a session where the transport implements them."
+  (if (not (ssh-keygen-available-p))
+      (skip "ssh-keygen is not installed")
+      (if (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)
+          (dolist (kex '("sntrup761x25519-sha512"
+                         "sntrup761x25519-sha512@openssh.com"))
+            (multiple-value-bind (stdout stderr status)
+                (ssh-test-loopback-result :kex-algorithms (list kex))
+              (is (equal "hello" stdout))
+              (is (equal "oops" stderr))
+              (is (eql 3 status))))
+          ;; libssh 0.10 has no sntrup761.  The configured name must name the
+          ;; missing feature; the two spellings are one method, so one
+          ;; refusal proves the capability gate.
+          (handler-case
+              (progn
+                (ssh-test-loopback-result
+                 :kex-algorithms '("sntrup761x25519-sha512"))
+                (is nil "libssh accepted a sntrup761 key exchange"))
+            (cl-pnet-ssh:ssh-unsupported-feature (condition)
+              (is (eq :sntrup
+                      (cl-pnet-ssh:ssh-unsupported-feature-name
+                       condition))))))))
+
+(test sntrup761-hybrids-are-default-and-selectable
+  "Both sntrup761 spellings are implemented and in every default offer."
+  (dolist (kex '("sntrup761x25519-sha512"
+                 "sntrup761x25519-sha512@openssh.com"))
+    (is (member kex cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+    (is (member kex cl-pnet-ssh:+ssh-kex-default-algorithms+
+                :test #'string=))
+    (is (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
+                :test #'string=))
+    (is (cl-pnet-ssh::ssh-kex-post-quantum-p kex))
+    (is (eq :sha512 (cl-pnet-ssh::ssh-kex-digest kex))))
+  ;; The capability the CLI uses to drop them on a transport without them.
+  (is (eq (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
+          (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup))))
+
 (test fixed-group-dh-loopback-exec
   "Each MODP group carries a real session on this transport."
   (if (not (ssh-keygen-available-p))

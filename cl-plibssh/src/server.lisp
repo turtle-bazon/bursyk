@@ -1766,6 +1766,8 @@ list, applied by the same inactivity accounting as the pure backend."
     ;; method list.  RequiredRSASize is set before the host keys so libssh
     ;; applies it to them as well as to user keys.
     (when sshd-config
+      (ssh-plibssh-reject-pq-kex-algorithms
+       (ssh-server-config-kex-algorithms sshd-config) "KexAlgorithms")
       (ssh-plibssh-bind-algorithm-option
        bind +ssh-bind-options-key-exchange+ "KexAlgorithms"
        (ssh-server-config-kex-algorithms sshd-config))

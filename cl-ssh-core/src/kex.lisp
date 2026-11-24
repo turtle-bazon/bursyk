@@ -385,11 +385,14 @@ Compression is chosen separately for each direction, as RFC 4253 requires."
 
 The NIST-curve exchanges name it in their SSH algorithm name; the MODP
 groups name it too (SHA-1 for the legacy pair, SHA-512 for groups 16 and
-18); every other method this build implements uses SHA-256."
-  (or (nth-value 2 (ssh-ecdh-kex-parameters kex))
-      (nth-value 2 (ssh-dh-group-parameters kex))
-      (ssh-gex-kex-parameters kex)
-      :sha256))
+18); the sntrup761 hybrids always use SHA-512; every other method this build
+implements uses SHA-256."
+  (if (ssh-sntrup761-hybrid-p kex)
+      :sha512
+      (or (nth-value 2 (ssh-ecdh-kex-parameters kex))
+          (nth-value 2 (ssh-dh-group-parameters kex))
+          (ssh-gex-kex-parameters kex)
+          :sha256)))
 
 (defun ssh-exchange-hash (client-version server-version
                           client-kexinit server-kexinit

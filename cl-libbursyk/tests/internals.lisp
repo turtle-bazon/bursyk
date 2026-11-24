@@ -1923,6 +1923,60 @@ server records the full string."
     (is (string= "mlkem768nistp256-sha256" (getf negotiated :kex)))))
 
 
+;;; ---- sntrup761x25519 hybrids ----
+
+(test sntrup761-hybrids-agree
+  "Both sntrup761 spellings derive one shared secret on both sides."
+  (dolist (kex '("sntrup761x25519-sha512"
+                 "sntrup761x25519-sha512@openssh.com"))
+    (let* ((state (cl-pnet-ssh::ssh-sntrup761-hybrid-client-keypair kex))
+           (client-public
+             (cl-pnet-ssh::ssh-sntrup761-hybrid-state-public state)))
+      ;; The sntrup761 encapsulation key (1158) then the X25519 key (32).
+      (is (= 1190 (length client-public)))
+      (multiple-value-bind (server-public shared)
+          (cl-pnet-ssh::ssh-sntrup761-hybrid-server-shared
+           kex client-public)
+        ;; The sntrup761 ciphertext (1039) then the X25519 key (32).
+        (is (= 1071 (length server-public)))
+        ;; The concatenated secrets are SHA-512 hashed, so both ends use a
+        ;; 64-octet secret that the exchange hash writes as an SSH string.
+        (is (= 64 (length shared)))
+        (is (equalp shared
+                    (cl-pnet-ssh::ssh-sntrup761-hybrid-client-shared
+                     state server-public))))))
+  ;; A malformed server blob, or a name that is not a sntrup761 method, is a
+  ;; protocol error rather than a crash.
+  (dolist (kex '("sntrup761x25519-sha512"
+                 "sntrup761x25519-sha512@openssh.com"))
+    (signals cl-pnet-ssh:ssh-protocol-error
+      (cl-pnet-ssh::ssh-sntrup761-hybrid-server-shared
+       kex (make-array 10 :element-type '(unsigned-byte 8)))))
+  (signals cl-pnet-ssh:ssh-protocol-error
+    (cl-pnet-ssh::ssh-sntrup761-hybrid-client-keypair
+     "curve25519-sha256")))
+
+(test sntrup761-hybrids-are-offered-by-default
+  "The sntrup761 hybrids are implemented, offered and hashed with SHA-512."
+  (dolist (kex '("sntrup761x25519-sha512"
+                 "sntrup761x25519-sha512@openssh.com"))
+    (is (member kex cl-pnet-ssh:+ssh-kex-real-algorithms+ :test #'string=))
+    (is (member kex cl-pnet-ssh:+ssh-kex-default-algorithms+
+                :test #'string=))
+    (is (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
+                :test #'string=))
+    (is (cl-pnet-ssh::ssh-kex-post-quantum-p kex))
+    (is (eq :sha512 (cl-pnet-ssh::ssh-kex-digest kex)))
+    ;; Both spellings are one method, and the predicate says so only for them.
+    (is (cl-pnet-ssh::ssh-sntrup761-hybrid-p kex)))
+  (is (not (cl-pnet-ssh::ssh-sntrup761-hybrid-p "curve25519-sha256")))
+  ;; The default KEXINIT carries both names.
+  (let ((offers (cl-pnet-ssh::ssh-parse-kexinit-payload
+                 (cl-pnet-ssh::ssh-make-kexinit-payload))))
+    (dolist (kex '("sntrup761x25519-sha512"
+                   "sntrup761x25519-sha512@openssh.com"))
+      (is (member kex (getf offers :kex) :test #'string=)))))
+
 ;;; ---- Composite ML-DSA-44 + Ed25519 signatures ----
 
 (defun mldsa44-test-material ()

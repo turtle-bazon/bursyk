@@ -411,10 +411,11 @@ model: after the destination everything belongs to the remote command."
 (defun supported-kex-algorithms ()
   "Every key exchange this build's transport can actually negotiate.
 
-The pure transport implements OpenSSH's post-quantum hybrids; libssh 0.10
-has no ML-KEM, so it advertises and accepts only the classical methods.
--Q kex and KexAlgorithms answer from this list, so a name the transport
-cannot use is refused before the connection instead of after it."
+The pure transport implements OpenSSH's post-quantum hybrids, both the
+ML-KEM and sntrup761 kinds; libssh 0.10 has neither, so it advertises and
+accepts only the classical methods.  -Q kex and KexAlgorithms answer from
+this list, so a name the transport cannot use is refused before the
+connection instead of after it."
   (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
       cl-pnet-ssh:+ssh-kex-real-algorithms+
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
@@ -453,8 +454,9 @@ preference order."
 (defun default-kex-algorithms ()
   "The key exchanges this build offers when KexAlgorithms is not set.
 
-This is OpenSSH's default order, which leaves mlkem768nistp256-sha256 out
-even though it is implemented; -G reports this list, as ssh does."
+This is OpenSSH's default order.  It offers the ML-KEM and sntrup761
+hybrids, but leaves mlkem768nistp256-sha256 out even though it is
+implemented; -G reports this list, as ssh does."
   (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
       cl-pnet-ssh:+ssh-kex-default-algorithms+
       (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p

@@ -168,6 +168,16 @@ CLI's decision and at the plist it filled."
             (not (null (member "mlkem768nistp256-sha256"
                                (burs::supported-kex-algorithms)
                                :test #'string=)))))
+    ;; The sntrup761 hybrids share the post-quantum capability gate.
+    (dolist (name '("sntrup761x25519-sha512"
+                    "sntrup761x25519-sha512@openssh.com"))
+      (is (eq supported
+              (not (null (member name kex :test #'string=)))))
+      (is (eq supported
+              (not (null (member name (burs::default-kex-algorithms)
+                                 :test #'string=))))))
+    (is (eq supported
+            (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)))
     ;; The MODP groups are implemented by both transports and listed by -Q.
     (dolist (name '("diffie-hellman-group14-sha256"
                     "diffie-hellman-group16-sha512"

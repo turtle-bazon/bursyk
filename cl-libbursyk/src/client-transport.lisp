@@ -311,6 +311,11 @@ as an mpint; and curve25519 sends the bare 32 octets."
                (setf (ssh-client-ephemeral-private client) state
                      (ssh-client-ephemeral-public client)
                      (ssh-mlkem768-hybrid-state-public state))))
+            ((ssh-sntrup761-hybrid-p kex)
+             (let ((state (ssh-sntrup761-hybrid-client-keypair kex)))
+               (setf (ssh-client-ephemeral-private client) state
+                     (ssh-client-ephemeral-public client)
+                     (ssh-sntrup761-hybrid-state-public state))))
             (ecdh
              (multiple-value-bind (private public) (ssh-ecdh-keypair kex)
                (setf (ssh-client-ephemeral-private client) private
@@ -337,7 +342,7 @@ as an mpint; and curve25519 sends the bare 32 octets."
           (ssh-client-derived-keys client)
           (ssh-session-keys (ssh-client-negotiated client)
                             shared hash (ssh-client-session-id client)
-                            :string-shared (ssh-mlkem768-hybrid-p kex)
+                            :string-shared (ssh-kem-hybrid-p kex)
                             :digest (ssh-kex-digest kex)))
     (ssh-client-send-newkeys client)))
 
@@ -351,13 +356,17 @@ as an mpint; and curve25519 sends the bare 32 octets."
                             (ssh-read-mpint reader)
                             (ssh-read-string reader)))
          (signature (ssh-read-string reader))
-         (hybrid (ssh-mlkem768-hybrid-p kex))
+         (hybrid (ssh-kem-hybrid-p kex))
+         (sntrup (ssh-sntrup761-hybrid-p kex))
          (ecdh (ssh-ecdh-kex-p kex))
          (shared
            (cond
              (dh
               (ssh-dh-shared
                (ssh-client-ephemeral-private client) server-public kex))
+             (sntrup
+              (ssh-sntrup761-hybrid-client-shared
+               (ssh-client-ephemeral-private client) server-public))
              (hybrid
               (ssh-mlkem768-hybrid-client-shared
                (ssh-client-ephemeral-private client) server-public))
