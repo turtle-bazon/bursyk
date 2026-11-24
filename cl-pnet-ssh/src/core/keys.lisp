@@ -41,13 +41,14 @@
 (defun ssh-key-fingerprint (key-blob &optional (hash :sha256))
   "OpenSSH's fingerprint of KEY-BLOB.
 
-HASH is :SHA256 for the modern SHA256:base64 form, or :MD5 for the legacy
-MD5:aa:bb:... form.  A certificate is fingerprinted through its plain key,
-as OpenSSH's sshkey_fingerprint does with force_plain."
+HASH is :SHA256 (the default), :SHA1, :SHA384, :SHA512, or :MD5 for the
+legacy MD5:aa:bb:... form.  A certificate is fingerprinted through its
+plain key, as OpenSSH's sshkey_fingerprint does with force_plain."
   (let ((digest (ssh-hash hash (ssh-key-plain-blob key-blob))))
     (ecase hash
-      (:sha256
-       (concatenate 'string "SHA256:"
+      ((:sha1 :sha256 :sha384 :sha512)
+       (concatenate 'string
+                    (string-upcase (symbol-name hash)) ":"
                     (string-right-trim
                      '(#\=) (ssh-octets-base64 digest))))
       (:md5

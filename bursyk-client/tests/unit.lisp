@@ -1467,7 +1467,7 @@ streams are captured; an empty INPUT stands for end of input."
   ;; not have, and a stray argument are all errors rather than defaults.
   (signals error (burs::keygen-parse-arguments '("-t")))
   (signals error (burs::keygen-parse-arguments '("-b" "many")))
-  (signals error (burs::keygen-parse-arguments '("-E" "sha1")))
+  (signals error (burs::keygen-parse-arguments '("-E" "bogus")))
   (signals error (burs::keygen-parse-arguments '("-s" "ca")))
   ;; -h is host-certificate signing in ssh-keygen, not help.
   (signals error (burs::keygen-parse-arguments '("-h")))
@@ -1605,6 +1605,24 @@ streams are captured; an empty INPUT stands for end of input."
                     (end (position #\Space output :start start)))
                (is (notany #'upper-case-p
                            (subseq output (+ start 4) end)))))
+           ;; ssh-keygen -E also takes the other digests it knows, with the
+           ;; digest name as the prefix and no base64 padding.
+           (dolist (hash '("sha1" "sha256" "sha384" "sha512"))
+             (multiple-value-bind (status output)
+                 (keygen-call
+                  (list "-l" "-E" hash "-f" (namestring public)))
+               (is (eql 0 status))
+               (is (search (concatenate 'string
+                                        (string-upcase hash) ":")
+                           output))
+               (is (not (find #\= output)))))
+           ;; An unknown digest is ssh-keygen's fatal error.
+           (multiple-value-bind (status output error)
+               (keygen-call
+                (list "-l" "-E" "bogus" "-f" (namestring public)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "Invalid hash algorithm \"bogus\"" error)))
            ;; Through the private path, the empty .pub comment becomes the
            ;; .pub file name.
            (multiple-value-bind (status output)

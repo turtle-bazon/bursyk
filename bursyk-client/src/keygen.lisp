@@ -14,7 +14,7 @@
                    [-N passphrase] [-t type] [-Z cipher]
        burs keygen -p [-a rounds] [-f file] [-N new] [-P old] [-Z cipher]
        burs keygen -y [-f file] [-P passphrase]
-       burs keygen -l [-E md5|sha256] [-f file]
+       burs keygen -l [-E hash] [-f file]
        burs keygen -B [-f file]
        burs keygen -c [-a rounds] [-C comment] [-f file] [-P passphrase]
        burs keygen -F hostname [-f known_hosts_file]"
@@ -75,8 +75,11 @@
     (#\E (setf (getf options :hash)
                (cond
                  ((string-equal value "md5") :md5)
+                 ((string-equal value "sha1") :sha1)
                  ((string-equal value "sha256") :sha256)
-                 (t (keygen-fail "-E must be md5 or sha256, not ~S" value)))))
+                 ((string-equal value "sha384") :sha384)
+                 ((string-equal value "sha512") :sha512)
+                 (t (keygen-fail "Invalid hash algorithm \"~A\"" value)))))
     (#\Z (unless (member value +keygen-ciphers+ :test #'string=)
             (keygen-fail "Invalid OpenSSH-format cipher '~A'" value))
           (setf (getf options :cipher) value))

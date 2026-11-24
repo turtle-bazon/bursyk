@@ -5325,6 +5325,14 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
 (test fingerprints-obey-the-hash-choice
   (let ((blob (ssh-random-octets 32)))
     (is (eql 0 (search "SHA256:" (ssh-key-fingerprint blob))))
+    (dolist (hash '(:sha1 :sha256 :sha384 :sha512))
+      (let ((fingerprint (ssh-key-fingerprint blob hash)))
+        (is (eql 0 (search (concatenate 'string
+                                        (string-upcase (symbol-name hash))
+                                        ":")
+                           fingerprint)))
+        ;; ssh-keygen trims the base64 padding.
+        (is (null (find #\= fingerprint)))))
     (let ((md5 (ssh-key-fingerprint blob :md5)))
       (is (eql 0 (search "MD5:" md5)))
       ;; MD5: plus sixteen two-hex groups and their separators, in the
