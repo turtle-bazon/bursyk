@@ -742,21 +742,27 @@ installed where the application offers an agent-forwarding hook."
              (ssh-server-channel-handle channel))
     (let* ((type 'ssh-channel-callbacks-struct)
            (struct (cffi:foreign-alloc (list :struct type))))
-      (setf (cffi:foreign-slot-value struct (list :struct type) 'size)
+      (setf (cffi:foreign-slot-value struct (list :struct type) 'cl-plibssh::size)
             (ssh-plibssh-callback-struct-size type))
-      (dolist (slot '(userdata channel-data-function channel-eof-function
-                      channel-close-function channel-signal-function
-                      channel-exit-status-function channel-exit-signal-function
-                      channel-pty-request-function channel-shell-request-function
-                      channel-x11-req-function
-                      channel-pty-window-change-function
-                      channel-exec-request-function channel-env-request-function
-                      channel-subsystem-request-function
-                      channel-write-wontblock-function))
+      (dolist (slot '(cl-plibssh::userdata
+                      cl-plibssh::channel-data-function
+                      cl-plibssh::channel-eof-function
+                      cl-plibssh::channel-close-function
+                      cl-plibssh::channel-signal-function
+                      cl-plibssh::channel-exit-status-function
+                      cl-plibssh::channel-exit-signal-function
+                      cl-plibssh::channel-pty-request-function
+                      cl-plibssh::channel-shell-request-function
+                      cl-plibssh::channel-x11-req-function
+                      cl-plibssh::channel-pty-window-change-function
+                      cl-plibssh::channel-exec-request-function
+                      cl-plibssh::channel-env-request-function
+                      cl-plibssh::channel-subsystem-request-function
+                      cl-plibssh::channel-write-wontblock-function))
         (setf (cffi:foreign-slot-value struct (list :struct type) slot)
               (cffi:null-pointer)))
       (setf (cffi:foreign-slot-value
-             struct (list :struct type) 'channel-auth-agent-req-function)
+             struct (list :struct type) 'cl-plibssh::channel-auth-agent-req-function)
             (cffi:callback ssh-plibssh-channel-agent-request-callback))
       (if (minusp (ssh-set-channel-callbacks
                    (ssh-server-channel-handle channel) struct))

@@ -2,11 +2,12 @@
 #
 # This repository carries bursyk-client, bursyk-server, cl-pnet-ssh (the
 # facade), cl-libbursyk (the pure SSH-2 implementation) and cl-plibssh (the
-# libssh backend).  The remaining systems they use (cl-pnet, cl-pnet-sockets,
-# cl-pnet-socks, cl-pnet-dns, cl-pnet-dns-plain, cl-puma, burzay) still live in
-# the pesekey checkout.  ~/.sbclrc adds that directory to
-# QL:*LOCAL-PROJECT-DIRECTORIES*, so QL:QUICKLOAD finds them here too; until
-# they are published the pesekey checkout is the rest of the dependency set.
+# libssh CFFI bindings).  The remaining systems they use (cl-pnet,
+# cl-pnet-sockets, cl-pnet-socks, cl-pnet-dns, cl-pnet-dns-plain, cl-puma,
+# burzay) still live in the pesekey checkout.  ~/.sbclrc adds that directory
+# to QL:*LOCAL-PROJECT-DIRECTORIES*, so QL:QUICKLOAD finds them here too;
+# until they are published the pesekey checkout is the rest of the dependency
+# set.
 #
 # The backend selection is a compile-time feature, so this Makefile pushes it
 # itself instead of reading another project's test helper.  The defaults are
@@ -14,8 +15,9 @@
 # backend is cl-libbursyk.  Neither libev/libuv nor libssh is needed.
 #
 # Each axis has a short matrix name: ev, uv and puma for the event loop, and
-# lisp and libssh for the SSH stack (cl-libbursyk and cl-plibssh).  The
-# underlying spellings libev, libuv and ffi are still accepted.
+# lisp and libssh for the SSH stack (cl-libbursyk, or the adapter in
+# cl-pnet-ssh over cl-plibssh).  The underlying spellings libev, libuv and
+# ffi are still accepted.
 #
 # Compiled files go under _build/fasl/<ssh>-<event-loop>/ and never into the
 # user's global ASDF cache.  The per-backend directory is what keeps a puma

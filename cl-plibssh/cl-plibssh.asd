@@ -3,18 +3,12 @@
   :author "pesekey"
   :license "GPL-3.0-or-later"
   :version "0.0.1.77"
-  :depends-on (#:cffi
-               #:cl-ssh-core
-               #:cl-pnet
-               #:cl-pnet-sockets
-               #:burzay
-               #:iterate
-               #:uiop)
+  ;; Bindings only: the roles that turn libssh into the CL-PNET-SSH API live
+  ;; in CL-PNET-SSH, so this system needs no protocol code and no other
+  ;; dependency than CFFI.
+  :depends-on (#:cffi)
   :serial t
   :components ((:module "src"
                 :serial t
-                :components ((:file "ffi")
-                             (:file "util")
-                             (:file "client")
-                             (:file "channel")
-                             (:file "server")))))
+                :components ((:file "packages")
+                             (:file "ffi")))))

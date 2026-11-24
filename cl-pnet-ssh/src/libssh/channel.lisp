@@ -133,7 +133,7 @@ refuse the open."
           handle)))))
 
 (cffi:defcallback ssh-plibssh-agent-open-request-callback
-    ssh-channel ((session :pointer) (userdata :pointer))
+    cl-plibssh:libssh-channel ((session :pointer) (userdata :pointer))
   (declare (ignore userdata))
   (let ((client (ssh-plibssh-session-object session)))
     (or (and client (ssh-plibssh-client-accept-agent-channel client))
@@ -144,16 +144,19 @@ refuse the open."
   (unless (ssh-client-callbacks client)
     (let* ((type 'ssh-callbacks-struct)
            (struct (cffi:foreign-alloc (list :struct type))))
-      (setf (cffi:foreign-slot-value struct (list :struct type) 'size)
+      (setf (cffi:foreign-slot-value struct (list :struct type) 'cl-plibssh::size)
             (ssh-plibssh-callback-struct-size type))
-      (dolist (slot '(userdata auth-function log-function
-                      connect-status-function global-request-function
-                      channel-open-request-x11-function))
+      (dolist (slot '(cl-plibssh::userdata
+                      cl-plibssh::auth-function
+                      cl-plibssh::log-function
+                      cl-plibssh::connect-status-function
+                      cl-plibssh::global-request-function
+                      cl-plibssh::channel-open-request-x11-function))
         (setf (cffi:foreign-slot-value struct (list :struct type) slot)
               (cffi:null-pointer)))
       (setf (cffi:foreign-slot-value
              struct (list :struct type)
-             'channel-open-request-auth-agent-function)
+             'cl-plibssh::channel-open-request-auth-agent-function)
             (cffi:callback ssh-plibssh-agent-open-request-callback))
       (when (minusp (ssh-set-callbacks (ssh-client-session client) struct))
         (cffi:foreign-free struct)

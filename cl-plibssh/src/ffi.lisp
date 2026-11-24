@@ -1,4 +1,4 @@
-(in-package #:cl-pnet-ssh)
+(in-package #:cl-plibssh)
 
 ;;;; CFFI bindings for libssh 0.10.  Only what the two roles use is bound:
 ;;;; sessions, options, authentication, channels, and the server message API.
@@ -24,8 +24,8 @@
 #+windows
 (cffi:defcfun ("_dup" ssh-dup-fd) :int (fd :int))
 
-(cffi:defctype ssh-session :pointer)
-(cffi:defctype ssh-channel :pointer)
+(cffi:defctype libssh-session :pointer)
+(cffi:defctype libssh-channel :pointer)
 (cffi:defctype ssh-key :pointer)
 (cffi:defctype ssh-bind :pointer)
 (cffi:defctype ssh-message :pointer)
@@ -160,42 +160,42 @@
 
 ;;; ---- Sessions and options ----
 
-(cffi:defcfun ("ssh_new" ssh-new) ssh-session)
-(cffi:defcfun ("ssh_free" ssh-free) :void (session ssh-session))
-(cffi:defcfun ("ssh_disconnect" ssh-disconnect) :void (session ssh-session))
-(cffi:defcfun ("ssh_connect" ssh-connect) :int (session ssh-session))
+(cffi:defcfun ("ssh_new" ssh-new) libssh-session)
+(cffi:defcfun ("ssh_free" ssh-free) :void (session libssh-session))
+(cffi:defcfun ("ssh_disconnect" ssh-disconnect) :void (session libssh-session))
+(cffi:defcfun ("ssh_connect" ssh-connect) :int (session libssh-session))
 (cffi:defcfun ("ssh_options_set" ssh-options-set) :int
-  (session ssh-session) (type :int) (value :pointer))
+  (session libssh-session) (type :int) (value :pointer))
 (cffi:defcfun ("ssh_set_blocking" ssh-set-blocking) :void
-  (session ssh-session) (blocking :int))
-(cffi:defcfun ("ssh_get_fd" ssh-get-fd) :int (session ssh-session))
-(cffi:defcfun ("ssh_is_connected" ssh-is-connected) :int (session ssh-session))
-(cffi:defcfun ("ssh_get_poll_flags" ssh-get-poll-flags) :int (session ssh-session))
-(cffi:defcfun ("ssh_get_error" ssh-get-error) :string (session ssh-session))
-(cffi:defcfun ("ssh_get_error_code" ssh-get-error-code) :int (session ssh-session))
+  (session libssh-session) (blocking :int))
+(cffi:defcfun ("ssh_get_fd" ssh-get-fd) :int (session libssh-session))
+(cffi:defcfun ("ssh_is_connected" ssh-is-connected) :int (session libssh-session))
+(cffi:defcfun ("ssh_get_poll_flags" ssh-get-poll-flags) :int (session libssh-session))
+(cffi:defcfun ("ssh_get_error" ssh-get-error) :string (session libssh-session))
+(cffi:defcfun ("ssh_get_error_code" ssh-get-error-code) :int (session libssh-session))
 (cffi:defcfun ("ssh_get_serverbanner" ssh-get-serverbanner) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_get_clientbanner" ssh-get-clientbanner) :string
-  (session ssh-session))
+  (session libssh-session))
 ;;; The negotiated algorithms, for -O conninfo.  These return libssh's own
 ;;; strings, which the caller must not free.  libssh has no host key
 ;;; algorithm getter, so that one comes from the host key blob.
 (cffi:defcfun ("ssh_get_kex_algo" ssh-get-kex-algo) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_get_cipher_in" ssh-get-cipher-in) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_get_cipher_out" ssh-get-cipher-out) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_get_hmac_in" ssh-get-hmac-in) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_get_hmac_out" ssh-get-hmac-out) :string
-  (session ssh-session))
+  (session libssh-session))
 ;;; The authentication banner (USERAUTH_BANNER), not the identification
 ;;; string above.  libssh returns a fresh C string the caller frees.
 (cffi:defcfun ("ssh_get_issue_banner" ssh-get-issue-banner) :pointer
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_send_issue_banner" ssh-send-issue-banner) :int
-  (session ssh-session) (banner ssh-string))
+  (session libssh-session) (banner ssh-string))
 (cffi:defcfun ("ssh_string_new" ssh-string-new) ssh-string
   (size :size))
 (cffi:defcfun ("ssh_string_fill" ssh-string-fill) :int
@@ -203,56 +203,56 @@
 (cffi:defcfun ("ssh_string_free" ssh-string-free) :void
   (string ssh-string))
 (cffi:defcfun ("ssh_set_auth_methods" ssh-set-auth-methods) :void
-  (session ssh-session) (methods :int))
+  (session libssh-session) (methods :int))
 (cffi:defcfun ("ssh_send_keepalive" ssh-send-keepalive) :int
-  (session ssh-session))
+  (session libssh-session))
 ;; Chaff: a decoy packet an observer cannot tell from traffic.  libssh has no
 ;; OpenSSH PING packet, so SSH_MSG_IGNORE serves the same purpose.
 (cffi:defcfun ("ssh_send_ignore" ssh-send-ignore) :int
-  (session ssh-session) (data :string))
+  (session libssh-session) (data :string))
 
 ;;; ---- Host keys and known hosts ----
 
 (cffi:defcfun ("ssh_get_server_publickey" ssh-get-server-publickey) :int
-  (session ssh-session) (key (:pointer ssh-key)))
+  (session libssh-session) (key (:pointer ssh-key)))
 (cffi:defcfun ("ssh_pki_export_pubkey_base64" ssh-pki-export-pubkey-base64) :int
   (key ssh-key) (base64 (:pointer :string)))
 (cffi:defcfun ("ssh_string_free_char" ssh-string-free-char) :void (string :pointer))
 (cffi:defcfun ("ssh_key_free" ssh-key-free) :void (key ssh-key))
 (cffi:defcfun ("ssh_session_is_known_server" ssh-session-is-known-server) :int
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_write_knownhost" ssh-write-knownhost) :int
-  (session ssh-session))
+  (session libssh-session))
 
 ;;; ---- Client authentication ----
 
 (cffi:defcfun ("ssh_userauth_agent" ssh-userauth-agent) :int
-  (session ssh-session) (username :string))
+  (session libssh-session) (username :string))
 (cffi:defcfun ("ssh_userauth_list" ssh-userauth-list) :int
-  (session ssh-session) (username :string))
+  (session libssh-session) (username :string))
 (cffi:defcfun ("ssh_userauth_publickey" ssh-userauth-publickey) :int
-  (session ssh-session) (username :string) (key ssh-key))
+  (session libssh-session) (username :string) (key ssh-key))
 (cffi:defcfun ("ssh_userauth_password" ssh-userauth-password) :int
-  (session ssh-session) (username :string) (password :string))
+  (session libssh-session) (username :string) (password :string))
 ;;; Keyboard-interactive: the first call starts the exchange; SSH_AUTH_INFO
 ;;; means prompts are ready, and the same call is repeated after the answers
 ;;; are set.  ECHO is a char the caller provides for GETPROMPT.
 (cffi:defcfun ("ssh_userauth_kbdint" ssh-userauth-kbdint) :int
-  (session ssh-session) (username :string) (submethods :string))
+  (session libssh-session) (username :string) (submethods :string))
 (cffi:defcfun ("ssh_userauth_kbdint_getname" ssh-userauth-kbdint-getname) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_userauth_kbdint_getinstruction"
           ssh-userauth-kbdint-getinstruction) :string
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_userauth_kbdint_getnprompts"
           ssh-userauth-kbdint-getnprompts) :int
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_userauth_kbdint_getprompt" ssh-userauth-kbdint-getprompt)
     :string
-  (session ssh-session) (index :uint) (echo (:pointer :char)))
+  (session libssh-session) (index :uint) (echo (:pointer :char)))
 (cffi:defcfun ("ssh_userauth_kbdint_setanswer" ssh-userauth-kbdint-setanswer)
     :int
-  (session ssh-session) (index :uint) (answer :string))
+  (session libssh-session) (index :uint) (answer :string))
 (cffi:defcfun ("ssh_pki_import_privkey_file" ssh-pki-import-privkey-file) :int
   (filename :string) (passphrase :string) (auth-function :pointer)
   (auth-data :pointer) (key (:pointer ssh-key)))
@@ -263,61 +263,61 @@
 
 ;;; ---- Channels ----
 
-(cffi:defcfun ("ssh_channel_new" ssh-channel-new) ssh-channel (session ssh-session))
-(cffi:defcfun ("ssh_channel_free" ssh-channel-free) :void (channel ssh-channel))
+(cffi:defcfun ("ssh_channel_new" ssh-channel-new) libssh-channel (session libssh-session))
+(cffi:defcfun ("ssh_channel_free" ssh-channel-free) :void (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_open_session" ssh-channel-open-session) :int
-  (channel ssh-channel))
+  (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_open_auth_agent" ssh-channel-open-auth-agent) :int
-  (channel ssh-channel))
+  (channel libssh-channel))
 (cffi:defcfun ("ssh_set_callbacks" ssh-set-callbacks) :int
-  (session ssh-session) (callbacks :pointer))
+  (session libssh-session) (callbacks :pointer))
 (cffi:defcfun ("ssh_set_channel_callbacks" ssh-set-channel-callbacks) :int
-  (channel ssh-channel) (callbacks :pointer))
+  (channel libssh-channel) (callbacks :pointer))
 (cffi:defcfun ("ssh_channel_open_forward_unix" ssh-channel-open-forward-unix)
     :int
   (channel :pointer) (remote-path :string) (source-host :string)
   (local-port :int))
 
 (cffi:defcfun ("ssh_channel_open_forward" ssh-channel-open-forward) :int
-  (channel ssh-channel) (remotehost :string) (remoteport :int)
+  (channel libssh-channel) (remotehost :string) (remoteport :int)
   (sourcehost :string) (localport :int))
 (cffi:defcfun ("ssh_channel_request_exec" ssh-channel-request-exec) :int
-  (channel ssh-channel) (command :string))
+  (channel libssh-channel) (command :string))
 (cffi:defcfun ("ssh_channel_request_env" ssh-channel-request-env) :int
-  (channel ssh-channel) (name :string) (value :string))
+  (channel libssh-channel) (name :string) (value :string))
 (cffi:defcfun ("ssh_channel_request_pty_size" ssh-channel-request-pty-size) :int
-  (channel ssh-channel) (term :string) (columns :int) (rows :int))
+  (channel libssh-channel) (term :string) (columns :int) (rows :int))
 (cffi:defcfun ("ssh_channel_request_shell" ssh-channel-request-shell) :int
-  (channel ssh-channel))
+  (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_request_subsystem" ssh-channel-request-subsystem) :int
-  (channel ssh-channel) (subsystem :string))
+  (channel libssh-channel) (subsystem :string))
 (cffi:defcfun ("ssh_channel_change_pty_size" ssh-channel-change-pty-size) :int
-  (channel ssh-channel) (columns :int) (rows :int))
+  (channel libssh-channel) (columns :int) (rows :int))
 (cffi:defcfun ("ssh_channel_request_auth_agent" ssh-channel-request-auth-agent) :int
-  (channel ssh-channel))
+  (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_request_x11" ssh-channel-request-x11) :int
-  (channel ssh-channel) (single-connection :int) (protocol :string)
+  (channel libssh-channel) (single-connection :int) (protocol :string)
   (cookie :string) (screen-number :int))
 (cffi:defcfun ("ssh_channel_read_nonblocking" ssh-channel-read-nonblocking) :int
-  (channel ssh-channel) (buffer :pointer) (length :uint32) (stderr :int))
+  (channel libssh-channel) (buffer :pointer) (length :uint32) (stderr :int))
 (cffi:defcfun ("ssh_channel_poll" ssh-channel-poll) :int
-  (channel ssh-channel) (stderr :int))
+  (channel libssh-channel) (stderr :int))
 (cffi:defcfun ("ssh_channel_write" ssh-plibssh-channel-write) :int
-  (channel ssh-channel) (buffer :pointer) (length :uint32))
+  (channel libssh-channel) (buffer :pointer) (length :uint32))
 (cffi:defcfun ("ssh_channel_write_stderr" ssh-plibssh-channel-write-stderr) :int
-  (channel ssh-channel) (buffer :pointer) (length :uint32))
+  (channel libssh-channel) (buffer :pointer) (length :uint32))
 (cffi:defcfun ("ssh_channel_send_eof" ssh-channel-send-eof) :int
-  (channel ssh-channel))
-(cffi:defcfun ("ssh_channel_close" ssh-plibssh-channel-close) :int (channel ssh-channel))
-(cffi:defcfun ("ssh_channel_is_open" ssh-channel-is-open) :int (channel ssh-channel))
+  (channel libssh-channel))
+(cffi:defcfun ("ssh_channel_close" ssh-plibssh-channel-close) :int (channel libssh-channel))
+(cffi:defcfun ("ssh_channel_is_open" ssh-channel-is-open) :int (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_is_closed" ssh-channel-is-closed) :int
-  (channel ssh-channel))
-(cffi:defcfun ("ssh_channel_is_eof" ssh-channel-is-eof) :int (channel ssh-channel))
+  (channel libssh-channel))
+(cffi:defcfun ("ssh_channel_is_eof" ssh-channel-is-eof) :int (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_get_exit_status" ssh-channel-get-exit-status) :int
-  (channel ssh-channel))
+  (channel libssh-channel))
 (cffi:defcfun ("ssh_channel_request_send_exit_status"
           ssh-channel-request-send-exit-status) :int
-  (channel ssh-channel) (status :int))
+  (channel libssh-channel) (status :int))
 
 ;;; ---- Server: bind, key exchange, messages ----
 
@@ -328,11 +328,11 @@
 (cffi:defcfun ("ssh_bind_listen" ssh-bind-listen) :int (bind ssh-bind))
 (cffi:defcfun ("ssh_bind_get_fd" ssh-bind-get-fd) :int (bind ssh-bind))
 (cffi:defcfun ("ssh_bind_accept_fd" ssh-bind-accept-fd) :int
-  (bind ssh-bind) (session ssh-session) (fd :int))
+  (bind ssh-bind) (session libssh-session) (fd :int))
 (cffi:defcfun ("ssh_handle_key_exchange" ssh-handle-key-exchange) :int
-  (session ssh-session))
+  (session libssh-session))
 
-(cffi:defcfun ("ssh_message_get" ssh-message-get) ssh-message (session ssh-session))
+(cffi:defcfun ("ssh_message_get" ssh-message-get) ssh-message (session libssh-session))
 (cffi:defcfun ("ssh_message_free" ssh-message-free) :void (message ssh-message))
 (cffi:defcfun ("ssh_message_type" ssh-message-type) :int (message ssh-message))
 (cffi:defcfun ("ssh_message_subtype" ssh-message-subtype) :int (message ssh-message))
@@ -372,10 +372,10 @@
   (message ssh-message))
 (cffi:defcfun ("ssh_userauth_kbdint_getnanswers"
           ssh-userauth-kbdint-getnanswers) :int
-  (session ssh-session))
+  (session libssh-session))
 (cffi:defcfun ("ssh_userauth_kbdint_getanswer" ssh-userauth-kbdint-getanswer)
     :string
-  (session ssh-session) (index :uint))
+  (session libssh-session) (index :uint))
 
 (cffi:defcfun ("ssh_message_channel_request_open_destination"
           ssh-message-open-destination) :string
@@ -390,14 +390,14 @@
           ssh-message-open-originator-port) :int
   (message ssh-message))
 (cffi:defcfun ("ssh_message_channel_request_open_reply_accept"
-          ssh-message-open-reply-accept) ssh-channel
+          ssh-message-open-reply-accept) libssh-channel
   (message ssh-message))
 (cffi:defcfun ("ssh_message_channel_request_open_reply_accept_channel"
           ssh-message-open-reply-accept-channel) :int
-  (message ssh-message) (channel ssh-channel))
+  (message ssh-message) (channel libssh-channel))
 
 (cffi:defcfun ("ssh_message_channel_request_channel"
-          ssh-message-channel-request-channel) ssh-channel
+          ssh-message-channel-request-channel) libssh-channel
   (message ssh-message))
 (cffi:defcfun ("ssh_message_channel_request_pty_term"
           ssh-message-channel-request-pty-term) :string
@@ -431,5 +431,5 @@
   (message ssh-message))
 (cffi:defcfun ("ssh_channel_request_send_exit_signal"
           ssh-channel-request-send-exit-signal) :int
-  (channel ssh-channel) (signal :string) (core-dumped :int)
+  (channel libssh-channel) (signal :string) (core-dumped :int)
   (error-message :string) (language :string))
