@@ -800,6 +800,70 @@ still cannot run these tests."
                    (ssh-load-private-key path))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+(defun ssh-test-private-key-cipher (path)
+  "The cipher name in PATH's openssh-key-v1 header."
+  (let* ((body (cl-pnet-ssh::ssh-private-key-body
+                (cl-pnet-ssh::ssh-read-octets-file path)))
+         (reader (cl-pnet-ssh::ssh-make-reader body)))
+    (dotimes (index (1+ (length cl-pnet-ssh::+openssh-key-magic+)))
+      (declare (ignore index))
+      (cl-pnet-ssh::ssh-read-u8 reader))
+    (cl-pnet-ssh::ssh-read-text reader)))
+
+(test openssh-private-key-ciphers-round-trip
+  "Every cipher an OpenSSH key file can use survives a write and a read.
+
+The authenticated ciphers (GCM and chacha20-poly1305) put their tag after
+the private section string, and \"none\" still carries a bcrypt KDF when a
+passphrase is given, so each is checked rather than assumed."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-cipher"))
+         (key (ssh-generate-private-key "ed25519" :comment "ciphers"))
+         (blob (ssh-public-key-blob-of key))
+         (ciphers '("none" "3des-cbc"
+                    "aes128-cbc" "aes192-cbc" "aes256-cbc"
+                    "aes128-ctr" "aes192-ctr" "aes256-ctr"
+                    "aes128-gcm@openssh.com" "aes256-gcm@openssh.com"
+                    "chacha20-poly1305@openssh.com"))
+         (reference (ssh-keygen-available-p)))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (dolist (cipher ciphers)
+             (let ((path (merge-pathnames
+                          (format nil "ours-~A" cipher) directory)))
+               (ssh-write-private-key key path :passphrase "pw" :cipher cipher)
+               (is (string= cipher (ssh-test-private-key-cipher path)))
+               (let ((loaded (ssh-load-private-key path :passphrase "pw")))
+                 (is (equalp blob (ssh-public-key-blob-of loaded)))
+                 (is (string= "ciphers" (ssh-private-key-comment loaded))))
+               (unless (string= cipher "none")
+                 ;; The none cipher authenticates nothing, so OpenSSH
+                 ;; accepts any passphrase; a bcrypt KDF alone does not
+                 ;; make a wrong one detectable.
+                 (signals ssh-authentication-error
+                   (ssh-load-private-key path :passphrase "wrong")))
+               (when reference
+                 (let ((line (ssh-keygen
+                              (list "-y" "-P" "pw" "-f" (namestring path)))))
+                   (is (search "ssh-ed25519 " line))))))
+           (when reference
+             (dolist (cipher ciphers)
+               (let ((path (merge-pathnames
+                            (format nil "ref-~A" cipher) directory)))
+                 (ssh-keygen
+                  (list "-q" "-t" "ed25519" "-N" "pw" "-Z" cipher
+                        "-f" (namestring path)))
+                 (let ((loaded (ssh-load-private-key path :passphrase "pw")))
+                   (is (equalp
+                        (ssh-test-public-key-blob
+                         (merge-pathnames
+                          (format nil "ref-~A.pub" cipher) directory))
+                        (ssh-public-key-blob-of loaded))))
+                 (unless (string= cipher "none")
+                   (signals ssh-authentication-error
+                     (ssh-load-private-key path :passphrase "wrong")))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 ;;; ---- OpenSSH certificates ----
 
 (defun ssh-test-public-key-blob (path)

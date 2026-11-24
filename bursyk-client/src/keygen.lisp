@@ -37,8 +37,11 @@ fingerprint output.")
   "ssh-keygen switches that belong to features this command does not have.")
 
 (defparameter +keygen-ciphers+
-  '("aes128-ctr" "aes192-ctr" "aes256-ctr"
-    "aes128-cbc" "aes192-cbc" "aes256-cbc")
+  '("none" "3des-cbc"
+    "aes128-ctr" "aes192-ctr" "aes256-ctr"
+    "aes128-cbc" "aes192-cbc" "aes256-cbc"
+    "aes128-gcm@openssh.com" "aes256-gcm@openssh.com"
+    "chacha20-poly1305@openssh.com")
   "The ciphers an OpenSSH private key can use here.")
 
 (defparameter +keygen-maximum-comment-length+ 2048

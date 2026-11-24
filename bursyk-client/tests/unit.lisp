@@ -2087,6 +2087,70 @@ streams are captured; an empty INPUT stands for end of input."
                (is (string= before (read-line stream))))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test keygen-ciphers-match-openssh-key-files
+  ;; -Z takes every cipher ssh-keygen 10.6 knows for private keys; each one
+  ;; writes a file that reads back, and the authenticated ciphers keep
+  ;; their tag outside the private section string.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (ciphers '("none" "3des-cbc"
+                    "aes128-cbc" "aes192-cbc" "aes256-cbc"
+                    "aes128-ctr" "aes192-ctr" "aes256-ctr"
+                    "aes128-gcm@openssh.com" "aes256-gcm@openssh.com"
+                    "chacha20-poly1305@openssh.com")))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (dolist (cipher ciphers)
+             (let ((path (merge-pathnames
+                          (format nil "key-~A" cipher) directory)))
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-q" "-t" "ed25519" "-N" "pw"
+                                      "-Z" cipher "-f" (namestring path)))
+                 (declare (ignore output))
+                 (is (eql 0 status) "~A generation: ~A" cipher error))
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-y" "-P" "pw" "-f" (namestring path)))
+                 (declare (ignore error))
+                 (is (eql 0 status) cipher)
+                 (is (search "ssh-ed25519 " output)))
+               ;; A bcrypt KDF demands the passphrase even under the none
+               ;; cipher, and end of input counts as a wrong one.
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-y" "-f" (namestring path)))
+                 (declare (ignore output))
+                 (is (eql 255 status) cipher)
+                 (is (search "incorrect passphrase supplied" error)))
+               ;; -l reads the cleartext public header and never prompts.
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-l" "-f" (namestring path)))
+                 (declare (ignore error))
+                 (is (eql 0 status) cipher)
+                 (is (search "SHA256:" output)))
+               ;; -p rewrites the file with the same cipher.
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-p" "-P" "pw" "-N" "pw2"
+                                      "-Z" cipher "-q"
+                                      "-f" (namestring path)))
+                 (declare (ignore output error))
+                 (is (eql 0 status) cipher))
+               (multiple-value-bind (status output error)
+                   (keygen-call (list "-y" "-P" "pw2" "-f" (namestring path)))
+                 (declare (ignore error))
+                 (is (eql 0 status) cipher)
+                 (is (search "ssh-ed25519 " output)))))
+           ;; Anything outside ssh-keygen's table is refused at once.
+           (multiple-value-bind (status output error)
+               (keygen-call
+                (list "-q" "-t" "ed25519" "-N" "pw" "-Z" "twofish-cbc"
+                      "-f" (namestring (merge-pathnames "bad" directory))))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "Invalid OpenSSH-format cipher 'twofish-cbc'" error))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test keygen-comment-change-prompts-and-stops-at-end-of-input
   ;; -c names the current comment, prompts with ssh-keygen's "New comment:",
   ;; and treats end of input as a cancellation with status 1.

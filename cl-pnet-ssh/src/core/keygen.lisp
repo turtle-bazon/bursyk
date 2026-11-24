@@ -208,7 +208,7 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
 
 ;;; ---- writing ----
 
-(defun ssh-private-key-section (key &key encrypted)
+(defun ssh-private-key-section (key &key (block-size +ssh-keygen-private-block-size+))
   "The private section of KEY's openssh-key-v1 file, padded but not encrypted."
   (let* ((type (ssh-private-key-type key))
          (writer (ssh-writer))
@@ -249,7 +249,7 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
       (t
        (ssh-keygen-fail "cannot write a ~A key" type)))
     (ssh-write-text writer (or (ssh-private-key-comment key) ""))
-    (let* ((block (if encrypted 16 +ssh-keygen-private-block-size+))
+    (let* ((block block-size)
            (length (length (ssh-writer-octets writer)))
            (padding (mod (- block length) block)))
       (dotimes (index padding)
@@ -257,27 +257,18 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
     (ssh-writer-output writer)))
 
 (defun ssh-encrypt-private-section (section passphrase cipher-name rounds)
-  "VALUES CIPHER-NAME KDF-NAME KDF-OPTIONS PAYLOAD for SECTION."
+  "VALUES CIPHER-NAME KDF-NAME KDF-OPTIONS PAYLOAD TAG for SECTION."
   (let* ((spec (ssh-openssh-key-cipher cipher-name))
-         (key-length (second spec))
          (salt (ironclad-unsafe:random-data 16))
-         (material
-           (ironclad-unsafe:derive-key
-            (make-instance 'ironclad-unsafe:bcrypt-pbkdf)
-            (ssh-string-octets passphrase)
-            salt rounds (+ key-length 16)))
-         (cipher (ironclad-unsafe:make-cipher
-                  :aes
-                  :mode (third spec)
-                  :key (subseq material 0 key-length)
-                  :initialization-vector (subseq material key-length)))
          (options (ssh-writer)))
     (ssh-write-string options salt)
     (ssh-write-u32 options rounds)
-    (values cipher-name
-            "bcrypt"
-            (ssh-writer-output options)
-            (ironclad-unsafe:encrypt-message cipher section))))
+    (let* ((kdf-options (ssh-writer-output options))
+           (material (ssh-openssh-key-material
+                      passphrase spec "bcrypt" kdf-options)))
+      (multiple-value-bind (payload tag)
+          (ssh-openssh-cipher-encrypt spec material section)
+        (values cipher-name "bcrypt" kdf-options payload tag)))))
 
 (defun ssh-private-key-file-octets (key &key passphrase
                                          (cipher +ssh-keygen-default-cipher+)
@@ -287,13 +278,19 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
 A non-empty PASSPHRASE encrypts the private half with CIPHER after ROUNDS of
 bcrypt; an empty or missing one writes it in the clear, as ssh-keygen does."
   (let* ((encrypted (and (stringp passphrase) (plusp (length passphrase))))
-         (section (ssh-private-key-section key :encrypted encrypted))
+         (spec (ssh-openssh-key-cipher (if encrypted cipher "none")))
+         (section (ssh-private-key-section
+                   key :block-size
+                   (if encrypted
+                       (ssh-openssh-key-cipher-block-size spec)
+                       +ssh-keygen-private-block-size+)))
          (payload section)
+         (tag nil)
          (cipher-name "none")
          (kdf-name "none")
          (kdf-options (make-array 0 :element-type '(unsigned-byte 8))))
     (when encrypted
-      (multiple-value-setq (cipher-name kdf-name kdf-options payload)
+      (multiple-value-setq (cipher-name kdf-name kdf-options payload tag)
         (ssh-encrypt-private-section section passphrase cipher rounds)))
     (let* ((writer (ssh-writer))
            (magic (map 'vector #'char-code +openssh-key-magic+)))
@@ -305,6 +302,10 @@ bcrypt; an empty or missing one writes it in the clear, as ssh-keygen does."
       (ssh-write-u32 writer 1)
       (ssh-write-string writer (ssh-public-key-blob-of key))
       (ssh-write-string writer payload)
+      ;; An authenticated cipher's tag follows the section string, whose
+      ;; declared length covers only the ciphertext.
+      (when tag
+        (ssh-write-octets writer tag))
       (let* ((base64 (ssh-octets-base64 (ssh-writer-output writer)))
              (text (with-output-to-string (out)
                      (write-line "-----BEGIN OPENSSH PRIVATE KEY-----" out)

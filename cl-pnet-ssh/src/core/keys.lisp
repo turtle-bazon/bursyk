@@ -618,13 +618,24 @@ the form every OpenSSH since 7.2 understands."
 (defparameter +openssh-key-magic+ "openssh-key-v1")
 
 (defparameter +openssh-key-ciphers+
-  '(("aes128-ctr" 16 :ctr)
-    ("aes192-ctr" 24 :ctr)
-    ("aes256-ctr" 32 :ctr)
-    ("aes128-cbc" 16 :cbc)
-    ("aes192-cbc" 24 :cbc)
-    ("aes256-cbc" 32 :cbc))
-  "Encrypted openssh-key-v1 ciphers: name, key octets, Ironclad mode.")
+  '(("none" :none 0 8 0 8)
+    ("3des-cbc" :3des-cbc 24 8 0 8)
+    ("aes128-cbc" :aes-cbc 16 16 0 16)
+    ("aes192-cbc" :aes-cbc 24 16 0 16)
+    ("aes256-cbc" :aes-cbc 32 16 0 16)
+    ("aes128-ctr" :aes-ctr 16 16 0 16)
+    ("aes192-ctr" :aes-ctr 24 16 0 16)
+    ("aes256-ctr" :aes-ctr 32 16 0 16)
+    ("aes128-gcm@openssh.com" :gcm 16 12 16 16)
+    ("aes256-gcm@openssh.com" :gcm 32 12 16 16)
+    ("chacha20-poly1305@openssh.com" :chacha-poly 64 0 16 8))
+  "Encrypted openssh-key-v1 ciphers.
+
+Each entry is NAME KIND KEY-OCTETS IV-OCTETS TAG-OCTETS BLOCK-OCTETS.
+KIND picks the primitive: :NONE copies the plaintext, :AES-CTR, :AES-CBC
+and :3DES-CBC use the ordinary Ironclad ciphers, :GCM is AES in GCM mode
+with its tag stored after the ciphertext, and :CHACHA-POLY is OpenSSH's
+64-octet ChaCha20 key with a Poly1305 tag.")
 
 (defun ssh-find-octets (needle haystack &optional (start 0))
   (search needle haystack :start2 start :test #'=))
@@ -757,38 +768,163 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
       (error 'ssh-authentication-error
              :detail (format nil "unsupported encrypted key cipher ~A" name))))
 
+(defun ssh-openssh-key-cipher-kind (spec)
+  (second spec))
+
+(defun ssh-openssh-key-cipher-key-length (spec)
+  (third spec))
+
+(defun ssh-openssh-key-cipher-iv-length (spec)
+  (fourth spec))
+
+(defun ssh-openssh-key-cipher-auth-length (spec)
+  (fifth spec))
+
+(defun ssh-openssh-key-cipher-block-size (spec)
+  (sixth spec))
+
 (defun ssh-openssh-kdf-options (octets)
   "SALT and ROUNDS from an OpenSSH bcrypt KDF options string."
   (let ((reader (ssh-make-reader octets)))
     (values (ssh-read-string reader)
             (ssh-read-u32 reader))))
 
+(defun ssh-openssh-key-material (passphrase spec kdf-name kdf-options)
+  "The KEY-OCTETS followed by IV-OCTETS derived for SPEC, as KDF says."
+  (let ((length (+ (ssh-openssh-key-cipher-key-length spec)
+                   (ssh-openssh-key-cipher-iv-length spec))))
+    (cond
+      ((string= kdf-name "none")
+       (when (plusp (ssh-openssh-key-cipher-key-length spec))
+         (error 'ssh-protocol-error
+                :detail "an encrypted private key names no KDF"))
+       (make-array length :element-type '(unsigned-byte 8)
+                          :initial-element 0))
+      ((string= kdf-name "bcrypt")
+       (multiple-value-bind (salt rounds)
+           (ssh-openssh-kdf-options kdf-options)
+         (ironclad-unsafe:derive-key
+          (make-instance 'ironclad-unsafe:bcrypt-pbkdf)
+          (ssh-string-octets passphrase)
+          salt rounds length)))
+      (t
+       (error 'ssh-authentication-error
+              :detail (format nil "unsupported private key KDF ~A" kdf-name))))))
+
+(defun ssh-chacha-poly-cipher (material)
+  "VALUES CIPHER POLY-KEY for OpenSSH's private-key ChaCha20 setup.
+
+OpenSSH runs ChaCha20 with an all-zero eight-octet IV: the first 32 octets
+of block 0 key Poly1305, and the private section is encrypted starting at
+block 1.  Consuming one full block here leaves the cipher at that point."
+  (let* ((cipher (ironclad-unsafe:make-cipher
+                  :chacha
+                  :key (subseq material 0 32)
+                  :mode :stream
+                  :initialization-vector
+                  (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+         (block (ironclad-unsafe:encrypt-message
+                 cipher
+                 (make-array 64 :element-type '(unsigned-byte 8)
+                               :initial-element 0))))
+    (values cipher (subseq block 0 32))))
+
+(defun ssh-openssh-cipher-encrypt (spec material plaintext)
+  "VALUES CIPHERTEXT TAG of PLAINTEXT under SPEC and its derived MATERIAL."
+  (let ((kind (ssh-openssh-key-cipher-kind spec))
+        (key-length (ssh-openssh-key-cipher-key-length spec))
+        (iv-length (ssh-openssh-key-cipher-iv-length spec)))
+    (ecase kind
+      (:none
+       (values plaintext nil))
+      ((:aes-ctr :aes-cbc :3des-cbc)
+       (values
+        (ironclad-unsafe:encrypt-message
+         (ironclad-unsafe:make-cipher
+          (if (eq kind :3des-cbc) :3des :aes)
+          :mode (if (eq kind :aes-ctr) :ctr :cbc)
+          :key (subseq material 0 key-length)
+          :initialization-vector (subseq material key-length
+                                         (+ key-length iv-length)))
+         plaintext)
+        nil))
+      (:gcm
+       (let ((mode (ironclad-unsafe:make-authenticated-encryption-mode
+                    :gcm
+                    :cipher-name :aes
+                    :key (subseq material 0 key-length)
+                    :initialization-vector (subseq material key-length
+                                                   (+ key-length iv-length)))))
+         (values (ironclad-unsafe:encrypt-message mode plaintext)
+                 (ironclad-unsafe:produce-tag mode))))
+      (:chacha-poly
+       (multiple-value-bind (cipher poly-key)
+           (ssh-chacha-poly-cipher material)
+         (let* ((ciphertext
+                  (ironclad-unsafe:encrypt-message cipher plaintext))
+                (mac (ironclad-unsafe:make-mac :poly1305 poly-key)))
+           (ironclad-unsafe:update-mac mac ciphertext)
+           (values ciphertext (ironclad-unsafe:produce-mac mac))))))))
+
+(defun ssh-openssh-cipher-decrypt (spec material ciphertext tag)
+  "The plaintext of CIPHERTEXT under SPEC and its derived MATERIAL.
+
+For the authenticated ciphers TAG must match; a mismatch means a wrong
+passphrase just as it does in OpenSSH, which turns its MAC error into
+SSH_ERR_KEY_WRONG_PASSPHRASE."
+  (let ((kind (ssh-openssh-key-cipher-kind spec))
+        (key-length (ssh-openssh-key-cipher-key-length spec))
+        (iv-length (ssh-openssh-key-cipher-iv-length spec)))
+    (handler-case
+        (ecase kind
+          (:none ciphertext)
+          ((:aes-ctr :aes-cbc :3des-cbc)
+           (ironclad-unsafe:decrypt-message
+            (ironclad-unsafe:make-cipher
+             (if (eq kind :3des-cbc) :3des :aes)
+             :mode (if (eq kind :aes-ctr) :ctr :cbc)
+             :key (subseq material 0 key-length)
+             :initialization-vector (subseq material key-length
+                                            (+ key-length iv-length)))
+            ciphertext))
+          (:gcm
+           (ironclad-unsafe:decrypt-message
+            (ironclad-unsafe:make-authenticated-encryption-mode
+             :gcm
+             :cipher-name :aes
+             :key (subseq material 0 key-length)
+             :initialization-vector (subseq material key-length
+                                            (+ key-length iv-length))
+             :tag tag)
+            ciphertext))
+          (:chacha-poly
+           (multiple-value-bind (cipher poly-key)
+               (ssh-chacha-poly-cipher material)
+             (let ((mac (ironclad-unsafe:make-mac :poly1305 poly-key)))
+               (ironclad-unsafe:update-mac mac ciphertext)
+               (unless (ironclad-unsafe:constant-time-equal
+                        (ironclad-unsafe:produce-mac mac) tag)
+                 (error 'ironclad-unsafe:bad-authentication-tag))
+               (ironclad-unsafe:decrypt-message cipher ciphertext)))))
+      (ironclad-unsafe:bad-authentication-tag ()
+        (error 'ssh-authentication-error
+               :detail
+               "incorrect passphrase supplied to decrypt private key")))))
+
 (defun ssh-decrypt-private-section (passphrase cipher-name kdf-name
-                                    kdf-options section)
+                                    kdf-options section tag)
   "Decrypt SECTION, the private half of an encrypted openssh-key-v1 key."
   (unless passphrase
     (error 'ssh-authentication-error
            :detail "the private key is encrypted; a passphrase is required"))
   (unless (string= kdf-name "bcrypt")
-    (error 'ssh-authentication-error
+    (error 'ssh-protocol-error
            :detail (format nil "unsupported private key KDF ~A" kdf-name)))
   (let* ((spec (ssh-openssh-key-cipher cipher-name))
-         (key-length (second spec))
-         (material
-           (multiple-value-bind (salt rounds)
-               (ssh-openssh-kdf-options kdf-options)
-             (let ((derived
-                     (ironclad-unsafe:derive-key
-                      (make-instance 'ironclad-unsafe:bcrypt-pbkdf)
-                      (ssh-string-octets passphrase)
-                      salt rounds (+ key-length 16))))
-               derived)))
-         (cipher (ironclad-unsafe:make-cipher
-                  :aes
-                  :mode (third spec)
-                  :key (subseq material 0 key-length)
-                  :initialization-vector (subseq material key-length))))
-    (ironclad-unsafe:decrypt-message cipher section)))
+         (material (ssh-openssh-key-material passphrase spec kdf-name
+                                             kdf-options)))
+    (ssh-openssh-cipher-decrypt spec material section tag)))
 
 (defun ssh-parse-openssh-private-key (body &key passphrase)
   "Parse an openssh-key-v1 BODY, decrypting it with PASSPHRASE if needed."
@@ -799,17 +935,39 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
          (kdf-options (ssh-read-string reader))
          (count (ssh-read-u32 reader))
          (public-blob (ssh-read-string reader))
-         (raw-section (ssh-read-string reader))
+         (spec (ssh-openssh-key-cipher cipher))
+         (auth-length (ssh-openssh-key-cipher-auth-length spec))
+         (section-length (ssh-read-u32 reader))
+         (raw-section (ssh-read-octets reader section-length))
+         ;; The authentication tag sits after the section string, so the
+         ;; declared length covers only the ciphertext.
+         (tag (when (plusp auth-length)
+                (ssh-read-octets reader auth-length)))
          (encrypted (not (string= cipher "none")))
          (section
-           (if encrypted
-               (ssh-decrypt-private-section passphrase cipher kdf
-                                            kdf-options raw-section)
-               (progn
-                 (unless (string= kdf "none")
-                   (error 'ssh-protocol-error
-                          :detail "unsupported private key KDF"))
-                 raw-section))))
+           (cond
+             ((string= cipher "none")
+              (cond
+                ((string= kdf "none")
+                 raw-section)
+                ((string= kdf "bcrypt")
+                 ;; OpenSSH still demands a non-empty passphrase when the
+                 ;; KDF is bcrypt, though nothing is actually encrypted.
+                 (when (or (null passphrase) (zerop (length passphrase)))
+                   (error 'ssh-authentication-error
+                          :detail
+                          "incorrect passphrase supplied to decrypt private key"))
+                 raw-section)
+                (t
+                 (error 'ssh-protocol-error
+                        :detail (format nil "unsupported private key KDF ~A"
+                                        kdf)))))
+             (t
+              (ssh-decrypt-private-section passphrase cipher kdf
+                                           kdf-options raw-section tag)))))
+    (unless (zerop (ssh-reader-remaining reader))
+      (error 'ssh-protocol-error
+             :detail "trailing data after the private key section"))
     (unless (= count 1)
       (error 'ssh-protocol-error :detail "a key file with several keys is unsupported"))
     (multiple-value-bind (type data) (ssh-public-key-parts public-blob)
@@ -832,8 +990,9 @@ hold one key."
 (defun ssh-private-key-file-encrypted-p (path)
   "Whether the private key file at PATH is passphrase-protected.
 
-The header names the cipher, so this answers without a passphrase and
-without decrypting anything."
+The header names the cipher and KDF, so this answers without a passphrase
+and without decrypting anything.  A \"none\" cipher with a bcrypt KDF still
+wants a passphrase, as OpenSSH demands one whenever the KDF is not none."
   (let* ((body (ssh-private-key-body (ssh-read-octets-file path))))
     (ssh-check-key-magic body)
     (let ((reader (ssh-make-reader body)))
@@ -841,7 +1000,10 @@ without decrypting anything."
       (dotimes (index (1+ (length +openssh-key-magic+)))
         (declare (ignore index))
         (ssh-read-u8 reader))
-      (not (string= (ssh-read-text reader) "none")))))
+      (let ((cipher (ssh-read-text reader))
+            (kdf (ssh-read-text reader)))
+        (not (and (string= cipher "none")
+                  (string= kdf "none")))))))
 
 (defun ssh-private-key-public-blob (path)
   "The public key blob in the openssh-key-v1 header at PATH.
