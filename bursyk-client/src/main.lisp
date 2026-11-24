@@ -3935,6 +3935,11 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
       (format *error-output* "~&")
       (finish-output *error-output*)
       (finish 130))
+    (cl-pnet-ssh:ssh-config-error (condition)
+      ;; A bad configuration value can surface outside resolution, when -G
+      ;; prints the algorithm lists it has to validate.  ssh treats every
+      ;; configuration error as fatal with status 255, not 1.
+      (fail "~A" condition))
     (error (condition)
       (when (uiop:getenv "BURS_DEBUG")
         (sb-debug:print-backtrace :count 40 :stream *error-output*))
