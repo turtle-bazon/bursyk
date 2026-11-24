@@ -1447,6 +1447,93 @@ streams are captured; an empty INPUT stands for end of input."
               (subseq line (1+ first) second)
               (if second (subseq line (1+ second)) "")))))
 
+;;; ---- PEM fixtures for the keygen command ----
+
+(defparameter +keygen-pem-passphrase+ "pem pass")
+
+(defparameter +keygen-pem-rsa+
+  "-----BEGIN RSA PRIVATE KEY-----
+MIICXQIBAAKBgQDNOaxK3xPyXKpvCagd7jtmY8DenWnHdoRQ5mgmFOMohJj2P6NI
+BLpmOFVkA8oFGS7I+SkHcGosDW1giFHcWsmSDnddYI7/1GQL9qvNi+0D4VFOGL+D
+XR36o/mnXR6Qbq1KEIku81XNi+TWDruBn1cnf/ErwrCrydyiDZy0kpUGdwIDAQAB
+AoGAav0kGyxNA87Xc2e/Y0stYGWkyOmbmcbpmBtmNGQzQI5QCCCJCSSd4GiB69Al
+456LS27Juv0Z/LlLSkYHFy+lYTWkBIBRA8kePmirLgNnaEISOj8gnP7Kv26yeBuW
+W/TOsPl6lg0RLV6GikWgmNZQzU2H0zyNkw4xKORieXLkqvECQQD5GsOoDVHZd65Y
+QLBINXOh6MZHEShZfCt6oUQU0GD5fxcz9Ys5GBwiS7SXX+EZ8X5ywYkTUXq2QlWv
+iwDV85slAkEA0uf3TbzEbX0KcQuALjO1Cphgmz8pOKc7e2R5p9XiSa/uYDqg1n6n
+D0PqkpC7lA5IJtkaQLYvtvHdyqzKOFYWawJBANo9mZc8/C2jjgphuk+5DLKYJkaT
+AJ/NiqYobWYy3hMYRnLOOAhwWA2v9+r7JFK/YcIWTwquwuy1Fy7xgGzxvUUCQEre
+n/MPvOdlSSyiOYmtP2qYd0sFW/vJmhsOqwVCr0cbVlMA3RHn+iQ4JvCKwpwnicOI
+tIIeasfWCrclKdBf9ysCQQDwp/pHj7SKW84E1VrVOWABMlYCN4YZgu4CyNR0wfGJ
+2wcdkOtF/7kCfnZ36ocHPFiejAZqCsca5mHKQFf3t9Vh
+-----END RSA PRIVATE KEY-----
+"
+  "A 1024-bit RSA key in traditional PKCS#1 form.")
+
+(defparameter +keygen-pem-rsa-encrypted+
+  "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,AE1738854067CA20D84E91862C823999
+
+ovUwPMO/I8gQTkOYejvGyzvg36ryvU5qtpHfss4vgly30EMdCmerUBJiZ42oRPKG
+TAvhphZY4ggIeB3RCuY0wA+b2WMdLXd3WvNU3nLD9XpMJhD2fafNu5JRE9wZvG44
+1GjxuIvCeqMS4ZV5WnXgmIaRNRKebaimKSvmaaJ/F9OYccqWsv63JzzbCCw/yRdp
+6ps1iejTpf+g5ZFYVMO9WBGGUj+NcNHMARRFmdbcv5HmOi7U8LG+CNMcRVTJLDjD
+i2O263ORC4ood/+GYEjKI8e+nyI3aqJ2U1ZHSw8GvibIe9c5F/ozFEITloUbrfnQ
+FeKjzKlgVnMcQGYgpPCO3JBd+cNFZjzQWfYWWAQx8hRp6j9ZKUy9KyFDDQxwuaLx
+/Fv8o/Jo4jmI2zoMhBIi0ZuoiFg8CknWhod7ylOMJQH8kDVTPHO5sYT2qoBHre5F
+ckz78DjRh/7oTK2K4FlbGwnyKuGKPUaAI1DOEepjs4vSAVtZth97IspK79nQDm2w
+wNJmt5SpbImUDbY/VpithAWDqOMuy+lcTeyhO9NGItNxXV7NnaVKrt+brKui7+P7
+LvOOmrZXGsxq6aBqq0RSFq/8L+KvvXVZILkcNkFh6q5ejgZQsLOhAoGN8XWP10HK
+VkOdYlt+QQnnCXgvB/TFktBfx+3MzM2y9AA4jC/Obs7EYidbHTv43q8bZHeiRiLG
+OvU46AEHSylkgCLLZuj6JGPOSW+0Yptz4RceDUDQLh7djKdEB0MxpbHDwkxN4RaI
+2EjgCouXxlkYU6ZahWwBrZZmlCG+J2mDm1X3MN4M8/fKYGPeDfhGTQTOZE34PYdJ
+-----END RSA PRIVATE KEY-----
+"
+  "The same key in traditional PEM, encrypted with AES-128-CBC.")
+
+(defparameter +keygen-pem-ed25519+
+  "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJ5fosgLKZgyVf3n+Ra5xgSjoVFyEQa4fDEBRloNZev/
+-----END PRIVATE KEY-----
+"
+  "An Ed25519 key in unencrypted PKCS#8 form.")
+
+(defparameter +keygen-pem-ec-withparams+
+  "-----BEGIN EC PARAMETERS-----
+BggqhkjOPQMBBw==
+-----END EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEICdVYYmBLD522JutAb7OdD9aFh7112+exITfFTTvwMaJoAoGCCqGSM49
+AwEHoUQDQgAEjbniMywTyVV9C8pMa7qnKz/OOMZJxiqUS1x86+U0q+5iChZGzrGh
+NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
+-----END EC PRIVATE KEY-----
+"
+  "An EC key preceded by the EC PARAMETERS block openssl ecparam writes.")
+
+(defparameter +keygen-pem-rsa-public+
+  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDNOaxK3xPyXKpvCagd7jtmY8DenWnHdoRQ5mgmFOMohJj2P6NIBLpmOFVkA8oFGS7I+SkHcGosDW1giFHcWsmSDnddYI7/1GQL9qvNi+0D4VFOGL+DXR36o/mnXR6Qbq1KEIku81XNi+TWDruBn1cnf/ErwrCrydyiDZy0kpUGdw==")
+
+(defparameter +keygen-pem-ed25519-public+
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOm4JHu0PTDjcpwl/RrNP6ZeUUxjKvVsB6TQnfcMP/Ot")
+
+
+(defun keygen-write-pem (path text)
+  "Write TEXT to PATH with the mode ssh-keygen demands of a private key."
+  (ensure-directories-exist path)
+  (cl-pnet-ssh::ssh-write-octets-file (map 'vector #'char-code text) path)
+  #+(and sbcl (not win32))
+  (sb-posix:chmod (namestring path) #o600)
+  path)
+
+(defun keygen-first-line-of (path)
+  (with-open-file (stream path :direction :input)
+    (read-line stream)))
+
+(defun keygen-public-comment-of (path)
+  (with-open-file (stream path :direction :input)
+    (burs::keygen-public-line-comment (read-line stream))))
+
 (test keygen-parses-ssh-keygen-options
   (let ((options (burs::keygen-parse-arguments
                   '("-t" "rsa" "-b2048" "-f/tmp/x" "-N" "pw" "-C" "me" "-q"))))
@@ -2050,6 +2137,195 @@ streams are captured; an empty INPUT stands for end of input."
                (declare (ignore output))
                (is (eql 255 status))
                (is (search "is not a public key file." error)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+;;; ---- PEM private keys at the command line ----
+
+(test keygen-prints-public-from-a-pem-private-key
+  ;; -y loads every PEM form and prints the same line; a protected one
+  ;; needs its passphrase and answers a wrong one like ssh-keygen.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (clear (merge-pathnames "id_rsa_pem" directory))
+         (locked (merge-pathnames "id_rsa_pem_locked" directory)))
+    (unwind-protect
+         (progn
+           (keygen-write-pem clear +keygen-pem-rsa+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-y" "-f" (namestring clear)))
+             (is (eql 0 status))
+             (is (string= +keygen-pem-rsa-public+
+                          (string-right-trim '(#\Return #\Newline) output))))
+           (keygen-write-pem locked +keygen-pem-rsa-encrypted+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-y" "-P" +keygen-pem-passphrase+
+                                  "-f" (namestring locked)))
+             (is (eql 0 status))
+             (is (string= +keygen-pem-rsa-public+
+                          (string-right-trim '(#\Return #\Newline) output))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-P" "wrong" "-f" (namestring locked)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search
+                  "incorrect passphrase supplied to decrypt private key"
+                  error))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-fingerprints-pem-private-keys
+  ;; A clear PEM key fingerprints as "no comment"; a protected one has no
+  ;; cleartext header, so -l stops with "is not a key file." unless a .pub
+  ;; sits beside it.  An EC PARAMETERS block first is not a private key to
+  ;; -l at all, matching ssh-keygen's first-line test.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (clear (merge-pathnames "id_rsa_pem" directory))
+         (locked (merge-pathnames "id_rsa_pem_locked" directory))
+         (params (merge-pathnames "id_ec_params" directory)))
+    (unwind-protect
+         (progn
+           (keygen-write-pem clear +keygen-pem-rsa+)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" (namestring clear)))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "1024 SHA256:" output))
+             (is (search " no comment (RSA)" output)))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-B" "-f" (namestring clear)))
+             (is (eql 0 status))
+             (is (search " no comment (RSA)" output)))
+           (keygen-write-pem locked +keygen-pem-rsa-encrypted+)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" (namestring locked)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search (format nil "~A is not a key file."
+                                 (namestring locked))
+                         error)))
+           ;; With a .pub beside it, -l reads that and keeps its comment.
+           (with-open-file (stream (burs::keygen-public-path locked)
+                                   :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)
+             (format stream "~A pub comment~%" +keygen-pem-rsa-public+))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-f" (namestring locked)))
+             (is (eql 0 status))
+             (is (search " pub comment (RSA)" output)))
+           (keygen-write-pem params +keygen-pem-ec-withparams+)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" (namestring params)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "is not a public key file." error))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-changes-a-pem-passphrase
+  ;; -p rewrites PEM as openssh-key-v1, prints no comment line because the
+  ;; format has none, and writes no .pub.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (clear (merge-pathnames "id_clear" directory))
+         (locked (merge-pathnames "id_locked" directory)))
+    (unwind-protect
+         (progn
+           (keygen-write-pem clear +keygen-pem-rsa+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-p" "-N" "new-pw"
+                                  "-f" (namestring clear)))
+             (is (eql 0 status))
+             (is (search
+                  "Your identification has been saved with the new passphrase."
+                  output))
+             (is (not (search "Key has comment" output))))
+           (is (string= "-----BEGIN OPENSSH PRIVATE KEY-----"
+                        (keygen-first-line-of clear)))
+           (is (not (probe-file (burs::keygen-public-path clear))))
+           (is (string= "ssh-rsa"
+                        (cl-pnet-ssh:ssh-private-key-type
+                         (cl-pnet-ssh:ssh-load-private-key
+                          clear :passphrase "new-pw"))))
+           (keygen-write-pem locked +keygen-pem-rsa-encrypted+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-p" "-P" +keygen-pem-passphrase+
+                                  "-N" "" "-f" (namestring locked)))
+             (is (eql 0 status))
+             (is (search
+                  "Your identification has been saved with the new passphrase."
+                  output))
+             (is (not (search "Key has comment" output))))
+           (is (not (cl-pnet-ssh:ssh-private-key-file-encrypted-p locked)))
+           (is (string= "ssh-rsa"
+                        (cl-pnet-ssh:ssh-private-key-type
+                         (cl-pnet-ssh:ssh-load-private-key locked)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-changes-a-pem-comment
+  ;; -c says "No existing comment" for PEM, not "Old comment:", rewrites as
+  ;; openssh-key-v1 and always writes the .pub, even for an empty comment.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (clear (merge-pathnames "id_clear" directory))
+         (empty (merge-pathnames "id_empty" directory))
+         (locked (merge-pathnames "id_locked" directory))
+         (public (burs::keygen-public-path clear)))
+    (unwind-protect
+         (progn
+           (keygen-write-pem clear +keygen-pem-rsa+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-C" "new comment" "-P" ""
+                                  "-f" (namestring clear)))
+             (is (eql 0 status))
+             (is (search "No existing comment" output))
+             (is (not (search "Old comment:" output)))
+             (is (search "Comment 'new comment' applied" output)))
+           (is (string= "-----BEGIN OPENSSH PRIVATE KEY-----"
+                        (keygen-first-line-of clear)))
+           (is (string= "new comment" (keygen-public-comment-of public)))
+           (is (string= "new comment"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key clear))))
+           ;; Another PEM key, this time removing its (absent) comment.
+           (keygen-write-pem empty +keygen-pem-rsa+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-C" "" "-P" ""
+                                  "-f" (namestring empty)))
+             (is (eql 0 status))
+             (is (search "No existing comment" output))
+             (is (search "Comment removed" output)))
+           (is (string= ""
+                        (keygen-public-comment-of
+                         (burs::keygen-public-path empty))))
+           ;; Once rewritten, the key is openssh-key-v1 and -c reports its
+           ;; comment the ordinary way.
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-C" "" "-P" ""
+                                  "-f" (namestring clear)))
+             (is (eql 0 status))
+             (is (search "Old comment: new comment" output))
+             (is (search "Comment removed" output)))
+           (is (string= "" (keygen-public-comment-of public)))
+           (keygen-write-pem locked +keygen-pem-rsa-encrypted+)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-C" "locked comment"
+                                  "-P" +keygen-pem-passphrase+
+                                  "-f" (namestring locked)))
+             (is (eql 0 status))
+             (is (search "No existing comment" output)))
+           (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p locked))
+           (is (string= "locked comment"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key
+                          locked :passphrase +keygen-pem-passphrase+)))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test keygen-passphrase-change-reports-and-keeps-comment

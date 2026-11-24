@@ -291,12 +291,18 @@ newline the terminal is not echoing."
     (and stream (read-line stream nil nil))))
 
 (defun keygen-private-file-p (path)
+  "Whether PATH's first line announces a private key.
+
+ssh-keygen's -l only treats a file as private when its first line holds
+\"PRIVATE KEY\", so an EC PARAMETERS block in front of an EC key makes -l
+look for public keys instead, exactly as it does there."
   (let ((line (keygen-first-line path)))
     (and line
          (let ((trimmed (string-left-trim '(#\Space #\Tab) line)))
            (and (> (length trimmed) (length "-----BEGIN"))
                 (string= "-----BEGIN" trimmed
-                         :end2 (length "-----BEGIN")))))))
+                         :end2 (length "-----BEGIN"))
+                (not (null (search "PRIVATE KEY" trimmed))))))))
 
 (defun keygen-require-file (path)
   "Signal ssh-keygen's message when PATH does not exist."
@@ -660,14 +666,35 @@ The checks happen before the overwrite question, as ssh-keygen's do."
              blob (or (getf options :hash) :sha256)))))
 
 (defun keygen-fingerprint-private-header (path options)
-  (if (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
-      (keygen-print-fingerprint
-       (cl-pnet-ssh:ssh-private-key-public-blob path) nil options)
-      (let ((key (keygen-load-key path)))
-        (keygen-print-fingerprint
-         (cl-pnet-ssh:ssh-public-key-blob-of key)
-         (or (cl-pnet-ssh:ssh-private-key-comment key) "")
-         options))))
+  "Fingerprint the private key at PATH without its .pub, as ssh-keygen -l does.
+
+OpenSSH's fingerprint_private asks sshkey_load_public first: for an
+openssh-key-v1 file that yields the cleartext public half, but never the
+comment, so it tries the private half next, which supplies the comment and
+also emits the too-open warning.  A PEM file gives sshkey_load_public
+nothing, so only an unencrypted one can be read by the private attempt; any
+failure there, whether from a passphrase, a bad mode or an unsupported
+type, ends as \"is not a key file.\""
+  (let ((native (uiop:native-namestring path)))
+    (if (cl-pnet-ssh:ssh-private-key-file-openssh-p path)
+        (let ((blob (cl-pnet-ssh:ssh-private-key-public-blob path))
+              (comment nil))
+          (unless (keygen-private-permissions-too-open-p path)
+            (handler-case
+                (let ((key (cl-pnet-ssh:ssh-load-private-key path)))
+                  (setf comment
+                        (or (cl-pnet-ssh:ssh-private-key-comment key) "")))
+              (error () nil)))
+          (keygen-print-fingerprint blob comment options))
+        (progn
+          (when (keygen-private-permissions-too-open-p path)
+            (keygen-fail "~A is not a key file." native))
+          (handler-case
+              (let ((key (cl-pnet-ssh:ssh-load-private-key path)))
+                (keygen-print-fingerprint
+                 (cl-pnet-ssh:ssh-public-key-blob-of key) nil options))
+            (error ()
+              (keygen-fail "~A is not a key file." native)))))))
 
 (defun keygen-fingerprint-private (path options)
   "Print fingerprints for the private key at PATH, as ssh-keygen -l does.
@@ -699,6 +726,9 @@ a cleartext key contributes the comment carried in its private section."
     (cond
       ((keygen-directory-p path)
        (keygen-fail "~A is not a public key file." native))
+      ((not (keygen-file-readable-p path))
+       ;; do_fingerprint opens the file before it looks at it.
+       (keygen-fail "~A: Permission denied" native))
       ((keygen-private-file-p path)
        (keygen-fingerprint-private path options))
       (t
@@ -787,16 +817,19 @@ The \"# Host ... found\" line is left out under -q."
     (if found 0 1)))
 
 (defun keygen-change-passphrase (options)
-  (let ((path (or (keygen-ask-path options)
-                  (return-from keygen-change-passphrase 1))))
+  (let* ((path (or (keygen-ask-path options)
+                   (return-from keygen-change-passphrase 1)))
+         (openssh (cl-pnet-ssh:ssh-private-key-file-openssh-p path)))
     (multiple-value-bind (key passphrase-used)
         (keygen-load-key path :passphrase (getf options :old-passphrase)
                               :prompt "Enter old passphrase: "
                               :failure :failed)
       (declare (ignore passphrase-used))
-      ;; ssh-keygen prints these two lines even under -q.
-      (format t "Key has comment '~A'~%"
-              (or (cl-pnet-ssh:ssh-private-key-comment key) ""))
+      ;; ssh-keygen prints this line even under -q, but only when the
+      ;; format carried a comment; a PEM key has none.
+      (when openssh
+        (format t "Key has comment '~A'~%"
+                (or (cl-pnet-ssh:ssh-private-key-comment key) "")))
       (let ((new (keygen-new-passphrase options)))
         (unless new
           (return-from keygen-change-passphrase 1))
@@ -814,7 +847,8 @@ The \"# Host ... found\" line is left out under -q."
 (defun keygen-change-comment (options)
   (let* ((path (or (keygen-ask-path options)
                    (return-from keygen-change-comment 1)))
-         (public (keygen-public-path path)))
+         (public (keygen-public-path path))
+         (openssh (cl-pnet-ssh:ssh-private-key-file-openssh-p path)))
     ;; Like ssh-keygen, -N can name the passphrase that opens the key when
     ;; -P is absent (the first attempt is always with an empty passphrase).
     (multiple-value-bind (key passphrase-used)
@@ -828,7 +862,9 @@ The \"# Host ... found\" line is left out under -q."
              (comment
                (keygen-clamp-comment
                 (progn
-                  (format t "Old comment: ~A~%" old)
+                  (if openssh
+                      (format t "Old comment: ~A~%" old)
+                      (format t "No existing comment~%"))
                   (if (stringp given)
                       given
                       (progn
@@ -845,8 +881,9 @@ The \"# Host ... found\" line is left out under -q."
              (passphrase
                (and (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
                     passphrase-used)))
-        (when (string= comment old)
-          ;; ssh-keygen leaves both files alone and says so.
+        (when (and openssh (string= comment old))
+          ;; ssh-keygen leaves both files alone and says so.  A PEM key has
+          ;; no old comment to compare against, so it is always rewritten.
           (format t "No change to comment~%")
           (return-from keygen-change-comment 0))
         (setf (cl-pnet-ssh:ssh-private-key-comment key) comment)

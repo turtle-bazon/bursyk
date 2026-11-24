@@ -454,6 +454,7 @@
    #:ssh-key-bubblebabble
    #:ssh-private-key-file-octets
    #:ssh-private-key-file-encrypted-p
+   #:ssh-private-key-file-openssh-p
    #:ssh-private-key-public-blob
    #:ssh-write-private-key
    #:ssh-write-public-key

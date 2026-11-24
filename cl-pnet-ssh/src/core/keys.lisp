@@ -613,6 +613,643 @@ the form every OpenSSH since 7.2 understands."
        (error 'ssh-authentication-error
               :detail (format nil "unsupported private key type ~A" type))))))
 
+;;;; ---- PEM and PKCS#8 private keys ----
+;;;;
+;;;; ssh-keygen reads the PEM forms OpenSSL writes as well as its own
+;;;; openssh-key-v1: PKCS#1 RSA, SEC1 EC, their traditional encrypted forms
+;;;; (Proc-Type/DEK-Info), and PKCS#8 both in the clear and under PBES2 or
+;;;; the PKCS#12-flavoured PBES1.  Only reading matters here: -m is not
+;;;; implemented, and -p and -c rewrite a loaded key in the OpenSSH format.
+
+(defun ssh-pem-blocks (octets)
+  "The armored blocks in OCTETS as plists of :LABEL, :HEADERS and :BODY.
+
+HEADERS is an alist of lower-case names, as the traditional RSA and EC
+encryption headers (Proc-Type, DEK-Info) carry them.  A file may hold
+several blocks; OpenSSL writes EC PARAMETERS before EC PRIVATE KEY."
+  (let ((blocks '())
+        (label nil)
+        (headers '())
+        (body (make-string-output-stream))
+        (body-started nil))
+    (labels ((finish ()
+               (when label
+                 (push (list :label label
+                             :headers (nreverse headers)
+                             :body (ssh-base64-octets
+                                    (get-output-stream-string body)))
+                       blocks))
+               (setf label nil headers nil body-started nil
+                     body (make-string-output-stream)))
+             (begin (line)
+               (finish)
+               (setf label (subseq line 11 (- (length line) 5)))))
+      (with-input-from-string (stream (map 'string #'code-char octets))
+        (loop for raw = (read-line stream nil nil)
+              while raw
+              do (let ((line (string-right-trim '(#\Return) raw)))
+                   (cond
+                     ((and (>= (length line) 16)
+                           (string= "-----BEGIN " line :end2 11))
+                      (begin line))
+                     ((and (>= (length line) 14)
+                           (string= "-----END " line :end2 9))
+                      (finish))
+                     ((null label))
+                     ((and (not body-started) (position #\: line))
+                      (let ((colon (position #\: line)))
+                        (push (cons (string-downcase (subseq line 0 colon))
+                                    (string-left-trim '(#\Space #\Tab)
+                                                      (subseq line (1+ colon))))
+                              headers)))
+                     ((plusp (length line))
+                      (setf body-started t)
+                      (write-string line body))))))
+      (finish))
+    (nreverse blocks)))
+
+(defstruct (ssh-der (:constructor %make-ssh-der))
+  (data nil)
+  (position 0 :type fixnum)
+  (end 0 :type fixnum))
+
+(defun ssh-der-reader (octets &optional (start 0) (end (length octets)))
+  (%make-ssh-der :data octets :position start :end end))
+
+(defun ssh-der-u8 (reader)
+  (when (>= (ssh-der-position reader) (ssh-der-end reader))
+    (error 'ssh-protocol-error :detail "truncated DER data"))
+  (prog1 (aref (ssh-der-data reader) (ssh-der-position reader))
+    (incf (ssh-der-position reader))))
+
+(defun ssh-der-length (reader)
+  (let ((first (ssh-der-u8 reader)))
+    (cond
+      ((< first #x80) first)
+      ((= first #x80)
+       (error 'ssh-protocol-error :detail "indefinite DER length"))
+      (t
+       (let ((count (- first #x80))
+             (length 0))
+         (when (> count 4)
+           (error 'ssh-protocol-error :detail "DER length is too large"))
+         (dotimes (index count)
+           (declare (ignore index))
+           (setf length (+ (* length 256) (ssh-der-u8 reader))))
+         length)))))
+
+(defun ssh-der-element (reader)
+  "VALUES TAG CONTENT of READER's next element, advancing past it."
+  (let* ((tag (ssh-der-u8 reader))
+         (length (ssh-der-length reader))
+         (start (ssh-der-position reader))
+         (end (+ start length)))
+    (when (> end (ssh-der-end reader))
+      (error 'ssh-protocol-error :detail "truncated DER element"))
+    (setf (ssh-der-position reader) end)
+    (values tag (subseq (ssh-der-data reader) start end))))
+
+(defun ssh-der-expect (tag content expected)
+  (unless (= tag expected)
+    (error 'ssh-protocol-error
+           :detail (format nil "unexpected DER tag ~2,'0X" tag)))
+  content)
+
+(defun ssh-der-sequence-reader (reader)
+  (multiple-value-bind (tag content) (ssh-der-element reader)
+    (ssh-der-reader (ssh-der-expect tag content #x30))))
+
+(defun ssh-der-integer-content (content)
+  (when (zerop (length content))
+    (error 'ssh-protocol-error :detail "empty DER integer"))
+  (let ((value 0))
+    (loop for octet across content
+          do (setf value (+ (* value 256) octet)))
+    (if (logbitp 7 (aref content 0))
+        (- value (ash 1 (* 8 (length content))))
+        value)))
+
+(defun ssh-der-integer (reader)
+  (multiple-value-bind (tag content) (ssh-der-element reader)
+    (ssh-der-integer-content (ssh-der-expect tag content #x02))))
+
+(defun ssh-der-octets (reader)
+  (multiple-value-bind (tag content) (ssh-der-element reader)
+    (ssh-der-expect tag content #x04)))
+
+(defun ssh-der-oid-content (content)
+  (when (zerop (length content))
+    (error 'ssh-protocol-error :detail "empty DER object identifier"))
+  (let ((values '())
+        (value 0))
+    (loop for octet across content
+          do (setf value (+ (* value 128) (logand octet #x7f)))
+             (unless (logtest octet #x80)
+               (push value values)
+               (setf value 0)))
+    (let ((parts (nreverse values)))
+      (unless parts
+        (error 'ssh-protocol-error :detail "empty DER object identifier"))
+      (format nil "~D.~D~{.~D~}"
+              (floor (first parts) 40)
+              (mod (first parts) 40)
+              (rest parts)))))
+
+(defun ssh-der-oid (reader)
+  (multiple-value-bind (tag content) (ssh-der-element reader)
+    (ssh-der-oid-content (ssh-der-expect tag content #x06))))
+
+(defun ssh-pem-mpints (&rest integers)
+  "The SSH mpint encoding of INTEGERS, concatenated."
+  (let ((writer (ssh-writer)))
+    (dolist (integer integers)
+      (ssh-write-mpint writer integer))
+    (ssh-writer-output writer)))
+
+(defun ssh-pem-trim-leading-zeros (octets)
+  (let ((start 0))
+    (loop while (and (< start (length octets))
+                     (zerop (aref octets start)))
+          do (incf start))
+    (subseq octets start)))
+
+(defun ssh-pem-unsigned-integer (octets)
+  "The big-endian unsigned integer in OCTETS.
+
+SEC1 stores the EC scalar without a sign octet, so the top bit says nothing
+about negativity the way it does in a DER INTEGER."
+  (let ((value 0))
+    (loop for octet across octets
+          do (setf value (+ (* value 256) octet)))
+    value))
+
+(defun ssh-pem-rsa-material (content)
+  "The ssh-rsa key in a DER PKCS#1 RSAPrivateKey CONTENT."
+  (let* ((reader (ssh-der-sequence-reader (ssh-der-reader content)))
+         (version (ssh-der-integer reader))
+         (n (ssh-der-integer reader))
+         (e (ssh-der-integer reader))
+         (d (ssh-der-integer reader))
+         (p (ssh-der-integer reader))
+         (q (ssh-der-integer reader))
+         (dp (ssh-der-integer reader))
+         (dq (ssh-der-integer reader))
+         (iqmp (ssh-der-integer reader)))
+    (declare (ignore version dp dq))
+    (list :type "ssh-rsa"
+          :public (ssh-pem-mpints e n)
+          :private (ssh-pem-mpints d iqmp p q)
+          :comment "")))
+
+(defparameter +ssh-pem-curve-oids+
+  '(("1.2.840.10045.3.1.7" . "nistp256")
+    ("1.3.132.0.34" . "nistp384")
+    ("1.3.132.0.35" . "nistp521"))
+  "The named curves a PEM key can hold, as OpenSSH names them.")
+
+(defun ssh-pem-curve-name (oid)
+  (or (cdr (assoc oid +ssh-pem-curve-oids+ :test #'string=))
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported PEM curve ~A" oid))))
+
+(defun ssh-pem-ec-material (content &optional default-curve)
+  "The ECDSA key in a DER SEC1 ECPrivateKey CONTENT.
+
+OpenSSL sometimes writes the curve in a preceding EC PARAMETERS block and
+leaves it out of the key; DEFAULT-CURVE is that name."
+  (let* ((reader (ssh-der-sequence-reader (ssh-der-reader content)))
+         (version (ssh-der-integer reader))
+         (private (ssh-der-octets reader))
+         (oid nil))
+    (declare (ignore version))
+    (loop while (< (ssh-der-position reader) (ssh-der-end reader))
+          do (multiple-value-bind (tag inner) (ssh-der-element reader)
+               (when (= tag #xa0)
+                 (setf oid (ssh-der-oid (ssh-der-reader inner))))))
+    (let* ((curve-name (if oid (ssh-pem-curve-name oid) default-curve))
+           (curve (cdr (assoc curve-name +ssh-ecdsa-curves+
+                              :test #'string=))))
+      (unless curve
+        (error 'ssh-protocol-error
+               :detail "the EC private key names no supported curve"))
+      (let* ((size (getf curve :size))
+             (scalar-octets (ssh-pem-trim-leading-zeros private)))
+        (when (or (zerop (length scalar-octets))
+                  (> (length scalar-octets) size))
+          (error 'ssh-protocol-error
+                 :detail "the EC private scalar is out of range"))
+        (let* ((scalar (ssh-pem-unsigned-integer scalar-octets))
+               (private-key
+                 (ironclad-unsafe:make-private-key
+                  (getf curve :curve)
+                  :x (ssh-integer-octets scalar size)))
+               (point (getf (ironclad-unsafe:destructure-private-key
+                             private-key)
+                            :y)))
+          (list :type (format nil "ecdsa-sha2-~A" curve-name)
+                :public point
+                :private (ssh-pem-mpints scalar)
+                :comment ""))))))
+
+(defun ssh-pem-ed25519-material (content)
+  "The ssh-ed25519 key in a PKCS#8 CurvePrivateKey CONTENT.
+
+RFC 8410 wraps the 32-octet seed in an OCTET STRING; a few encoders put the
+seed there directly, so both are accepted."
+  (let ((seed (if (= (length content) 32)
+                  content
+                  (ssh-der-octets (ssh-der-reader content)))))
+    (unless (= (length seed) 32)
+      (error 'ssh-protocol-error
+             :detail "an Ed25519 private key is 32 octets"))
+    (let ((public (ironclad-unsafe:ed25519-public-key
+                   (ssh-copy-octets seed))))
+      (list :type "ssh-ed25519"
+            :public (ssh-copy-octets public)
+            :private (ssh-concat (ssh-copy-octets seed) public)
+            :comment ""))))
+
+(defun ssh-pem-pkcs8-material (content)
+  "The key in a DER PKCS#8 PrivateKeyInfo CONTENT."
+  (let* ((reader (ssh-der-sequence-reader (ssh-der-reader content)))
+         (version (ssh-der-integer reader))
+         (algorithm (ssh-der-sequence-reader reader))
+         (private (ssh-der-octets reader)))
+    (declare (ignore version))
+    (let ((oid (ssh-der-oid algorithm))
+          (curve nil))
+      (when (< (ssh-der-position algorithm) (ssh-der-end algorithm))
+        (multiple-value-bind (tag params) (ssh-der-element algorithm)
+          (when (= tag #x06)
+            (setf curve (ssh-pem-curve-name
+                         (ssh-der-oid-content params))))))
+      (cond
+        ((string= oid "1.2.840.113549.1.1.1")
+         (ssh-pem-rsa-material private))
+        ((string= oid "1.2.840.10045.2.1")
+         (ssh-pem-ec-material private curve))
+        ((string= oid "1.3.101.112")
+         (ssh-pem-ed25519-material private))
+        (t
+         (error 'ssh-protocol-error
+                :detail (format nil "unsupported PKCS#8 key algorithm ~A"
+                                oid)))))))
+
+(defparameter +ssh-pem-ciphers+
+  '(("AES-128-CBC" :aes 16 16)
+    ("AES-192-CBC" :aes 24 16)
+    ("AES-256-CBC" :aes 32 16)
+    ("DES-EDE3-CBC" :3des 24 8)
+    ("DES-CBC" :des 8 8))
+  "The traditional PEM ciphers, as NAME KIND KEY-BYTES BLOCK-BYTES.")
+
+(defun ssh-pem-hex-octets (text)
+  (let ((out (make-array (floor (length text) 2)
+                         :element-type '(unsigned-byte 8))))
+    (dotimes (index (length out) out)
+      (setf (aref out index)
+            (parse-integer text :start (* 2 index) :end (+ 2 (* 2 index))
+                           :radix 16)))))
+
+(defun ssh-pem-header (block name)
+  (cdr (assoc name (getf block :headers) :test #'string-equal)))
+
+(defun ssh-pem-block-encrypted-p (block)
+  (let ((proc (ssh-pem-header block "proc-type")))
+    (and proc
+         (not (null (search "ENCRYPTED" proc :test #'char-equal))))))
+
+(defun ssh-pem-evp-bytes-to-key (passphrase salt length)
+  "OpenSSL's EVP_BytesToKey with MD5 and one iteration."
+  (let ((key (make-array 0 :element-type '(unsigned-byte 8)))
+        (previous (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop while (< (length key) length)
+          do (let ((digest (ssh-hash :md5 previous
+                                     (ssh-string-octets passphrase) salt)))
+               (setf key (ssh-concat key digest)
+                     previous digest)))
+    (subseq key 0 length)))
+
+(defun ssh-pem-strip-padding (octets block-size)
+  (let* ((length (length octets))
+         (padding (and (plusp length) (aref octets (1- length)))))
+    (unless (and padding
+                 (<= 1 padding block-size)
+                 (<= padding length)
+                 (loop for index from (- length padding) below length
+                       always (= (aref octets index) padding)))
+      (error 'ssh-protocol-error :detail "bad PEM padding"))
+    (subseq octets 0 (- length padding))))
+
+(defun ssh-pem-cbc-decrypt (kind key iv ciphertext block-size)
+  (let ((plain (ironclad-unsafe:decrypt-message
+                (ironclad-unsafe:make-cipher kind :mode :cbc :key key
+                                            :initialization-vector iv)
+                ciphertext)))
+    (ssh-pem-strip-padding plain block-size)))
+
+(defun ssh-pem-decrypt-traditional (block passphrase)
+  (let* ((dek (ssh-pem-header block "dek-info")))
+    (unless dek
+      (error 'ssh-protocol-error :detail "encrypted PEM has no DEK-Info"))
+    (let* ((comma (position #\, dek))
+           (name (and comma (subseq dek 0 comma)))
+           (spec (and name (assoc name +ssh-pem-ciphers+ :test #'string-equal)))
+           (iv (and comma (ssh-pem-hex-octets (subseq dek (1+ comma))))))
+      (unless (and spec iv)
+        (error 'ssh-protocol-error
+               :detail (format nil "unsupported PEM cipher ~A" name)))
+      (unless (and (stringp passphrase) (plusp (length passphrase)))
+        (error 'ssh-authentication-error
+               :detail "incorrect passphrase supplied to decrypt private key"))
+      (let* ((kind (second spec))
+             (key-length (third spec))
+             (block-size (fourth spec))
+             (key (ssh-pem-evp-bytes-to-key passphrase (subseq iv 0 8)
+                                            key-length)))
+        (ssh-pem-cbc-decrypt kind key iv (getf block :body) block-size)))))
+
+(defparameter +ssh-pem-pbes2-oid+ "1.2.840.113549.1.5.13")
+(defparameter +ssh-pem-pbkdf2-oid+ "1.2.840.113549.1.5.12")
+
+(defparameter +ssh-pem-prf-digests+
+  '(("1.2.840.113549.2.7" . :sha1)
+    ("1.2.840.113549.2.8" . :sha224)
+    ("1.2.840.113549.2.9" . :sha256)
+    ("1.2.840.113549.2.10" . :sha384)
+    ("1.2.840.113549.2.11" . :sha512))
+  "PBKDF2 PRF object identifiers, as Ironclad digest names.")
+
+(defparameter +ssh-pem-pbes2-ciphers+
+  '(("2.16.840.1.101.3.4.1.2" :aes 16 16)
+    ("2.16.840.1.101.3.4.1.22" :aes 24 16)
+    ("2.16.840.1.101.3.4.1.42" :aes 32 16)
+    ("1.2.840.113549.3.7" :3des 24 8)
+    ("1.3.14.3.2.7" :des 8 8))
+  "PBES2 ciphers as OID KIND KEY-BYTES BLOCK-BYTES.")
+
+(defun ssh-pem-parse-pbkdf2 (algorithm)
+  "The PBKDF2 parameters of the AlgorithmIdentifier READER ALGORITHM."
+  (let* ((params (ssh-der-sequence-reader algorithm))
+         (salt (ssh-der-octets params))
+         (iterations (ssh-der-integer params))
+         (digest :sha1))
+    (loop while (< (ssh-der-position params) (ssh-der-end params))
+          do (multiple-value-bind (tag content) (ssh-der-element params)
+               (cond
+                 ((= tag #x02)
+                  (ssh-der-integer-content content))
+                 ((= tag #x30)
+                  (let* ((prf (ssh-der-reader content))
+                         (oid (ssh-der-oid prf)))
+                    (setf digest
+                          (or (cdr (assoc oid +ssh-pem-prf-digests+
+                                          :test #'string=))
+                              (error 'ssh-protocol-error
+                                     :detail
+                                     (format nil "unsupported PBKDF2 PRF ~A"
+                                             oid))))))
+                 (t nil))))
+    (list :salt salt :iterations iterations :digest digest)))
+
+(defun ssh-pem-pbes2-decrypt (params passphrase data)
+  "Decrypt DATA with a PBES2 AlgorithmIdentifier parameter CONTENT."
+  (let* ((reader (ssh-der-reader params))
+         (kdf (ssh-der-sequence-reader reader))
+         (scheme (ssh-der-sequence-reader reader))
+         (kdf-oid (ssh-der-oid kdf))
+         (cipher-oid (ssh-der-oid scheme)))
+    (unless (string= kdf-oid +ssh-pem-pbkdf2-oid+)
+      (error 'ssh-protocol-error
+             :detail (format nil "unsupported PBES2 KDF ~A" kdf-oid)))
+    (let* ((pbkdf2 (ssh-pem-parse-pbkdf2 kdf))
+           (spec (assoc cipher-oid +ssh-pem-pbes2-ciphers+
+                        :test #'string=)))
+      (unless spec
+        (error 'ssh-protocol-error
+               :detail (format nil "unsupported PBES2 cipher ~A" cipher-oid)))
+      (let* ((kind (second spec))
+             (key-length (third spec))
+             (block-size (fourth spec))
+             (iv (multiple-value-bind (tag content)
+                     (ssh-der-element scheme)
+                   (ssh-der-expect tag content #x04)))
+             (key (ironclad-unsafe:derive-key
+                   (ironclad-unsafe:make-kdf :pbkdf2
+                                             :digest (getf pbkdf2 :digest))
+                   (ssh-string-octets passphrase)
+                   (getf pbkdf2 :salt)
+                   (getf pbkdf2 :iterations)
+                   key-length)))
+        (ssh-pem-cbc-decrypt kind key iv data block-size)))))
+
+(defparameter +ssh-pem-pbes1+
+  '(("1.2.840.113549.1.5.3" :pbkdf1 :md5 :des 8 8)
+    ("1.2.840.113549.1.5.10" :pbkdf1 :sha1 :des 8 8)
+    ("1.2.840.113549.1.12.1.3" :pkcs12 :sha1 :3des 24 8)
+    ("1.2.840.113549.1.12.1.4" :pkcs12 :sha1 :3des 16 8))
+  "PBES1 ciphers as OID KDF DIGEST KIND KEY-BYTES BLOCK-BYTES.")
+
+(defun ssh-pem-repeat-to-multiple (octets multiple)
+  (if (zerop (length octets))
+      (make-array 0 :element-type '(unsigned-byte 8))
+      (let* ((length (* multiple
+                        (ceiling (length octets) multiple)))
+             (out (make-array length :element-type '(unsigned-byte 8))))
+        (dotimes (index length out)
+          (setf (aref out index)
+                (aref octets (mod index (length octets))))))))
+
+(defun ssh-pem-write-code-unit (writer unit)
+  (ssh-write-u8 writer (ldb (byte 8 8) unit))
+  (ssh-write-u8 writer (ldb (byte 8 0) unit)))
+
+(defun ssh-pem-bmpstring (string)
+  "STRING as the BMPString PKCS#12 keys hash, including its terminator."
+  (let ((writer (ssh-writer)))
+    (loop for character across string
+          for code = (char-code character)
+          do (cond
+               ((< code #x10000)
+                (ssh-pem-write-code-unit writer code))
+               (t
+                (let ((value (- code #x10000)))
+                  (ssh-pem-write-code-unit writer
+                                           (+ #xd800 (ash value -10)))
+                  (ssh-pem-write-code-unit writer
+                                           (+ #xdc00 (logand value #x3ff)))))))
+    (ssh-pem-write-code-unit writer 0)
+    (ssh-writer-output writer)))
+
+(defun ssh-pem-pkcs12-kdf (passphrase salt id iterations length)
+  "The PKCS#12 KDF (RFC 7292) with SHA-1, for ID 1 (key) or 2 (IV).
+
+The salt and the password are repeated to whole 64-octet SHA-1 blocks, as
+the standard's v, while each round contributes its 20-octet digest to the
+output and, repeated to a block, to the running I."
+  (let* ((hash-block 64)
+         (salt-block (ssh-pem-repeat-to-multiple salt hash-block))
+         (password (ssh-pem-bmpstring passphrase))
+         (password-block (ssh-pem-repeat-to-multiple password hash-block))
+         (i (ssh-concat salt-block password-block))
+         (key (make-array 0 :element-type '(unsigned-byte 8)))
+         (d (make-array hash-block :element-type '(unsigned-byte 8)
+                                    :initial-element id)))
+    (loop while (< (length key) length)
+          do (let ((a (ssh-hash :sha1 d i)))
+               (dotimes (round (1- iterations))
+                 (declare (ignore round))
+                 (setf a (ssh-hash :sha1 a)))
+               (setf key (ssh-concat key a))
+               (let ((block (ssh-pem-repeat-to-multiple a hash-block)))
+                 (loop for start from 0 below (length i) by hash-block
+                       do (let ((carry 1))
+                            (loop for index downfrom (1- hash-block) to 0
+                                  do (let ((at (+ start index))
+                                           (sum 0))
+                                       (when (< at (length i))
+                                         (setf sum (+ (aref i at)
+                                                      (aref block index)
+                                                      carry))
+                                         (setf (aref i at) (logand sum #xff)
+                                               carry (ash sum -8))))))))))
+    (subseq key 0 length)))
+
+(defun ssh-pem-pbes1-decrypt (spec params passphrase data)
+  "Decrypt DATA with a PBES1 SPEC and its parameter CONTENT."
+  (let* ((reader (ssh-der-reader params))
+         (salt (ssh-der-octets reader))
+         (iterations (ssh-der-integer reader))
+         (kdf (second spec))
+         (digest (third spec))
+         (kind (fourth spec))
+         (key-length (fifth spec))
+         (block-size (sixth spec)))
+    (unless (and (stringp passphrase) (plusp (length passphrase)))
+      (error 'ssh-authentication-error
+             :detail "incorrect passphrase supplied to decrypt private key"))
+    (multiple-value-bind (key iv)
+        (ecase kdf
+          (:pbkdf1
+           (let ((material
+                   (ironclad-unsafe:derive-key
+                    (ironclad-unsafe:make-kdf :pbkdf1 :digest digest)
+                    (ssh-string-octets passphrase) salt iterations
+                    (+ key-length block-size))))
+             (values (subseq material 0 key-length)
+                     (subseq material key-length))))
+          (:pkcs12
+           (values (ssh-pem-pkcs12-kdf passphrase salt 1 iterations
+                                       key-length)
+                   (ssh-pem-pkcs12-kdf passphrase salt 2 iterations
+                                       block-size))))
+      (ssh-pem-cbc-decrypt kind key iv data block-size))))
+
+(defun ssh-pem-decrypt-pkcs8 (content passphrase)
+  "Decrypt an EncryptedPrivateKeyInfo CONTENT to a PrivateKeyInfo CONTENT."
+  (unless (and (stringp passphrase) (plusp (length passphrase)))
+    (error 'ssh-authentication-error
+           :detail "incorrect passphrase supplied to decrypt private key"))
+  (handler-case
+      (let* ((reader (ssh-der-sequence-reader (ssh-der-reader content)))
+             (algorithm (ssh-der-sequence-reader reader))
+             (data (ssh-der-octets reader))
+             (oid (ssh-der-oid algorithm)))
+        (multiple-value-bind (tag params) (ssh-der-element algorithm)
+          (ssh-der-expect tag params #x30)
+          (cond
+            ((string= oid +ssh-pem-pbes2-oid+)
+             (ssh-pem-pbes2-decrypt params passphrase data))
+            ((assoc oid +ssh-pem-pbes1+ :test #'string=)
+             (ssh-pem-pbes1-decrypt
+              (assoc oid +ssh-pem-pbes1+ :test #'string=)
+              params passphrase data))
+            (t
+             (error 'ssh-protocol-error
+                    :detail (format nil "unsupported encrypted key scheme ~A"
+                                    oid))))))
+    (error ()
+      ;; OpenSSH turns every libcrypto PEM failure with a non-empty
+      ;; passphrase into the same wrong-passphrase answer.
+      (error 'ssh-authentication-error
+             :detail "incorrect passphrase supplied to decrypt private key"))))
+
+(defun ssh-pem-block-private-p (block)
+  (let ((label (getf block :label)))
+    (and (search "PRIVATE KEY" label)
+         (not (string= label "OPENSSH PRIVATE KEY")))))
+
+(defun ssh-pem-private-block (blocks)
+  (find-if #'ssh-pem-block-private-p blocks))
+
+(defun ssh-pem-ec-parameters-curve (blocks)
+  (let ((block (find-if (lambda (block)
+                          (string= "EC PARAMETERS" (getf block :label)))
+                        blocks)))
+    (when block
+      (handler-case
+          (ssh-pem-curve-name
+           (ssh-der-oid (ssh-der-reader (getf block :body))))
+        (error () nil)))))
+
+(defun ssh-pem-key-material (block passphrase parser)
+  "PARSER applied to BLOCK's body, after decrypting it when needed.
+
+Any failure under an encrypted block is a wrong passphrase, as OpenSSH
+reports for PEM: it has no authenticated error of its own to distinguish."
+  (if (ssh-pem-block-encrypted-p block)
+      (handler-case
+          (funcall parser (ssh-pem-decrypt-traditional block passphrase))
+        (error ()
+          (error 'ssh-authentication-error
+                 :detail "incorrect passphrase supplied to decrypt private key")))
+      (funcall parser (getf block :body))))
+
+(defun ssh-pem-private-material (blocks passphrase)
+  "The key material plist of the private block among BLOCKS."
+  (let ((block (ssh-pem-private-block blocks)))
+    (unless block
+      (error 'ssh-protocol-error :detail "not a PEM private key"))
+    (let ((label (getf block :label)))
+      (cond
+        ((string= label "RSA PRIVATE KEY")
+         (ssh-pem-key-material block passphrase #'ssh-pem-rsa-material))
+        ((string= label "EC PRIVATE KEY")
+         (let ((default-curve
+                 (ssh-pem-ec-parameters-curve
+                  (subseq blocks 0 (position block blocks)))))
+           (ssh-pem-key-material
+            block passphrase
+            (lambda (content) (ssh-pem-ec-material content default-curve)))))
+        ((string= label "PRIVATE KEY")
+         (ssh-pem-pkcs8-material (getf block :body)))
+        ((string= label "ENCRYPTED PRIVATE KEY")
+         (handler-case
+             (ssh-pem-pkcs8-material
+              (ssh-pem-decrypt-pkcs8 (getf block :body) passphrase))
+           (error ()
+             (error 'ssh-authentication-error
+                    :detail
+                    "incorrect passphrase supplied to decrypt private key"))))
+        (t
+         (error 'ssh-protocol-error
+                :detail (format nil "unsupported PEM key ~A" label)))))))
+
+(defun ssh-pem-private-key-encrypted-p (blocks)
+  (let ((block (ssh-pem-private-block blocks)))
+    (and block
+         (cond
+           ((string= (getf block :label) "ENCRYPTED PRIVATE KEY") t)
+           ((string= (getf block :label) "PRIVATE KEY") nil)
+           (t (ssh-pem-block-encrypted-p block))))))
+
+(defun ssh-openssh-private-key-octets-p (octets)
+  "Whether OCTETS hold an armored openssh-key-v1 key."
+  (not (null
+        (ssh-find-octets
+         (map 'vector #'char-code "-----BEGIN OPENSSH PRIVATE KEY-----")
+         octets))))
+
 ;;; ---- OpenSSH private key files ----
 
 (defparameter +openssh-key-magic+ "openssh-key-v1")
@@ -975,54 +1612,77 @@ SSH_ERR_KEY_WRONG_PASSPHRASE."
       (ssh-parse-private-section section type :encrypted encrypted))))
 
 (defun ssh-load-private-key (path &key passphrase)
-  "Load an OpenSSH PRIVATE-KEY from PATH.
+  "Load a private key from PATH.
 
-PASSPHRASE decrypts a passphrase-protected file; an unencrypted file ignores
-it.  ssh-ed25519, ssh-rsa and the ECDSA curves all sign here.  The file must
-hold one key."
-  (let* ((body (ssh-private-key-body (ssh-read-octets-file path)))
-         (magic (ssh-check-key-magic body)))
-    (declare (ignore magic))
-    (let ((key (ssh-parse-openssh-private-key body :passphrase passphrase)))
+Both armored openssh-key-v1 files and the PEM forms OpenSSL writes (PKCS#1
+RSA, SEC1 EC, and PKCS#8 in the clear or encrypted) are read.  PASSPHRASE
+decrypts a protected file; an unencrypted file ignores it.  ssh-ed25519,
+ssh-rsa and the ECDSA curves all sign here.  The file must hold one key."
+  (let ((octets (ssh-read-octets-file path)))
+    (let ((key
+            (if (ssh-openssh-private-key-octets-p octets)
+                (let ((body (ssh-private-key-body octets)))
+                  (ssh-check-key-magic body)
+                  (ssh-parse-openssh-private-key
+                   body :passphrase passphrase))
+                (let ((material (ssh-pem-private-material
+                                 (ssh-pem-blocks octets) passphrase)))
+                  (%make-ssh-private-key
+                   :type (getf material :type)
+                   :public (getf material :public)
+                   :private (getf material :private)
+                   :comment (or (getf material :comment) ""))))))
       (setf (ssh-private-key-path key) path)
       key)))
+
+(defun ssh-private-key-file-openssh-p (path)
+  "Whether PATH is an armored openssh-key-v1 private key."
+  (ssh-openssh-private-key-octets-p (ssh-read-octets-file path)))
 
 (defun ssh-private-key-file-encrypted-p (path)
   "Whether the private key file at PATH is passphrase-protected.
 
 The header names the cipher and KDF, so this answers without a passphrase
 and without decrypting anything.  A \"none\" cipher with a bcrypt KDF still
-wants a passphrase, as OpenSSH demands one whenever the KDF is not none."
-  (let* ((body (ssh-private-key-body (ssh-read-octets-file path))))
-    (ssh-check-key-magic body)
-    (let ((reader (ssh-make-reader body)))
-      ;; Step over the magic and its trailing NUL to the cipher string.
-      (dotimes (index (1+ (length +openssh-key-magic+)))
-        (declare (ignore index))
-        (ssh-read-u8 reader))
-      (let ((cipher (ssh-read-text reader))
-            (kdf (ssh-read-text reader)))
-        (not (and (string= cipher "none")
-                  (string= kdf "none")))))))
+wants a passphrase, as OpenSSH demands one whenever the KDF is not none.
+A PEM key is protected when its traditional header says so or when it is a
+PKCS#8 EncryptedPrivateKeyInfo."
+  (let ((octets (ssh-read-octets-file path)))
+    (if (not (ssh-openssh-private-key-octets-p octets))
+        (ssh-pem-private-key-encrypted-p (ssh-pem-blocks octets))
+        (let ((body (ssh-private-key-body octets)))
+          (ssh-check-key-magic body)
+          (let ((reader (ssh-make-reader body)))
+            ;; Step over the magic and its trailing NUL to the cipher string.
+            (dotimes (index (1+ (length +openssh-key-magic+)))
+              (declare (ignore index))
+              (ssh-read-u8 reader))
+            (let ((cipher (ssh-read-text reader))
+                  (kdf (ssh-read-text reader)))
+              (not (and (string= cipher "none")
+                        (string= kdf "none")))))))))
 
 (defun ssh-private-key-public-blob (path)
-  "The public key blob in the openssh-key-v1 header at PATH.
+  "The public key blob in the openssh-key-v1 header at PATH, or NIL.
 
-The header sits outside the encrypted section, so a protected key can be
-identified without its passphrase, as ssh-keygen -l does."
-  (let* ((body (ssh-private-key-body (ssh-read-octets-file path)))
-         (magic (ssh-check-key-magic body)))
-    (declare (ignore magic))
-    (let ((reader (ssh-make-reader
-                   body (+ (length +openssh-key-magic+) 1))))
-      (ssh-read-text reader)                 ; cipher
-      (ssh-read-text reader)                 ; kdf
-      (ssh-read-string reader)               ; kdf options
-      (let ((count (ssh-read-u32 reader)))
-        (unless (= count 1)
-          (error 'ssh-protocol-error
-                 :detail "a key file with several keys is unsupported"))
-        (ssh-read-string reader)))))
+The new format bundles the public half in the clear, so a protected key can
+be identified without its passphrase, as ssh-keygen -l does.  A PEM key has
+no such header: ssh-keygen cannot fingerprint a protected one without its
+passphrase either, and a clear one is loaded through SSH-LOAD-PRIVATE-KEY."
+  (let ((octets (ssh-read-octets-file path)))
+    (when (ssh-openssh-private-key-octets-p octets)
+      (let ((body (ssh-private-key-body octets)))
+        (ssh-check-key-magic body)
+        (let ((reader (ssh-make-reader
+                       body (+ (length +openssh-key-magic+) 1))))
+          (ssh-read-text reader)                 ; cipher
+          (ssh-read-text reader)                 ; kdf
+          (ssh-read-string reader)               ; kdf options
+          (let ((count (ssh-read-u32 reader)))
+            (unless (= count 1)
+              (error 'ssh-protocol-error
+                     :detail "a key file with several keys is unsupported"))
+            (ssh-read-string reader)))))))
 
 (defun ssh-public-key-blob-of (key)
   "The public key blob of private KEY, or an agent-backed host key."

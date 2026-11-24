@@ -23,6 +23,250 @@
 (defun octets-ascii (string)
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code string))
 
+;;; ---- PEM private-key fixtures ----
+
+;; OpenSSL 3.0 wrote these, so they test the PEM reader against an
+;; independent encoder.  Every encrypted fixture uses the passphrase
+;; "pem pass".  The public lines come from ssh-keygen 10.6.
+
+(defparameter +pem-fixture-rsa-pkcs1+
+  "-----BEGIN RSA PRIVATE KEY-----
+MIICXQIBAAKBgQDNOaxK3xPyXKpvCagd7jtmY8DenWnHdoRQ5mgmFOMohJj2P6NI
+BLpmOFVkA8oFGS7I+SkHcGosDW1giFHcWsmSDnddYI7/1GQL9qvNi+0D4VFOGL+D
+XR36o/mnXR6Qbq1KEIku81XNi+TWDruBn1cnf/ErwrCrydyiDZy0kpUGdwIDAQAB
+AoGAav0kGyxNA87Xc2e/Y0stYGWkyOmbmcbpmBtmNGQzQI5QCCCJCSSd4GiB69Al
+456LS27Juv0Z/LlLSkYHFy+lYTWkBIBRA8kePmirLgNnaEISOj8gnP7Kv26yeBuW
+W/TOsPl6lg0RLV6GikWgmNZQzU2H0zyNkw4xKORieXLkqvECQQD5GsOoDVHZd65Y
+QLBINXOh6MZHEShZfCt6oUQU0GD5fxcz9Ys5GBwiS7SXX+EZ8X5ywYkTUXq2QlWv
+iwDV85slAkEA0uf3TbzEbX0KcQuALjO1Cphgmz8pOKc7e2R5p9XiSa/uYDqg1n6n
+D0PqkpC7lA5IJtkaQLYvtvHdyqzKOFYWawJBANo9mZc8/C2jjgphuk+5DLKYJkaT
+AJ/NiqYobWYy3hMYRnLOOAhwWA2v9+r7JFK/YcIWTwquwuy1Fy7xgGzxvUUCQEre
+n/MPvOdlSSyiOYmtP2qYd0sFW/vJmhsOqwVCr0cbVlMA3RHn+iQ4JvCKwpwnicOI
+tIIeasfWCrclKdBf9ysCQQDwp/pHj7SKW84E1VrVOWABMlYCN4YZgu4CyNR0wfGJ
+2wcdkOtF/7kCfnZ36ocHPFiejAZqCsca5mHKQFf3t9Vh
+-----END RSA PRIVATE KEY-----
+"
+  "A 1024-bit RSA key in traditional PKCS#1 form, unencrypted.")
+
+(defparameter +pem-fixture-rsa-pkcs8+
+  "-----BEGIN PRIVATE KEY-----
+MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAM05rErfE/Jcqm8J
+qB3uO2ZjwN6dacd2hFDmaCYU4yiEmPY/o0gEumY4VWQDygUZLsj5KQdwaiwNbWCI
+UdxayZIOd11gjv/UZAv2q82L7QPhUU4Yv4NdHfqj+addHpBurUoQiS7zVc2L5NYO
+u4GfVyd/8SvCsKvJ3KINnLSSlQZ3AgMBAAECgYBq/SQbLE0DztdzZ79jSy1gZaTI
+6ZuZxumYG2Y0ZDNAjlAIIIkJJJ3gaIHr0CXjnotLbsm6/Rn8uUtKRgcXL6VhNaQE
+gFEDyR4+aKsuA2doQhI6PyCc/sq/brJ4G5Zb9M6w+XqWDREtXoaKRaCY1lDNTYfT
+PI2TDjEo5GJ5cuSq8QJBAPkaw6gNUdl3rlhAsEg1c6HoxkcRKFl8K3qhRBTQYPl/
+FzP1izkYHCJLtJdf4RnxfnLBiRNRerZCVa+LANXzmyUCQQDS5/dNvMRtfQpxC4Au
+M7UKmGCbPyk4pzt7ZHmn1eJJr+5gOqDWfqcPQ+qSkLuUDkgm2RpAti+28d3KrMo4
+VhZrAkEA2j2Zlzz8LaOOCmG6T7kMspgmRpMAn82KpihtZjLeExhGcs44CHBYDa/3
+6vskUr9hwhZPCq7C7LUXLvGAbPG9RQJASt6f8w+852VJLKI5ia0/aph3SwVb+8ma
+Gw6rBUKvRxtWUwDdEef6JDgm8IrCnCeJw4i0gh5qx9YKtyUp0F/3KwJBAPCn+keP
+tIpbzgTVWtU5YAEyVgI3hhmC7gLI1HTB8YnbBx2Q60X/uQJ+dnfqhwc8WJ6MBmoK
+xxrmYcpAV/e31WE=
+-----END PRIVATE KEY-----
+"
+  "The same RSA key in unencrypted PKCS#8 PrivateKeyInfo form.")
+
+(defparameter +pem-fixture-rsa-trad-aes128+
+  "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,AE1738854067CA20D84E91862C823999
+
+ovUwPMO/I8gQTkOYejvGyzvg36ryvU5qtpHfss4vgly30EMdCmerUBJiZ42oRPKG
+TAvhphZY4ggIeB3RCuY0wA+b2WMdLXd3WvNU3nLD9XpMJhD2fafNu5JRE9wZvG44
+1GjxuIvCeqMS4ZV5WnXgmIaRNRKebaimKSvmaaJ/F9OYccqWsv63JzzbCCw/yRdp
+6ps1iejTpf+g5ZFYVMO9WBGGUj+NcNHMARRFmdbcv5HmOi7U8LG+CNMcRVTJLDjD
+i2O263ORC4ood/+GYEjKI8e+nyI3aqJ2U1ZHSw8GvibIe9c5F/ozFEITloUbrfnQ
+FeKjzKlgVnMcQGYgpPCO3JBd+cNFZjzQWfYWWAQx8hRp6j9ZKUy9KyFDDQxwuaLx
+/Fv8o/Jo4jmI2zoMhBIi0ZuoiFg8CknWhod7ylOMJQH8kDVTPHO5sYT2qoBHre5F
+ckz78DjRh/7oTK2K4FlbGwnyKuGKPUaAI1DOEepjs4vSAVtZth97IspK79nQDm2w
+wNJmt5SpbImUDbY/VpithAWDqOMuy+lcTeyhO9NGItNxXV7NnaVKrt+brKui7+P7
+LvOOmrZXGsxq6aBqq0RSFq/8L+KvvXVZILkcNkFh6q5ejgZQsLOhAoGN8XWP10HK
+VkOdYlt+QQnnCXgvB/TFktBfx+3MzM2y9AA4jC/Obs7EYidbHTv43q8bZHeiRiLG
+OvU46AEHSylkgCLLZuj6JGPOSW+0Yptz4RceDUDQLh7djKdEB0MxpbHDwkxN4RaI
+2EjgCouXxlkYU6ZahWwBrZZmlCG+J2mDm1X3MN4M8/fKYGPeDfhGTQTOZE34PYdJ
+-----END RSA PRIVATE KEY-----
+"
+  "The same RSA key in traditional PEM, encrypted with AES-128-CBC.")
+
+(defparameter +pem-fixture-rsa-trad-3des+
+  "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: DES-EDE3-CBC,28C330C27091DFA2
+
+jhSJSLykj+qZ93CoqwvYFdmmSFZssvxh1JNxQtsqBLt4pVeOfRdNslTbbMu1Isfi
+zNmGSiPz3F5PBGbdXB6whPRITicdSINNb+YCA/nvexWxv8HPXXJlP5sQWHRNKalj
+ntH8WSORhHdoqj+LPh60yqPKne/gNfNyyJWcAF3gNN+aLGhcOkk4W+yUqnXuT1mE
+8CjM15RNcIBr+h95Hna2Q/dPG9OFcac5E4o0Q/syehRUx39QMU4tAnLmGCrgcsIp
+BtRiZNgDbJ9E4pgieW0F4qdRqxMWOzhiW2EXl2p+A4HyQBE53NAw7GJFLqd2TKXw
+khSKLTeWF/tHk3n3PT31oL5bdlpAmTL1ARbvgIAX6XjEqvVzQs6rfiESuwaUni1U
+4lgHOq/l84DETTo133WL7pKayPLTGPy4BuWslJ3vTRxtXz8teSw/UKrjkutb9Mzy
+V9nUUyMu6biYaEpePx18f7dmNSiDppS2/145k0m/hbTq5JLXU8rSAlYOtKtNmJOT
+24I/i0jAH6yybafjXVvwsPwY8TZPQBiwHImh8LwLcPp7nK0igwBSZI5tfqOOc+6x
+cce10WxHv+iSiN+xlwAbobs+rQtDDqj6mGsgHAHU3kJt9mRTuVjcjRt7maXx4JjI
+XPoWDsMLDK2+LOkQgZLFJIu5m/PJb4qg4M5i5+qba8abdLfp1mbkIQ/u4rQGy4sR
+n8N/a327cs5UukPrpMMztuIjkECtt0r0/44hgqN56f2Pm70ETcsEAQnKNA+mV/8P
+QQgfGOSOQaGvg7GmhQ2d1SHrYNt0Cs4h8s1pKPdfDwjm+cf2aLX26g==
+-----END RSA PRIVATE KEY-----
+"
+  "The same RSA key in traditional PEM, encrypted with three-key triple DES.")
+
+(defparameter +pem-fixture-rsa-trad-des+
+  "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: DES-CBC,CB05CB8B2A9E9203
+
+r5+CVcGIs6l3cmBzZlEzOhX6lLB3rkil46odo8vlwxAPs6EcQ+DqaRD9rHWEJYU7
+pnmGL49HWjAZbBdCRbt3hOkQj3/Pv5FqmYw8HeE/wsO2i0w6lSaYlW8yC8zQ9l7q
+UxoeZxgh2JBupxdkOjGi09T5OgeFLZd++KVXFwqMNulSII95/ibZ1vhIET+snxpq
+KmoGWCr5tC0oqEBwMVvVp1I929pJp9pcJZI9iPw6nCWUZedmvdX/VN88kCSIKEZZ
+Z/P0jlnOAP1QDFI/ZLzgNhbdjlww6qPk5yuJ/sC7wNDWPTb7c75CHZvAaCa0yD5L
+H7KS8R2yHNUWdJbx+k1y5Ik6YSRL3e+2xkQo9hlP9L88XUnvERVadrGEwGkT08Ju
+YsLbCCa6yF2lg/EQCCa22MXDl2PZHHkwYUZMMKRTHX8VPItylsKbDo1zP2Sa7cQv
+8n1EYD9NxlvjisQOlYsGqiOGjlxFpbegvi3mkYKj8dJYkfUCMhNDzRvQyR6C+HPc
+MeUISoYffWiA8iL0h9eDlFGKzviZ3Xpg94G1veXIe8OhetyA45hzMl8HvoEZenYl
+ZFfCA8TboEquDb9eCh14OEeoLnyHph5Ak4dMCMqeaeyeUJf54tk/hMgzHqS9Ur/q
+pU1O/BnCjIBUW5EsuxAgol5SWrqMAE1WsB0yVyT4zyGnp5gctAvwxSQFRXHuBG/t
+uMvl4n5TGl1l1QZNQ+NbSUQP43d6HYrc0+WrJm/jqocSWirhAbh6SB4auqPEgX7/
+SgR76XErJUkNvpke1j8f9Or3lD6pvSNJK/yexyc+5VcaXN32q/D8PQ==
+-----END RSA PRIVATE KEY-----
+"
+  "The same RSA key in traditional PEM, encrypted with single DES.")
+
+(defparameter +pem-fixture-rsa-pbes2-aes128+
+  "-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIIC3TBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQIxcDTIzyR7uECAggA
+MAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAECBBCwA4KANGn+j0au0euKfEb2BIIC
+gFUEfdU4g2AvKswOvMXF1fvtGqtBIAONPejK7HZD/DJbh+Kuq4w9PXjO435F1i2R
+u/WH+qokULqCsiLkn0ZWqLgoAlSUJJdotY500MGQD5kc1YLzmWduEud015Au/o+I
+oSgfZI+rQh6k+C1ZwJ7/mqiIB23fSdhnACszZSaTpEXNGAY8BapTjQ5ywqWn0R0N
+GPEbOimNLMJx9Sphbxodbh6Q8KYUflm3CzAh9ZmM8C4xskFBxmm1PfECtfim11Rz
+dzm4sbhYOkB8B7bp8YgtCHo8YidmQt8Xb6gMwI66u3M9E8KWPCrT4+HR0nehjtVe
+GRJBpsn34TIWz4qvi8Ct/vdtcY8tURaj1v+jHCAdzFUqLDPaBmHs1sU5/KX0+l1e
+Ve7vkTdqIHdJH8xJ8aEQxTEtnuPwRHan3U2pLcottEIiecKOkTFBd0kuC/FQdNxo
+48lfWDWMu7fjj4U2P0EchM6Jg8Uo1hkqA/NtuQZzCqQU/hXfFhajDk/URmH8YJkm
+XNQIY8iNI2KCswD0w27OSIZbVhK/thZQp8drQjGsp32x7Ocdvwr+c7kdSElMLFca
+aLmYNljwNRM4FSgD6AWHVX+Ck9n77dWx13RDZZr48j6MflVD5iuLCz07GPAlK6XI
+G6wubYlESQO7TUbdjRH11ASPXFWsPE+x2fJgKc0LXzn3SEl2ToaJdU2uaAvHh2VJ
+LGaxsLm44Lsd9sz+hBLci4u75NjZfnj8aTOUfOCI7F7nKEVA3XjhCy2jEoseZskr
+Lplq7eq92ubd93g1Geltzx0J9svc7e0U2ezlhAwTN4W7ohxKWLok/p2eCwr5yWtB
+IwSHSYo+3FMlVbIMn7C0zrY=
+-----END ENCRYPTED PRIVATE KEY-----
+"
+  "The same RSA key in PKCS#8 under PBES2, PBKDF2-SHA256 and AES-128-CBC.")
+
+(defparameter +pem-fixture-rsa-pbes1-3des+
+  "-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIICojAcBgoqhkiG9w0BDAEDMA4ECPQ19D4DmjlOAgIIAASCAoAAxefz7up1o07e
+C0ppDWHIFUUKrsQ0ld4FKu3JcARXWR1LoYrd7s0UgbLSltZN95P6w9t7pfAn+0hk
+MaaCnSfViKKOYXczamFytO60f4AjDnqzO9c4PJuq+AmrngbOH6xz5xWNtuwL5BcI
+VPO2PrpPuSo9Wfa7IrCeHYjwFLbVTu2/moqQyhNMO42Qqpma4CiIeGJJMYWzhm8v
+5s0G+2dPwhEEEwGOIXt5KvLveMkNbgFCsM/GDLXlWWWyG03VmhtpVON3zLlOCR3H
+2EbdkB25JqZBfwk8weCdsQLn9t+fy85bu0/XB0Ob4WdFLCc+z7T531lS72DeEmsp
+vcpi/KJVNdRLcZbbNvX319jQ+licO7dHPZwEp9yBg8Joi3509bOzR7PJzS/bXZOd
+XHL2JFlwVHc/ESXaryZiPmnD1x9dDB2Om1ZDyn1EWLa9pyIY3RjTmmxf6fr9ZrFx
+vJYVwkdaFvZjUageIl0FIgpH8UOiMzYAhb4JWVqC/XE+PSmYNUGhqjKJxsLQwxB1
+gAA3affn2DUf8VZ3zpZYX3ppY6th7usFA4/RpvkAv0wTBK0GSelXrpqKmt0dOqkx
+NDGV06Pa7WW/EcB4yTrnlidYCWdLdH91ZPRIyXLdbLG2U3WcquGCZ8JeqYa7utNm
+2b7ohxCpsM8mjOTdoTiHyXSPKpQ+r83/2Q8Emf7tH1hi3JOR9kZHHNtomestsVtd
+Nikg0iFRxgztkVy/XKXbO9BgizyrRdhoHMbXdOc1Db4ZtcNfxE5wfl7B5YeEAyyu
+R7CWYvMsNDXqFyn+3aIe9kOlka+KegBjZZoTH0iQ3r28SHHaLwWR4RD0vDSKce4P
+Y+xDWafl
+-----END ENCRYPTED PRIVATE KEY-----
+"
+  "The same RSA key in PKCS#8 under the PKCS#12 PBES1 three-key triple DES.")
+
+(defparameter +pem-fixture-ec-sec1+
+  "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIPw6IL9qNnld0xDwQ11bF/ldKzF3gHqaaxaIEXRwXLlIoAoGCCqGSM49
+AwEHoUQDQgAEnHTMtmkW2bbPSkapTh90cDTqUoP9FgE12Rc5FIzuFyTkhKpTyIoq
+/OZovTfKV9ySENR3LhGM5igpDg8BSdVTtw==
+-----END EC PRIVATE KEY-----
+"
+  "A nistp256 key in SEC1 ECPrivateKey form, unencrypted.")
+
+(defparameter +pem-fixture-ec-p384-sec1+
+  "-----BEGIN EC PRIVATE KEY-----
+MIGkAgEBBDAL2n9Z4q8ufZP3JUB/RbLOl7kSkYrnS3I9wGeaMiyXx4JUPrM58+Fe
+oCwI7WX0Ro+gBwYFK4EEACKhZANiAAS43dBYFa99TSqp4/Cv+ej1bRcbdgYzJO93
+wO9159qx3gAd6wk9vG/rrirxdhK3B+fO7m00ywDt6nQ3ewCfFTZlyg3cmNKrnWXR
+DJVtwMhRiHDFWhINFqkM1Lq8plM18s0=
+-----END EC PRIVATE KEY-----
+"
+  "A nistp384 key in SEC1 ECPrivateKey form, whose scalar has its top bit set.")
+
+(defparameter +pem-fixture-ec-p521-sec1+
+  "-----BEGIN EC PRIVATE KEY-----
+MIHcAgEBBEIALGYK0bHxmOUXgASuLZvtqUn+nCg0vK6QAhxtGtljwuOilUYoqgzL
+uOJdHSCXUmZ+CK9ZSI14mqAmLS9NBg50vtGgBwYFK4EEACOhgYkDgYYABABy/ZDj
+uGfp09MA31nTdcsmzFHp5fMzuNgyP80zq/QuqRNacu2yZ/CGjqSmN/ukCBKUxHRD
+i/2S21xhwL9SI7pQUAA9dpnJ1xC423gxOcV8QWzUFXLKDNLoGbs0S6Gedrvponhc
+JsX4nAEAUoXB57JIOrIFFPum26KwcSl8A73fh9cBcA==
+-----END EC PRIVATE KEY-----
+"
+  "A nistp521 key in SEC1 ECPrivateKey form.")
+
+(defparameter +pem-fixture-ec-withparams+
+  "-----BEGIN EC PARAMETERS-----
+BggqhkjOPQMBBw==
+-----END EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEICdVYYmBLD522JutAb7OdD9aFh7112+exITfFTTvwMaJoAoGCCqGSM49
+AwEHoUQDQgAEjbniMywTyVV9C8pMa7qnKz/OOMZJxiqUS1x86+U0q+5iChZGzrGh
+NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
+-----END EC PRIVATE KEY-----
+"
+  "The same EC key preceded by an EC PARAMETERS block, as openssl ecparam writes it.")
+
+(defparameter +pem-fixture-ec-trad-aes128+
+  "-----BEGIN EC PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,261B36A5A265EC8E2258DB27F9499995
+
+Nast8gUC7hEvbGNQtQQhnHE53QjEy8vP3yhIV2ZTUmB42h/CYCe88MeuTbAdZ6/z
+ZlDpoWNJKf88tFYRM6xNw4DjTLpTTs9ISaNtjXzGeV6DLsOw4NAPgJtUYMSUxz2T
+4WGLIRfQYz06dPTaQ7YCfRl8zEdnZE9PiQuu7N3moE0=
+-----END EC PRIVATE KEY-----
+"
+  "The same EC key in traditional PEM, encrypted with AES-128-CBC.")
+
+(defparameter +pem-fixture-ed25519-pkcs8+
+  "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJ5fosgLKZgyVf3n+Ra5xgSjoVFyEQa4fDEBRloNZev/
+-----END PRIVATE KEY-----
+"
+  "An Ed25519 key in unencrypted PKCS#8 form.")
+
+(defparameter +pem-fixture-ed25519-pbes2-aes128+
+  "-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIGbMFcGCSqGSIb3DQEFDTBKMCkGCSqGSIb3DQEFDDAcBAgxSbnRQrlZlQICCAAw
+DAYIKoZIhvcNAgkFADAdBglghkgBZQMEAQIEEPzp+x9qF40uTxRftJR6bXwEQFyb
+cO9u6owPUfj6EKeA4u+kBeS0OQ9P/otUiRRuWijwQojhrsTOSnqAp3p6Fx+2UG3Y
+wdFmcgujgs5ewv9m29U=
+-----END ENCRYPTED PRIVATE KEY-----
+"
+  "The same Ed25519 key in PKCS#8 under PBES2 and AES-128-CBC.")
+
+(defparameter +pem-fixture-rsa-public+
+  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDNOaxK3xPyXKpvCagd7jtmY8DenWnHdoRQ5mgmFOMohJj2P6NIBLpmOFVkA8oFGS7I+SkHcGosDW1giFHcWsmSDnddYI7/1GQL9qvNi+0D4VFOGL+DXR36o/mnXR6Qbq1KEIku81XNi+TWDruBn1cnf/ErwrCrydyiDZy0kpUGdw==")
+
+(defparameter +pem-fixture-ec-public+
+  "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJx0zLZpFtm2z0pGqU4fdHA06lKD/RYBNdkXORSM7hck5ISqU8iKKvzmaL03ylfckhDUdy4RjOYoKQ4PAUnVU7c=")
+
+(defparameter +pem-fixture-ec-withparams-public+
+  "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI254jMsE8lVfQvKTGu6pys/zjjGScYqlEtcfOvlNKvuYgoWRs6xoTWcCLiZTGYV2P2i8XoG6LoL/VGr2+xoheI=")
+
+(defparameter +pem-fixture-ec-p384-public+
+  "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBLjd0FgVr31NKqnj8K/56PVtFxt2BjMk73fA73Xn2rHeAB3rCT28b+uuKvF2ErcH587ubTTLAO3qdDd7AJ8VNmXKDdyY0qudZdEMlW3AyFGIcMVaEg0WqQzUurymUzXyzQ==")
+
+(defparameter +pem-fixture-ec-p521-public+
+  "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBABy/ZDjuGfp09MA31nTdcsmzFHp5fMzuNgyP80zq/QuqRNacu2yZ/CGjqSmN/ukCBKUxHRDi/2S21xhwL9SI7pQUAA9dpnJ1xC423gxOcV8QWzUFXLKDNLoGbs0S6GedrvponhcJsX4nAEAUoXB57JIOrIFFPum26KwcSl8A73fh9cBcA==")
+
+(defparameter +pem-fixture-ed25519-public+
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOm4JHu0PTDjcpwl/RrNP6ZeUUxjKvVsB6TQnfcMP/Ot")
+
+
 (defun concatenated (&rest sequences)
   (let ((out (make-array (reduce #'+ sequences :key #'length)
                          :element-type '(unsigned-byte 8)))
@@ -8173,6 +8417,134 @@ validated, so -G reports what ssh would and a bad line fails the same way."
                   (cl-pnet-ssh::ssh-read-string reader))
                (is (= 32 rounds))
                (is (= 16 (length salt))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+;;; ---- PEM and PKCS#8 private keys ----
+
+(defun pem-fixture-write (directory name text)
+  "Write TEXT as NAME under DIRECTORY and return its path."
+  (let ((path (keygen-test-path directory name)))
+    (ensure-directories-exist path)
+    (cl-pnet-ssh::ssh-write-octets-file (map 'vector #'char-code text) path)
+    path))
+
+(test pem-private-key-forms-load-and-sign
+  ;; Every form OpenSSL writes loads to the same key the reference
+  ;; ssh-keygen derives, and that key signs verifiably.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-pem"))
+         (passphrase "pem pass"))
+    (unwind-protect
+         (flet ((path (name text) (pem-fixture-write directory name text))
+                (check (path expected type)
+                  (let ((key (ssh-load-private-key path
+                                                   :passphrase passphrase)))
+                    (is (string= type (ssh-private-key-type key)))
+                    ;; PEM carries no comment field at all.
+                    (is (string= "" (ssh-private-key-comment key)))
+                    (is (string= expected
+                                 (string-right-trim
+                                  '(#\Return #\Newline)
+                                  (ssh-public-key-line key :comment nil))))
+                    ;; Only openssh-key-v1 has an armored private header.
+                    (is (not (ssh-private-key-file-openssh-p path)))
+                    (is (null (ssh-private-key-public-blob path)))
+                    (let* ((message (octets-ascii "pem private key"))
+                           (signature
+                             (cl-pnet-ssh::ssh-private-key-signature-blob
+                              key message)))
+                      (is (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                           (ssh-public-key-blob-of key) signature message))))))
+           (let ((rsa (path "rsa" +pem-fixture-rsa-pkcs1+))
+                 (rsa8 (path "rsa8" +pem-fixture-rsa-pkcs8+))
+                 (trad (path "trad" +pem-fixture-rsa-trad-aes128+))
+                 (trad3des (path "trad3des" +pem-fixture-rsa-trad-3des+))
+                 (traddes (path "traddes" +pem-fixture-rsa-trad-des+))
+                 (pbes2 (path "pbes2" +pem-fixture-rsa-pbes2-aes128+))
+                 (pbes1 (path "pbes1" +pem-fixture-rsa-pbes1-3des+))
+                 (ec (path "ec" +pem-fixture-ec-sec1+))
+                 (ec384 (path "ec384" +pem-fixture-ec-p384-sec1+))
+                 (ec521 (path "ec521" +pem-fixture-ec-p521-sec1+))
+                 (params (path "params" +pem-fixture-ec-withparams+))
+                 (ectrad (path "ectrad" +pem-fixture-ec-trad-aes128+))
+                 (ed (path "ed" +pem-fixture-ed25519-pkcs8+))
+                 (edenc (path "edenc" +pem-fixture-ed25519-pbes2-aes128+)))
+             (check rsa +pem-fixture-rsa-public+ "ssh-rsa")
+             (check rsa8 +pem-fixture-rsa-public+ "ssh-rsa")
+             (check trad +pem-fixture-rsa-public+ "ssh-rsa")
+             (check trad3des +pem-fixture-rsa-public+ "ssh-rsa")
+             ;; OpenSSL 3's default provider no longer carries single DES, so
+             ;; ssh-keygen 10.6 cannot open this one at all; the reader
+             ;; follows the historical derivation, which openssl -provider
+             ;; legacy agrees with.
+             (check traddes +pem-fixture-rsa-public+ "ssh-rsa")
+             (check pbes2 +pem-fixture-rsa-public+ "ssh-rsa")
+             (check pbes1 +pem-fixture-rsa-public+ "ssh-rsa")
+             (check ec +pem-fixture-ec-public+ "ecdsa-sha2-nistp256")
+             (check ec384 +pem-fixture-ec-p384-public+ "ecdsa-sha2-nistp384")
+             (check ec521 +pem-fixture-ec-p521-public+ "ecdsa-sha2-nistp521")
+             ;; openssl ecparam writes the curve in its own block first; the
+             ;; key then has no parameters of its own.
+             (check params +pem-fixture-ec-withparams-public+
+                    "ecdsa-sha2-nistp256")
+             (check ectrad +pem-fixture-ec-public+ "ecdsa-sha2-nistp256")
+             (check ed +pem-fixture-ed25519-public+ "ssh-ed25519")
+             (check edenc +pem-fixture-ed25519-public+ "ssh-ed25519")
+             ;; The unencrypted forms ignore any passphrase.
+             (dolist (path (list rsa rsa8 ec ec384 ec521 params ed))
+               (is (not (ssh-private-key-file-encrypted-p path)))
+               (is (ssh-load-private-key path :passphrase "ignored")))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test pem-encrypted-keys-demand-the-passphrase
+  ;; OpenSSH has no authenticated error for PEM, so an empty or wrong
+  ;; passphrase is always the same answer and never a parse failure.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-pem-pass"))
+         (passphrase "pem pass"))
+    (unwind-protect
+         (flet ((path (name text) (pem-fixture-write directory name text)))
+           (let ((encrypted
+                   (list (path "trad" +pem-fixture-rsa-trad-aes128+)
+                         (path "trad3des" +pem-fixture-rsa-trad-3des+)
+                         (path "traddes" +pem-fixture-rsa-trad-des+)
+                         (path "pbes2" +pem-fixture-rsa-pbes2-aes128+)
+                         (path "pbes1" +pem-fixture-rsa-pbes1-3des+)
+                         (path "ectrad" +pem-fixture-ec-trad-aes128+)
+                         (path "edenc" +pem-fixture-ed25519-pbes2-aes128+)))
+                 (clear (path "clear" +pem-fixture-rsa-pkcs1+)))
+             (dolist (path encrypted)
+               (is (ssh-private-key-file-encrypted-p path))
+               (dolist (candidate (list "wrong" "" nil))
+                 (handler-case
+                     (progn
+                       (ssh-load-private-key path :passphrase candidate)
+                       (is nil "an encrypted key accepted ~S" candidate))
+                   (ssh-authentication-error (condition)
+                     (is (search
+                          "incorrect passphrase supplied to decrypt private key"
+                          (ssh-error-detail condition))))))
+               (is (ssh-load-private-key path :passphrase passphrase)))
+             ;; A malformed unencrypted block is a structural error, since
+             ;; nothing marks it as encrypted.
+             (let ((broken
+                     (path "broken"
+                           (format nil "-----BEGIN RSA PRIVATE KEY-----~%~
+                                        AAAA~%~
+                                        -----END RSA PRIVATE KEY-----~%"))))
+               (signals ssh-protocol-error (ssh-load-private-key broken))
+               (is (not (ssh-private-key-file-encrypted-p broken))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test pem-private-key-without-a-public-block
+  ;; ssh-keygen -l cannot fingerprint a protected PEM key without asking,
+  ;; which it never does; the library reports no public blob for any PEM.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-pem-header"))
+         (path (pem-fixture-write directory "key"
+                                  +pem-fixture-rsa-trad-aes128+)))
+    (unwind-protect
+         (progn
+           (is (not (ssh-private-key-file-openssh-p path)))
+           (is (ssh-private-key-file-encrypted-p path))
+           (is (null (ssh-private-key-public-blob path))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test written-public-key-keeps-openssh-trailing-space
