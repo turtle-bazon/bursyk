@@ -13,7 +13,7 @@
   :description "Backend-neutral SSH-2 protocol core shared by the pure and libssh transports"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.1.3"
+  :version "0.0.1.4"
   :depends-on (#:ironclad-unsafe
                #:cl-base64
                #:babel
@@ -43,6 +43,7 @@
                                             (:file "umac")
                                             (:file "packet")
                                             (:file "keys")
+                                            (:file "keygen")
                                             (:file "known-hosts")
                                             (:file "revoked-keys")
                                             (:file "server-policy")

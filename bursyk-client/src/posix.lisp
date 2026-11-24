@@ -116,24 +116,6 @@ treat a closed stdin as a cancelled prompt rather than an empty answer."
         (format *error-output* "~%")
         (finish-output *error-output*)))))
 
-(defun read-keyboard-interactive-answers (name instruction prompts)
-  "Ask each of PROMPTS, a list of (TEXT ECHO-P), and return the answers.
-
-NAME and INSTRUCTION are shown first when the server supplied them, as ssh
-does.  NIL means the input ended before every prompt was answered."
-  (when (and name (plusp (length name)))
-    (format *error-output* "~A~%" name))
-  (when (and instruction (plusp (length instruction)))
-    (format *error-output* "~A~%" instruction))
-  (finish-output *error-output*)
-  (let ((answers '()))
-    (dolist (prompt prompts (nreverse answers))
-      (let ((answer (read-prompt-line (first prompt)
-                                      :echo (second prompt))))
-        (unless answer
-          (return nil))
-        (push answer answers)))))
-
 (defun terminal-enter-raw ()
   "Save the terminal settings and stop local line editing and signals.
 

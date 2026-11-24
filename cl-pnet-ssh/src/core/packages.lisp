@@ -444,8 +444,22 @@
    #:ssh-private-key-p
    #:ssh-private-key-type
    #:ssh-private-key-public
+   #:ssh-private-key-comment
    #:ssh-private-key-path
    #:ssh-load-private-key
+   ;; key generation and OpenSSH key files (BURS KEYGEN)
+   #:ssh-generate-private-key
+   #:ssh-normalize-key-type
+   #:ssh-key-bits
+   #:ssh-private-key-file-octets
+   #:ssh-private-key-file-encrypted-p
+   #:ssh-write-private-key
+   #:ssh-write-public-key
+   #:ssh-public-key-line
+   #:+ssh-keygen-default-rsa-bits+
+   #:+ssh-keygen-minimum-rsa-bits+
+   #:+ssh-keygen-default-cipher+
+   #:ssh-keygen-error
    #:ssh-public-key-parts
    #:ssh-make-public-key-blob
    #:ssh-public-key-blob-of

@@ -302,6 +302,16 @@ user a second question."
 
 ;;; ---- handle and item management ----
 
+(defun pam-conf-dir-supported-p ()
+  "Whether this libpam can be pointed at a config directory.
+
+Linux-PAM 1.4 added pam_start_confdir; OpenPAM, which the BSDs use, has no
+equivalent and always reads /etc/pam.d.  The ordinary lookup works either way,
+so this only says whether per-transaction fixtures are possible."
+  (and (load-pam)
+       (not (null (cffi:foreign-symbol-pointer "pam_start_confdir"
+                                               :library 'libpam)))))
+
 (defun pam-start (service user &key (conf-dir *pam-conf-dir*))
   "Start a PAM transaction for USER and return its handle."
   (unless (load-pam)

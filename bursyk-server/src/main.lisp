@@ -1770,7 +1770,9 @@ than one account."
 
 #-win32
 (cffi:define-foreign-library libcrypt
-  (:unix (:or "libcrypt.so.1" "libcrypt.so"))
+  ;; glibc ships libcrypt.so.1; the BSDs version it as libcrypt.so.5 (and
+  ;; FreeBSD's libcrypt.so is only a linker script, not a loadable file).
+  (:unix (:or "libcrypt.so.1" "libcrypt.so.5" "libcrypt.so"))
   (t (:default "libcrypt")))
 
 #-win32

@@ -29,6 +29,11 @@
              (format stream "SSH authentication failed~@[: ~A~]"
                      (ssh-error-detail condition)))))
 
+(define-condition ssh-keygen-error (ssh-error) ()
+  (:report (lambda (condition stream)
+             (format stream "SSH key error~@[: ~A~]"
+                     (ssh-error-detail condition)))))
+
 (define-condition ssh-host-key-error (ssh-error)
   ((fingerprint :initarg :fingerprint :initform nil
                 :reader ssh-host-key-error-fingerprint))

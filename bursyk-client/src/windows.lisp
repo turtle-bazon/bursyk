@@ -111,6 +111,35 @@
               (values (1+ (- bottom top))
                       (1+ (- right left)))))))))
 
+(defun read-prompt-line (prompt &key (echo t))
+  "Write PROMPT to stderr and read one line from stdin.
+
+When ECHO is false and stdin is a console, the console's echo bit is cleared
+for the read and restored afterwards.  NIL is returned at end of input, so a
+non-interactive caller can treat a closed stdin as a cancelled prompt rather
+than an empty answer."
+  (format *error-output* "~A" prompt)
+  (finish-output *error-output*)
+  (let ((handle (and (not echo)
+                     (stdin-terminal-p)
+                     (c-get-std-handle +std-input-handle+)))
+        (saved nil))
+    (unwind-protect
+         (progn
+           (when handle
+             (let ((mode (console-mode handle)))
+               (when mode
+                 (setf saved mode)
+                 (ignore-errors
+                  (c-set-console-mode
+                   handle (logand mode (lognot +enable-echo-input+)))))))
+           (read-line *standard-input* nil nil))
+      (when saved
+        (ignore-errors (c-set-console-mode handle saved)))
+      (when (not echo)
+        (format *error-output* "~%")
+        (finish-output *error-output*)))))
+
 (defun restore-terminal ()
   "Put the console modes and code pages back the way they were."
   (when *console-code-pages*

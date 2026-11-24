@@ -773,7 +773,9 @@ client from falling through to publickey."
                answer)))
     (is (eq t (evaluate "exit 0")))
     (is (eq nil (evaluate "exit 1")))
-    (is (eq t (evaluate "true")))))
+    ;; The last case is a command with no side effects that succeeds, spelled
+    ;; for the shell the client runs: sh on POSIX, cmd.exe on Windows.
+    (is (eq t (evaluate #-win32 "true" #+win32 "exit /b 0")))))
 
 (test client-port-reads-the-number-the-command-line-gave
   (let ((burs::*options* (empty-options)))
@@ -1339,7 +1341,9 @@ and ProxyJump/ProxyCommand stay off the output when unset."
       (write-public-key (merge-pathnames "id_ed25519.pub" directory) blob)
       (with-open-file (stream config :direction :output :if-exists :supersede
                                      :if-does-not-exist :create)
-        (format stream "IdentityFile ~A~%IdentityFile ~A~%"
+        ;; IdentitiesOnly keeps an agent that happens to run in the test
+        ;; environment from adding lines this test counts.
+        (format stream "IdentitiesOnly yes~%IdentityFile ~A~%IdentityFile ~A~%"
                 (namestring present) (namestring missing)))
       (let ((burs::*options* (empty-options)))
         (setf (getf burs::*options* :config) (namestring config))
@@ -1379,7 +1383,8 @@ and ProxyJump/ProxyCommand stay off the output when unset."
         (write-line "placeholder" stream))
       (with-open-file (stream config :direction :output :if-exists :supersede
                                      :if-does-not-exist :create)
-        (format stream "IdentityFile ~A~%" (namestring path)))
+        (format stream "IdentitiesOnly yes~%IdentityFile ~A~%"
+                (namestring path)))
       (let ((burs::*options* (empty-options)))
         (setf (getf burs::*options* :config) (namestring config)
               (getf burs::*options* :identity-arguments)
@@ -1398,8 +1403,8 @@ SBCL refuses to serve events while a deferrable signal is blocked.  Running
 STTY or a LocalCommand in that state used to kill the client instead of
 returning; the helper unblocks the signal for the child and restores the
 mask afterwards."
-  #-sbcl (skip "SBCL-only signal mask")
-  #+sbcl
+  #-(and sbcl (not win32)) (skip "SBCL's POSIX signal mask only")
+  #+(and sbcl (not win32))
   (let ((handle (handler-case
                     (cl-pnet:signal-start sb-unix:sigwinch (lambda () nil))
                   (error () nil))))
@@ -1414,3 +1419,190 @@ mask afterwards."
       (when handle
         (ignore-errors (cl-pnet:signal-stop handle))))))
 
+
+;;; ---- BURS KEYGEN ----
+
+(test keygen-parses-ssh-keygen-options
+  (let ((options (burs::keygen-parse-arguments
+                  '("-t" "rsa" "-b2048" "-f/tmp/x" "-N" "pw" "-C" "me" "-q"))))
+    (is (string= "rsa" (getf options :type)))
+    (is (= 2048 (getf options :bits)))
+    (is (string= "/tmp/x" (getf options :file)))
+    (is (string= "pw" (getf options :new-passphrase)))
+    (is (string= "me" (getf options :comment)))
+    (is (eq t (getf options :quiet))))
+  ;; Switches cluster, and -E selects the fingerprint hash.
+  (let ((options (burs::keygen-parse-arguments '("-ly" "-E" "md5"))))
+    (is (eq t (getf options :fingerprint)))
+    (is (eq t (getf options :print-public)))
+    (is (eq :md5 (getf options :hash))))
+  (let ((options (burs::keygen-parse-arguments '("--help"))))
+    (is (eq t (getf options :help))))
+  ;; A missing value, a bad number, a bad hash, a feature this command does
+  ;; not have, and a stray argument are all errors rather than defaults.
+  (signals error (burs::keygen-parse-arguments '("-t")))
+  (signals error (burs::keygen-parse-arguments '("-b" "many")))
+  (signals error (burs::keygen-parse-arguments '("-E" "sha1")))
+  (signals error (burs::keygen-parse-arguments '("-s" "ca")))
+  ;; -h is host-certificate signing in ssh-keygen, not help.
+  (signals error (burs::keygen-parse-arguments '("-h")))
+  (signals error (burs::keygen-parse-arguments '("stray"))))
+
+(test keygen-default-file-names-follow-the-type
+  (is (string= "id_ed25519" (burs::keygen-default-name "ed25519")))
+  (is (string= "id_rsa" (burs::keygen-default-name "rsa")))
+  (is (string= "id_ecdsa" (burs::keygen-default-name "ecdsa")))
+  (is (string= "id_ecdsa" (burs::keygen-default-name "ecdsa-sha2-nistp384")))
+  (is (string= "id_mldsa44_ed25519"
+               (burs::keygen-default-name "mldsa44-ed25519")))
+  ;; -f wins over the default, whether or not it is absolute.
+  (let ((options (list :file "/tmp/elsewhere" :type "ed25519")))
+    ;; Compare through the platform's native spelling: Windows turns the
+    ;; separators round, and the pathname object is not EQ across calls.
+    (is (string= (uiop:native-namestring
+                  (uiop:parse-native-namestring "/tmp/elsewhere"))
+                 (uiop:native-namestring (burs::keygen-path options))))))
+
+(test keygen-writes-a-key-and-public-file
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (flet ((invoke (&rest arguments)
+                  (let ((*standard-output* (make-broadcast-stream))
+                        (*error-output* (make-broadcast-stream)))
+                    (burs::keygen-main arguments))))
+           (is (eql 0 (invoke "-t" "ed25519" "-f" (namestring path)
+                           "-N" "" "-C" "test@example" "-q")))
+           (is (probe-file path))
+           (is (probe-file (concatenate 'string (namestring path) ".pub")))
+           (let ((key (cl-pnet-ssh:ssh-load-private-key path)))
+             (is (string= "ssh-ed25519"
+                          (cl-pnet-ssh:ssh-private-key-type key)))
+             (is (string= "test@example"
+                          (cl-pnet-ssh:ssh-private-key-comment key))))
+           ;; -y and -l both read the file back, and -y prints one line.
+           (let ((line (with-output-to-string (out)
+                         (let ((*standard-output* out))
+                           (burs::keygen-main
+                            (list "-y" "-f" (namestring path)))))))
+             (is (string= "ssh-ed25519" (subseq line 0 11)))
+             (is (search "test@example" line)))
+           (let ((line (with-output-to-string (out)
+                         (let ((*standard-output* out))
+                           (burs::keygen-main
+                            (list "-l" "-f" (namestring path)))))))
+             (is (search "SHA256:" line))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-comment-change-preserves-encryption
+  ;; -c rewrites both halves of the pair.  It must keep an unprotected key
+  ;; unprotected even when the caller passes a stray -P, and keep a
+  ;; protected key protected under the passphrase that opened it.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (plain (merge-pathnames "id_plain" directory))
+         (locked (merge-pathnames "id_locked" directory)))
+    (ensure-directories-exist plain)
+    (labels ((invoke (&rest arguments)
+               (let ((*standard-output* (make-broadcast-stream))
+                     (*error-output* (make-broadcast-stream)))
+                 (burs::keygen-main arguments)))
+             (public-comment (path)
+               (with-open-file (stream (burs::keygen-public-path path))
+                 (burs::keygen-public-line-comment (read-line stream)))))
+      (unwind-protect
+           (progn
+             (is (eql 0 (invoke "-t" "ed25519" "-f" (namestring plain)
+                                "-N" "" "-C" "before" "-q")))
+             (is (eql 0 (invoke "-c" "-C" "after" "-P" "stray"
+                                "-f" (namestring plain) "-q")))
+             (is (not (cl-pnet-ssh:ssh-private-key-file-encrypted-p plain)))
+             (is (string= "after"
+                          (cl-pnet-ssh:ssh-private-key-comment
+                           (cl-pnet-ssh:ssh-load-private-key plain))))
+             (is (string= "after" (public-comment plain)))
+             ;; A missing .pub is recreated, and the messages match
+             ;; ssh-keygen's, which -q does not silence.
+             (delete-file (burs::keygen-public-path plain))
+             (let ((text (with-output-to-string (out)
+                           (let ((*standard-output* out))
+                             (burs::keygen-main
+                              (list "-c" "-C" "later" "-P" ""
+                                    "-f" (namestring plain) "-q"))))))
+               (is (search "Old comment: after" text))
+               (is (search "Comment 'later' applied" text)))
+             (is (string= "later" (public-comment plain)))
+             (is (eql 0 (invoke "-t" "ed25519" "-f" (namestring locked)
+                                "-N" "pw" "-C" "before" "-q")))
+             (is (eql 0 (invoke "-c" "-C" "after" "-P" "pw"
+                                "-f" (namestring locked) "-q")))
+             (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p locked))
+             (is (string= "after"
+                          (cl-pnet-ssh:ssh-private-key-comment
+                           (cl-pnet-ssh:ssh-load-private-key
+                            locked :passphrase "pw"))))
+             (is (string= "after" (public-comment locked))))
+        (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
+(test keygen-fingerprint-format-matches-ssh-keygen
+  ;; -E md5 is lower case, and a key without a comment reads "no comment".
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (let ((*standard-output* (make-broadcast-stream))
+                 (*error-output* (make-broadcast-stream)))
+             (is (eql 0 (burs::keygen-main
+                         (list "-t" "ed25519" "-f" (namestring path)
+                               "-N" "" "-C" "" "-q")))))
+           (let ((line (with-output-to-string (out)
+                         (let ((*standard-output* out))
+                           (burs::keygen-main
+                            (list "-l" "-E" "md5" "-f" (namestring path)))))))
+             (is (search "MD5:" line))
+             (is (search "no comment" line))
+             (let* ((start (search "MD5:" line))
+                    (end (position #\Space line :start start)))
+               (is (notany #'upper-case-p
+                           (subseq line (+ start 4) end))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-refuses-to-generate-over-an-existing-file
+  ;; With stdin not a terminal there is no question to ask, so the command
+  ;; fails instead of replacing a key somebody may still need.
+  #+(and sbcl (not win32))
+  (progn
+    (let* ((directory (merge-pathnames
+                       (format nil "burs-keygen-~D-~D/"
+                               (get-universal-time) (random 1000000))
+                       (uiop:temporary-directory)))
+           (path (merge-pathnames "id_ed25519" directory)))
+      (ensure-directories-exist path)
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+               (write-line "existing" stream))
+             ;; The test process runs with a pipe or a terminal on stdin;
+             ;; only assert the non-terminal path when that is the case.
+             (unless (burs::stdin-terminal-p)
+               (let ((*standard-output* (make-broadcast-stream))
+                     (*error-output* (make-broadcast-stream)))
+                 (is (eql 1 (burs::keygen-main
+                             (list "-t" "ed25519" "-f" (namestring path)
+                                   "-q"))))))
+             (with-open-file (stream path)
+               (is (string= "existing" (read-line stream)))))
+        (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+    #+(and sbcl win32) (skip "overwrite prompt needs a console"))

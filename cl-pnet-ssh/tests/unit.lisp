@@ -717,11 +717,18 @@ must not consume or advance the chaining IV."
 ;;; ---- Private keys ----
 
 (defun ssh-keygen-available-p ()
-  (handler-case
-      (zerop (nth-value 2 (uiop:run-program '("sh" "-c" "command -v ssh-keygen")
-                                            :ignore-error-status t
-                                            :output nil :error-output nil)))
-    (error () nil)))
+  "True when the loopback tests can run here.
+
+They need ssh-keygen and a POSIX shell: the loopback server runs each
+command through /bin/sh, so a host such as Windows has the key tool but
+still cannot run these tests."
+  (and (probe-file #p"/bin/sh")
+       (handler-case
+           (zerop (nth-value 2
+                             (uiop:run-program '("sh" "-c" "command -v ssh-keygen")
+                                               :ignore-error-status t
+                                               :output nil :error-output nil)))
+         (error () nil))))
 
 (defun ssh-keygen (arguments)
   (uiop:run-program (cons "ssh-keygen" arguments)
@@ -735,7 +742,7 @@ must not consume or advance the chaining IV."
 
 (test openssh-private-key-round-trip
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-test"))
              (path (merge-pathnames "id_ed25519" directory)))
         (ensure-directories-exist path)
@@ -758,7 +765,7 @@ must not consume or advance the chaining IV."
 
 (test openssh-private-key-passphrase-round-trip
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-enc"))
              (path (merge-pathnames "id_ed25519" directory)))
         (ensure-directories-exist path)
@@ -800,7 +807,7 @@ must not consume or advance the chaining IV."
   "A CA-signed user certificate carries the right fields, verifies against
 its CA, and is admitted only for a principal and address its options allow."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-cert"))
              (ca (merge-pathnames "ca" directory))
              (user (merge-pathnames "user" directory))
@@ -953,7 +960,7 @@ its CA, and is admitted only for a principal and address its options allow."
   "A CertificateFile kept away from the key's -cert.pub path still logs in:
 the private key it certifies is offered with the certificate's identity."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-certfile-login"))
              (server-key (merge-pathnames "host_key" directory))
              (ca (merge-pathnames "ca" directory))
@@ -1029,6 +1036,8 @@ the private key it certifies is offered with the certificate's identity."
 (test client-no-host-authentication-for-localhost
   "NoHostAuthenticationForLocalhost accepts a loopback key without recording
 it, and HostKeyAlias turns that exception off."
+  #+win32 (skip "the loopback exec needs a POSIX shell")
+  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-nohostauth"))
          (server-key (merge-pathnames "host_key" directory))
          (client-key (merge-pathnames "client_key" directory))
@@ -1091,7 +1100,7 @@ it, and HostKeyAlias turns that exception off."
   "AddressFamily :INET6 resolves and dials ::1, while :INET rejects that
 address before a socket is opened."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-ipv6"))
              (server-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -1143,7 +1152,7 @@ address before a socket is opened."
   "BatchMode refuses an unknown host key without consulting the confirmation
 callback; without it the same callback trusts the key."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-batchmode"))
              (server-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -1374,7 +1383,7 @@ different force-command clauses cannot be merged."
   "ssh -i KEY offers KEY-cert.pub when it is the certificate of KEY, and
 refuses to pair a certificate with a different key."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-cert"))
              (ca (merge-pathnames "ca" directory))
              (user (merge-pathnames "user" directory)))
@@ -1426,7 +1435,7 @@ refuses to pair a certificate with a different key."
 (test rsa-key-offers-both-sha2-names
   "An RSA key answers as rsa-sha2-512 or rsa-sha2-256, chosen by policy."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa-sigalg"))
              (path (merge-pathnames "id_rsa" directory)))
         (ensure-directories-exist path)
@@ -1504,7 +1513,7 @@ refuses to pair a certificate with a different key."
 (test rsa-certificate-offers-both-spellings
   "An RSA certificate is named with SHA-512 or SHA-256, as the peer allows."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa-cert-sigalg"))
              (ca (merge-pathnames "ca" directory))
              (user (merge-pathnames "user" directory)))
@@ -2093,6 +2102,8 @@ key under the bare name is still only unknown, so the port entry decides."
                 (ssh-error-detail condition)))))
 
 (test agent-identities-over-a-unix-socket
+  #+win32 (skip "no Unix-domain sockets on this platform")
+  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-i"))
          (path (namestring (merge-pathnames "agent.sock" directory)))
          (blob (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
@@ -2115,6 +2126,8 @@ key under the bare name is still only unknown, so the port entry decides."
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test agent-sign-over-a-unix-socket
+  #+win32 (skip "no Unix-domain sockets on this platform")
+  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-s"))
          (path (namestring (merge-pathnames "agent.sock" directory)))
          (blob (ssh-make-public-key-blob "ssh-ed25519" (ssh-random-octets 32)))
@@ -2590,7 +2603,7 @@ share the test, so each must dispatch the same channel requests."
 
 (test server-loopback-exec
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status) (ssh-test-loopback-result)
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
@@ -2665,7 +2678,7 @@ share the test, so each must dispatch the same channel requests."
 (test nist-curve-kex-loopback-exec
   "Each NIST-curve ECDH method carries a real session on this transport."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (kex '("ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
                      "ecdh-sha2-nistp521"))
         (multiple-value-bind (stdout stderr status)
@@ -2679,7 +2692,7 @@ share the test, so each must dispatch the same channel requests."
 (test sntrup761-kex-loopback-exec
   "The sntrup761 hybrids carry a session where the transport implements them."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (if (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)
           (dolist (kex '("sntrup761x25519-sha512"
                          "sntrup761x25519-sha512@openssh.com"))
@@ -2720,7 +2733,7 @@ share the test, so each must dispatch the same channel requests."
 (test fixed-group-dh-loopback-exec
   "Each MODP group carries a real session on this transport."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (kex '("diffie-hellman-group14-sha256"
                      "diffie-hellman-group16-sha512"
                      "diffie-hellman-group18-sha512"))
@@ -2735,7 +2748,7 @@ share the test, so each must dispatch the same channel requests."
 (test gex-loopback-exec
   "Each RFC 4419 group-exchange method carries a real session."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (kex '("diffie-hellman-group-exchange-sha256"
                      "diffie-hellman-group-exchange-sha1"))
         (multiple-value-bind (stdout stderr status)
@@ -2748,6 +2761,8 @@ share the test, so each must dispatch the same channel requests."
 
 (test mldsa-client-loopback-exec
   "A composite ML-DSA key authenticates where the transport implements it."
+  #+win32 (skip "the loopback exec needs a POSIX shell")
+  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-mldsa-client"))
          (key (ssh-test-write-mldsa-key
                (merge-pathnames "client_key" directory)))
@@ -2797,7 +2812,7 @@ share the test, so each must dispatch the same channel requests."
 (test compression-loopback-exec
   "A compressed session runs a command and returns its output."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-loopback-result :compression t)
         (is (equal "hello" stdout))
@@ -2807,7 +2822,7 @@ share the test, so each must dispatch the same channel requests."
 (test compression-loopback-streams-more-than-one-window
   "A compressed stream survives many packets and the codec's 32 KiB window."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-loopback-result :compression t
                                     :command "seq 1 20000")
@@ -2822,7 +2837,7 @@ share the test, so each must dispatch the same channel requests."
 (test server-compression-no-still-connects
   "Compression no narrows the offer but a -C client still connects."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-loopback-result :compression t
                                     :sshd-options '("Compression no"))
@@ -2991,7 +3006,7 @@ server-side half of agent forwarding, so the test needs no external tools."
   "A session that asks for agent forwarding gets a working SSH_AUTH_SOCK,
 and an agent channel reaches the client's own agent socket."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent"))
              (server-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -3110,7 +3125,7 @@ and an agent channel reaches the client's own agent socket."
   "BindAddress and BindInterface change where a direct connection comes
 from, and a source the kernel cannot assign fails the connection."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (progn
         (multiple-value-bind (stdout stderr status)
             (ssh-test-loopback-result :bind-address "127.0.0.1")
@@ -3130,7 +3145,7 @@ from, and a source the kernel cannot assign fails the connection."
   ;; An ssh-rsa key serves rsa-sha2-512/256, so the client must negotiate one
   ;; of those and verify an RSA signature over the exchange hash.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-loopback-result
            :host-key-arguments '("-t" "rsa" "-b" "2048"))
@@ -3142,7 +3157,7 @@ from, and a source the kernel cannot assign fails the connection."
   ;; A pty request must be answered, its metadata kept, a window change applied,
   ;; and a shell request must start the application's command after the reply.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout pty window-change status)
           (ssh-test-loopback-pty-shell-result)
         (is (equal "pty-shell" stdout))
@@ -3155,7 +3170,7 @@ from, and a source the kernel cannot assign fails the connection."
   ;; A no-pty option on the authenticating key refuses the pty request; the
   ;; shell itself still runs, as it does in sshd.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout pty window-change status)
           (ssh-test-loopback-pty-shell-result :authorized-options "no-pty")
         (is (equal "pty-shell" stdout))
@@ -3166,7 +3181,7 @@ from, and a source the kernel cannot assign fails the connection."
 
 (test server-loopback-exec-ecdsa-host-key
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-loopback-result :host-key-arguments '("-t" "ecdsa"))
         (is (equal "hello" stdout))
@@ -3177,7 +3192,7 @@ from, and a source the kernel cannot assign fails the connection."
   "publickey,publickey requires two different keys, and ExposeAuthInfo
 records both successful methods."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-authmethods"))
              (host-key (merge-pathnames "host_key" directory))
              (client-key-1 (merge-pathnames "client_key_1" directory))
@@ -3321,7 +3336,7 @@ STDOUT STDERR STATUS)."
 (test server-loopback-password-authentication
   "A password request completes a login when the application accepts it."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let ((prompted 0))
         (multiple-value-bind (stdout stderr status)
             (ssh-test-auth-method-loopback-run
@@ -3353,7 +3368,7 @@ STDOUT STDERR STATUS)."
 (test server-loopback-keyboard-interactive-authentication
   "The server asks one prompt, then accepts the answer round."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let ((rounds 0)
             (seen nil))
         (flet ((hook (session user request)
@@ -3386,7 +3401,7 @@ STDOUT STDERR STATUS)."
 (test server-loopback-authentication-methods-publickey-then-password
   "AuthenticationMethods publickey,password accepts a key and then a password."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
           (ssh-test-auth-method-loopback-run
            "secret" nil
@@ -3404,7 +3419,7 @@ STDOUT STDERR STATUS)."
   "A @cert-authority line trusts the certificate; a @revoked line for the
 certificate, its plain key or its CA refuses it."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert-known"))
              (ca (merge-pathnames "ca" directory))
              (host-key (merge-pathnames "host" directory))
@@ -3455,7 +3470,7 @@ certificate, its plain key or its CA refuses it."
   ;; KEXINIT must list exactly the algorithms the loaded keys can sign with,
   ;; in preference order, and no algorithm whose key is missing.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostkeys"))
              (rsa (merge-pathnames "rsa" directory))
              (ecdsa (merge-pathnames "ecdsa" directory))
@@ -3499,7 +3514,7 @@ certificate, its plain key or its CA refuses it."
   "A paired certificate outranks its plain key, and is what KEX_ECDH_REPLY
 carries; without it only the plain algorithm is offered."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert"))
              (ca (merge-pathnames "ca" directory))
              (host-key (merge-pathnames "host" directory))
@@ -3729,7 +3744,7 @@ and closes them all together."
   ;; The server advertises several key types and the client picks the one it
   ;; prefers; the KEX must succeed whichever key is chosen.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-multikey"))
              (rsa (merge-pathnames "rsa" directory))
              (ecdsa (merge-pathnames "ecdsa" directory))
@@ -3866,7 +3881,7 @@ environment= list the server recorded for the authenticated key."
 The callback is the prompt; returning false has to refuse the host rather
 than connect and quietly skip the known_hosts record."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -3881,7 +3896,7 @@ than connect and quietly skip the known_hosts record."
 The greeting is what a peer shows in its logs, so leaving it at the
 library's default string hides which program is actually serving."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -3895,7 +3910,7 @@ library's default string hides which program is actually serving."
 (test server-version-addendum-follows-the-version
   "sshd's VersionAddendum is a comment after the version, not a replacement."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -3910,7 +3925,7 @@ library's default string hides which program is actually serving."
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -3925,7 +3940,7 @@ library's default string hides which program is actually serving."
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting banner)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -3944,7 +3959,7 @@ Disconnect immediately if you are not an operator.
 (test banner-may-be-a-function-so-the-file-can-change
   "sshd reads its Banner file for each connection; a function keeps that."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let ((calls 0))
         (multiple-value-bind (opened error greeting banner)
             (ssh-test-loopback-outcome
@@ -3965,7 +3980,7 @@ Disconnect immediately if you are not an operator.
 (test no-banner-means-no-userauth-banner-packet
   "A server without Banner leaves the client's banner slot empty."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting banner)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4650,7 +4665,7 @@ path that selects the agent socket to forward."
 
 (test client-accepts-a-secure-sshfp-record
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-sshfp"))
              (path (merge-pathnames "host_key" directory)))
         (ensure-directories-exist path)
@@ -4704,7 +4719,7 @@ path that selects the agent socket to forward."
 (test client-loopback-sshfp-trust
   "A strict client trusts an unknown host only through a secure SSHFP record."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-sshfp-loop"))
              (server-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -5092,7 +5107,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
 (test client-loopback-canonical-domains
   "A short name is found by appending CanonicalDomains."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-canon-loop"))
              (server-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -5303,8 +5318,10 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
     (is (eql 0 (search "SHA256:" (ssh-key-fingerprint blob))))
     (let ((md5 (ssh-key-fingerprint blob :md5)))
       (is (eql 0 (search "MD5:" md5)))
-      ;; MD5: plus sixteen two-hex groups and their separators.
-      (is (= 16 (count #\: md5))))))
+      ;; MD5: plus sixteen two-hex groups and their separators, in the
+      ;; lower case ssh-keygen uses.
+      (is (= 16 (count #\: md5)))
+      (is (notany #'upper-case-p (subseq md5 4))))))
 
 (test fingerprint-hash-parses
   (let* ((config
@@ -5956,7 +5973,7 @@ so a malformed duplicate is a configuration error rather than ignored."
 
 (test openssh-rsa-private-key-round-trip
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-rsa"))
              (path (merge-pathnames "id_rsa" directory)))
         (ensure-directories-exist path)
@@ -5986,7 +6003,7 @@ so a malformed duplicate is a configuration error rather than ignored."
   ;; An ECDSA key file holds the scalar and the point; signing must produce
   ;; the two mpints RFC 5656 wants, and the curve key type must survive.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (spec '(("id_ecdsa_256" "256" "ecdsa-sha2-nistp256")
                       ("id_ecdsa_384" "384" "ecdsa-sha2-nistp384")
                       ("id_ecdsa_521" "521" "ecdsa-sha2-nistp521")))
@@ -6030,7 +6047,7 @@ so a malformed duplicate is a configuration error rather than ignored."
   ;; it catches a key blob that round-trips locally but cannot be sent: an
   ;; ssh-rsa blob has two bare mpints, not one length-prefixed string.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (spec '(("id_ed25519" "ed25519" nil)
                       ("id_rsa" "rsa" "2048")
                       ("id_ecdsa_256" "ecdsa" "256")
@@ -6356,7 +6373,7 @@ option the server cannot honour refuses the line rather than being lost."
 (test server-records-authorized-key-environment
   "A successful publickey login keeps the environment= options it carried."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (opened error greeting banner key-env)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -6680,7 +6697,7 @@ refuse a session's agent request, and the defaults allow it."
   ;; authorized key of any supported type must verify under the signature
   ;; algorithm its request names.
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (dolist (spec '(("ed25519" nil "ssh-ed25519" "rsa-sha2-256")
                       ("rsa" "2048" "ssh-rsa" "ssh-ed25519")
                       ("ecdsa" "256" "ecdsa-sha2-nistp256"
@@ -6920,7 +6937,7 @@ refuse a session's agent request, and the defaults allow it."
 (test server-loopback-refuse-connection
   "RefuseConnection in a Match block terminates the connection before auth."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-refuse"))
              (host-key (merge-pathnames "host_key" directory))
              (client-key (merge-pathnames "client_key" directory))
@@ -7142,7 +7159,7 @@ must not be disabled by the key or the connection."
   "RevokedHostKeys refuses a listed host key, and an unreadable list fails
 closed rather than being ignored."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-revoked"))
              (key-path (merge-pathnames "host_key" directory))
              (revoked (merge-pathnames "revoked_keys" directory))
@@ -7181,7 +7198,7 @@ closed rather than being ignored."
   "A host certificate is trusted only when its CA signature algorithm is
 allowed by CASignatureAlgorithms."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-client-caalg"))
              (ca (merge-pathnames "ca" directory))
              (host-key (merge-pathnames "host_key" directory))
@@ -7230,7 +7247,7 @@ allowed by CASignatureAlgorithms."
 (test client-keys-obey-required-rsa-size
   "RequiredRSASize rejects small RSA host keys and authentication keys."
   (if (not (ssh-keygen-available-p))
-      (skip "ssh-keygen is not installed")
+      (skip "no ssh-keygen or POSIX shell")
       (let ((directory (ssh-test-directory "cl-pnet-ssh-client-rsasize")))
         (unwind-protect
              (let* ((short (merge-pathnames "rsa-1024" directory))
@@ -7915,3 +7932,188 @@ validated, so -G reports what ssh would and a bad line fails the same way."
                    (cl-pnet-ssh:ssh-server-supported-algorithms kind)
                    :test #'string=)
           (format nil "server default ~A" kind)))))
+
+;;; ---- Key generation ----
+;;;
+;;; BURS KEYGEN is a thin command line over these functions.  The generator
+;;; must produce a file ssh-keygen accepts and one this library reads back,
+;;; for every type it claims to make.
+
+(defun keygen-test-path (directory name)
+  (merge-pathnames name directory))
+
+(defun keygen-file-octets (path)
+  (with-open-file (stream path :direction :input
+                               :element-type '(unsigned-byte 8))
+    (let ((octets (make-array (file-length stream)
+                              :element-type '(unsigned-byte 8))))
+      (read-sequence octets stream)
+      octets)))
+
+(defun keygen-contains-ascii-p (octets string)
+  (let ((needle (octets-ascii string)))
+    (and (<= (length needle) (length octets))
+         (not (null (search needle octets :test #'=))))))
+
+(defun keygen-armored-body-octets (path)
+  "The decoded openssh-key-v1 body of the armored file at PATH."
+  (with-open-file (stream path :direction :input)
+    (let ((lines '()))
+      (loop for line = (read-line stream nil nil)
+            while line
+            unless (or (search "BEGIN OPENSSH PRIVATE KEY" line)
+                       (search "END OPENSSH PRIVATE KEY" line))
+              do (push line lines))
+      (ssh-base64-octets (format nil "~{~A~}" (nreverse lines))))))
+
+(test generated-keys-write-load-and-sign
+  (dolist (spec '(("ed25519" nil "ssh-ed25519")
+                  ("rsa" 1024 "ssh-rsa")
+                  ("ecdsa" 256 "ecdsa-sha2-nistp256")
+                  ("mldsa44-ed25519" nil "ssh-mldsa44-ed25519")))
+    (destructuring-bind (kind bits type) spec
+      (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen"))
+             (path (keygen-test-path directory (format nil "id_~A" kind)))
+             (public-path (keygen-test-path
+                           directory (format nil "id_~A.pub" kind))))
+        (ensure-directories-exist path)
+        (unwind-protect
+             (let* ((key (ssh-generate-private-key
+                          kind :num-bits bits :comment "generated@example"))
+                    (blob (ssh-public-key-blob-of key))
+                    (message (octets-ascii "keygen round-trip"))
+                    (signature (cl-pnet-ssh::ssh-private-key-signature-blob
+                                key message)))
+               (is (string= type (ssh-private-key-type key)))
+               (ssh-write-private-key key path)
+               (ssh-write-public-key key public-path)
+               ;; The private file names its type in the armor and loads back
+               ;; to the very same public key.
+               (let ((loaded (ssh-load-private-key path)))
+                 (is (string= type (ssh-private-key-type loaded)))
+                 (is (string= "generated@example"
+                              (ssh-private-key-comment loaded)))
+                 (is (equalp blob (ssh-public-key-blob-of loaded))))
+               ;; A freshly generated key signs, and the signature verifies
+               ;; under its own public blob.
+               (is (cl-pnet-ssh::ssh-public-key-signature-valid-p
+                    blob signature message))
+               ;; The .pub file is one authorized_keys line for the key.
+               (with-open-file (stream public-path)
+                 (let ((line (read-line stream)))
+                   (is (string= type line :end2 (length type)))
+                   (is (equalp blob (ssh-authorized-key-line-blob line)))))
+               (is (string= type (nth-value 0 (ssh-public-key-parts blob)))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t)))))))
+
+(test generated-key-key-sizes
+  (is (= 256 (ssh-key-bits (ssh-public-key-blob-of
+                            (ssh-generate-private-key "ed25519")))))
+  (is (= 384 (ssh-key-bits (ssh-public-key-blob-of
+                            (ssh-generate-private-key "ecdsa" :num-bits 384)))))
+  (is (= 521 (ssh-key-bits (ssh-public-key-blob-of
+                            (ssh-generate-private-key "ecdsa" :num-bits 521)))))
+  (is (= 1024 (ssh-key-bits (ssh-public-key-blob-of
+                             (ssh-generate-private-key "rsa" :num-bits 1024)))))
+  (is (= 256 (ssh-key-bits (ssh-public-key-blob-of
+                            (ssh-generate-private-key "mldsa44-ed25519"))))))
+
+(test generated-key-rejects-impossible-sizes
+  (signals ssh-keygen-error (ssh-generate-private-key "ed25519" :num-bits 512))
+  (signals ssh-keygen-error (ssh-generate-private-key "ecdsa" :num-bits 200))
+  (signals ssh-keygen-error (ssh-generate-private-key "rsa" :num-bits 512))
+  (signals ssh-keygen-error (ssh-generate-private-key "nonsense")))
+
+(test generated-key-passphrase-round-trip
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-enc"))
+         (path (keygen-test-path directory "id_locked")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let ((key (ssh-generate-private-key "ed25519"
+                                              :comment "locked@example")))
+           (ssh-write-private-key key path :passphrase "correct horse"
+                                             :rounds 4)
+           (let ((octets (keygen-armored-body-octets path)))
+             ;; The header names the cipher and the KDF, exactly as
+             ;; ssh-keygen writes them for -N.
+             (is (eq t (keygen-contains-ascii-p octets "aes256-ctr")))
+             (is (eq t (keygen-contains-ascii-p octets "bcrypt"))))
+           (let ((loaded (ssh-load-private-key path
+                                               :passphrase "correct horse")))
+             (is (string= "locked@example" (ssh-private-key-comment loaded)))
+             (is (equalp (ssh-public-key-blob-of key)
+                         (ssh-public-key-blob-of loaded))))
+           (signals ssh-authentication-error
+             (ssh-load-private-key path :passphrase "wrong"))
+           ;; An encrypted file without a passphrase is not silently read.
+           (signals ssh-error (ssh-load-private-key path))
+           ;; The same passphrase can be changed by rewriting the key.
+           (ssh-write-private-key (ssh-load-private-key
+                                   path :passphrase "correct horse")
+                                  path :passphrase "new pass" :rounds 4)
+           (is (string= "locked@example"
+                        (ssh-private-key-comment
+                         (ssh-load-private-key path :passphrase "new pass"))))
+           (signals ssh-authentication-error
+             (ssh-load-private-key path :passphrase "correct horse")))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test generated-public-line-round-trips-through-the-file
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-line"))
+         (path (keygen-test-path directory "id_ed25519.pub")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let* ((key (ssh-generate-private-key "ed25519" :comment "a b c"))
+                (text (ssh-public-key-line key)))
+           (cl-pnet-ssh::ssh-write-octets-file (map 'vector #'char-code text)
+                                              path)
+           (with-open-file (stream path)
+             (let ((line (read-line stream)))
+               (is (equalp (ssh-public-key-blob-of key)
+                           (ssh-authorized-key-line-blob line)))
+               ;; The comment is the remainder after the base64 field.
+               (let ((space (search " " line)))
+                 (is (string= "a b c"
+                               (subseq line (1+ (search " " line
+                                                        :start2 (1+ space))))))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test ssh-keygen-accepts-generated-keys
+  ;; The real test of the writer: OpenSSH itself reads the private half and
+  ;; derives the same public key.  ssh-keygen is not part of the build, so
+  ;; skip where it is absent (for example Windows without a POSIX shell).
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen or POSIX shell")
+      (dolist (spec '(("ed25519" nil) ("rsa" 1024) ("ecdsa" 256)))
+        (destructuring-bind (kind bits) spec
+          (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-ossh"))
+                 (path (keygen-test-path directory (format nil "id_~A" kind))))
+            (ensure-directories-exist path)
+            (unwind-protect
+                 (let ((key (ssh-generate-private-key
+                             kind :num-bits bits :comment "openssh@example")))
+                   (ssh-write-private-key key path)
+                   (let ((derived (string-trim
+                                   '(#\Space #\Tab #\Return #\Newline)
+                                   (ssh-keygen (list "-y" "-f"
+                                                     (namestring path))))))
+                     (is (string= derived
+                                  (string-right-trim
+                                   '(#\Return #\Newline)
+                                   (ssh-public-key-line key))))
+                     (is (search "openssh@example" derived))
+                     (let ((fingerprint
+                             (ssh-keygen (list "-l" "-f" (namestring path)))))
+                       (is (search (ssh-key-fingerprint
+                                    (ssh-public-key-blob-of key))
+                                   fingerprint))))
+                   ;; ssh-keygen can also decrypt one of ours.
+                   (let ((locked (keygen-test-path directory "locked"))
+                         (type (nth-value 0
+                                          (ssh-public-key-parts
+                                           (ssh-public-key-blob-of key)))))
+                     (ssh-write-private-key key locked :passphrase "pw" :rounds 4)
+                     (is (search type
+                                 (ssh-keygen (list "-y" "-P" "pw" "-f"
+                                                   (namestring locked)))))))
+              (ignore-errors (uiop:delete-directory-tree directory :validate t))))))))

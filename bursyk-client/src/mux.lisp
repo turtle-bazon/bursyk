@@ -398,7 +398,7 @@ finish and reports its status, exactly as it does for a multiplexed session."
 OpenSSH relays SIGWINCH by signal; the master owns the channel, so it is
 the process that may send window-change.  The master's pid is discovered
 through the alive check before the session starts."
-  #+sbcl
+  #+(and sbcl (not win32))
   (ignore-errors
    (sb-sys:enable-interrupt
     sb-unix:sigwinch
@@ -407,7 +407,7 @@ through the alive check before the session starts."
       (when (and master-pid (plusp master-pid))
         (ignore-errors
          (sb-unix:unix-kill master-pid sb-unix:sigwinch))))))
-  #-sbcl
+  #-(and sbcl (not win32))
   (declare (ignore master-pid)))
 
 ;;; ---- The master's control connections ----

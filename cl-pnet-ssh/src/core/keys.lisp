@@ -51,7 +51,13 @@ as OpenSSH's sshkey_fingerprint does with force_plain."
                     (string-right-trim
                      '(#\=) (ssh-octets-base64 digest))))
       (:md5
-       (format nil "MD5:~{~2,'0x~^:~}" (coerce digest 'list))))))
+       ;; ssh-keygen prints the hexadecimal groups in lower case; FORMAT's
+       ;; ~X directive is upper case on some implementations even with a
+       ;; lower-case directive, so normalise here.
+       (concatenate
+        'string "MD5:"
+        (string-downcase
+         (format nil "~{~2,'0x~^:~}" (coerce digest 'list))))))))
 
 (defun ssh-key-randomart-title (key-blob)
   "The [TYPE SIZE] title OpenSSH puts over a randomart field."
@@ -777,6 +783,20 @@ hold one key."
     (let ((key (ssh-parse-openssh-private-key body :passphrase passphrase)))
       (setf (ssh-private-key-path key) path)
       key)))
+
+(defun ssh-private-key-file-encrypted-p (path)
+  "Whether the private key file at PATH is passphrase-protected.
+
+The header names the cipher, so this answers without a passphrase and
+without decrypting anything."
+  (let* ((body (ssh-private-key-body (ssh-read-octets-file path))))
+    (ssh-check-key-magic body)
+    (let ((reader (ssh-make-reader body)))
+      ;; Step over the magic and its trailing NUL to the cipher string.
+      (dotimes (index (1+ (length +openssh-key-magic+)))
+        (declare (ignore index))
+        (ssh-read-u8 reader))
+      (not (string= (ssh-read-text reader) "none")))))
 
 (defun ssh-public-key-blob-of (key)
   "The public key blob of private KEY, or an agent-backed host key."

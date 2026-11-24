@@ -1968,26 +1968,24 @@ LAST-USED, so a timer that fires early simply recomputes and rearms."
     (when (and (not (ssh-session-closed session)) (consp timeouts))
       (loop for channel being the hash-values of
               (ssh-session-channels session)
-            do (let ((deadline (+ (ssh-server-channel-last-used channel)
-                                  (ssh-server-channel-inactive-timeout
-                                   channel))))
+            do (let ((used (ssh-server-channel-last-used channel))
+                     (limit (ssh-server-channel-inactive-timeout channel)))
                  (when (and (eq (ssh-server-channel-state channel) :open)
-                            (plusp (ssh-server-channel-inactive-timeout channel))
-                            (or (null earliest) (< deadline earliest)))
-                   (setf earliest deadline))))
+                            used
+                            (plusp limit))
+                   (let ((deadline (+ used limit)))
+                     (when (or (null earliest) (< deadline earliest))
+                       (setf earliest deadline))))))
       ;; A global timeout runs from the newest activity on any open channel.
       (let ((global (ssh-session-global-channel-timeout session))
             (latest nil))
         (when (and global (plusp global))
           (loop for channel being the hash-values of
                   (ssh-session-channels session)
-                when (and (eq (ssh-server-channel-state channel) :open)
-                          (plusp (ssh-server-channel-last-used channel)))
-                  do (setf latest
-                           (if latest
-                               (max latest (ssh-server-channel-last-used
-                                            channel))
-                               (ssh-server-channel-last-used channel))))
+                do (let ((used (ssh-server-channel-last-used channel)))
+                     (when (and (eq (ssh-server-channel-state channel) :open)
+                                used)
+                       (setf latest (if latest (max latest used) used)))))
           (when latest
             (let ((deadline (+ latest global)))
               (when (or (null earliest) (< deadline earliest))
@@ -2012,23 +2010,22 @@ the global interval."
       (dolist (channel (iter (for (id channel) in-hashtable
                                     (ssh-session-channels session))
                         (collect channel)))
-        (when (and (eq (ssh-server-channel-state channel) :open)
-                   (plusp (ssh-server-channel-inactive-timeout channel))
-                   (>= now (+ (ssh-server-channel-last-used channel)
-                              (ssh-server-channel-inactive-timeout channel))))
-          (ssh-server-channel-force-close channel)))
+        (let ((used (ssh-server-channel-last-used channel))
+              (limit (ssh-server-channel-inactive-timeout channel)))
+          (when (and (eq (ssh-server-channel-state channel) :open)
+                     used
+                     (plusp limit)
+                     (>= now (+ used limit)))
+            (ssh-server-channel-force-close channel))))
       (let ((global (ssh-session-global-channel-timeout session))
             (latest nil))
         (when (and global (plusp global))
           (loop for channel being the hash-values of
                   (ssh-session-channels session)
-                when (and (eq (ssh-server-channel-state channel) :open)
-                          (plusp (ssh-server-channel-last-used channel)))
-                  do (setf latest
-                           (if latest
-                               (max latest (ssh-server-channel-last-used
-                                            channel))
-                               (ssh-server-channel-last-used channel))))
+                do (let ((used (ssh-server-channel-last-used channel)))
+                     (when (and (eq (ssh-server-channel-state channel) :open)
+                                used)
+                       (setf latest (if latest (max latest used) used)))))
           (when (and latest (>= now (+ latest global)))
             (dolist (channel (iter (for (id channel) in-hashtable
                                         (ssh-session-channels session))

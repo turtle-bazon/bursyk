@@ -2,7 +2,7 @@
   :description "SSH client command line"
   :author "pesekey"
   :license "GPL-3.0-or-later"
-  :version "0.0.2.85"
+  :version "0.0.2.86"
   :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cl-pnet-socks #:clingon
                ;; SSHFP queries for VerifyHostKeyDNS; the SSH library finds
                ;; these packages at call time.
@@ -19,6 +19,8 @@
                              ;; control master.  MAIN wires it into the
                              ;; ordinary connection path.
                              (:file "mux")
+                             ;; `burs keygen`: generated keys and key files.
+                             (:file "keygen")
                              (:file "main"))))
   :build-operation "program-op"
   :build-pathname "../_build/burs"

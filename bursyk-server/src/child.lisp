@@ -45,12 +45,18 @@
   (x-pixels :unsigned-short)
   (y-pixels :unsigned-short))
 
-;; Linux values.  BURSYK-SERVER is a Linux sshd; the constants are not
-;; abstracted because no other platform runs this binary today.
+;; Linux values, with the BSD spellings the other Unix targets need.  O_NOCTTY
+;; and the ioctl numbers are not the same: Linux puts the terminal ioctls in
+;; the 0x54xx range, while the BSDs use an _IO/_IOW encoding.  BURSYK-SERVER is
+;; primarily a Linux sshd, but the same bridge runs on FreeBSD.
 (defconstant +o-rdwr+ 2)
-(defconstant +o-noctty+ #o400)
-(defconstant +tiocsctty+ #x540E)
-(defconstant +tiocswinsz+ #x5414)
+#+linux (defconstant +o-noctty+ #o400)
+#+darwin (defconstant +o-noctty+ #x20000)
+#-(or linux darwin) (defconstant +o-noctty+ #x8000)
+#+linux (defconstant +tiocsctty+ #x540E)
+#-linux (defconstant +tiocsctty+ #x20007461)
+#+linux (defconstant +tiocswinsz+ #x5414)
+#-linux (defconstant +tiocswinsz+ #x80087467)
 (defconstant +sighup+ 1)
 
 (cffi:defcstruct rlimit
@@ -58,7 +64,8 @@
   (maximum :unsigned-long))
 
 (defconstant +sigkill+ 9)
-(defconstant +rlimit-nofile+ 7)
+#+linux (defconstant +rlimit-nofile+ 7)
+#-linux (defconstant +rlimit-nofile+ 8)
 (defconstant +status-descriptor+ 3)
 (defconstant +exec-failed-status+ 127)
 

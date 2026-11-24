@@ -283,9 +283,9 @@ present after RequiredRSASize, for callers that only want to describe it."
   ;; session:command or session:subsystem:NAME.  NIL means TYPE itself.
   (x-type nil)
   ;; Seconds of inactivity before this channel is closed, 0 for none, and the
-  ;; monotonic time of the last byte read or written (0 before it opens).
+  ;; monotonic time of the last byte read or written, NIL before it opens.
   (inactive-timeout 0)
-  (last-used 0)
+  (last-used nil)
   (open-extra (make-array 0 :element-type '(unsigned-byte 8)))
   (state :opening)
   (remote-window 0)

@@ -299,7 +299,9 @@ that ends the stream too."
 
 #+win32
 (test pty-size-packs-columns-then-rows
-  (is (eql #x00320050 (bursyk-server::pty-size 80 50)))
+  ;; PTY-SIZE takes (ROWS COLUMNS) and packs the COORD CreatePseudoConsole
+  ;; wants: columns are X (the low short), rows are Y.
+  (is (eql #x00320050 (bursyk-server::pty-size 50 80)))
   ;; Zero is never sent: a zero-sized console is rejected.
   (is (eql #x00010001 (bursyk-server::pty-size 0 0))))
 
@@ -555,12 +557,19 @@ session required pam_permit.so
 
 #-win32
 (defmacro with-pam-fixture ((variable) &body body)
-  `(let ((,variable (pam-fixture-directory)))
-     (unwind-protect
-          (progn ,@body)
-       (ignore-errors
-         (uiop:delete-directory-tree ,variable :validate t
-                                     :if-does-not-exist :ignore)))))
+  "Run BODY against a fixture PAM service directory, or skip when it cannot.
+
+Only Linux-PAM's pam_start_confdir selects a config directory for one
+transaction; OpenPAM reads /etc/pam.d unconditionally, so there is nothing
+these tests can point at on the BSDs."
+  `(if (bursyk-server::pam-conf-dir-supported-p)
+       (let ((,variable (pam-fixture-directory)))
+         (unwind-protect
+              (progn ,@body)
+           (ignore-errors
+             (uiop:delete-directory-tree ,variable :validate t
+                                         :if-does-not-exist :ignore))))
+       (skip "this libpam has no pam_start_confdir")))
 
 #-win32
 (defmacro with-pam (&body body)
@@ -620,14 +629,16 @@ session required pam_permit.so
 
 #-win32
 (defmacro with-pam-expired-fixture ((variable) &body body)
-  `(let ((,variable (pam-expired-fixture-directory)))
-     (if (null ,variable)
-         (skip "no C compiler for the PAM test module")
-         (unwind-protect
-              (progn ,@body)
-           (ignore-errors
-             (uiop:delete-directory-tree ,variable :validate t
-                                         :if-does-not-exist :ignore))))))
+  `(if (not (bursyk-server::pam-conf-dir-supported-p))
+       (skip "this libpam has no pam_start_confdir")
+       (let ((,variable (pam-expired-fixture-directory)))
+         (if (null ,variable)
+             (skip "no C compiler for the PAM test module")
+             (unwind-protect
+                  (progn ,@body)
+               (ignore-errors
+                 (uiop:delete-directory-tree ,variable :validate t
+                                             :if-does-not-exist :ignore)))))))
 
 ;;; The system modules cannot fail pam_setcred or pam_open_session on
 ;;; demand either, so tests/pam-session.c makes each stage fail when the
@@ -678,14 +689,16 @@ session required ~A open-session-fail
 
 #-win32
 (defmacro with-pam-session-fixture ((variable) &body body)
-  `(let ((,variable (pam-session-fixture-directory)))
-     (if (null ,variable)
-         (skip "no C compiler for the PAM test module")
-         (unwind-protect
-              (progn ,@body)
-           (ignore-errors
-             (uiop:delete-directory-tree ,variable :validate t
-                                         :if-does-not-exist :ignore))))))
+  `(if (not (bursyk-server::pam-conf-dir-supported-p))
+       (skip "this libpam has no pam_start_confdir")
+       (let ((,variable (pam-session-fixture-directory)))
+         (if (null ,variable)
+             (skip "no C compiler for the PAM test module")
+             (unwind-protect
+                  (progn ,@body)
+               (ignore-errors
+                 (uiop:delete-directory-tree ,variable :validate t
+                                             :if-does-not-exist :ignore)))))))
 
 #-win32
 (test pam-password-accept-and-refuse
@@ -2058,8 +2071,11 @@ ListenAddress 127.0.0.1")))
 (test -f-none-reads-no-config-file
   (let ((bursyk-server::*options* (list :config-file "none")))
     (is (null (bursyk-server::config-file-path))))
-  (let ((bursyk-server::*options* nil))
-    (is (equal cl-pnet-ssh:+ssh-server-config-default-file+
+  ;; Without -f the default is read only when it exists; a host that has no
+  ;; /etc/ssh/sshd_config (Windows) correctly starts with no config file.
+  (let ((bursyk-server::*options* nil)
+        (default cl-pnet-ssh:+ssh-server-config-default-file+))
+    (is (equal (and (probe-file default) default)
                (bursyk-server::config-file-path)))))
 
 (test -o-lines-win-over-the-config-file
@@ -2386,6 +2402,7 @@ DenyGroups banned")))
   (is (cl-pnet-ssh:ssh-root-login-allowed-p
        :forced-commands-only "publickey" :force-command "id")))
 
+#-win32
 (test password-hashes-are-checked-with-crypt
   ;; The DES hash of "secret"; crypt(3) accepts the traditional setting too.
   (is (bursyk-server::password-hash-valid-p "secret" "abNANd1rDfiNc"))
@@ -2396,6 +2413,7 @@ DenyGroups banned")))
   (is (not (bursyk-server::password-hash-valid-p "" "abNANd1rDfiNc")))
   (is (not (bursyk-server::password-hash-valid-p "secret" ""))))
 
+#-win32
 (test shadow-and-passwd-password-files-are-read-in-order
   ;; The real /etc/shadow is not readable in the test environment, so use
   ;; fixture files through the rebindable paths.
@@ -3526,7 +3544,10 @@ file is removed with the session."
            ;; sshd's mkstemp makes the file readable only by its owner.
            (is (equal "600"
                       (uiop:run-program
-                       (list "stat" "-c" "%a" path)
+                       (list "stat"
+                             #+linux "-c" #-linux "-f"
+                             #+linux "%a" #-linux "%Lp"
+                             path)
                        :output '(:string :stripped t))))
            (is (equal path (bursyk-server::auth-info-file session))))
       (bursyk-server::delete-auth-info-file session)
@@ -3930,6 +3951,7 @@ Match User alice
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "ChrootDirectory")))
 
+#-win32
 (test chroot-path-expansion-and-safety
   "ChrootDirectory expands ~ and %h/%u/%U, and refuses an unsafe directory."
   (is (equal "/srv/alice/%"
@@ -4201,8 +4223,8 @@ The puma backend blocks SIGINT so its signalfd sees it, and SBCL refuses to
 serve events while a deferrable signal is blocked.  AuthorizedKeysCommand
 and AuthorizedPrincipalsCommand run in that state, so their wait must
 unblock the signal and restore the mask."
-  #-sbcl (skip "SBCL-only signal mask")
-  #+sbcl
+  #-(and sbcl (not win32)) (skip "SBCL's POSIX signal mask only")
+  #+(and sbcl (not win32))
   (let ((handle (handler-case
                     (cl-pnet:signal-start sb-unix:sigint (lambda () nil))
                   (error () nil))))

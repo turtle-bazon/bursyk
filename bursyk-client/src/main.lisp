@@ -666,15 +666,22 @@ refusal."
 
 The config is resolved before the event loop starts, so running the shell
 test here costs the process nothing that was concurrent anyway.  The library
-itself never blocks: this matcher is what a caller supplies."
+itself never blocks: this matcher is what a caller supplies.  The command is
+written for the platform shell, as ssh runs it through sh and sshd on Windows
+runs it through cmd.exe."
   (handler-case
       (funcall on-result
                (eql 0
-                    (nth-value 2
-                               (uiop:run-program (list "/bin/sh" "-c" command)
-                                                 :ignore-error-status t
-                                                 :output nil
-                                                 :error-output nil))))
+                    (nth-value
+                     2
+                     (uiop:run-program
+                      (if (uiop:os-windows-p)
+                          (list (or (uiop:getenv "COMSPEC") "cmd.exe")
+                                "/c" command)
+                          (list "/bin/sh" "-c" command))
+                      :ignore-error-status t
+                      :output nil
+                      :error-output nil))))
     (error (condition) (funcall on-error condition))))
 
 (defun true-value-p (value)
@@ -3654,6 +3661,26 @@ of calling back in the middle of authentication."
       (format *error-output* "~A" banner)
       (finish-output *error-output*))))
 
+(defun read-keyboard-interactive-answers (name instruction prompts)
+  "Ask each of PROMPTS, a list of (TEXT ECHO-P), and return the answers.
+
+NAME and INSTRUCTION are shown first when the server supplied them, as ssh
+does.  NIL means the input ended before every prompt was answered.  The
+per-prompt reading is platform specific: READ-PROMPT-LINE lives in POSIX.LISP
+or WINDOWS.LISP."
+  (when (and name (plusp (length name)))
+    (format *error-output* "~A~%" name))
+  (when (and instruction (plusp (length instruction)))
+    (format *error-output* "~A~%" instruction))
+  (finish-output *error-output*)
+  (let ((answers '()))
+    (dolist (prompt prompts (nreverse answers))
+      (let ((answer (read-prompt-line (first prompt)
+                                      :echo (second prompt))))
+        (unless answer
+          (return nil))
+        (push answer answers)))))
+
 (defun password-authentication-prompt (client prompt)
   "Ask for a password the way ssh's password method does."
   (declare (ignore client))
@@ -3842,6 +3869,10 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
   "Entry point for the BURS program."
   (handler-case
       (let ((arguments (uiop:command-line-arguments)))
+        ;; `burs keygen` is a second program on the same binary: it has its
+        ;; own options and never connects anywhere.
+        (when (and arguments (string= (first arguments) "keygen"))
+          (uiop:quit (keygen-main (rest arguments))))
         (multiple-value-bind (destination command)
             (parse-arguments arguments)
           (when (getf *options* :version)
