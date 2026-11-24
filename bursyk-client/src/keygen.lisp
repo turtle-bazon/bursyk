@@ -56,7 +56,10 @@ longer -C or typed comment is silently shortened.")
       comment))
 
 (defun keygen-fail (format-string &rest arguments)
-  (error (apply #'format nil format-string arguments)))
+  ;; ERror's string shorthand makes the text the condition's format control,
+  ;; so a path or comment containing ~ would be parsed as a directive when
+  ;; the condition is printed.  Keep the message as an argument instead.
+  (error "~A" (apply #'format nil format-string arguments)))
 
 (define-condition keygen-usage-error (error)
   ((message :initarg :message :reader keygen-usage-error-message))
@@ -279,6 +282,16 @@ POSIX host keeps ssh-keygen's plain $USER."
   (declare (ignore path mode))
   (values))
 
+(defun keygen-write-stdout-octets (octets)
+  "Write OCTETS to standard output without re-encoding them.
+
+A key comment is free-form bytes that ssh-keygen passes to fprintf, so the
+bytes must reach the stream unchanged.  When standard output is a captured
+character stream, as in the tests, the closest text is used."
+  (unless (write-standard-output-octets octets)
+    (write-string (cl-pnet-ssh:ssh-utf8-escaped-string octets)
+                  *standard-output*)))
+
 ;;; ---- prompts ----
 
 (defun keygen-read-passphrase (prompt)
@@ -325,8 +338,12 @@ newline the terminal is not echoing."
 
 (defun keygen-first-line (path)
   (unless (keygen-empty-path-p path)
+    ;; -l only inspects the first line to tell a private key from a public
+    ;; list, and a public list's comment may hold any byte.  Latin-1 keeps
+    ;; the read total; the ASCII marker is unaffected.
     (with-open-file (stream path :direction :input
-                                 :if-does-not-exist nil)
+                                 :if-does-not-exist nil
+                                 :external-format :latin-1)
       (and stream (read-line stream nil nil)))))
 
 (defun keygen-private-file-p (path)
@@ -485,6 +502,115 @@ with, or NIL when it was in the clear, so a rewrite can preserve it."
                      (subseq trimmed (1+ second)))
         "")))
 
+(defun keygen-line-space-p (character)
+  (or (char= character #\Space) (char= character #\Tab)))
+
+(defun keygen-line-token-end (line start)
+  "The index where the whitespace-delimited token at START ends on LINE."
+  (let ((index start)
+        (length (length line)))
+    (loop while (and (< index length)
+                     (not (keygen-line-space-p (char line index))))
+          do (incf index)
+          finally (return index))))
+
+(defun keygen-line-skip-space (line start)
+  (let ((index start)
+        (length (length line)))
+    (loop while (and (< index length)
+                     (keygen-line-space-p (char line index)))
+          do (incf index)
+          finally (return index))))
+
+(defun keygen-line-read-key (line start)
+  "VALUES BLOB NEXT when LINE holds a key at START, or NIL.
+
+This is sshkey_read as do_fingerprint uses it: a type token, whitespace,
+the base64 blob, and then whitespace.  NEXT is the index of the first
+character after that whitespace."
+  (let* ((length (length line))
+         (type-end (keygen-line-token-end line start)))
+    (when (and (< start type-end) (< type-end length))
+      (let* ((type (subseq line start type-end))
+             (encoded-start (keygen-line-skip-space line type-end))
+             (encoded-end (keygen-line-token-end line encoded-start)))
+        (when (< encoded-start encoded-end)
+          (let ((blob (handler-case
+                          (cl-pnet-ssh:ssh-base64-octets
+                           (subseq line encoded-start encoded-end))
+                        (error () nil))))
+            (when blob
+              (multiple-value-bind (blob-type data)
+                  (handler-case (cl-pnet-ssh:ssh-public-key-parts blob)
+                    (error () (values nil nil)))
+                (declare (ignore data))
+                (when (and blob-type (string= blob-type type))
+                  (values blob
+                          (keygen-line-skip-space line encoded-end)))))))))))
+
+(defun keygen-line-option-token-end (line start)
+  "The index where the quoted hostname or options token at START ends.
+
+This is ssh-keygen's scan: a backslash-escaped quote stays inside the
+quotes, an unescaped quote toggles them, and an unquoted space or tab ends
+the token."
+  (let ((length (length line))
+        (inline nil)
+        (index start))
+    (loop while (and (< index length)
+                     (or inline
+                         (not (keygen-line-space-p (char line index)))))
+          do (cond
+               ((and (char= (char line index) #\\)
+                     (< (1+ index) length)
+                     (char= (char line (1+ index)) #\"))
+                (incf index 2))
+               (t
+                (when (char= (char line index) #\")
+                  (setf inline (not inline)))
+                (incf index))))
+    index))
+
+(defun keygen-line-number-leading-p (line start)
+  "Whether LINE has a nonzero integer followed by whitespace at START.
+
+ssh-keygen's do_fingerprint treats such a line as the old numeric key
+format and never retries it after a leading hostname or options token."
+  (let* ((length (length line))
+         (digits (if (and (< start length)
+                          (member (char line start) '(#\+ #\-)))
+                     (1+ start)
+                     start))
+         (end digits))
+    (loop while (and (< end length) (digit-char-p (char line end)))
+          do (incf end))
+    (and (> end digits)
+         (< end length)
+         (keygen-line-space-p (char line end))
+         (/= (parse-integer line :start start :end end) 0))))
+
+(defun keygen-line-comment (line index fallback)
+  "COMMENT for a key on LINE whose text ends at INDEX.
+
+A trailing comment beginning with # counts as absent, exactly as
+do_fingerprint leaves it, so FALLBACK is used instead."
+  (let ((index (keygen-line-skip-space line index))
+        (length (length line)))
+    (cond
+      ((>= index length) fallback)
+      ((char= (char line index) #\#) fallback)
+      (t (subseq line index)))))
+
+(defun keygen-line-comment-text (comment)
+  "COMMENT with bytes OpenSSH escapes written as octal, for printing.
+
+The line is read as latin-1, so each character's code is the file byte;
+a valid UTF-8 sequence becomes its character and anything else becomes
+the escape mprintf() would print."
+  (when comment
+    (cl-pnet-ssh:ssh-utf8-escaped-string
+     (map '(vector (unsigned-byte 8)) #'char-code comment))))
+
 (defun keygen-line-key (line)
   "VALUES BLOB COMMENT for the key on one LINE, or NIL.
 
@@ -493,52 +619,83 @@ options, or a known_hosts line that starts with host patterns.  COMMENT is
 the text after the base64 key, as in ssh-keygen; when there is none the
 prefix ssh-keygen would have kept is used instead, and a bare key with no
 comment returns NIL so the caller can print \"no comment\"."
-  (let ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
-    (when (and (plusp (length trimmed))
-               (not (member (char trimmed 0) '(#\# #\@))))
-      (let ((fields (cl-pnet-ssh::ssh-authorized-key-line-fields trimmed)))
-        (loop for rest on fields
-              for index from 0
-              for type = (first rest)
-              for encoded = (second rest)
-              while encoded
-              do (let ((blob (handler-case
-                                 (cl-pnet-ssh:ssh-base64-octets encoded)
-                               (error () nil))))
-                   (when blob
-                     (multiple-value-bind (blob-type data)
-                         (handler-case
-                             (cl-pnet-ssh:ssh-public-key-parts blob)
-                           (error () (values nil nil)))
-                       (declare (ignore data))
-                       (when (and blob-type (string= blob-type type))
-                         (let* ((tail (cddr rest))
-                                (tail-string
-                                  (and tail (format nil "~{~A~^ ~}" tail))))
-                           (return-from keygen-line-key
-                             (values blob
-                                     (cond
-                                       ((and tail-string
-                                             (plusp (length tail-string))
-                                             (not (char= (char tail-string 0)
-                                                         #\#)))
-                                        tail-string)
-                                       ((plusp index) (first fields))
-                                       (t nil))))))))))))))
+  (let* ((start (keygen-line-skip-space line 0))
+         (length (length line)))
+    (when (and (< start length) (not (char= (char line start) #\#)))
+      (multiple-value-bind (blob next)
+          (keygen-line-read-key line start)
+        (if blob
+            (values blob (keygen-line-comment-text
+                          (keygen-line-comment line next nil)))
+          ;; The key may follow an authorized_keys option list or a
+          ;; known_hosts hostname.  ssh-keygen skips one such token and
+          ;; retries, but not when the line starts with a number.
+          (unless (keygen-line-number-leading-p line start)
+            (let ((token-end (keygen-line-option-token-end line start)))
+              (when (< token-end length)
+                (let ((leading (subseq line start token-end)))
+                  (multiple-value-bind (blob next)
+                      (keygen-line-read-key line (1+ token-end))
+                    (when blob
+                      (values blob
+                              (keygen-line-comment-text
+                               (keygen-line-comment line next
+                                                    leading))))))))))))))
+
+(defun keygen-public-file-keys-from-stream (stream)
+  "A list of (BLOB COMMENT) for each key line in character STREAM."
+  (loop for line = (read-line stream nil nil)
+        while line
+        for key = (multiple-value-list (keygen-line-key line))
+        when (first key) collect key))
+
+(defun keygen-octet-line (stream)
+  "One line from binary STREAM as octets without its terminator; NIL at EOF."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (any nil))
+    (loop for octet = (read-byte stream nil nil)
+          do (cond
+               ((null octet)
+                (return (and any
+                             (coerce out '(vector (unsigned-byte 8))))))
+               ((= octet 10)
+                (return (coerce out '(vector (unsigned-byte 8)))))
+               ((= octet 13)
+                ;; A CRLF terminator leaves no CR in a comment.
+                nil)
+               (t
+                (setf any t)
+                (vector-push-extend octet out))))))
+
+(defun keygen-public-file-keys-from-octet-stream (stream)
+  "A list of (BLOB COMMENT) for each key line in binary STREAM."
+  (loop for octets = (keygen-octet-line stream)
+        while octets
+        for line = (map 'string #'code-char octets)
+        for key = (multiple-value-list (keygen-line-key line))
+        when (first key) collect key))
 
 (defun keygen-public-file-keys (path)
-  "A list of (BLOB COMMENT) for each key line in the file at PATH."
+  "A list of (BLOB COMMENT) for each key line in the file at PATH.
+
+The file is read as latin-1 so that a comment holding bytes that are not
+valid UTF-8 survives to the printer instead of failing the read."
   (keygen-require-file path)
   (when (keygen-directory-p path)
     (keygen-fail "~A is not a public key file."
                  (uiop:native-namestring path)))
   (with-open-file (stream path :direction :input
                                :if-does-not-exist nil
-                               :external-format :utf-8)
-    (loop for line = (read-line stream nil nil)
-          while line
-          for key = (multiple-value-list (keygen-line-key line))
-          when (first key) collect key)))
+                               :external-format :latin-1)
+    (keygen-public-file-keys-from-stream stream)))
+
+(defun keygen-public-file-keys-from-standard-input ()
+  "The public keys on standard input, byte-preserving when possible."
+  (let ((stream (standard-input-binary-stream)))
+    (if (subtypep (stream-element-type stream) '(unsigned-byte 8))
+        (keygen-public-file-keys-from-octet-stream stream)
+        (keygen-public-file-keys-from-stream stream))))
 
 ;;; ---- overwrite handling ----
 
@@ -666,8 +823,6 @@ The checks happen before the overwrite question, as ssh-keygen's do."
          :rounds (or (getf options :rounds)
                              cl-pnet-ssh:+ssh-keygen-default-rounds+))
         (cl-pnet-ssh:ssh-write-public-key key public :comment comment)
-        (keygen-set-permissions path #o600)
-        (keygen-set-permissions public #o644)
         (unless quiet
           (format t "Your identification has been saved in ~A~%"
                   (uiop:native-namestring path))
@@ -690,7 +845,8 @@ The checks happen before the overwrite question, as ssh-keygen's do."
                                 (format nil "Enter passphrase for \"~A\": "
                                         (uiop:native-namestring path))
                                 :failure :load)))
-      (format t "~A" (cl-pnet-ssh:ssh-public-key-line key))))
+      (keygen-write-stdout-octets
+       (cl-pnet-ssh:ssh-public-key-line-octets key))))
   nil)
 
 (defun keygen-fingerprint-string (blob options)
@@ -765,27 +921,39 @@ a cleartext key contributes the comment carried in its private section."
         (keygen-fingerprint-private-header path options))))
 
 (defun keygen-fingerprint (options)
-  (let* ((path (or (keygen-ask-path options)
-                   (return-from keygen-fingerprint 1)))
-         (native (uiop:native-namestring path)))
-    (keygen-require-file path)
-    (cond
-      ((keygen-directory-p path)
-       (keygen-fail "~A is not a public key file." native))
-      ((not (keygen-file-readable-p path))
-       ;; do_fingerprint opens the file before it looks at it.
-       (keygen-fail "~A: Permission denied" native))
-      ((keygen-private-file-p path)
-       (keygen-fingerprint-private path options))
-      (t
-       ;; One file can hold many keys: authorized_keys with options and
-       ;; known_hosts with host patterns both list one key per line.
-       (let ((keys (keygen-public-file-keys path)))
-         (unless keys
+  (if (let ((file (getf options :file)))
+        (and file (string= file "-")))
+      ;; do_fingerprint reads a public key list from stdin when -f is "-".
+      ;; It never accepts a private key from there, and calls the source
+      ;; "(stdin)" in its diagnostics.
+      (let ((keys (keygen-public-file-keys-from-standard-input)))
+        (unless keys
+          (keygen-fail "(stdin) is not a public key file."))
+        (dolist (entry keys)
+          (keygen-print-fingerprint (first entry) (second entry) options))
+        nil)
+      (let* ((path (or (keygen-ask-path options)
+                       (return-from keygen-fingerprint 1)))
+             (native (uiop:native-namestring path)))
+        (keygen-require-file path)
+        (cond
+          ((keygen-directory-p path)
            (keygen-fail "~A is not a public key file." native))
-         (dolist (entry keys)
-           (keygen-print-fingerprint (first entry) (second entry) options)))))
-    nil))
+          ((not (keygen-file-readable-p path))
+           ;; do_fingerprint opens the file before it looks at it.
+           (keygen-fail "~A: Permission denied" native))
+          ((keygen-private-file-p path)
+           (keygen-fingerprint-private path options))
+          (t
+           ;; One file can hold many keys: authorized_keys with options and
+           ;; known_hosts with host patterns both list one key per line.
+           (let ((keys (keygen-public-file-keys path)))
+             (unless keys
+               (keygen-fail "~A is not a public key file." native))
+             (dolist (entry keys)
+               (keygen-print-fingerprint (first entry) (second entry)
+                                         options)))))
+        nil)))
 
 (defun keygen-known-host-line-comment (line)
   "The comment after the base64 key on known_hosts LINE, or NIL.
@@ -887,7 +1055,6 @@ The \"# Host ... found\" line is left out under -q."
                      cl-pnet-ssh:+ssh-keygen-default-cipher+)
          :rounds (or (getf options :rounds)
                              cl-pnet-ssh:+ssh-keygen-default-rounds+))
-        (keygen-set-permissions path #o600)
         (format t "Your identification has been saved with the new passphrase.~%")))
     nil))
 
@@ -937,6 +1104,8 @@ The \"# Host ... found\" line is left out under -q."
           (format t "No change to comment~%")
           (return-from keygen-change-comment 0))
         (setf (cl-pnet-ssh:ssh-private-key-comment key) comment)
+        (setf (cl-pnet-ssh:ssh-private-key-comment-octets key)
+              (cl-pnet-ssh:ssh-string-octets comment))
         (cl-pnet-ssh:ssh-write-private-key
          key path
          :passphrase passphrase
@@ -947,8 +1116,6 @@ The \"# Host ... found\" line is left out under -q."
         ;; ssh-keygen rewrites the .pub alongside the private file, even
         ;; when it was missing, and says so even under -q.
         (cl-pnet-ssh:ssh-write-public-key key public :comment comment)
-        (keygen-set-permissions path #o600)
-        (keygen-set-permissions public #o644)
         (if (plusp (length comment))
             (format t "Comment '~A' applied~%" comment)
             (format t "Comment removed~%"))))

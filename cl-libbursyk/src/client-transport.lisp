@@ -655,11 +655,26 @@ another exchange, exactly as OpenSSH's queue drain does."
     (ssh-write-text writer "ssh-userauth")
     (ssh-client-send-payload client (ssh-writer-output writer))))
 
+(defun ssh-client-send-none-request (client)
+  "Ask which methods the server allows, with the empty \"none\" method.
+
+RFC 4252's \"none\" request is what OpenSSH sends first: the server answers
+USERAUTH_FAILURE with its method list (or accepts outright, as some
+installations with no password do), and the client then knows what it may
+offer and what to name in \"Permission denied (...)\"."
+  (setf (ssh-client-last-auth-method client) nil)
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer +ssh-msg-userauth-request+)
+    (ssh-write-text writer (ssh-client-user client))
+    (ssh-write-text writer "ssh-connection")
+    (ssh-write-text writer "none")
+    (ssh-client-send-payload client (ssh-writer-output writer))))
+
 (defun ssh-client-handle-service-accept (client payload)
   (let* ((reader (ssh-make-reader payload))
          (service (progn (ssh-read-u8 reader) (ssh-read-text reader))))
     (when (string= service "ssh-userauth")
-      (ssh-client-send-auth-request client))))
+      (ssh-client-send-none-request client))))
 
 (defparameter +ssh-auth-attempt-limit+ 6
   "Keys to offer before giving up, matching OpenSSH's default.")

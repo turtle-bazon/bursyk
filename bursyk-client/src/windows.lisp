@@ -271,6 +271,38 @@ or pipe that wants the raw stream."
               (finish-output stream))))
     (error () (finish 141))))
 
+(defun resolve-stream-synonym (stream)
+  "STREAM with any SYNONYM-STREAM wrappers followed."
+  (loop while (typep stream 'synonym-stream)
+        do (setf stream (symbol-value (synonym-stream-symbol stream)))
+        finally (return stream)))
+
+#+sbcl
+(defun standard-output-is-ours-p ()
+  "Whether *STANDARD-OUTPUT* is still the process's own standard output."
+  (eq (resolve-stream-synonym *standard-output*)
+      (resolve-stream-synonym sb-sys:*stdout*)))
+#-sbcl
+(defun standard-output-is-ours-p ()
+  nil)
+
+(defun write-standard-output-octets (octets)
+  "Write OCTETS to the process's standard output handle, or return NIL.
+
+NIL means standard output was captured by the caller, which then has to use
+the character stream.  The handle write keeps a key comment's bytes intact."
+  (handler-case
+      (when (standard-output-is-ours-p)
+        (let ((handle (c-get-std-handle +std-output-handle+)))
+          (when (console-mode handle) (ensure-console-codepage))
+          (finish-output *standard-output*)
+          (write-handle handle octets)))
+    (error () nil)))
+
+(defun standard-input-binary-stream ()
+  "Windows keeps the character stream; the caller parses it as text."
+  *standard-input*)
+
 (defun stop-stdin ()
   "Stop posting input.  The blocked ReadFile is left to the process exit."
   (setf *stdin-stopped* t))

@@ -248,7 +248,7 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
          (ssh-write-mpint writer (ssh-read-mpint reader))))
       (t
        (ssh-keygen-fail "cannot write a ~A key" type)))
-    (ssh-write-text writer (or (ssh-private-key-comment key) ""))
+    (ssh-write-string writer (ssh-private-key-comment-bytes key))
     (let* ((block block-size)
            (length (length (ssh-writer-octets writer)))
            (padding (mod (- block length) block)))
@@ -320,15 +320,27 @@ bcrypt; an empty or missing one writes it in the clear, as ssh-keygen does."
                      (write-line "-----END OPENSSH PRIVATE KEY-----" out))))
         (map 'vector #'char-code text)))))
 
-(defun ssh-public-key-line (key &key comment)
-  "The one-line public key for KEY, as ssh-keygen writes the .pub file."
+(defun ssh-public-key-line-octets (key &key comment)
+  "The -y line for KEY as octets, ending in a newline.
+
+When COMMENT is given it is UTF-8 text; otherwise the key's own comment
+bytes are reused so a comment that is not valid UTF-8 keeps its bytes."
   (let* ((blob (ssh-public-key-blob-of key))
          (type (nth-value 0 (ssh-public-key-parts blob)))
-         (comment (or comment (ssh-private-key-comment key) "")))
-    (format nil "~A ~A~@[ ~A~]~%"
-            type
-            (ssh-octets-base64 blob)
-            (and (plusp (length comment)) comment))))
+         (comment-octets (if comment
+                             (ssh-string-octets comment)
+                             (ssh-private-key-comment-bytes key))))
+    (ssh-concat (ssh-string-octets
+                 (format nil "~A ~A" type (ssh-octets-base64 blob)))
+                (if (plusp (length comment-octets))
+                    (ssh-concat (ssh-string-octets " ")
+                                comment-octets)
+                    (ssh-string-octets ""))
+                (ssh-string-octets (string #\Newline)))))
+
+(defun ssh-public-key-line (key &key comment)
+  "The one-line public key for KEY, as ssh-keygen writes the .pub file."
+  (ssh-utf8-escaped-string (ssh-public-key-line-octets key :comment comment)))
 
 (defun ssh-write-octets-file (octets path)
   "Write OCTETS to PATH, replacing it.
@@ -355,17 +367,30 @@ protects the file."
   (declare (ignore path mode))
   (values))
 
+(defun ssh-umask ()
+  "The process umask, read without changing it."
+  #+(and sbcl (not win32))
+  (let ((mask (sb-posix:umask 0)))
+    (sb-posix:umask mask)
+    mask)
+  #-(and sbcl (not win32))
+  0)
+
 (defun ssh-write-private-key (key path &key passphrase
                                           (cipher +ssh-keygen-default-cipher+)
                                           (rounds +ssh-keygen-default-rounds+))
   "Write KEY to PATH as an armored openssh-key-v1 file and return PATH."
-  (ssh-write-octets-file
-   (ssh-private-key-file-octets key
-                                :passphrase passphrase
-                                :cipher cipher
-                                :rounds rounds)
-   path)
-  (ssh-secure-file-permissions path #o600)
+  (let ((existing (probe-file path)))
+    (ssh-write-octets-file
+     (ssh-private-key-file-octets key
+                                  :passphrase passphrase
+                                  :cipher cipher
+                                  :rounds rounds)
+     path)
+    ;; sshkey_save_private opens a new file as 0600; an existing file keeps
+    ;; the mode it had, exactly as open(2) without a chmod does.
+    (unless existing
+      (ssh-secure-file-permissions path (logand #o600 (lognot (ssh-umask))))))
   path)
 
 (defun ssh-write-public-key (key path &key comment)
@@ -376,12 +401,22 @@ so an empty comment leaves a trailing space in the file even though -y
 omits it.  Keep that byte."
   (let* ((blob (ssh-public-key-blob-of key))
          (type (nth-value 0 (ssh-public-key-parts blob)))
-         (comment (or comment (ssh-private-key-comment key) "")))
+         (comment-octets (if comment
+                             (ssh-string-octets comment)
+                             (ssh-private-key-comment-bytes key)))
+         (existing (probe-file path)))
     (ssh-write-octets-file
-     (map 'vector
-          #'char-code
-          (format nil "~A ~A ~A~%"
-                  type (ssh-octets-base64 blob) comment))
+     ;; ssh-keygen writes the line with fprintf to a text stream, so a
+     ;; comment's characters become their UTF-8 octets; a comment read from
+     ;; the key file keeps the bytes the file already had.
+     (ssh-concat (ssh-string-octets
+                  (format nil "~A ~A " type (ssh-octets-base64 blob)))
+                 comment-octets
+                 (ssh-string-octets (string #\Newline)))
      path)
-    (ssh-secure-file-permissions path #o644)
+    ;; sshkey_save_public opens a new file with mode 0644, so the umask
+    ;; masks that rather than fopen's 0666; a rewrite keeps the mode the
+    ;; file already had.
+    (unless existing
+      (ssh-secure-file-permissions path (logand #o644 (lognot (ssh-umask)))))
     path))

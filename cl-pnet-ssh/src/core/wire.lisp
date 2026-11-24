@@ -46,6 +46,71 @@
   "OCTETS as a UTF-8 string."
   (babel:octets-to-string octets :encoding :utf-8))
 
+(defun ssh-utf8-escaped-string (octets)
+  "OCTETS as a string, escaping bytes that are not printable UTF-8.
+
+OpenSSH prints a key comment through mprintf(), which passes valid UTF-8
+through but writes a byte that is not part of a printable character as a
+three-digit octal escape.  A comment is the only free-form text in a key
+file, so that is where a key written by another tool can hold arbitrary
+bytes; mirror the escaping instead of refusing the file."
+  (let ((out (make-string-output-stream))
+        (n (length octets))
+        (i 0))
+    (labels ((octet (j) (aref octets j))
+             (continuation-p (j)
+               (and (< j n) (<= #x80 (octet j) #xBF)))
+             (escape (b) (format out "\\~3,'0O" b))
+             (emit (code) (write-char (code-char code) out)))
+      (loop while (< i n)
+            do (let ((b (octet i)))
+                 (cond
+                   ;; mprintf() passes tab, newline and carriage return
+                   ;; through when no width limit is asked for, so only the
+                   ;; other C0 controls and DEL are escaped.
+                   ((or (and (< b #x20)
+                             (/= b #x09) (/= b #x0A) (/= b #x0D))
+                        (= b #x7F))
+                    (escape b)
+                    (incf i))
+                   ((< b #x80)
+                    (emit b)
+                    (incf i))
+                   ((and (<= #xC2 b #xDF) (continuation-p (1+ i)))
+                    (let ((code (logior (ash (logand b #x1F) 6)
+                                        (logand (octet (1+ i)) #x3F))))
+                      (cond
+                        ((<= #x80 code #x9F)
+                         (escape b)
+                         (escape (octet (1+ i))))
+                        (t
+                         (emit code)))
+                      (incf i 2)))
+                   ((and (<= #xE0 b #xEF)
+                         (continuation-p (1+ i))
+                         (continuation-p (+ i 2))
+                         (or (/= b #xE0) (>= (octet (1+ i)) #xA0))
+                         (or (/= b #xED) (<= (octet (1+ i)) #x9F)))
+                    (emit (logior (ash (logand b #x0F) 12)
+                                  (ash (logand (octet (1+ i)) #x3F) 6)
+                                  (logand (octet (+ i 2)) #x3F)))
+                    (incf i 3))
+                   ((and (<= #xF0 b #xF4)
+                         (continuation-p (1+ i))
+                         (continuation-p (+ i 2))
+                         (continuation-p (+ i 3))
+                         (or (/= b #xF0) (>= (octet (1+ i)) #x90))
+                         (or (/= b #xF4) (<= (octet (1+ i)) #x8F)))
+                    (emit (logior (ash (logand b #x07) 18)
+                                  (ash (logand (octet (1+ i)) #x3F) 12)
+                                  (ash (logand (octet (+ i 2)) #x3F) 6)
+                                  (logand (octet (+ i 3)) #x3F)))
+                    (incf i 4))
+                   (t
+                    (escape b)
+                    (incf i))))))
+    (get-output-stream-string out)))
+
 (defun ssh-uint32-octets (value)
   "VALUE as four big-endian octets."
   (let ((out (make-array 4 :element-type '(unsigned-byte 8))))
@@ -159,6 +224,14 @@ Only non-negative values are needed: every integer this protocol sends
 (defun ssh-read-text (reader)
   "A length-prefixed string, returned as a UTF-8 string."
   (ssh-octets-string (ssh-read-string reader)))
+
+(defun ssh-read-comment (reader)
+  "A length-prefixed key comment, escaped as ssh-keygen prints it.
+
+ssh-keygen stores a comment's octets as given but prints them through
+mprintf(), which escapes anything that is not printable UTF-8.  Decoding
+that way here keeps a key from another tool readable and makes -l match."
+  (ssh-utf8-escaped-string (ssh-read-string reader)))
 
 (defun ssh-read-name-list (reader)
   "A comma-separated name-list as a list of strings; empty means NIL."

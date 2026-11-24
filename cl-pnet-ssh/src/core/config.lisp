@@ -81,6 +81,27 @@ has nothing to configure here stays accepted and ignored, exactly as before.
 The table exists so a line that is not a keyword at all can be refused the
 way ssh refuses it.")
 
+(defparameter +ssh-config-deprecated-keywords+
+  '("cipher" "fallbacktorsh" "globalknownhostsfile2" "rhostsauthentication"
+    "userknownhostsfile2" "useroaming" "usersh" "useprivilegedport")
+  "Keywords readconf still recognises only to report them as deprecated.
+
+OpenSSH reports these at debug level, so they appear with -v and vanish with
+-q.  A -o option never shows the notice at all, because ssh applies it before
+it initialises logging.  PROTOCOL is the exception, which readconf ignores
+silently.")
+
+(defparameter +ssh-config-unsupported-keywords+
+  '("afstokenpassing" "kerberosauthentication" "kerberostgtpassing"
+    "rsaauthentication" "rhostsrsaauthentication" "compressionlevel"
+    ;; readconf maps these two to oUnsupported when OpenSSH is built without
+    ;; GSSAPI, and this build has none either.
+    "gssapiauthentication" "gssapidelegatecredentials")
+  "Keywords accepted but reported, as readconf's oUnsupported entries.
+
+readconf prints these by default and a single -q silences them, which is the
+warning reporter's own rule; the option itself never takes effect.")
+
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)
   (directives nil))
@@ -219,11 +240,9 @@ way ssh refuses it.")
   ;; limit, as ssh_config's NONE and 0 do.
   (forward-x11-timeout nil)
   (gateway-ports nil)
-  ;; GSSAPIAuthentication and GSSAPIDelegateCredentials have no
-  ;; implementation here; they are parsed so an ssh_config that turns them
-  ;; off (the usual default) is not refused, and -G can print the value.
-  (gssapi-authentication nil)
-  (gssapi-delegate-credentials nil)
+  ;; GSSAPIAuthentication and GSSAPIDelegateCredentials are unsupported in
+  ;; this build, exactly as in an OpenSSH compiled without GSSAPI: readconf
+  ;; reports them and they configure nothing, so no slot records them.
   ;; BindInterface names the local interface whose address ssh binds the
   ;; source to.  Parsed for diagnosis; the dialer has no interface support.
   (bind-interface nil)
@@ -1020,16 +1039,35 @@ enough.  Commas in a pattern are separators, as in ssh_config."
               (setf matched t)))))))
 
 (defun ssh-config-host-block-matches-p (line options context)
-  "Whether LINE's Host pattern matches the name this pass works on.
+  "VALUES MATCHED PATTERN SKIPPED for LINE's Host patterns.
+
+MATCHED says whether the block applies.  PATTERN is the first positive
+pattern that selected it, which is the one readconf names in its \"Applying
+options for\" debug line, and SKIPPED is the negated pattern that vetoed the
+block, if a negation is why it does not apply.
 
 The first pass follows a HostName directive that has already been read; the
 final pass follows the canonical name placed in HOSTNAME by its caller.
 ORIGINAL-HOST remains the name the user typed, for %n and OriginalHost."
-  (ssh-config-pattern-list-match-p
-   (ssh-config-line-args line)
-   (or (ssh-config-options-hostname options)
-       (ssh-config-context-original-host context))
-   :case-insensitive t))
+  (let ((text (or (ssh-config-options-hostname options)
+                  (ssh-config-context-original-host context)))
+        (matched nil)
+        (pattern nil))
+    (dolist (argument (ssh-config-line-args line))
+      (dolist (piece (uiop:split-string argument :separator ","))
+        (let ((negated (and (plusp (length piece))
+                            (char= (char piece 0) #\!))))
+          (when negated
+            (setf piece (subseq piece 1)))
+          (when (ssh-config-glob-match (string-downcase piece)
+                                       (string-downcase text))
+            (if negated
+                (return-from ssh-config-host-block-matches-p
+                  (values nil nil piece))
+                (unless matched
+                  (setf matched t
+                        pattern argument)))))))
+    (values matched pattern nil)))
 
 (defun ssh-config-ipv4-integer (octets)
   (reduce (lambda (whole octet) (+ (ash whole 8) octet)) octets))
@@ -1824,11 +1862,6 @@ present."
          (setf (ssh-config-options-forward-x11-timeout options)
                (let ((seconds (ssh-config-seconds line value)))
                  (if (eq seconds :none) nil seconds))))
-        ((string= keyword "gssapiauthentication")
-         (setf (ssh-config-options-gssapi-authentication options) (boolean)))
-        ((string= keyword "gssapidelegatecredentials")
-         (setf (ssh-config-options-gssapi-delegate-credentials options)
-               (boolean)))
         ((string= keyword "bindinterface")
          (setf (ssh-config-options-bind-interface options) value))
         ((string= keyword "kbdinteractivedevices")
@@ -2026,6 +2059,32 @@ present."
   "Whether KEYWORD is one ssh's client configuration parser accepts."
   (member keyword +ssh-config-client-keywords+ :test #'string=))
 
+(defun ssh-config-note-legacy-option (line)
+  "Report LINE when readconf would call its option deprecated or unsupported.
+
+Neither notice depends on the surrounding Host block matching, so this runs
+with the keyword check rather than while applying the directive.  Deprecated
+options are reported at debug level and unsupported ones through the warning
+reporter, matching readconf's log() and error().  PROTOCOL is absent from
+both tables because readconf ignores it silently."
+  (let* ((keyword (ssh-config-line-keyword line))
+         (where (if (ssh-config-line-path line)
+                    (namestring (ssh-config-line-path line))
+                    "command-line"))
+         (number (or (ssh-config-line-number line) 0)))
+    (cond
+      ((member keyword +ssh-config-unsupported-keywords+ :test #'string=)
+       (ssh-warn "~A line ~D: Unsupported option \"~A\""
+                 where number keyword))
+      ((member keyword +ssh-config-deprecated-keywords+ :test #'string=)
+       ;; ssh applies a -o option while it is still parsing its own
+       ;; arguments, before log_init, so the debug-level notice for a
+       ;; command-line option is never shown even with -v.  Only a
+       ;; configuration file's deprecation is visible.
+       (when (ssh-config-line-path line)
+         (ssh-log "~A line ~D: Deprecated option \"~A\""
+                  where number keyword))))))
+
 (defun ssh-config-check-client-keyword (line options)
   "Refuse LINE's keyword when it is not an ssh_config keyword at all.
 
@@ -2034,7 +2093,8 @@ client has nothing to do with it: an ssh_config written for OpenSSH must keep
 loading.  A name outside the table is a typo or belongs to another program,
 and OpenSSH refuses it with \"Bad configuration option\" unless IgnoreUnknown
 already named it.  The check happens whether or not the surrounding Host
-block is active, as ssh's parse_token does."
+block is active, as ssh's parse_token does, and that is also where the
+deprecated and unsupported notices belong."
   (let ((keyword (ssh-config-line-keyword line)))
     (unless (ssh-config-known-client-keyword-p keyword)
       (let ((ignored (ssh-config-options-ignored-unknown options)))
@@ -2043,7 +2103,8 @@ block is active, as ssh's parse_token does."
                       (list ignored) keyword :case-insensitive t))
           (error (ssh-config-line-error line
                                         "Bad configuration option: ~A"
-                                        keyword)))))))
+                                        keyword)))))
+    (ssh-config-note-legacy-option line)))
 
 (defun ssh-config-apply-directive (line options seen context)
   "Apply one non-block directive when the current block is selected."
@@ -2084,8 +2145,7 @@ block is active, as ssh's parse_token does."
       ((member keyword '("proxyjump" "proxycommand" "bindaddress" "sendenv"
                          "serveraliveinterval" "serveralivecountmax"
                          "forwardagent" "forwardx11" "forwardx11trusted"
-                         "forwardx11timeout" "gssapiauthentication"
-                         "gssapidelegatecredentials" "bindinterface"
+                         "forwardx11timeout" "bindinterface"
                          "kbdinteractivedevices" "pkcs11provider"
                          "smartcarddevice" "securitykeyprovider"
                          "proxyusefdpass" "syslogfacility" "tunnel"
@@ -2276,9 +2336,27 @@ Returns CONFIG."
                        do (let ((line (aref directives index)))
                             (cond
                               ((string= (ssh-config-line-keyword line) "host")
-                               (setf parsing
-                                     (ssh-config-host-block-matches-p
-                                      line options context))
+                               (multiple-value-bind (matched pattern skipped)
+                                   (ssh-config-host-block-matches-p
+                                    line options context)
+                                 ;; readconf names the block it applies and,
+                                 ;; when a negation is why it does not, the
+                                 ;; pattern that vetoed it.
+                                 (let ((where
+                                         (if (ssh-config-line-path line)
+                                             (namestring
+                                              (ssh-config-line-path line))
+                                             "command-line")))
+                                   (when skipped
+                                     (ssh-log
+                                      "~A line ~D: Skipping Host block because of negated match for ~A"
+                                      where (ssh-config-line-number line)
+                                      skipped))
+                                   (when matched
+                                     (ssh-log "~A line ~D: Applying options for ~A"
+                                              where (ssh-config-line-number line)
+                                              pattern)))
+                                 (setf parsing matched))
                                (incf index))
                               ((string= (ssh-config-line-keyword line) "match")
                                (return

@@ -12,6 +12,11 @@
   (public nil :type (or null ssh-octets))
   (private nil :type (or null ssh-octets))
   (comment "" :type string)
+  ;; The comment's bytes as the key file carried them.  COMMENT is those
+  ;; bytes decoded as ssh-keygen prints them, so a comment that is not
+  ;; valid UTF-8 is shown escaped; this slot keeps -y and a rewrite of the
+  ;; key byte-for-byte faithful.
+  (comment-octets nil :type (or null ssh-octets))
   ;; Where the key came from, when it came from a file.  The libssh backend
   ;; hands paths to libssh, so a parsed key is useful to it only with one.
   (path nil))
@@ -1303,6 +1308,19 @@ with its tag stored after the ciphertext, and :CHACHA-POLY is OpenSSH's
              :detail "unsupported private key format (expected openssh-key-v1)"))
     t))
 
+(defun ssh-read-comment-parts (reader)
+  "VALUES COMMENT COMMENT-OCTETS for the comment at READER's position.
+
+COMMENT is the text ssh-keygen's -l would print for those bytes and
+COMMENT-OCTETS is the same comment as stored."
+  (let ((octets (ssh-read-string reader)))
+    (values (ssh-utf8-escaped-string octets) octets)))
+
+(defun ssh-private-key-comment-bytes (key)
+  "KEY's comment as the bytes to store: the file's own, else UTF-8."
+  (or (ssh-private-key-comment-octets key)
+      (ssh-string-octets (or (ssh-private-key-comment key) ""))))
+
 (defun ssh-parse-private-section (section type &key encrypted)
   "The key material in an openssh-key-v1 private SECTION.
 
@@ -1327,10 +1345,12 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
       (cond
         ((string= key-type "ssh-ed25519")
          (let ((public (ssh-read-string reader))
-               (private (ssh-read-string reader))
-               (comment (ssh-read-text reader)))
-           (%make-ssh-private-key :type key-type :public public
-                                  :private private :comment comment)))
+               (private (ssh-read-string reader)))
+           (multiple-value-bind (comment comment-octets)
+               (ssh-read-comment-parts reader)
+             (%make-ssh-private-key :type key-type :public public
+                                    :private private :comment comment
+                                    :comment-octets comment-octets))))
         ((string= key-type "ssh-rsa")
          (let ((n (ssh-read-mpint reader))
                (e (ssh-read-mpint reader))
@@ -1338,7 +1358,6 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
                (iqmp (ssh-read-mpint reader))
                (p (ssh-read-mpint reader))
                (q (ssh-read-mpint reader))
-               (comment (ssh-read-text reader))
                (public-writer (ssh-writer))
                (private-writer (ssh-writer)))
            ;; The stored halves keep the layouts the rest of this file
@@ -1350,11 +1369,14 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
            (ssh-write-mpint private-writer iqmp)
            (ssh-write-mpint private-writer p)
            (ssh-write-mpint private-writer q)
-           (%make-ssh-private-key
-            :type key-type
-            :public (ssh-writer-output public-writer)
-            :private (ssh-writer-output private-writer)
-            :comment comment)))
+           (multiple-value-bind (comment comment-octets)
+               (ssh-read-comment-parts reader)
+             (%make-ssh-private-key
+              :type key-type
+              :public (ssh-writer-output public-writer)
+              :private (ssh-writer-output private-writer)
+              :comment comment
+              :comment-octets comment-octets))))
         ((string= key-type "ssh-mldsa44-ed25519")
          ;; OpenSSH writes the composite public key (ML-DSA then Ed25519)
          ;; followed by the two 32-octet seeds.  The rest of this file keeps
@@ -1362,7 +1384,7 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
          ;; the 64-octet seed pair.
          (let ((public (ssh-read-string reader))
                (private (ssh-read-string reader))
-               (comment (ssh-read-text reader)))
+               (comment (ssh-read-comment reader)))
            (unless (= (length public)
                       +ssh-mldsa44-ed25519-public-key-bytes+)
              (error 'ssh-protocol-error
@@ -1383,7 +1405,7 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
                 (expected (subseq key-type (length "ecdsa-sha2-")))
                 (public (ssh-read-string reader))
                 (d (ssh-read-mpint reader))
-                (comment (ssh-read-text reader))
+                (comment (ssh-read-comment reader))
                 (private-writer (ssh-writer)))
            (unless (string= curve expected)
              (error 'ssh-protocol-error

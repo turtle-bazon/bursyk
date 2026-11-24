@@ -156,6 +156,89 @@ as failure and exiting 128+13 keeps the usual pipeline behavior."
         (finish-output stream))
     (error () (finish 141))))
 
+;;; ---- raw standard streams ----
+;;;
+;;; A key comment is arbitrary bytes, but the standard character streams
+;;; encode what is written to them.  These helpers reach the process's own
+;;; descriptors when the standard streams are still the process's streams,
+;;; and report NIL when a caller has rebound them (as tests do) so the
+;;; caller can fall back to the character stream.
+
+(defun resolve-stream-synonym (stream)
+  "STREAM with any SYNONYM-STREAM wrappers followed."
+  (loop while (typep stream 'synonym-stream)
+        do (setf stream (symbol-value (synonym-stream-symbol stream)))
+        finally (return stream)))
+
+#+sbcl
+(defun process-stream-descriptor (stream)
+  "STREAM's descriptor when it is one of the process's own standard streams."
+  (let ((stream (resolve-stream-synonym stream)))
+    (when (and (typep stream 'sb-sys:fd-stream)
+               (member stream
+                       (mapcar #'resolve-stream-synonym
+                               (list sb-sys:*stdin* sb-sys:*stdout*
+                                     sb-sys:*stderr*))
+                       :test #'eq))
+      (sb-sys:fd-stream-fd stream))))
+#-sbcl
+(defun process-stream-descriptor (stream)
+  (declare (ignore stream))
+  nil)
+
+(defun standard-output-descriptor ()
+  (process-stream-descriptor *standard-output*))
+
+(defun standard-input-descriptor ()
+  (process-stream-descriptor *standard-input*))
+
+(cffi:defcfun ("write" c-write) :ssize
+  (descriptor :int) (buffer :pointer) (count :size))
+
+(defun write-standard-output-octets (octets)
+  "Write OCTETS to the process's stdout unchanged, or return NIL.
+
+NIL means standard output is not the process's own stream, so the caller
+must write through *STANDARD-OUTPUT* instead.  Otherwise the descriptor is
+written directly, which keeps a key comment's arbitrary bytes intact; the
+Lisp stream is flushed first so earlier output stays in order."
+  (let ((descriptor (standard-output-descriptor)))
+    (when descriptor
+      (finish-output *standard-output*)
+      (cffi:with-pointer-to-vector-data (pointer octets)
+        (let ((length (length octets))
+              (offset 0))
+          (loop while (< offset length)
+                do (let ((written
+                           (c-write descriptor
+                                    (cffi:inc-pointer pointer offset)
+                                    (- length offset))))
+                     (unless (plusp written)
+                       (return-from write-standard-output-octets nil))
+                     (incf offset written)))
+          t)))))
+
+#+sbcl
+(defun standard-input-binary-stream ()
+  "A binary stream over the process's standard input when it is one.
+
+When *STANDARD-INPUT* has been rebound, that stream is returned instead so
+a caller keeps control of the input.  Reading bytes directly keeps a
+comment that is not valid UTF-8 from being replaced by the character
+decoder before the parser sees it."
+  (let ((descriptor (standard-input-descriptor)))
+    (if descriptor
+        (sb-sys:make-fd-stream descriptor
+                               :input t
+                               :element-type '(unsigned-byte 8)
+                               :buffering :full
+                               :auto-close nil
+                               :name "standard input")
+        *standard-input*)))
+#-sbcl
+(defun standard-input-binary-stream ()
+  *standard-input*)
+
 (defun stop-stdin ()
   (when *stdin-watcher*
     (cl-pnet:fd-unwatch *stdin-watcher*)

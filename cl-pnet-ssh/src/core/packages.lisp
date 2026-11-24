@@ -21,6 +21,7 @@
    #:ssh-client-connect-port
    #:ssh-client-host
    #:ssh-client-user
+   #:ssh-client-auth-offered-methods
    #:ssh-client-obscure-keystroke-timing
    #:ssh-client-ping-supported
    #:ssh-client-send-chaff
@@ -247,8 +248,6 @@
    #:ssh-config-options-bind-address
    #:ssh-config-options-bind-interface
    #:ssh-config-options-forward-x11-timeout
-   #:ssh-config-options-gssapi-authentication
-   #:ssh-config-options-gssapi-delegate-credentials
    #:ssh-config-options-kbd-interactive-devices
    #:ssh-config-options-pkcs11-provider
    #:ssh-config-options-security-key-provider
@@ -445,6 +444,7 @@
    #:ssh-private-key-type
    #:ssh-private-key-public
    #:ssh-private-key-comment
+   #:ssh-private-key-comment-octets
    #:ssh-private-key-path
    #:ssh-load-private-key
    ;; key generation and OpenSSH key files (BURS KEYGEN)
@@ -459,6 +459,7 @@
    #:ssh-write-private-key
    #:ssh-write-public-key
    #:ssh-public-key-line
+   #:ssh-public-key-line-octets
    #:+ssh-keygen-default-rsa-bits+
    #:+ssh-keygen-minimum-rsa-bits+
    #:+ssh-keygen-maximum-rsa-bits+
@@ -550,6 +551,7 @@
    #:ssh-concat
    #:ssh-string-octets
    #:ssh-octets-string
+   #:ssh-utf8-escaped-string
    #:ssh-uint32-octets
    #:ssh-uint64-octets
    #:ssh-octets-uint32

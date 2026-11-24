@@ -8002,8 +8002,6 @@ validated, so -G reports what ssh would and a bad line fails the same way."
     (multiple-value-bind (options condition)
         (options-for "Port 22")
       (is (null condition))
-      (is (null (cl-pnet-ssh:ssh-config-options-gssapi-authentication
-                 options)))
       (is (null (cl-pnet-ssh:ssh-config-options-bind-interface options)))
       (is (null (cl-pnet-ssh:ssh-config-options-tunnel options)))
       (is (null (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
@@ -8021,13 +8019,8 @@ validated, so -G reports what ssh would and a bad line fails the same way."
       (is (null (cl-pnet-ssh:ssh-config-options-forward-x11-timeout
                  options))))
     (multiple-value-bind (options condition)
-        (options-for "GSSAPIAuthentication yes"
-                     "GSSAPIDelegateCredentials yes"
-                     "ProxyUseFdpass yes")
+        (options-for "ProxyUseFdpass yes")
       (is (null condition))
-      (is (cl-pnet-ssh:ssh-config-options-gssapi-authentication options))
-      (is (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
-           options))
       (is (cl-pnet-ssh:ssh-config-options-proxy-use-fdpass options)))
     (multiple-value-bind (options condition)
         (options-for "BindInterface eth0"
@@ -8098,6 +8091,96 @@ validated, so -G reports what ssh would and a bad line fails the same way."
         (is (search (cdr case)
                     (cl-pnet-ssh::ssh-error-detail condition))
             (car case))))))
+
+(test legacy-options-are-reported-like-readconf
+  "readconf's oDeprecated and oUnsupported entries configure nothing but are
+reported: deprecated ones at debug level and unsupported ones as warnings,
+whichever Host block they sit in.  GSSAPI is unsupported here because this
+build has no GSSAPI, exactly as in an OpenSSH compiled without it."
+  (let ((warnings '())
+        (debugs '())
+        (condition nil))
+    (let ((cl-pnet-ssh:*ssh-warning-function*
+            (lambda (message) (push message warnings)))
+          (cl-pnet-ssh:*ssh-log-function*
+            (lambda (message) (push message debugs))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "useroaming" :args '("yes")
+               :path "/home/user/.ssh/config" :number 7)
+              (cl-pnet-ssh::ssh-config-option-line "UseRoaming yes")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIAuthentication yes")
+              (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "compressionlevel" :args '("6")
+               :path "/etc/ssh/ssh_config" :number 53)))
+       "alias.example"
+       :on-options (lambda (value) (declare (ignore value)))
+       :on-error (lambda (value) (setf condition value))))
+    (is (null condition))
+    (flet ((matching (needle messages)
+             (remove-if-not (lambda (message) (search needle message))
+                            messages)))
+      (is (equal
+           '("/etc/ssh/ssh_config line 53: Unsupported option \"compressionlevel\""
+             "command-line line 0: Unsupported option \"gssapiauthentication\"")
+           (matching "Unsupported option" warnings)))
+      ;; The -o spelling of a deprecated option stays quiet, as in ssh.
+      (is (equal
+           '("/home/user/.ssh/config line 7: Deprecated option \"useroaming\"")
+           (matching "Deprecated option" debugs))))))
+
+(test legacy-option-notices-ignore-host-blocks
+  "readconf reports a deprecated or unsupported option even inside a Host
+block that does not match, because the notice is part of parsing rather than
+applying the directive."
+  (let ((warnings '())
+        (condition nil))
+    (let ((cl-pnet-ssh:*ssh-warning-function*
+            (lambda (message) (push message warnings))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::ssh-config-option-line "Host other")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIAuthentication yes")))
+       "alias.example"
+       :on-options (lambda (value) (declare (ignore value)))
+       :on-error (lambda (value) (setf condition value))))
+    (is (null condition))
+    (is (equal '("command-line line 0: Unsupported option \"gssapiauthentication\"")
+               (nreverse warnings)))))
+
+(test host-blocks-log-like-readconf
+  "readconf names the block it applies at debug level, and the negated
+pattern when one is why it does not apply the block."
+  (let ((debugs '())
+        (condition nil))
+    (let ((cl-pnet-ssh:*ssh-log-function*
+            (lambda (message) (push message debugs))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "host" :args '("alias.*")
+               :path "/home/user/.ssh/config" :number 1)
+              (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "host" :args '("*" "!alias.example")
+               :path "/home/user/.ssh/config" :number 3)))
+       "alias.example"
+       :on-options (lambda (value) (declare (ignore value)))
+       :on-error (lambda (value) (setf condition value))))
+    (is (null condition))
+    (flet ((matching (needle messages)
+             (remove-if-not (lambda (message) (search needle message))
+                            messages)))
+      (is (equal '("/home/user/.ssh/config line 1: Applying options for alias.*")
+                 (matching "Applying options" debugs)))
+      (is (equal
+           '("/home/user/.ssh/config line 3: Skipping Host block because of negated match for alias.example")
+           (matching "Skipping Host block" debugs))))))
 
 ;;; ---- ping@openssh.com and keystroke chaff ----
 

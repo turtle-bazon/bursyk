@@ -533,14 +533,53 @@ CLI's decision and at the plist it filled."
     (is (burs::exit-on-forward-failure-p client))))
 
 (test gssapi-config-does-not-block-other-methods
-  "A distribution's stock ssh_config sets GSSAPIAuthentication yes.  The
-directive only toggles a method this build lacks, so it must not stop the
-client from falling through to publickey."
-  (let ((client (cl-pnet-ssh::%make-ssh-client)))
-    (setf (cl-pnet-ssh:ssh-client-config-options client)
-          (cl-pnet-ssh::%make-ssh-config-options
-           :gssapi-authentication t))
-    (is (null (burs::check-config-supported client)))))
+  "A distribution's stock ssh_config sets GSSAPIAuthentication yes.  This
+build has no GSSAPI, so the parser reports the line as unsupported, as
+readconf does, but it configures nothing and must not stop the client from
+falling through to publickey."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "GSSAPIAuthentication yes"))))
+         (options nil)
+         (client (cl-pnet-ssh::%make-ssh-client)))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "alias.example"
+     :on-options (lambda (value) (setf options value)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client) options)
+    (let ((burs::*options* (empty-options)))
+      (is (null (burs::check-config-supported client))))))
+
+(test gssapi-flags-are-accepted-and-ignored
+  "ssh accepts -K and -k even when built without GSSAPI; they only switch on
+a method that does not exist, so they cannot refuse the connection."
+  (dolist (flag '("-K" "-k"))
+    (multiple-value-bind (destination command options)
+        (parse (list flag "host.example"))
+      (declare (ignore destination command))
+      (let ((burs::*options* options))
+        (is (null (burs::check-supported-options)) flag)))))
+
+(test print-config-omits-gssapi-options
+  "-G prints a GSSAPI build's two lines only when it has GSSAPI; with none
+compiled in, an ssh_config that sets them is reported while resolving and
+the lines never reach the output."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "GSSAPIAuthentication yes")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "GSSAPIDelegateCredentials yes"))))
+         (options nil))
+    (cl-pnet-ssh:ssh-config-resolve
+     config "alias.example"
+     :on-options (lambda (value) (setf options value)))
+    (let ((burs::*options* (empty-options))
+          (text (with-output-to-string (*standard-output*)
+                  (burs::print-config-options "alias.example" options nil))))
+      (is (not (search "gssapi" text))))))
 
 (test compression-config-is-accepted
   "Compression is implemented, so -C and Compression yes must not be refused."
@@ -1937,6 +1976,181 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
                             (list "-l" "-f" (namestring path)))))))
              (is (search "SHA256:" line))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-writes-comments-as-utf-8
+  ;; ssh-keygen writes the comment through fprintf, so its characters become
+  ;; their UTF-8 bytes; -l and -y read the same bytes back.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_utf8" directory))
+         (public (concatenate 'string (namestring path) ".pub")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-q" "-t" "ed25519" "-N" ""
+                                  "-C" "ünïcode" "-f" (namestring path)))
+             (is (eql 0 status))
+             (is (string= "" output))
+             (is (string= "" error)))
+           (with-open-file (stream public :direction :input
+                                          :element-type '(unsigned-byte 8))
+             (let ((octets (make-array (file-length stream)
+                                       :element-type '(unsigned-byte 8))))
+               (read-sequence octets stream)
+               ;; "ünïcode" as UTF-8, not the comment's low bytes.
+               (is (search #(195 188 110 195 175 99 111 100 101)
+                           octets))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" (namestring path)))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "ünïcode" output))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-keeps-arbitrary-comment-bytes
+  ;; A comment is free-form bytes.  A file written by another tool can hold
+  ;; a byte that is not valid UTF-8: -l escapes it as OpenSSH's mprintf does,
+  ;; while -y and a rewrite keep the byte itself.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_raw" directory))
+         (public (concatenate 'string (namestring path) ".pub"))
+         (comment-octets
+           (make-array 3 :element-type '(unsigned-byte 8)
+                         :initial-contents '(120 252 121)))) ; x, 0xFC, y
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let ((key (cl-pnet-ssh:ssh-generate-private-key
+                     "ed25519" :comment "x\\374y")))
+           (setf (cl-pnet-ssh:ssh-private-key-comment-octets key)
+                 comment-octets)
+           (cl-pnet-ssh:ssh-write-private-key key path)
+           (cl-pnet-ssh:ssh-write-public-key key public)
+           ;; The public file carries the bytes, not their escapes.
+           (with-open-file (stream public :direction :input
+                                          :element-type '(unsigned-byte 8))
+             (let ((octets (make-array (file-length stream)
+                                       :element-type '(unsigned-byte 8))))
+               (read-sequence octets stream)
+               (is (search comment-octets octets))))
+           ;; -l prints the escaped form for both the private key and the
+           ;; public key, exactly as ssh-keygen's mprintf does.
+           (dolist (target (list path public))
+             (multiple-value-bind (status output error)
+                 (keygen-call (list "-l" "-f" (namestring target)))
+               (declare (ignore error))
+               (is (eql 0 status))
+               (is (search "x\\374y" output))))
+           ;; A rewrite keeps the raw bytes; -y emits them unchanged.
+           (let ((reloaded (cl-pnet-ssh:ssh-load-private-key path)))
+             (is (equalp comment-octets
+                         (cl-pnet-ssh:ssh-private-key-comment-octets
+                          reloaded)))
+             (is (search comment-octets
+                         (cl-pnet-ssh:ssh-public-key-line-octets reloaded)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-public-file-mode-follows-umask
+  ;; sshkey_save_public opens a new file with mode 0644, so the umask masks
+  ;; that rather than fopen's 0666.  The private file is always 0600.
+  #-(and sbcl (not win32)) (skip "POSIX file modes only")
+  #+(and sbcl (not win32))
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_mode" directory))
+         (public (concatenate 'string (namestring path) ".pub"))
+         (saved (sb-posix:umask #o022)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (flet ((mode (file)
+                  (logand #o777
+                          (sb-posix:stat-mode (sb-posix:stat file))))
+                (reset ()
+                  (ignore-errors (delete-file path))
+                  (ignore-errors (delete-file public))))
+           (dolist (spec (list (cons #o022 #o644) (cons #o077 #o600)
+                               (cons #o027 #o640)))
+             (reset)
+             (sb-posix:umask (car spec))
+             (multiple-value-bind (status output error)
+                 (keygen-call (list "-q" "-t" "ed25519" "-N" ""
+                                    "-f" (namestring path)))
+               (declare (ignore output error))
+               (is (eql 0 status)))
+             (is (eql #o600 (mode (namestring path))))
+             (is (eql (cdr spec) (mode public))))
+           ;; A rewrite keeps the mode the public file already had.
+           (reset)
+           (sb-posix:umask #o022)
+           (keygen-call (list "-q" "-t" "ed25519" "-N" ""
+                              "-f" (namestring path)))
+           (sb-posix:chmod public #o600)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-q" "-c" "-C" "changed" "-P" ""
+                                  "-f" (namestring path)))
+             (declare (ignore output error))
+             (is (eql 0 status)))
+           (is (eql #o600 (mode public))))
+      (sb-posix:umask saved)
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-fingerprints-public-keys-on-stdin
+  ;; do_fingerprint reads the key list from stdin for -f - and labels the
+  ;; source (stdin).  A private key there is not a public key file.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_stdin" directory))
+         (public (concatenate 'string (namestring path) ".pub")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (keygen-call (list "-q" "-t" "ed25519" "-N" "" "-C" "stdin@test"
+                              "-f" (namestring path)))
+           (let ((text (with-open-file (stream public :direction :input)
+                         (let ((line (read-line stream)))
+                           (concatenate 'string line (string #\Newline))))))
+             (dolist (arguments (list (list "-l" "-f" "-")
+                                      (list "-B" "-f" "-")))
+               (multiple-value-bind (status output error)
+                   (keygen-call arguments :input text)
+                 (declare (ignore error))
+                 (is (eql 0 status))
+                 (is (if (search "-B" arguments)
+                         (search "(ED25519)" output)
+                         (search "stdin@test" output))))))
+           (let ((private
+                   (with-open-file (stream path :direction :input)
+                     (let ((line (read-line stream)))
+                       (concatenate 'string line (string #\Newline))))))
+             (multiple-value-bind (status output error)
+                 (keygen-call (list "-l" "-f" "-") :input private)
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search "(stdin) is not a public key file." error)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-treats-a-tilde-path-literally
+  ;; ssh-keygen does not expand ~ in -f; the path is passed to open() as is.
+  ;; A ~ must therefore not turn into a FORMAT directive in the message.
+  (let ((name (concatenate 'string
+                           "~/burs-keygen-tilde-"
+                           (princ-to-string (get-universal-time))
+                           "-" (princ-to-string (random 1000000)))))
+    (multiple-value-bind (status output error)
+        (keygen-call (list "-l" "-f" name))
+      (declare (ignore output))
+      (is (eql 255 status))
+      (is (search (format nil "~A: No such file or directory" name) error))
+      (is (not (search "FORMAT" error))))))
 
 (test keygen-does-not-create-missing-directories
   ;; ssh-keygen creates only ~/.ssh; any other missing parent makes the

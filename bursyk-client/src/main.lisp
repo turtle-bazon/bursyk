@@ -543,8 +543,6 @@ is for the CBC ciphers."
     (unsupported "-w" "TUN/TAP forwarding is not implemented"))
   (when (getf *options* :protocol-1)
     (fail "SSH protocol v.1 is no longer supported"))
-  (when (getf *options* :gssapi-auth)
-    (unsupported "-K" "GSSAPI authentication is not implemented"))
   (when (and (eq (getf *options* :x11-forward) :yes)
              (not (cl-pnet-ssh:ssh-client-feature-supported-p :x11-forward)))
     (unsupported "-X" "X11 forwarding is not implemented by this transport"))
@@ -618,16 +616,9 @@ refusal."
                        :x11-forward)))
         (unsupported "ForwardX11"
                      "X11 forwarding is not implemented by this transport"))
-      ;; GSSAPIAuthentication only toggles a method this build does not
-      ;; implement; it does not demand that the connection use it.  OpenSSH
-      ;; without GSSAPI reports the option as unsupported and carries on, and
-      ;; a distribution's stock ssh_config commonly sets it under "Host *".
-      ;; Refusing the connection there would make publickey unusable, so the
-      ;; toggle is ignored.  A PreferredAuthentications list that names only
-      ;; GSSAPI is still refused below.
-      (when (cl-pnet-ssh:ssh-config-options-gssapi-authentication options)
-        (cl-pnet-ssh:ssh-log
-         "GSSAPIAuthentication ignored; GSSAPI is not implemented"))
+      ;; GSSAPIAuthentication and GSSAPIDelegateCredentials are reported by
+      ;; the config parser as unsupported options (readconf's oUnsupported
+      ;; when OpenSSH has no GSSAPI), so nothing here has to say anything.
       ;; Every one of these is a real request from the configuration.  This
       ;; build cannot honour it, and pretending otherwise would leave the
       ;; user with a weaker or different connection than they asked for.
@@ -641,23 +632,7 @@ refusal."
       ;; ProxyCommand=- together with it is refused by the client itself.
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
-          (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
-      ;; A PreferredAuthentications list that leaves none of the methods the
-      ;; transport implements is a real request this build cannot satisfy,
-      ;; so it is refused rather than silently widened.
-      (let ((methods
-              (cl-pnet-ssh:ssh-config-options-preferred-authentications
-               options))
-            (supported
-              (cl-pnet-ssh:ssh-client-supported-authentication-methods)))
-        (when (and methods
-                   (notany (lambda (method)
-                             (member method supported :test #'string-equal))
-                           methods))
-          (unsupported
-           "PreferredAuthentications"
-           (format nil "~{~A~^,~} names no authentication method implemented"
-                   methods)))))))
+          (unsupported "Tunnel" "TUN/TAP forwarding is not implemented"))))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -3168,16 +3143,11 @@ and known-hosts files) are printed as this client will actually use them."
               (yes-no (or (getf *options* :gateway-ports)
                           (cl-pnet-ssh:ssh-config-options-gateway-ports
                            options))))
-      ;; GSSAPI is not built in here, so its default is off even though
-      ;; OpenSSH's GSSAPI build prints on.  A configured value still shows.
-      (format t "gssapiauthentication ~A~%"
-              (yes-no (or (getf *options* :gssapi-auth)
-                          (cl-pnet-ssh:ssh-config-options-gssapi-authentication
-                           options))))
-      (format t "gssapidelegatecredentials ~A~%"
-              (yes-no
-               (cl-pnet-ssh:ssh-config-options-gssapi-delegate-credentials
-                options)))
+      ;; GSSAPIAuthentication and GSSAPIDelegateCredentials are unsupported
+      ;; here, just as in an OpenSSH compiled without GSSAPI: the config
+      ;; parser reports them and they configure nothing, so -G prints
+      ;; neither line.  -K and -k are accepted the way ssh accepts them, and
+      ;; do nothing because no gssapi-with-mic method exists to offer.
       (format t "hashknownhosts ~A~%"
               (yes-no (cl-pnet-ssh:ssh-config-options-hash-known-hosts
                        options)))
@@ -3835,7 +3805,21 @@ a controlling terminal refuses instead of blocking."
               (start-session client command command-given-p))))))
    :on-error (lambda (client condition)
                (show-banner client)
-               (format *error-output* "burs: ~A~%" condition)
+               ;; ssh reports a refused authentication as "user@host:
+               ;; Permission denied (methods)." with the server's own list,
+               ;; and only says something else when it never got that far.
+               (let ((offered
+                       (and (typep condition
+                                   'cl-pnet-ssh:ssh-authentication-error)
+                            (cl-pnet-ssh:ssh-client-auth-offered-methods
+                             client))))
+                 (if offered
+                     (format *error-output*
+                             "~A@~A: Permission denied (~{~A~^,~}).~%"
+                             (cl-pnet-ssh:ssh-client-user client)
+                             (cl-pnet-ssh:ssh-client-host client)
+                             offered)
+                     (format *error-output* "burs: ~A~%" condition)))
                (finish 255))
    :on-close (lambda (client reason)
                (declare (ignore client reason))

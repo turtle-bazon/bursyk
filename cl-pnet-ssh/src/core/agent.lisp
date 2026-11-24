@@ -305,7 +305,7 @@ ssh-authentication-error when the agent cannot be reached or refuses."
        (ssh-write-text writer type)
        (ssh-write-string writer (ssh-private-key-public key))
        (ssh-write-string writer (ssh-private-key-private key))
-       (ssh-write-text writer (ssh-private-key-comment key)))
+       (ssh-write-string writer (ssh-private-key-comment-bytes key)))
       ((string= type "ssh-rsa")
        (ssh-write-text writer type)
        (let ((public (ssh-make-reader (ssh-private-key-public key)))
@@ -317,7 +317,7 @@ ssh-authentication-error when the agent cannot be reached or refuses."
          (dotimes (i 4)
            (declare (ignore i))
            (ssh-write-mpint writer (ssh-read-mpint private))))
-       (ssh-write-text writer (ssh-private-key-comment key)))
+       (ssh-write-string writer (ssh-private-key-comment-bytes key)))
       ((and (> (length type) (length "ecdsa-sha2-"))
             (string= "ecdsa-sha2-" type
                      :end2 (length "ecdsa-sha2-")))
@@ -327,7 +327,7 @@ ssh-authentication-error when the agent cannot be reached or refuses."
        (ssh-write-mpint
         writer
         (ssh-read-mpint (ssh-make-reader (ssh-private-key-private key))))
-       (ssh-write-text writer (ssh-private-key-comment key)))
+       (ssh-write-string writer (ssh-private-key-comment-bytes key)))
       (t
        (error 'ssh-protocol-error
               :detail (format nil "cannot add ~A to an ssh-agent" type))))
