@@ -517,8 +517,14 @@
    ;; What the selected transport can do, asked through the facade so an
    ;; application never tests a backend feature itself.
    #:ssh-client-feature-supported-p
+   #:ssh-client-supported-algorithms
+   #:ssh-client-default-algorithms
    #:ssh-client-supported-authentication-methods
+   #:ssh-client-capabilities
    #:ssh-server-feature-supported-p
+   #:ssh-server-supported-algorithms
+   #:ssh-server-default-algorithms
+   #:ssh-server-capabilities
    ;; protocol core: shared by the client and a future server
    #:ssh-octets
    #:ssh-copy-octets

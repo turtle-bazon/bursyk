@@ -1002,18 +1002,15 @@ PubkeyAcceptedAlgorithms rsa-sha2-512,ssh-ed25519
 RequiredRSASize 2048
 PermitListen 8080 127.0.0.1:9000")))
     ;; "+name" appends to the build's list; chacha is already there.
-    (is (equal cl-pnet-ssh:+ssh-ciphers+
+    (is (equal (cl-pnet-ssh:ssh-server-default-algorithms :ciphers)
                (cl-pnet-ssh:ssh-server-config-ciphers config)))
     ;; "-name" removes from the build's list and leaves the rest in order.
-    (is (equal (remove "hmac-sha2-256" cl-pnet-ssh:+ssh-macs+
+    ;; The default itself is transport-specific: libssh has no UMAC.
+    (is (equal (remove "hmac-sha2-256"
+                       (cl-pnet-ssh:ssh-server-default-algorithms :macs)
                        :test #'string=)
                (cl-pnet-ssh:ssh-server-config-macs config)))
-    (is (equal '("mlkem768x25519-sha256"
-                 "sntrup761x25519-sha512"
-                 "sntrup761x25519-sha512@openssh.com"
-                 "curve25519-sha256" "curve25519-sha256@libssh.org"
-                 "ecdh-sha2-nistp256" "ecdh-sha2-nistp384"
-                 "ecdh-sha2-nistp521")
+    (is (equal (cl-pnet-ssh:ssh-server-default-algorithms :kex)
                (cl-pnet-ssh:ssh-server-config-kex-algorithms config)))
     ;; A plain list replaces the default outright.
     (is (equal '("ssh-ed25519")
@@ -1042,11 +1039,17 @@ PubkeyAcceptedKeyTypes rsa-sha2-512")))
   (is (equal '("aes128-cbc")
              (config-value #'cl-pnet-ssh:ssh-server-config-ciphers
                            "Ciphers aes128-cbc")))
-  ;; The legacy MD5 and 96-bit truncated HMACs are implemented but outside
-  ;; the default offer, so a configuration may name them.
-  (is (equal '("hmac-md5" "hmac-sha1-96")
-             (config-value #'cl-pnet-ssh:ssh-server-config-macs
-                           "MACs hmac-md5,hmac-sha1-96")))
+  ;; The legacy MD5 and 96-bit truncated HMACs are implemented by the pure
+  ;; transport but outside the default offer, so a configuration may name
+  ;; them there.  A transport that lacks them refuses the name instead.
+  (if (member "hmac-md5"
+              (cl-pnet-ssh:ssh-server-supported-algorithms :macs)
+              :test #'string=)
+      (is (equal '("hmac-md5" "hmac-sha1-96")
+                 (config-value #'cl-pnet-ssh:ssh-server-config-macs
+                               "MACs hmac-md5,hmac-sha1-96")))
+      (signals cl-pnet-ssh:ssh-server-config-error
+        (config-from-text "MACs hmac-md5,hmac-sha1-96")))
   (signals cl-pnet-ssh:ssh-server-config-error
     (config-from-text "Ciphers aes128-nope"))
   (signals cl-pnet-ssh:ssh-server-config-error

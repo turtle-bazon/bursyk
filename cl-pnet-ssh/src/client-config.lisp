@@ -190,27 +190,31 @@ MAKE-SSH-CLIENT's own defaults."
         :kex-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-kex-algorithms
-         +ssh-kex-default-algorithms+ "KexAlgorithms"
-         :all +ssh-kex-real-algorithms+)
+         (ssh-client-default-algorithms :kex) "KexAlgorithms"
+         :all (ssh-client-supported-algorithms :kex))
         :host-key-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-host-key-algorithms
-         +ssh-host-key-algorithms+ "HostKeyAlgorithms"
-         :all +ssh-host-key-all-algorithms+)
+         (ssh-client-default-algorithms :host-key-algorithms)
+         "HostKeyAlgorithms"
+         :all (ssh-client-supported-algorithms :host-key-algorithms))
         :ciphers
         (ssh-config-client-algorithms
          options #'ssh-config-options-ciphers
-         +ssh-ciphers+ "Ciphers" :all +ssh-all-ciphers+)
+         (ssh-client-default-algorithms :ciphers) "Ciphers"
+         :all (ssh-client-supported-algorithms :ciphers))
         :macs
         (ssh-config-client-algorithms
          options #'ssh-config-options-macs
-         +ssh-macs+ "MACs" :all +ssh-all-macs+)
+         (ssh-client-default-algorithms :macs) "MACs"
+         :all (ssh-client-supported-algorithms :macs))
         :compression (ssh-config-options-compression options)
         :pubkey-accepted-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-pubkey-accepted-algorithms
-         +ssh-signature-algorithms+ "PubkeyAcceptedAlgorithms"
-         :all +ssh-signature-all-algorithms+)
+         (ssh-client-default-algorithms :signature-algorithms)
+         "PubkeyAcceptedAlgorithms"
+         :all (ssh-client-supported-algorithms :signature-algorithms))
         :revoked-host-keys
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
@@ -228,8 +232,9 @@ MAKE-SSH-CLIENT's own defaults."
         :hostbased-accepted-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-hostbased-accepted-algorithms
-         +ssh-signature-algorithms+ "HostbasedAcceptedAlgorithms"
-         :all +ssh-signature-all-algorithms+)
+         (ssh-client-default-algorithms :signature-algorithms)
+         "HostbasedAcceptedAlgorithms"
+         :all (ssh-client-supported-algorithms :signature-algorithms))
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
         :password-authentication
@@ -275,8 +280,9 @@ MAKE-SSH-CLIENT's own defaults."
         :ca-signature-algorithms
         (ssh-config-client-algorithms
          options #'ssh-config-options-ca-signature-algorithms
-         +ssh-server-ca-signature-algorithms+ "CASignatureAlgorithms"
-         :all +ssh-server-ca-signature-algorithm-names+)
+         (ssh-client-default-algorithms :ca-signature-algorithms)
+         "CASignatureAlgorithms"
+         :all (ssh-client-supported-algorithms :ca-signature-algorithms))
         :required-rsa-size
         (or (ssh-config-options-required-rsa-size options)
             +ssh-rsa-minimum-modulus-size+)

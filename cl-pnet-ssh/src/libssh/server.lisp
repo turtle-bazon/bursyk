@@ -1772,30 +1772,38 @@ list, applied by the same inactivity accounting as the pure backend."
     ;; method list.  RequiredRSASize is set before the host keys so libssh
     ;; applies it to them as well as to user keys.
     (when sshd-config
-      (ssh-plibssh-reject-pq-kex-algorithms
-       (ssh-server-config-kex-algorithms sshd-config) "KexAlgorithms")
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-key-exchange+ "KexAlgorithms"
-       (ssh-server-config-kex-algorithms sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-ciphers-c-s+ "Ciphers"
-       (ssh-server-config-ciphers sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-ciphers-s-c+ "Ciphers"
-       (ssh-server-config-ciphers sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-hmac-c-s+ "MACs"
-       (ssh-server-config-macs sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-hmac-s-c+ "MACs"
-       (ssh-server-config-macs sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-hostkey-algorithms+ "HostKeyAlgorithms"
-       (ssh-server-config-host-key-algorithms sshd-config))
-      (ssh-plibssh-bind-algorithm-option
-       bind +ssh-bind-options-pubkey-accepted-key-types+
-       "PubkeyAcceptedAlgorithms"
-       (ssh-server-config-pubkey-accepted-algorithms sshd-config))
+      (let ((kex (ssh-server-config-kex-algorithms sshd-config))
+            (ciphers (ssh-server-config-ciphers sshd-config))
+            (macs (ssh-server-config-macs sshd-config))
+            (host-keys (ssh-server-config-host-key-algorithms sshd-config))
+            (pubkey (ssh-server-config-pubkey-accepted-algorithms sshd-config)))
+        ;; Refuse a configured name the loaded libssh does not know before
+        ;; handing it to ssh_bind, where the error would be a generic bind
+        ;; failure.  A newer libssh that gains sntrup or ML-DSA passes here
+        ;; because the check reads the same capability probe as -Q.
+        (ssh-plibssh-check-server-algorithms :kex kex "KexAlgorithms")
+        (ssh-plibssh-check-server-algorithms :ciphers ciphers "Ciphers")
+        (ssh-plibssh-check-server-algorithms :macs macs "MACs")
+        (ssh-plibssh-check-server-algorithms
+         :host-key-algorithms host-keys "HostKeyAlgorithms")
+        (ssh-plibssh-check-server-algorithms
+         :signature-algorithms pubkey "PubkeyAcceptedAlgorithms")
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-key-exchange+ "KexAlgorithms" kex)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-ciphers-c-s+ "Ciphers" ciphers)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-ciphers-s-c+ "Ciphers" ciphers)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-hmac-c-s+ "MACs" macs)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-hmac-s-c+ "MACs" macs)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-hostkey-algorithms+ "HostKeyAlgorithms"
+         host-keys)
+        (ssh-plibssh-bind-algorithm-option
+         bind +ssh-bind-options-pubkey-accepted-key-types+
+         "PubkeyAcceptedAlgorithms" pubkey))
       ;; libssh rejects a value between 1 and 767 and then applies its own
       ;; 1024-bit floor (2048 under FIPS).  sshd likewise lets its 1024-bit
       ;; floor win over any smaller RequiredRSASize, so a smaller value is
@@ -1810,7 +1818,9 @@ list, applied by the same inactivity accounting as the pure backend."
             (error 'ssh-connection-error
                    :detail (format nil "libssh rejected RequiredRSASize: ~A"
                                    detail))))))
-    (when mldsa-host-key
+    (when (and mldsa-host-key
+               (not (ssh-plibssh-algorithm-supported-p
+                     :host-key-algorithms "ssh-mldsa44-ed25519")))
       (ssh-bind-free bind)
       (error 'ssh-unsupported-feature
              :feature :mldsa
@@ -1875,13 +1885,6 @@ list, applied by the same inactivity accounting as the pure backend."
           (ssh-session-finish session :server-closed :close)))
       (when bind (ssh-bind-free bind))))
   server)
-
-(defun ssh-server-feature-supported-p (feature)
-  "Whether the libssh server transport can honour FEATURE.
-
-Agent forwarding is implemented; remote forwarding and X11 forwarding are
-not, and the server application learns that through the facade."
-  (not (null (member feature '(:agent-forward)))))
 
 (defun ssh-server-open-forwarded-tcpip (session bind-address bind-port
                                        &rest arguments)

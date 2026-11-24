@@ -408,38 +408,52 @@ model: after the destination everything belongs to the remote command."
         while comma
         do (setf start (1+ comma))))
 
+(defun transport-supports-algorithm-p (name kind)
+  "Whether this build's client transport can negotiate NAME as KIND.
+
+KIND is one of the facade's capability kinds: :KEX, :HOST-KEY-ALGORITHMS,
+:SIGNATURE-ALGORITHMS, :CA-SIGNATURE-ALGORITHMS, :CIPHERS, :MACS or
+:COMPRESSIONS.  The answer comes from the transport, so a libssh that gains
+sntrup is reflected here without a version test."
+  (member name (cl-pnet-ssh:ssh-client-supported-algorithms kind)
+          :test #'string=))
+
+(defun transport-supported-algorithms (names kind)
+  "NAMES filtered to those the transport can negotiate as KIND, in NAMES order."
+  (remove-if-not (lambda (name)
+                   (transport-supports-algorithm-p name kind))
+                 names))
+
+(defun transport-supports-key-type-p (name)
+  "Whether NAME is a key type either a host or a user key may use."
+  (or (transport-supports-algorithm-p name :host-key-algorithms)
+      (transport-supports-algorithm-p name :signature-algorithms)))
+
 (defun supported-kex-algorithms ()
   "Every key exchange this build's transport can actually negotiate.
 
-The pure transport implements OpenSSH's post-quantum hybrids, both the
-ML-KEM and sntrup761 kinds; libssh 0.10 has neither, so it advertises and
-accepts only the classical methods.  -Q kex and KexAlgorithms answer from
-this list, so a name the transport cannot use is refused before the
-connection instead of after it."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
-      cl-pnet-ssh:+ssh-kex-real-algorithms+
-      (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
-                 cl-pnet-ssh:+ssh-kex-real-algorithms+)))
+The transport reports its own KEX names, so OpenSSH's post-quantum hybrids
+appear when the library implements them and disappear when it does not, with
+no backend or version test here.  -Q kex and KexAlgorithms answer from this
+list, so a name the transport cannot use is refused before the connection
+instead of after it."
+  (transport-supported-algorithms cl-pnet-ssh:+ssh-kex-real-algorithms+
+                                  :kex))
 
 (defun default-mac-algorithms ()
   "The MACs this build offers when MACs is not configured, in ssh's order.
 
-The pure transport implements OpenSSH's UMAC constructions; libssh 0.10 does
-not, so they are filtered out of the default offer there."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :umac)
-      cl-pnet-ssh:+ssh-macs+
-      (remove-if #'cl-pnet-ssh::ssh-mac-umac-p cl-pnet-ssh:+ssh-macs+)))
+The transport drops any construction it cannot negotiate, so UMAC disappears
+on a libssh that lacks it and stays when it gains it."
+  (transport-supported-algorithms cl-pnet-ssh:+ssh-macs+ :macs))
 
 (defun supported-mac-algorithms ()
   "Every MAC this build's transport can actually negotiate.
 
 The pure transport implements the whole OpenSSH table, including the legacy
-MD5 and 96-bit truncated HMACs its default offer leaves out.  libssh 0.10
-implements only the HMACs in OpenSSH's default offer, so the UMAC and legacy
-names are dropped there."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :legacy-macs)
-      cl-pnet-ssh:+ssh-all-macs+
-      (remove-if #'cl-pnet-ssh::ssh-mac-umac-p cl-pnet-ssh:+ssh-macs+)))
+MD5 and 96-bit truncated HMACs its default offer leaves out.  A transport
+without them simply reports a shorter list."
+  (transport-supported-algorithms cl-pnet-ssh:+ssh-all-macs+ :macs))
 
 (defun query-mac-algorithms ()
   "Every MAC the transport can negotiate, in -Q mac's macs[] order.
@@ -454,72 +468,55 @@ preference order."
 (defun default-kex-algorithms ()
   "The key exchanges this build offers when KexAlgorithms is not set.
 
-This is OpenSSH's default order.  It offers the ML-KEM and sntrup761
-hybrids, but leaves mlkem768nistp256-sha256 out even though it is
-implemented; -G reports this list, as ssh does."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
-      cl-pnet-ssh:+ssh-kex-default-algorithms+
-      (remove-if #'cl-pnet-ssh::ssh-kex-post-quantum-p
-                 cl-pnet-ssh:+ssh-kex-default-algorithms+)))
-
-(defun mldsa-algorithm-name-p (name)
-  "Whether NAME is the composite ML-DSA-44 + Ed25519 key or its certificate."
-  (or (string= name "ssh-mldsa44-ed25519")
-      (string= name "ssh-mldsa44-ed25519-cert")))
+This is OpenSSH's default order, filtered to what the transport can
+negotiate.  It offers the ML-KEM and sntrup761 hybrids when the transport has
+them, but leaves mlkem768nistp256-sha256 out even though it is implemented;
+-G reports this list, as ssh does."
+  (transport-supported-algorithms cl-pnet-ssh:+ssh-kex-default-algorithms+
+                                  :kex))
 
 (defun supported-host-key-algorithms ()
   "Host key algorithms this build's transport can actually present.
-
-The pure transport implements OpenSSH's composite ML-DSA key; libssh 0.10
-has no ML-DSA, so it is left out of -Q key, -G and the default offer."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-host-key-algorithms+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-host-key-algorithms+)))
+The transport's capability list is authoritative, so the composite ML-DSA
+key appears exactly when the library underneath can verify it."
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-host-key-algorithms+ :host-key-algorithms))
 
 (defun supported-host-key-all-algorithms ()
   "Every host key algorithm HostKeyAlgorithms may name.
 
 The SHA-1 ssh-rsa forms are implemented but outside the default offer, as in
-OpenSSH; a configuration may still name them."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-host-key-all-algorithms+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-host-key-all-algorithms+)))
+OpenSSH; a configuration may still name them when the transport has them."
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-host-key-all-algorithms+ :host-key-algorithms))
 
 (defun supported-signature-algorithms ()
   "Signature algorithms this build's transport can actually use.
 
-This is OpenSSH's PubkeyAcceptedAlgorithms order, without names the linked
-libssh cannot verify."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-signature-algorithms+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-signature-algorithms+)))
+This is OpenSSH's PubkeyAcceptedAlgorithms order, filtered to names the
+transport can verify."
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-signature-algorithms+ :signature-algorithms))
 
 (defun supported-signature-all-algorithms ()
   "Every signature name PubkeyAcceptedAlgorithms may select.
 
 The SHA-1 ssh-rsa forms are implemented but outside the default offer, as in
-OpenSSH; a configuration may still name them."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-signature-all-algorithms+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-signature-all-algorithms+)))
+OpenSSH; a configuration may still name them when the transport has them."
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-signature-all-algorithms+ :signature-algorithms))
 
 (defun supported-ca-signature-algorithms ()
   "CA signature algorithms this build's transport can actually check."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-server-ca-signature-algorithms+)))
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-server-ca-signature-algorithms+
+   :ca-signature-algorithms))
 
 (defun supported-ca-signature-algorithm-names ()
   "Every CA signature algorithm this build's transport can name."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+
-      (remove-if #'mldsa-algorithm-name-p
-                 cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+)))
+  (transport-supported-algorithms
+   cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+
+   :ca-signature-algorithms))
 
 (defun check-algorithm-list (option value supported &optional all)
   "Reject an algorithm choice this build cannot offer.
@@ -563,8 +560,10 @@ is for the CBC ciphers."
     (unsupported "-R" "remote forwarding is not implemented by this transport"))
   (when (getf *options* :ciphers)
     (check-algorithm-list "-c" (getf *options* :ciphers)
-                          cl-pnet-ssh:+ssh-ciphers+
-                          cl-pnet-ssh:+ssh-all-ciphers+))
+                          (transport-supported-algorithms
+                           cl-pnet-ssh:+ssh-ciphers+ :ciphers)
+                          (transport-supported-algorithms
+                           cl-pnet-ssh:+ssh-all-ciphers+ :ciphers)))
   (when (getf *options* :macs)
     (check-algorithm-list "-m" (getf *options* :macs)
                           (supported-mac-algorithms)))
@@ -892,15 +891,12 @@ names; those are signature algorithms and belong to -Q sig and -Q key-sig.")
 
 (defun query-plain-key-algorithms ()
   "Key types this client can load, without the certificate spellings."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      +query-key-types+
-      (remove-if #'mldsa-algorithm-name-p +query-key-types+)))
+  (remove-if-not #'transport-supports-key-type-p +query-key-types+))
 
 (defun query-certificate-key-algorithms ()
   "Certificate key types this client can present."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      +query-certificate-key-types+
-      (remove-if #'mldsa-algorithm-name-p +query-certificate-key-types+)))
+  (remove-if-not #'transport-supports-key-type-p
+                 +query-certificate-key-types+))
 
 (defparameter +query-plain-signature-names+
   '("ssh-ed25519"
@@ -929,9 +925,8 @@ suffix, but the composite ML-DSA key uses a plain -cert."
 
 (defun query-plain-signature-names ()
   "Signature names this client can make or check, without certificates."
-  (if (cl-pnet-ssh:ssh-client-feature-supported-p :mldsa)
-      +query-plain-signature-names+
-      (remove-if #'mldsa-algorithm-name-p +query-plain-signature-names+)))
+  (transport-supported-algorithms +query-plain-signature-names+
+                                  :signature-algorithms))
 
 (defun query-signature-algorithms (&key plain-only)
   "Signature names this client can verify, certificate forms included.
@@ -947,20 +942,22 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
   (let ((name (string-downcase what)))
     (cond
       ((member name '("cipher" "ciphers") :test #'string=)
-       cl-pnet-ssh:+ssh-all-ciphers+)
+       (transport-supported-algorithms cl-pnet-ssh:+ssh-all-ciphers+
+                                       :ciphers))
       ;; -Q cipher-auth names only the ciphers that authenticate their own
       ;; packets; the CTR and CBC modes rely on the negotiated MAC instead.
       ((string= name "cipher-auth")
-       (remove-if-not #'cl-pnet-ssh::ssh-cipher-aead-p
-                      cl-pnet-ssh:+ssh-all-ciphers+))
+       (transport-supported-algorithms
+        (remove-if-not #'cl-pnet-ssh::ssh-cipher-aead-p
+                       cl-pnet-ssh:+ssh-all-ciphers+)
+        :ciphers))
       ((member name '("mac" "macs") :test #'string=)
        (query-mac-algorithms))
       ((member name '("kex" "kexalgorithms") :test #'string=)
-       (remove-if-not (lambda (algorithm)
-                        (member algorithm (supported-kex-algorithms)
-                                :test #'string=))
-                      cl-pnet-ssh:+ssh-kex-real-algorithms+))
-      ((string= name "compression") cl-pnet-ssh:+ssh-compressions+)
+       (supported-kex-algorithms))
+      ((string= name "compression")
+       (transport-supported-algorithms cl-pnet-ssh:+ssh-compressions+
+                                       :compressions))
       ((string= name "key")
        ;; -Q key pairs each key type with its certificate, as ssh does.
        (loop for plain in (query-plain-key-algorithms)
@@ -3325,8 +3322,11 @@ and known-hosts files) are printed as this client will actually use them."
           (format t "bindinterface ~A~%" value)))
       (format t "ciphers ~{~A~^,~}~%"
               (algorithms #'cl-pnet-ssh:ssh-config-options-ciphers
-                          cl-pnet-ssh::+ssh-ciphers+ "Ciphers"
-                          cl-pnet-ssh::+ssh-all-ciphers+))
+                          (transport-supported-algorithms
+                           cl-pnet-ssh::+ssh-ciphers+ :ciphers)
+                          "Ciphers"
+                          (transport-supported-algorithms
+                           cl-pnet-ssh::+ssh-all-ciphers+ :ciphers)))
       (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
         (when (and path (not (eq path :none)) (not (string-equal path "none")))
           (format t "controlpath ~A~%"
@@ -3395,7 +3395,8 @@ and known-hosts files) are printed as this client will actually use them."
                    "info")))
       (format t "macs ~{~A~^,~}~%"
               (algorithms #'cl-pnet-ssh:ssh-config-options-macs
-                          (default-mac-algorithms) "MACs"))
+                          (default-mac-algorithms) "MACs"
+                          (supported-mac-algorithms)))
       (let ((provider (or (getf *options* :pkcs11)
                           (cl-pnet-ssh:ssh-config-options-pkcs11-provider
                            options))))

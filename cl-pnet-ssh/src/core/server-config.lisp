@@ -1057,9 +1057,10 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'ca-signature-algorithms
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-server-ca-signature-algorithms+
+         line arguments
+         (ssh-server-default-algorithms :ca-signature-algorithms)
          "CASignatureAlgorithms"
-         :all +ssh-server-ca-signature-algorithm-names+)))
+         :all (ssh-server-supported-algorithms :ca-signature-algorithms))))
       ;; ---- algorithms ----
       ;; sshd resolves these with kex_assemble_names: the configured text may
       ;; replace the default list or adjust it with + - ^.  Resolving here
@@ -1069,13 +1070,14 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'ciphers
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-ciphers+ "Ciphers"
-         :all +ssh-all-ciphers+)))
+         line arguments (ssh-server-default-algorithms :ciphers) "Ciphers"
+         :all (ssh-server-supported-algorithms :ciphers))))
       ((string= keyword "macs")
        (ssh-server-config-set-once
         config 'macs
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-macs+ "MACs" :all +ssh-all-macs+)))
+         line arguments (ssh-server-default-algorithms :macs) "MACs"
+         :all (ssh-server-supported-algorithms :macs))))
       ((string= keyword "kexalgorithms")
        (ssh-server-config-set-once
         config 'kex-algorithms
@@ -1084,15 +1086,16 @@ cannot apply per connection."
         ;; list replaces the default, while the pattern set also admits a
         ;; method this build implements but does not offer by default.
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-server-default-kex-algorithms+ "KexAlgorithms"
-         :all +ssh-kex-real-algorithms+)))
+         line arguments (ssh-server-default-algorithms :kex)
+         "KexAlgorithms"
+         :all (ssh-server-supported-algorithms :kex))))
       ((string= keyword "hostkeyalgorithms")
        (ssh-server-config-set-once
         config 'host-key-algorithms
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-server-host-key-preference+
+         line arguments (ssh-server-default-algorithms :host-key-algorithms)
          "HostKeyAlgorithms"
-         :all +ssh-server-host-key-all-algorithms+)))
+         :all (ssh-server-supported-algorithms :host-key-algorithms))))
       ((or (string= keyword "pubkeyacceptedalgorithms")
            (string= keyword "pubkeyacceptedkeytypes"))
        ;; PubkeyAcceptedKeyTypes is the obsolete name for the same field;
@@ -1100,9 +1103,10 @@ cannot apply per connection."
        (ssh-server-config-set-once
         config 'pubkey-accepted-algorithms
         (ssh-server-config-resolve-algorithms
-         line arguments +ssh-server-user-key-algorithms+
+         line arguments
+         (ssh-server-default-algorithms :signature-algorithms)
          (ssh-config-line-keyword line)
-         :all +ssh-server-user-key-all-algorithms+)))
+         :all (ssh-server-supported-algorithms :signature-algorithms))))
       ((string= keyword "pubkeyauthoptions")
        ;; sshd keeps the first line's flags and max-pk-ok budget but still
        ;; validates every later line.

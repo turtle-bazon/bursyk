@@ -919,17 +919,6 @@ role-neutral."
     (and blob (ssh-key-fingerprint
                blob (ssh-client-fingerprint-hash client)))))
 
-(defun ssh-client-feature-supported-p (feature)
-  "Whether the pure transport can honour FEATURE.
-
-Applications ask this through CL-PNET-SSH instead of testing which backend
-was built, so the same client code runs unchanged against either transport."
-  (not (null (member feature '(:remote-forward :streamlocal-forward
-                               :x11-forward :hostbased-authentication
-                               :version-addendum :agent-forward
-                               :compression :post-quantum-kex :sntrup
-                               :umac :legacy-macs :mldsa)))))
-
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the pure transport implements."
   '("publickey" "hostbased" "keyboard-interactive" "password"))

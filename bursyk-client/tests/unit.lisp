@@ -148,36 +148,36 @@ CLI's decision and at the plist it filled."
 
 (test kex-queries-follow-the-transport
   "A transport without ML-KEM neither lists nor accepts the hybrid."
-  (let ((kex (burs::query-answer "kex"))
-        (supported (cl-pnet-ssh:ssh-client-feature-supported-p
-                    :post-quantum-kex)))
-    (is (eq supported
+  (let* ((kex (burs::query-answer "kex"))
+         (mlkem (cl-pnet-ssh:ssh-client-feature-supported-p :mlkem))
+         (sntrup (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)))
+    (is (eq (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
+            (or mlkem sntrup)))
+    (is (eq mlkem
             (not (null (member "mlkem768x25519-sha256" kex
                                :test #'string=)))))
     (is (member "curve25519-sha256" kex :test #'string=))
-    (is (eq supported
+    (is (eq mlkem
             (not (null (member "mlkem768x25519-sha256"
                                (burs::supported-kex-algorithms)
                                :test #'string=)))))
     ;; The P-256 ML-KEM hybrid is implemented too, and -Q lists every method
     ;; the transport can negotiate, not just the default offer.
-    (is (eq supported
+    (is (eq mlkem
             (not (null (member "mlkem768nistp256-sha256" kex
                                :test #'string=)))))
-    (is (eq supported
+    (is (eq mlkem
             (not (null (member "mlkem768nistp256-sha256"
                                (burs::supported-kex-algorithms)
                                :test #'string=)))))
-    ;; The sntrup761 hybrids share the post-quantum capability gate.
+    ;; sntrup761 is its own family; a transport may learn ML-KEM without it.
     (dolist (name '("sntrup761x25519-sha512"
                     "sntrup761x25519-sha512@openssh.com"))
-      (is (eq supported
+      (is (eq sntrup
               (not (null (member name kex :test #'string=)))))
-      (is (eq supported
+      (is (eq sntrup
               (not (null (member name (burs::default-kex-algorithms)
                                  :test #'string=))))))
-    (is (eq supported
-            (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)))
     ;; The MODP groups are implemented by both transports and listed by -Q.
     (dolist (name '("diffie-hellman-group14-sha256"
                     "diffie-hellman-group16-sha512"

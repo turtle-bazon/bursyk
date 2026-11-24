@@ -3,7 +3,7 @@
   :author "pesekey"
   :license "GPL-3.0-or-later"
   :version "0.0.1.88"
-  :depends-on (#:cl-ssh-core
+  :depends-on (#:cl-pnet-ssh/core
                #:cl-pnet
                #:cl-pnet-sockets
                #:burzay
@@ -15,7 +15,8 @@
   :serial t
   :components ((:module "src"
                 :serial t
-                :components ((:file "client-state")
+                :components ((:file "capabilities")
+                             (:file "client-state")
                              (:file "client-transport")
                              (:file "client-proxy")
                              (:file "client-channel")

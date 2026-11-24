@@ -263,39 +263,6 @@ meant to prevent."
                                (ssh-plibssh-error session))))))
   session)
 
-(defun ssh-plibssh-reject-pq-kex-algorithms (names option)
-  "Refuse NAMES when they ask for a post-quantum key exchange.
-
-libssh 0.10 has neither ML-KEM nor sntrup761, so a configured name must be
-reported as an unsupported feature rather than handed to libssh, which would
-reject it as a generic algorithm mismatch.  The two primitives are kept
-apart, because a later libssh may learn one without the other."
-  (when names
-    (cond
-      ((some #'ssh-sntrup761-hybrid-p names)
-       (error 'ssh-unsupported-feature
-              :feature :sntrup
-              :detail (format nil "~A by the libssh transport" option)))
-      ((some #'ssh-kex-post-quantum-p names)
-       (error 'ssh-unsupported-feature
-              :feature :post-quantum-kex
-              :detail (format nil "~A by the libssh transport" option))))))
-
-(defun ssh-plibssh-reject-mldsa-algorithms (names option)
-  "Refuse NAMES when they ask for a composite ML-DSA key.
-
-libssh 0.10 has no ML-DSA, so a configured name must be reported as an
-unsupported feature rather than handed to libssh, which would reject it as a
-generic algorithm mismatch."
-  (when (some (lambda (name)
-                (member name '("ssh-mldsa44-ed25519"
-                               "ssh-mldsa44-ed25519-cert")
-                        :test #'string=))
-              names)
-    (error 'ssh-unsupported-feature
-           :feature :mldsa
-           :detail (format nil "~A by the libssh transport" option))))
-
 (defun ssh-plibssh-client-new-session (client &key fd proxy-command)
   "Make CLIENT's libssh session.
 
@@ -336,14 +303,8 @@ host is named but no descriptor is passed: libssh dials nothing itself."
      session +ssh-options-ciphers-c-s+ (ssh-client-ciphers client) "Ciphers")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-ciphers-s-c+ (ssh-client-ciphers client) "Ciphers")
-    (when (some #'ssh-mac-umac-p (ssh-client-macs client))
-      (error 'ssh-unsupported-feature
-             :feature :umac
-             :detail "by the libssh transport"))
-    (when (some #'ssh-mac-legacy-p (ssh-client-macs client))
-      (error 'ssh-unsupported-feature
-             :feature :legacy-macs
-             :detail "by the libssh transport"))
+    (ssh-plibssh-check-client-algorithms
+     :macs (ssh-client-macs client) "MACs")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hmac-c-s+ (ssh-client-macs client) "MACs")
     (ssh-plibssh-apply-algorithm-option
@@ -363,10 +324,6 @@ host is named but no descriptor is passed: libssh dials nothing itself."
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-key-exchange+ (ssh-client-kex-algorithms client)
      "KexAlgorithms")
-    (ssh-plibssh-reject-mldsa-algorithms
-     (ssh-client-host-key-algorithms client) "HostKeyAlgorithms")
-    (ssh-plibssh-reject-mldsa-algorithms
-     (ssh-client-pubkey-accepted-algorithms client) "PubkeyAcceptedAlgorithms")
     (ssh-plibssh-apply-algorithm-option
      session +ssh-options-hostkeys+ (ssh-client-host-key-algorithms client)
      "HostKeyAlgorithms")
@@ -596,9 +553,9 @@ than a quiet fallback to the plain key, matching ssh."
 (defun ssh-plibssh-mldsa-key-path-p (path passphrase)
   "Whether the private key at PATH is a composite ML-DSA key.
 
-libssh 0.10 has no ML-DSA and would only report a generic import failure,
-so the transport names the real reason.  A key this parser cannot read is
-left to libssh, which may still understand a format it does not."
+libssh has no ML-DSA today and would only report a generic import failure,
+so the transport names the real reason when its own capability probe says
+the key type cannot be used."
   (handler-case
       (string= "ssh-mldsa44-ed25519"
                (ssh-private-key-type
@@ -607,7 +564,9 @@ left to libssh, which may still understand a format it does not."
 
 (defun ssh-plibssh-import-key (path passphrase)
   "Import the private key at PATH, using PASSPHRASE when it is encrypted."
-  (when (ssh-plibssh-mldsa-key-path-p path passphrase)
+  (when (and (ssh-plibssh-mldsa-key-path-p path passphrase)
+             (not (ssh-plibssh-algorithm-supported-p
+                   :signature-algorithms "ssh-mldsa44-ed25519")))
     (error 'ssh-unsupported-feature
            :feature :mldsa
            :detail "by the libssh transport"))
@@ -1168,15 +1127,6 @@ transport limitation into the same diagnostic."
            :feature name
            :detail "by the libssh transport")))
 
-(defun ssh-client-feature-supported-p (feature)
-  "Whether the libssh transport can honour FEATURE.
-
-Agent forwarding, password and keyboard-interactive authentication and the
-common option surface are implemented; the remaining entries are not, and
-callers learn that through the facade rather than a backend test.  In
-particular libssh 0.10 has no UMAC, so :UMAC is absent here."
-  (not (null (member feature '(:agent-forward :compression)))))
-
 (defun ssh-client-supported-authentication-methods ()
   "The client authentication method names the libssh transport implements."
   '("publickey" "keyboard-interactive" "password"))
@@ -1279,10 +1229,22 @@ the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
   (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
   (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
-  ;; Refuse a post-quantum KEX before the event loop starts.  libssh would
-  ;; otherwise reject the option from a descriptor callback, where the error
-  ;; is logged and the connection simply stalls.
-  (ssh-plibssh-reject-pq-kex-algorithms kex-algorithms "KexAlgorithms")
+  ;; A configured algorithm this libssh cannot negotiate is refused before
+  ;; the event loop starts: libssh would otherwise reject the option from a
+  ;; descriptor callback, where the error is logged and the connection simply
+  ;; stalls.  The lists themselves come from the same capability probe that
+  ;; answers -Q, so a newer libssh that learns sntrup or ML-DSA passes here
+  ;; without an adapter change.
+  (ssh-plibssh-check-client-algorithms
+   :kex kex-algorithms "KexAlgorithms")
+  (ssh-plibssh-check-client-algorithms
+   :host-key-algorithms host-key-algorithms "HostKeyAlgorithms")
+  (ssh-plibssh-check-client-algorithms :ciphers ciphers "Ciphers")
+  (ssh-plibssh-check-client-algorithms :macs macs "MACs")
+  (ssh-plibssh-check-client-algorithms
+   :signature-algorithms pubkey-accepted-algorithms "PubkeyAcceptedAlgorithms")
+  (ssh-plibssh-check-client-algorithms
+   :ca-signature-algorithms ca-signature-algorithms "CASignatureAlgorithms")
   ;; libssh owns its banner and hashes it into the exchange hash, so a
   ;; VersionAddendum cannot be applied by this transport.
   (ssh-plibssh-reject-option "VersionAddendum" version-addendum)

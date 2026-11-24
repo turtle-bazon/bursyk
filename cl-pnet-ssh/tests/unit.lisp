@@ -2712,9 +2712,10 @@ share the test, so each must dispatch the same channel requests."
                 :test #'string=))
     (is (cl-pnet-ssh::ssh-kex-post-quantum-p kex))
     (is (eq :sha512 (cl-pnet-ssh::ssh-kex-digest kex))))
-  ;; The capability the CLI uses to drop them on a transport without them.
-  (is (eq (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex)
-          (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup))))
+  ;; A transport can gain one post-quantum family without the other, so
+  ;; sntrup only ever implies the broader capability.
+  (when (cl-pnet-ssh:ssh-client-feature-supported-p :sntrup)
+    (is (cl-pnet-ssh:ssh-client-feature-supported-p :post-quantum-kex))))
 
 (test fixed-group-dh-loopback-exec
   "Each MODP group carries a real session on this transport."
@@ -7878,3 +7879,39 @@ validated, so -G reports what ssh would and a bad line fails the same way."
 
 
 
+
+(test capability-report-matches-the-transport
+  "The facade reports the same lists and features it enforces elsewhere."
+  (let ((client (cl-pnet-ssh:ssh-client-capabilities))
+        (server (cl-pnet-ssh:ssh-server-capabilities))
+        (kinds '(:kex :host-key-algorithms :signature-algorithms
+                 :ca-signature-algorithms :ciphers :macs :compressions))
+        (algorithm-features '(:compression :post-quantum-kex :sntrup :mlkem
+                              :umac :legacy-macs :mldsa)))
+    (dolist (kind kinds)
+      (is (equal (getf client kind)
+                 (cl-pnet-ssh:ssh-client-supported-algorithms kind))
+          (format nil "client ~A" kind))
+      (is (equal (getf server kind)
+                 (cl-pnet-ssh:ssh-server-supported-algorithms kind))
+          (format nil "server ~A" kind)))
+    ;; Every algorithm-shaped feature is derived from those lists, so the
+    ;; report cannot drift from the list a connection actually offers.
+    (dolist (feature algorithm-features)
+      (is (eq (getf (getf client :features) feature)
+              (cl-pnet-ssh:ssh-client-feature-supported-p feature))
+          (format nil "client feature ~A" feature))
+      (is (eq (getf (getf server :features) feature)
+              (cl-pnet-ssh:ssh-server-feature-supported-p feature))
+          (format nil "server feature ~A" feature)))
+    ;; An unconfigured offer never names an algorithm the transport lacks.
+    (dolist (kind '(:kex :host-key-algorithms :signature-algorithms
+                    :ciphers :macs))
+      (is (subsetp (cl-pnet-ssh:ssh-client-default-algorithms kind)
+                   (cl-pnet-ssh:ssh-client-supported-algorithms kind)
+                   :test #'string=)
+          (format nil "client default ~A" kind))
+      (is (subsetp (cl-pnet-ssh:ssh-server-default-algorithms kind)
+                   (cl-pnet-ssh:ssh-server-supported-algorithms kind)
+                   :test #'string=)
+          (format nil "server default ~A" kind)))))
