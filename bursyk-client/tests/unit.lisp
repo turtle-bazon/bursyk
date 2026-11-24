@@ -1461,17 +1461,28 @@ streams are captured; an empty INPUT stands for end of input."
     (is (eq t (getf options :fingerprint)))
     (is (eq t (getf options :print-public)))
     (is (eq :md5 (getf options :hash))))
-  (let ((options (burs::keygen-parse-arguments '("--help"))))
-    (is (eq t (getf options :help))))
+  (let ((options (burs::keygen-parse-arguments '("-h" "-ly" "-E" "md5"))))
+    (is (eq t (getf options :fingerprint)))
+    (is (eq t (getf options :print-public)))
+    (is (eq :md5 (getf options :hash))))
   ;; A missing value, a bad number, a bad hash, a feature this command does
   ;; not have, and a stray argument are all errors rather than defaults.
+  ;; getopt-style errors carry ssh-keygen's wording.
   (signals error (burs::keygen-parse-arguments '("-t")))
   (signals error (burs::keygen-parse-arguments '("-b" "many")))
   (signals error (burs::keygen-parse-arguments '("-E" "bogus")))
   (signals error (burs::keygen-parse-arguments '("-s" "ca")))
-  ;; -h is host-certificate signing in ssh-keygen, not help.
-  (signals error (burs::keygen-parse-arguments '("-h")))
-  (signals error (burs::keygen-parse-arguments '("stray"))))
+  (signals error (burs::keygen-parse-arguments '("stray")))
+  (flet ((message (arguments)
+           (handler-case (burs::keygen-parse-arguments arguments)
+             (burs::keygen-usage-error (condition)
+               (burs::keygen-usage-error-message condition)))))
+    ;; ssh-keygen has no --help; its getopt reports the second dash as the
+    ;; unknown option and prints the usage.
+    (is (string= "unknown option -- -" (message '("--help"))))
+    (is (string= "unknown option -- x" (message '("-x"))))
+    (is (string= "option requires an argument -- f" (message '("-f"))))
+    (is (string= "Too many arguments." (message '("-q" "stray"))))))
 
 (test keygen-default-file-names-follow-the-type
   (is (string= "id_ed25519" (burs::keygen-default-name "ed25519")))
@@ -1487,6 +1498,78 @@ streams are captured; an empty INPUT stands for end of input."
     (is (string= (uiop:native-namestring
                   (uiop:parse-native-namestring "/tmp/elsewhere"))
                  (uiop:native-namestring (burs::keygen-path options))))))
+
+(test keygen-generation-defaults-match-openssh-10
+  ;; ssh-keygen's default type is ed25519 even when -b is given without -t,
+  ;; and the announcement echoes the -t spelling instead of a canonical
+  ;; short name.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (plain (merge-pathnames "id_ed25519" directory))
+         (ecdsa (merge-pathnames "id_ecdsa" directory)))
+    (ensure-directories-exist plain)
+    (unwind-protect
+         (progn
+           (multiple-value-bind (status output)
+               (keygen-call (list "-b" "512" "-f" (namestring plain)
+                                  "-N" ""))
+             (is (eql 0 status))
+             (is (search "Generating public/private ed25519 key pair."
+                         output)))
+           (is (string= "ssh-ed25519"
+                        (nth-value 0 (keygen-public-parts
+                                      (burs::keygen-public-path plain)))))
+           ;; -b chooses the curve even when -t names a different one, and
+           ;; the message keeps the name the user typed.
+           (multiple-value-bind (status output)
+               (keygen-call
+                (list "-t" "ecdsa-sha2-nistp256" "-b" "384"
+                      "-f" (namestring ecdsa) "-N" ""))
+             (is (eql 0 status))
+             (is (search
+                  "Generating public/private ecdsa-sha2-nistp256 key pair."
+                  output)))
+           (is (string= "ecdsa-sha2-nistp384"
+                        (nth-value 0 (keygen-public-parts
+                                      (burs::keygen-public-path ecdsa))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-comments-are-clamped-like-ssh-keygen
+  ;; ssh-keygen copies comments through a KEY_COMMENT_MAX buffer, so both
+  ;; -C and a typed -c comment stop at 2048 characters.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (long (make-string 3000 :initial-element #\x)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "" "-C" long "-q")))))
+           (multiple-value-bind (type blob comment)
+               (keygen-public-parts (burs::keygen-public-path path))
+             (declare (ignore type blob))
+             (is (= 2048 (length comment)))
+             (is (every (lambda (character) (char= character #\x))
+                        comment)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-c" "-C" long "-N" "" "-q"
+                                  "-f" (namestring path)))
+             (declare (ignore output error))
+             (is (eql 0 status)))
+           (multiple-value-bind (type blob comment)
+               (keygen-public-parts (burs::keygen-public-path path))
+             (declare (ignore type blob))
+             (is (= 2048 (length comment)))
+             (is (every (lambda (character) (char= character #\x))
+                        comment))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test keygen-writes-a-key-and-public-file
   (let* ((directory (merge-pathnames
@@ -1521,6 +1604,36 @@ streams are captured; an empty INPUT stands for end of input."
                            (burs::keygen-main
                             (list "-l" "-f" (namestring path)))))))
              (is (search "SHA256:" line))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-does-not-create-missing-directories
+  ;; ssh-keygen creates only ~/.ssh; any other missing parent makes the
+  ;; save fail with its message and status 1, leaving no directory behind.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "missing/key" directory)))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-t" "ed25519" "-f" (namestring path)
+                                  "-N" "" "-q"))
+             (declare (ignore output))
+             (is (eql 1 status))
+             (is (search "Saving key" error))
+             (is (search "No such file or directory" error))
+             (is (not (probe-file (merge-pathnames "missing/" directory)))))
+           ;; A directory target is refused after the overwrite answer.
+           (multiple-value-bind (status output error)
+               (keygen-call
+                (list "-t" "ed25519" "-f" (namestring directory)
+                      "-N" "" "-q")
+                :input (format nil "y~%"))
+             (declare (ignore output))
+             (is (eql 1 status))
+             (is (search "Is a directory" error))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test keygen-comment-change-preserves-encryption
@@ -1906,6 +2019,166 @@ streams are captured; an empty INPUT stands for end of input."
                     (list "-F" "absent.invalid" "-f" (namestring known)))
                  (is (eql 1 status))
                  (is (zerop (length output)))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-generation-reads-piped-passphrases
+  ;; Without -N ssh-keygen reads the answer from standard input even when
+  ;; it is a pipe, asks twice, and retries a mismatch.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (retry (merge-pathnames "retry" directory))
+         (empty (merge-pathnames "empty" directory)))
+    (ensure-directories-exist retry)
+    (unwind-protect
+         (progn
+           (multiple-value-bind (status output error)
+               (keygen-call
+                (list "-t" "ed25519" "-f" (namestring retry) "-q")
+                :input (format nil "one~%two~%three~%three~%"))
+             (is (eql 0 status))
+             ;; 10.6 names the file the passphrase will protect.
+             (is (search
+                  (format nil "Enter passphrase for \"~A\" (empty for no passphrase): "
+                          (namestring retry))
+                  error))
+             (is (search "Passphrases do not match.  Try again." output)))
+           (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p retry))
+           (is (string= "ssh-ed25519"
+                        (cl-pnet-ssh:ssh-private-key-type
+                         (cl-pnet-ssh:ssh-load-private-key
+                          retry :passphrase "three"))))
+           ;; End of input stands for an empty passphrase, so no encryption.
+           (multiple-value-bind (status)
+               (keygen-call
+                (list "-t" "ed25519" "-f" (namestring empty) "-q")
+                :input "")
+             (is (eql 0 status)))
+           (is (not (cl-pnet-ssh:ssh-private-key-file-encrypted-p empty))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-print-public-prompts-for-a-passphrase
+  ;; Without -P, -y asks for the passphrase on standard input and reports
+  ;; ssh-keygen's Load key message when it does not decrypt the key.  An
+  ;; explicit empty -P is used as-is, so it does not prompt.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "pw" "-q")))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" (namestring path))
+                            :input (format nil "pw~%"))
+             (is (eql 0 status))
+             (is (search "ssh-ed25519" output))
+             (is (search (format nil "Enter passphrase for \"~A\": "
+                                 (namestring path))
+                         error)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" (namestring path)) :input "")
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "Load key" error))
+             (is (search "incorrect passphrase supplied to decrypt private key"
+                         error)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-P" "" "-f" (namestring path))
+                            :input (format nil "pw~%"))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (not (search "Enter passphrase" error)))
+             (is (search "Load key" error))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-passphrase-change-prompts-for-the-new-passphrase
+  ;; -p reads the new passphrase twice, gives up on a mismatch with status
+  ;; 1 and touches nothing, and reports a wrong old passphrase as ssh-keygen
+  ;; does.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "old" "-q")))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-p" "-P" "old" "-f" (namestring path))
+                            :input (format nil "a~%b~%"))
+             (is (eql 1 status))
+             (is (search "Pass phrases do not match.  Try again." output))
+             (is (search "Enter new passphrase (empty for no passphrase): "
+                         error)))
+           (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p path))
+           (is (string= "ssh-ed25519"
+                        (cl-pnet-ssh:ssh-private-key-type
+                         (cl-pnet-ssh:ssh-load-private-key
+                          path :passphrase "old"))))
+           (multiple-value-bind (status)
+               (keygen-call (list "-p" "-P" "old" "-f" (namestring path))
+                            :input (format nil "new~%new~%"))
+             (is (eql 0 status)))
+           (is (string= "ssh-ed25519"
+                        (cl-pnet-ssh:ssh-private-key-type
+                         (cl-pnet-ssh:ssh-load-private-key
+                          path :passphrase "new"))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-p" "-P" "wrong" "-N" "other"
+                                  "-f" (namestring path)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "Failed to load key" error))
+             (is (search "incorrect passphrase supplied to decrypt private key"
+                         error)))
+           ;; An explicit empty -P is used without asking.
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-p" "-P" "" "-N" "other"
+                                  "-f" (namestring path))
+                            :input (format nil "new~%"))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (not (search "Enter old passphrase" error)))
+             (is (search "Failed to load key" error))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-comment-change-prompts-for-the-opener
+  ;; -c without -P or -N asks for the passphrase that opens the key and
+  ;; keeps the key protected by it.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "pw" "-C" "before" "-q")))))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-c" "-C" "after" "-f" (namestring path))
+                            :input (format nil "pw~%"))
+             (is (eql 0 status))
+             (is (search "Enter passphrase: " error))
+             (is (search "Comment 'after' applied" output)))
+           (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p path))
+           (is (string= "after"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key
+                          path :passphrase "pw")))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test keygen-overwrite-question-matches-ssh-keygen

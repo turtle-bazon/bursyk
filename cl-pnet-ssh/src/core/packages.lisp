@@ -462,6 +462,7 @@
    #:+ssh-keygen-minimum-rsa-bits+
    #:+ssh-keygen-maximum-rsa-bits+
    #:+ssh-keygen-default-cipher+
+   #:+ssh-keygen-default-rounds+
    #:ssh-keygen-error
    #:ssh-public-key-parts
    #:ssh-make-public-key-blob

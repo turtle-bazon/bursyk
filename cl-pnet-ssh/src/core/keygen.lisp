@@ -20,7 +20,7 @@
 (defparameter +ssh-keygen-default-cipher+ "aes256-ctr"
   "The cipher ssh-keygen uses for a passphrase-protected key.")
 
-(defparameter +ssh-keygen-default-rounds+ 16
+(defparameter +ssh-keygen-default-rounds+ 32
   "The bcrypt KDF rounds ssh-keygen uses by default.")
 
 (defparameter +ssh-keygen-private-block-size+ 8
@@ -42,24 +42,21 @@
 (defun ssh-normalize-key-type (type)
   "TYPE as one of the SSH type names KEYGEN understands.
 
-Accepts both ssh-keygen's short spelling (ed25519, rsa) and the wire name
-(ssh-ed25519, ssh-rsa).  ECDSA accepts the short name, a curve suffix, or
-the full wire name."
-  (let ((name (string-downcase (string type))))
+ssh-keygen matches wire names exactly and short names without regard to
+case, so \"RSA\" is rsa but \"ssh-RSA\" is not a name; a bare curve name
+such as nistp256 is not accepted either."
+  (let ((name (string type))
+        (short (string-downcase (string type))))
     (cond
-      ((string= name "ed25519") "ssh-ed25519")
-      ((string= name "ssh-ed25519") "ssh-ed25519")
-      ((string= name "rsa") "ssh-rsa")
-      ((string= name "ssh-rsa") "ssh-rsa")
-      ((string= name "mldsa44-ed25519") "ssh-mldsa44-ed25519")
-      ((string= name "ssh-mldsa44-ed25519") "ssh-mldsa44-ed25519")
-      ((string= name "ecdsa") "ecdsa-sha2-nistp256")
-      ((member name '("ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384"
+      ((member name '("ssh-ed25519" "ssh-rsa" "ssh-mldsa44-ed25519"
+                      "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384"
                       "ecdsa-sha2-nistp521")
                :test #'string=)
        name)
-      ((member name '("nistp256" "nistp384" "nistp521") :test #'string=)
-       (concatenate 'string "ecdsa-sha2-" name))
+      ((string= short "ed25519") "ssh-ed25519")
+      ((string= short "rsa") "ssh-rsa")
+      ((string= short "ecdsa") "ecdsa-sha2-nistp256")
+      ((string= short "mldsa44-ed25519") "ssh-mldsa44-ed25519")
       (t
        (ssh-keygen-fail "unknown key type ~A" type)))))
 
@@ -92,8 +89,8 @@ the full wire name."
       ((string= type "ssh-rsa")
        (ssh-rsa-public-key-bits key-blob))
       ((string= type "ssh-ed25519") 256)
-      ;; OpenSSH sizes the composite by its classical half.
-      ((string= type "ssh-mldsa44-ed25519") 256)
+      ;; OpenSSH sizes the hybrid key by the whole blob (its keybits).
+      ((string= type "ssh-mldsa44-ed25519") 512)
       ((ssh-key-type-ecdsa-p type)
        (getf (ssh-key-type-ecdsa-curve type) :bits))
       (t 0))))
@@ -371,9 +368,19 @@ protects the file."
   path)
 
 (defun ssh-write-public-key (key path &key comment)
-  "Write KEY's public line to PATH and return PATH."
-  (ssh-write-octets-file
-   (map 'vector #'char-code (ssh-public-key-line key :comment comment))
-   path)
-  (ssh-secure-file-permissions path #o644)
-  path)
+  "Write KEY's public line to PATH and return PATH.
+
+ssh-keygen's sshkey_save_public always appends a space and the comment,
+so an empty comment leaves a trailing space in the file even though -y
+omits it.  Keep that byte."
+  (let* ((blob (ssh-public-key-blob-of key))
+         (type (nth-value 0 (ssh-public-key-parts blob)))
+         (comment (or comment (ssh-private-key-comment key) "")))
+    (ssh-write-octets-file
+     (map 'vector
+          #'char-code
+          (format nil "~A ~A ~A~%"
+                  type (ssh-octets-base64 blob) comment))
+     path)
+    (ssh-secure-file-permissions path #o644)
+    path))

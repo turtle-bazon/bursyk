@@ -8032,7 +8032,7 @@ validated, so -G reports what ssh would and a bad line fails the same way."
                             (ssh-generate-private-key "ecdsa" :num-bits 521)))))
   (is (= 1024 (ssh-key-bits (ssh-public-key-blob-of
                              (ssh-generate-private-key "rsa" :num-bits 1024)))))
-  (is (= 256 (ssh-key-bits (ssh-public-key-blob-of
+  (is (= 512 (ssh-key-bits (ssh-public-key-blob-of
                             (ssh-generate-private-key "mldsa44-ed25519"))))))
 
 (test generated-key-rejects-impossible-sizes
@@ -8043,6 +8043,17 @@ validated, so -G reports what ssh would and a bad line fails the same way."
   (signals ssh-keygen-error (ssh-generate-private-key "ecdsa" :num-bits 200))
   (signals ssh-keygen-error (ssh-generate-private-key "rsa" :num-bits 512))
   (signals ssh-keygen-error (ssh-generate-private-key "nonsense")))
+
+(test generated-key-type-names-match-ssh-keygen
+  ;; Wire names match exactly and short names ignore case, as ssh-keygen's
+  ;; type_from_name does; a bare curve name is not a key type.
+  (is (string= "ssh-rsa" (ssh-normalize-key-type "RSA")))
+  (is (string= "ssh-ed25519" (ssh-normalize-key-type "Ed25519")))
+  (is (string= "ssh-rsa" (ssh-normalize-key-type "ssh-rsa")))
+  (is (string= "ecdsa-sha2-nistp384"
+               (ssh-normalize-key-type "ecdsa-sha2-nistp384")))
+  (signals ssh-keygen-error (ssh-normalize-key-type "ssh-RSA"))
+  (signals ssh-keygen-error (ssh-normalize-key-type "nistp256")))
 
 (test generated-key-passphrase-round-trip
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-enc"))
@@ -8076,6 +8087,47 @@ validated, so -G reports what ssh would and a bad line fails the same way."
                          (ssh-load-private-key path :passphrase "new pass"))))
            (signals ssh-authentication-error
              (ssh-load-private-key path :passphrase "correct horse")))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test generated-key-default-kdf-rounds-match-openssh
+  ;; ssh-keygen 10.6 derives a new key with 32 bcrypt rounds.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-rounds"))
+         (path (keygen-test-path directory "id_rounds")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let ((key (ssh-generate-private-key "ed25519")))
+           ;; No :ROUNDS means the writer's default, the one the CLI uses.
+           (ssh-write-private-key key path :passphrase "pw")
+           (let* ((body (keygen-armored-body-octets path))
+                  (reader (cl-pnet-ssh::ssh-make-reader
+                           body
+                           (+ (length cl-pnet-ssh::+openssh-key-magic+) 1))))
+             (cl-pnet-ssh::ssh-read-text reader) ; cipher
+             (cl-pnet-ssh::ssh-read-text reader) ; KDF
+             (multiple-value-bind (salt rounds)
+                 (cl-pnet-ssh::ssh-openssh-kdf-options
+                  (cl-pnet-ssh::ssh-read-string reader))
+               (is (= 32 rounds))
+               (is (= 16 (length salt))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test written-public-key-keeps-openssh-trailing-space
+  ;; sshkey_save_public appends " %s\n" whatever the comment is, so an
+  ;; empty comment leaves one space before the newline; -y's line does not.
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-keygen-pubspace"))
+         (path (keygen-test-path directory "id_space.pub")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (let* ((key (ssh-generate-private-key "ed25519" :comment ""))
+                (line (ssh-public-key-line key)))
+           (ssh-write-public-key key path)
+           (let ((written
+                   (with-open-file (stream path :direction :input)
+                     (read-line stream))))
+             (is (char= #\Space (char written (1- (length written)))))
+             (is (string= (string-right-trim '(#\Newline) line)
+                          written :end2 (1- (length written)))))
+           (is (not (char= #\Space (char line (1- (length line)))))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test generated-public-line-round-trips-through-the-file

@@ -666,7 +666,7 @@ wrong passphrase; ENCRYPTED selects which of the two to report."
     (unless (= check-one check-two)
       (if encrypted
           (error 'ssh-authentication-error
-                 :detail "the passphrase for the private key is wrong")
+                 :detail "incorrect passphrase supplied to decrypt private key")
           (error 'ssh-protocol-error :detail "private key check values differ")))
     (let ((key-type (ssh-read-text reader)))
       (unless (string= key-type type)
