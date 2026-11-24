@@ -1976,6 +1976,53 @@ streams are captured; an empty INPUT stands for end of input."
                    (is (search "(ECDSA)" output)))))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test keygen-verbose-fingerprints-add-randomart
+  ;; -l -v appends the randomart after the fingerprint line; -E picks the
+  ;; hash in its footer and -B leaves the picture alone.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (public (burs::keygen-public-path path))
+         (known (merge-pathnames "known_hosts" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-N" "" "-C" "one"
+                                "-q" "-f" (namestring path))))))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-v" "-f" (namestring public)))
+             (is (eql 0 status))
+             (is (search "+--[ED25519 256]--+" output))
+             (is (search "+----[SHA256]-----+" output)))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-v" "-E" "md5"
+                                  "-f" (namestring public)))
+             (is (eql 0 status))
+             (is (search "+------[MD5]------+" output)))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-v" "-B" "-f" (namestring public)))
+             (is (eql 0 status))
+             (is (search "+----[SHA256]-----+" output)))
+           ;; -v is accepted even where it changes nothing.
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-y" "-v" "-f" (namestring path))))))
+           (with-open-file (stream known :direction :output
+                                         :if-exists :supersede)
+             (format stream "a.example ~A~%"
+                     (string-right-trim '(#\Newline #\Return)
+                                        (uiop:read-file-string public))))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-F" "a.example" "-l" "-v"
+                                  "-f" (namestring known)))
+             (is (eql 0 status))
+             (is (search "+--[ED25519 256]--+" output))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test keygen-fingerprint-errors-match-ssh-keygen
   ;; A missing file, an empty file and a directory are all ssh-keygen's
   ;; "not a public key file" failures with status 255.

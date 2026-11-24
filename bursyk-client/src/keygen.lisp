@@ -14,8 +14,8 @@
                    [-N passphrase] [-t type] [-Z cipher]
        burs keygen -p [-a rounds] [-f file] [-N new] [-P old] [-Z cipher]
        burs keygen -y [-f file] [-P passphrase]
-       burs keygen -l [-E hash] [-f file]
-       burs keygen -B [-f file]
+       burs keygen -l [-v] [-E hash] [-f file]
+       burs keygen -B [-v] [-f file]
        burs keygen -c [-a rounds] [-C comment] [-f file] [-P passphrase]
        burs keygen -F hostname [-f known_hosts_file]"
   "The usage text, laid out like ssh-keygen's own synopsis.")
@@ -25,10 +25,11 @@
   "The short options that take a value.")
 
 (defparameter +keygen-flag-options+
-  '(#\q #\y #\l #\p #\c #\B #\h)
+  '(#\q #\y #\l #\p #\c #\B #\h #\v)
   "The short options that are switches.  ssh-keygen's -h means
 host-certificate signing and is ignored outside -s, so it is accepted here
-and does nothing; it is not help.")
+and does nothing; it is not help.  -v only adds the randomart picture to
+fingerprint output.")
 
 (defparameter +keygen-unsupported-options+
   '(#\A #\D #\H #\K #\Q #\R #\r #\s #\u #\V #\Y #\k #\e #\i
@@ -127,7 +128,7 @@ non-option arguments, so one before an option does not stop the parse."
                        :cipher nil :rounds nil :quiet nil :print-public nil
                        :fingerprint nil :change-passphrase nil
                        :change-comment nil :bubblebabble nil
-                       :find-host nil))
+                       :find-host nil :verbose nil))
         (remaining (copy-list arguments))
         (extras nil))
     (loop while remaining
@@ -160,7 +161,8 @@ non-option arguments, so one before an option does not stop the parse."
                               (#\p (setf (getf options :change-passphrase) t))
                               (#\c (setf (getf options :change-comment) t))
                               (#\B (setf (getf options :bubblebabble) t))
-                              (#\h nil))
+                              (#\h nil)
+                              (#\v (setf (getf options :verbose) t)))
                             (incf index))
                            ((member option +keygen-unsupported-options+)
                             (keygen-fail "-~A is not supported by burs keygen"
@@ -648,7 +650,11 @@ The checks happen before the overwrite question, as ssh-keygen's do."
           (cl-pnet-ssh:ssh-key-bits blob)
           (keygen-fingerprint-string blob options)
           (if comment comment "no comment")
-          (cl-pnet-ssh:ssh-key-type-name blob)))
+          (cl-pnet-ssh:ssh-key-type-name blob))
+  (when (getf options :verbose)
+    (format t "~A~%"
+            (cl-pnet-ssh:ssh-key-randomart
+             blob (or (getf options :hash) :sha256)))))
 
 (defun keygen-fingerprint-private-header (path options)
   (if (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
@@ -769,7 +775,11 @@ The \"# Host ... found\" line is left out under -q."
                       host
                       (cl-pnet-ssh:ssh-key-type-name blob)
                       (keygen-fingerprint-string blob options)
-                      (and comment (plusp (length comment)) comment)))
+                      (and comment (plusp (length comment)) comment))
+              (when (getf options :verbose)
+                (format t "~A~%"
+                        (cl-pnet-ssh:ssh-key-randomart
+                         blob (or (getf options :hash) :sha256)))))
             (format t "~A~%" (cl-pnet-ssh::ssh-known-host-entry-line entry)))))
     (if found 0 1)))
 
