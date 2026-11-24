@@ -839,7 +839,17 @@ session down."
                       (format stream "~A~%" line)
                       (finish-output stream))
                   (error ()
-                    (setf *log-stream* nil))))))))
+                    (setf *log-stream* nil)))))))
+  ;; ssh applies a command-line -o while it is still parsing its arguments,
+  ;; before -q, -E and -v take effect, so readconf's notice about an
+  ;; unsupported one always reaches stderr.
+  (setf cl-pnet-ssh:*ssh-forced-warning-function*
+        (lambda (line)
+          (handler-case
+              (progn
+                (format *error-output* "~A~%" line)
+                (finish-output *error-output*))
+            (error () nil)))))
 
 ;;; ---- -Q: algorithm queries ----
 

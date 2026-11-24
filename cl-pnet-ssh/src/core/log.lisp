@@ -34,3 +34,19 @@ falls back to SSH-LOG when a library user only bound the logger.")
       (*ssh-warning-function*
        (ignore-errors (funcall *ssh-warning-function* message)))
       (t (ssh-log "~A" message)))))
+
+(defvar *ssh-forced-warning-function* nil
+  "A function of one string for notices ssh prints before it logs anything.
+
+ssh applies every -o option while it is still reading its own arguments and
+calls log_init only afterwards.  A readconf message about a command-line
+option therefore reaches stderr before -q, -E or -v can have any effect on
+it.  Command-line config notices use this reporter; file notices do not.")
+
+(defun ssh-warn-always (format-string &rest arguments)
+  "Report a warning through *SSH-FORCED-WARNING-FUNCTION*, else SSH-WARN."
+  (let ((message (apply #'format nil format-string arguments)))
+    (cond
+      (*ssh-forced-warning-function*
+       (ignore-errors (funcall *ssh-forced-warning-function* message)))
+      (t (ssh-warn "~A" message)))))

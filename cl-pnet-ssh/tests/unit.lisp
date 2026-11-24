@@ -8153,6 +8153,34 @@ applying the directive."
     (is (equal '("command-line line 0: Unsupported option \"gssapiauthentication\"")
                (nreverse warnings)))))
 
+(test command-line-unsupported-option-bypasses-quiet
+  "ssh applies a -o option before log_init, so readconf's notice about an
+unsupported one reaches stderr even under -q and -E; a file's notice does
+not, because logging is already initialised by then."
+  (let ((warnings '())
+        (forced '())
+        (condition nil))
+    (let ((cl-pnet-ssh:*ssh-warning-function*
+            (lambda (message) (push message warnings)))
+          (cl-pnet-ssh:*ssh-forced-warning-function*
+            (lambda (message) (push message forced))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIAuthentication yes")
+              (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "gssapidelegatecredentials" :args '("no")
+               :path "/home/user/.ssh/config" :number 4)))
+       "alias.example"
+       :on-options (lambda (value) (declare (ignore value)))
+       :on-error (lambda (value) (setf condition value))))
+    (is (null condition))
+    (is (equal '("command-line line 0: Unsupported option \"gssapiauthentication\"")
+               (nreverse forced)))
+    (is (equal '("/home/user/.ssh/config line 4: Unsupported option \"gssapidelegatecredentials\"")
+               (nreverse warnings)))))
+
 (test host-blocks-log-like-readconf
   "readconf names the block it applies at debug level, and the negated
 pattern when one is why it does not apply the block."

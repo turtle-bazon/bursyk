@@ -2074,8 +2074,13 @@ both tables because readconf ignores it silently."
          (number (or (ssh-config-line-number line) 0)))
     (cond
       ((member keyword +ssh-config-unsupported-keywords+ :test #'string=)
-       (ssh-warn "~A line ~D: Unsupported option \"~A\""
-                 where number keyword))
+       (if (ssh-config-line-path line)
+           (ssh-warn "~A line ~D: Unsupported option \"~A\""
+                     where number keyword)
+           ;; A command-line option is applied before log_init, so its
+           ;; notice reaches stderr even under -q or -E.
+           (ssh-warn-always "~A line ~D: Unsupported option \"~A\""
+                            where number keyword)))
       ((member keyword +ssh-config-deprecated-keywords+ :test #'string=)
        ;; ssh applies a -o option while it is still parsing its own
        ;; arguments, before log_init, so the debug-level notice for a

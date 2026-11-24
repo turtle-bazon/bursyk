@@ -30,6 +30,8 @@
    #:ssh-log
    #:*ssh-warning-function*
    #:ssh-warn
+   #:*ssh-forced-warning-function*
+   #:ssh-warn-always
    ;; channels
    #:ssh-open-session
    #:ssh-open-direct-tcpip
