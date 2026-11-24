@@ -101,13 +101,17 @@ all: build
 # so it only loads them and saves the executable, and the image that does the
 # saving is the size the program gets when it runs.  The dump pass depends on
 # the compile pass rather than sitting beside it, so even `make -j` cannot run
-# the second half against a half-built cache.
+# the second half against a half-built cache.  It also removes the program
+# first: program-op treats an existing output newer than its inputs as up to
+# date, and with a warm cache the inputs are not rewritten, so without the
+# removal a build for another backend would keep the previous executable.
 build: build-client build-server
 
 build-client: build-client-dump
 
 build-client-dump: build-client-compile
 	@mkdir -p _build "$(FASL_ROOT)"
+	@rm -f _build/burs
 	$(LISP) $(DUMP_LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
 	  --eval '(ql:quickload "bursyk-client")' \
 	  --eval '(asdf:make "bursyk-client")'
@@ -121,6 +125,7 @@ build-server: build-server-dump
 
 build-server-dump: build-server-compile
 	@mkdir -p _build "$(FASL_ROOT)"
+	@rm -f _build/bursyk-server
 	$(LISP) $(DUMP_LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
 	  --eval '(ql:quickload "bursyk-server")' \
 	  --eval '(asdf:make "bursyk-server")'
