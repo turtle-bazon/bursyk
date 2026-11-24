@@ -451,13 +451,16 @@
    #:ssh-generate-private-key
    #:ssh-normalize-key-type
    #:ssh-key-bits
+   #:ssh-key-bubblebabble
    #:ssh-private-key-file-octets
    #:ssh-private-key-file-encrypted-p
+   #:ssh-private-key-public-blob
    #:ssh-write-private-key
    #:ssh-write-public-key
    #:ssh-public-key-line
    #:+ssh-keygen-default-rsa-bits+
    #:+ssh-keygen-minimum-rsa-bits+
+   #:+ssh-keygen-maximum-rsa-bits+
    #:+ssh-keygen-default-cipher+
    #:ssh-keygen-error
    #:ssh-public-key-parts

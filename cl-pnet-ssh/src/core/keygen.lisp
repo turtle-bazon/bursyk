@@ -103,11 +103,13 @@ the full wire name."
 (defun ssh-generate-rsa-private-key (num-bits comment)
   (let* ((bits (or num-bits +ssh-keygen-default-rsa-bits+))
          (bits (if (integerp bits) bits
-                   (ssh-keygen-fail "-b needs an integer, not ~A" num-bits))))
-    (unless (<= +ssh-keygen-minimum-rsa-bits+ bits +ssh-keygen-maximum-rsa-bits+)
-      (ssh-keygen-fail "RSA bits must be between ~D and ~D"
-                        +ssh-keygen-minimum-rsa-bits+
-                        +ssh-keygen-maximum-rsa-bits+))
+                   (ssh-keygen-fail "Bits has bad value ~A (invalid)" num-bits))))
+    (when (< bits +ssh-keygen-minimum-rsa-bits+)
+      (ssh-keygen-fail "Invalid RSA key length: minimum is ~D bits"
+                       +ssh-keygen-minimum-rsa-bits+))
+    (when (> bits +ssh-keygen-maximum-rsa-bits+)
+      (ssh-keygen-fail "Invalid RSA key length: maximum is ~D bits"
+                       +ssh-keygen-maximum-rsa-bits+))
     (multiple-value-bind (private public)
         (ironclad-unsafe:generate-key-pair :rsa :num-bits bits)
       (let* ((e (getf (ironclad-unsafe:destructure-public-key public) :e))
@@ -131,20 +133,18 @@ the full wire name."
          :comment (or comment ""))))))
 
 (defun ssh-generate-ecdsa-private-key (type num-bits comment)
-  (let* ((name (if (string= type "ecdsa-sha2-nistp256")
-                   ;; -b chooses the curve for a plain `-t ecdsa'.
-                   (if (and num-bits (/= num-bits 256))
-                       (cond
-                         ((= num-bits 384) "ecdsa-sha2-nistp384")
-                         ((= num-bits 521) "ecdsa-sha2-nistp521")
-                         (t (ssh-keygen-fail
-                             "ECDSA bits must be 256, 384 or 521")))
-                       type)
-                   type))
-         (curve (ssh-key-type-ecdsa-curve name))
-         (bits (getf curve :bits)))
-    (when (and num-bits (/= num-bits bits))
-      (ssh-keygen-fail "~A needs ~D bits, not ~D" name bits num-bits))
+  ;; ssh-keygen lets -b choose the curve even when -t names another one, so
+  ;; `-t ecdsa-sha2-nistp256 -b 384' makes a 384-bit key.
+  (let* ((name
+           (if num-bits
+               (cond
+                 ((= num-bits 256) "ecdsa-sha2-nistp256")
+                 ((= num-bits 384) "ecdsa-sha2-nistp384")
+                 ((= num-bits 521) "ecdsa-sha2-nistp521")
+                 (t (ssh-keygen-fail
+                     "Invalid ECDSA key length: valid lengths are 256, 384 or 521 bits")))
+               type))
+         (curve (ssh-key-type-ecdsa-curve name)))
     (multiple-value-bind (private public)
         (ironclad-unsafe:generate-key-pair (getf curve :curve))
       (let ((x (getf (ironclad-unsafe:destructure-private-key private) :x))
@@ -198,8 +198,7 @@ SSH-WRITE-PRIVATE-KEY and is otherwise identical to one read from a file."
   (let ((name (ssh-normalize-key-type type)))
     (cond
       ((string= name "ssh-ed25519")
-       (when (and num-bits (/= num-bits 256))
-         (ssh-keygen-fail "ed25519 keys are fixed at 256 bits"))
+       ;; ssh-keygen accepts -b for ed25519 and ignores it.
        (ssh-generate-ed25519-private-key comment))
       ((string= name "ssh-rsa")
        (ssh-generate-rsa-private-key num-bits comment))

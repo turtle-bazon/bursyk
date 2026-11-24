@@ -10,27 +10,34 @@
 ;;;; command runs on Linux, FreeBSD and Windows.
 
 (defparameter +keygen-usage+
-  "usage: burs keygen [-q] [-t type] [-b bits] [-f file] [-N passphrase]
-                   [-C comment] [-Z cipher] [-a rounds]
+  "usage: burs keygen [-q] [-a rounds] [-b bits] [-C comment] [-f file]
+                   [-N passphrase] [-t type] [-Z cipher]
+       burs keygen -p [-a rounds] [-f file] [-N new] [-P old] [-Z cipher]
        burs keygen -y [-f file] [-P passphrase]
        burs keygen -l [-E md5|sha256] [-f file]
-       burs keygen -p [-f file] [-P old] [-N new] [-a rounds]
-       burs keygen -c [-f file] [-P passphrase] [-C comment]"
+       burs keygen -B [-f file]
+       burs keygen -c [-a rounds] [-C comment] [-f file] [-P passphrase]
+       burs keygen -F hostname [-f known_hosts_file]"
   "The usage text, laid out like ssh-keygen's own synopsis.")
 
 (defparameter +keygen-value-options+
-  '(#\t #\b #\f #\N #\C #\P #\E #\Z #\a)
+  '(#\t #\b #\f #\N #\C #\P #\E #\Z #\a #\F)
   "The short options that take a value.")
 
 (defparameter +keygen-flag-options+
-  '(#\q #\y #\l #\p #\c)
+  '(#\q #\y #\l #\p #\c #\B)
   "The short options that are switches.  ssh-keygen has no -h for help; its
 -h is host-certificate signing, which this command does not do.")
 
 (defparameter +keygen-unsupported-options+
-  '(#\A #\B #\D #\F #\H #\K #\Q #\R #\r #\s #\u #\V #\Y #\h #\k #\e #\i
+  '(#\A #\D #\H #\K #\Q #\R #\r #\s #\u #\V #\Y #\h #\k #\e #\i
     #\m #\n #\w #\j #\I #\O #\S #\z)
   "ssh-keygen switches that belong to features this command does not have.")
+
+(defparameter +keygen-ciphers+
+  '("aes128-ctr" "aes192-ctr" "aes256-ctr"
+    "aes128-cbc" "aes192-cbc" "aes256-cbc")
+  "The ciphers an OpenSSH private key can use here.")
 
 (defun keygen-fail (format-string &rest arguments)
   (error (apply #'format nil format-string arguments)))
@@ -39,16 +46,28 @@
   (format *error-output* "~A~%" +keygen-usage+)
   (finish-output *error-output*))
 
-(defun keygen-parse-integer (option value)
-  (handler-case
-      (parse-integer value)
-    (error ()
-      (keygen-fail "~A needs an integer, not ~S" option value))))
+(defun keygen-parse-bits (value)
+  "VALUE as ssh-keygen reads -b, with its wording for a bad value."
+  (let ((bits (handler-case (parse-integer value)
+                (error ()
+                  (keygen-fail "Bits has bad value ~A (invalid)" value)))))
+    (when (<= bits 0)
+      (keygen-fail "Bits has bad value ~A (too small)" value))
+    bits))
+
+(defun keygen-parse-rounds (value)
+  "VALUE as ssh-keygen reads -a, with its wording for a bad value."
+  (let ((rounds (handler-case (parse-integer value)
+                  (error ()
+                    (keygen-fail "Invalid number: ~A (invalid)" value)))))
+    (when (< rounds 1)
+      (keygen-fail "Invalid number: ~A (too small)" value))
+    rounds))
 
 (defun keygen-set-value (options option value)
   (ecase option
     (#\t (setf (getf options :type) (string-downcase value)))
-    (#\b (setf (getf options :bits) (keygen-parse-integer "-b" value)))
+    (#\b (setf (getf options :bits) (keygen-parse-bits value)))
     (#\f (setf (getf options :file) value))
     (#\N (setf (getf options :new-passphrase) value))
     (#\C (setf (getf options :comment) value))
@@ -58,9 +77,11 @@
                  ((string-equal value "md5") :md5)
                  ((string-equal value "sha256") :sha256)
                  (t (keygen-fail "-E must be md5 or sha256, not ~S" value)))))
-    (#\Z (setf (getf options :cipher) (string-downcase value)))
-    (#\a (setf (getf options :rounds)
-               (keygen-parse-integer "-a" value)))))
+    (#\Z (unless (member value +keygen-ciphers+ :test #'string=)
+            (keygen-fail "Invalid OpenSSH-format cipher '~A'" value))
+          (setf (getf options :cipher) value))
+    (#\a (setf (getf options :rounds) (keygen-parse-rounds value)))
+    (#\F (setf (getf options :find-host) value))))
 
 (defun keygen-parse-arguments (arguments)
   "The option plist for ARGUMENTS.
@@ -71,7 +92,8 @@ or the next argument, as ssh-keygen's getopt does."
                        :comment nil :old-passphrase nil :hash :sha256
                        :cipher nil :rounds nil :quiet nil :print-public nil
                        :fingerprint nil :change-passphrase nil
-                       :change-comment nil :help nil))
+                       :change-comment nil :bubblebabble nil
+                       :find-host nil :help nil))
         (remaining (copy-list arguments)))
     (loop while remaining
           for argument = (pop remaining)
@@ -104,7 +126,8 @@ or the next argument, as ssh-keygen's getopt does."
                               (#\y (setf (getf options :print-public) t))
                               (#\l (setf (getf options :fingerprint) t))
                               (#\p (setf (getf options :change-passphrase) t))
-                              (#\c (setf (getf options :change-comment) t)))
+                              (#\c (setf (getf options :change-comment) t))
+                              (#\B (setf (getf options :bubblebabble) t)))
                             (incf index))
                            ((member option +keygen-unsupported-options+)
                             (keygen-fail "-~A is not supported by burs keygen"
@@ -220,6 +243,17 @@ ssh-keygen's empty passphrase does."
                 (string= "-----BEGIN" trimmed
                          :end2 (length "-----BEGIN")))))))
 
+(defun keygen-require-file (path)
+  "Signal ssh-keygen's message when PATH does not exist."
+  (unless (probe-file path)
+    (keygen-fail "~A: No such file or directory"
+                 (uiop:native-namestring path)))
+  path)
+
+(defun keygen-directory-p (path)
+  (let ((truename (probe-file path)))
+    (and truename (uiop:directory-pathname-p truename))))
+
 (defun keygen-prompt-passphrase (path)
   (format *error-output* "Enter passphrase for key '~A': "
           (uiop:native-namestring path))
@@ -233,6 +267,7 @@ A missing passphrase for an encrypted key is prompted for once; a wrong one
 is an error, so a typo cannot silently rewrite the key.  PASSPHRASE-USED is
 the non-empty string the key was decrypted with, or NIL when it was in the
 clear, so a rewrite can preserve the protection."
+  (keygen-require-file path)
   (handler-case
       (values (cl-pnet-ssh:ssh-load-private-key path :passphrase passphrase)
               (and (stringp passphrase) (plusp (length passphrase))
@@ -262,42 +297,87 @@ clear, so a rewrite can preserve the protection."
                      (subseq trimmed (1+ second)))
         "")))
 
-(defun keygen-file-blob-and-comment (path &key passphrase)
-  "VALUES BLOB COMMENT for the key file at PATH, private or public."
-  (if (keygen-private-file-p path)
-      (let ((key (keygen-load-key path :passphrase passphrase)))
-        (values (cl-pnet-ssh:ssh-public-key-blob-of key)
-                (or (cl-pnet-ssh:ssh-private-key-comment key) "")))
-      (let ((line (keygen-first-line path)))
-        (unless line
-          (keygen-fail "~A is not a key file" (uiop:native-namestring path)))
-        (let ((blob (cl-pnet-ssh:ssh-authorized-key-line-blob line)))
-          (unless blob
-            (keygen-fail "~A is not a key file" (uiop:native-namestring path)))
-          (values blob (keygen-public-line-comment line))))))
+(defun keygen-line-key (line)
+  "VALUES BLOB COMMENT for the key on one LINE, or NIL.
+
+LINE may be a plain public key, an authorized_keys line that starts with
+options, or a known_hosts line that starts with host patterns.  COMMENT is
+the text after the base64 key, as in ssh-keygen; when there is none the
+prefix ssh-keygen would have kept is used instead, and a bare key with no
+comment returns NIL so the caller can print \"no comment\"."
+  (let ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
+    (when (and (plusp (length trimmed))
+               (not (member (char trimmed 0) '(#\# #\@))))
+      (let ((fields (cl-pnet-ssh::ssh-authorized-key-line-fields trimmed)))
+        (loop for rest on fields
+              for index from 0
+              for type = (first rest)
+              for encoded = (second rest)
+              while encoded
+              do (let ((blob (handler-case
+                                 (cl-pnet-ssh:ssh-base64-octets encoded)
+                               (error () nil))))
+                   (when blob
+                     (multiple-value-bind (blob-type data)
+                         (handler-case
+                             (cl-pnet-ssh:ssh-public-key-parts blob)
+                           (error () (values nil nil)))
+                       (declare (ignore data))
+                       (when (and blob-type (string= blob-type type))
+                         (let* ((tail (cddr rest))
+                                (tail-string
+                                  (and tail (format nil "~{~A~^ ~}" tail))))
+                           (return-from keygen-line-key
+                             (values blob
+                                     (cond
+                                       ((and tail-string
+                                             (plusp (length tail-string))
+                                             (not (char= (char tail-string 0)
+                                                         #\#)))
+                                        tail-string)
+                                       ((plusp index) (first fields))
+                                       (t nil))))))))))))))
+
+(defun keygen-public-file-keys (path)
+  "A list of (BLOB COMMENT) for each key line in the file at PATH."
+  (keygen-require-file path)
+  (when (keygen-directory-p path)
+    (keygen-fail "~A is not a public key file."
+                 (uiop:native-namestring path)))
+  (with-open-file (stream path :direction :input
+                               :if-does-not-exist nil
+                               :external-format :utf-8)
+    (loop for line = (read-line stream nil nil)
+          while line
+          for key = (multiple-value-list (keygen-line-key line))
+          when (first key) collect key)))
 
 ;;; ---- overwrite handling ----
 
-(defun keygen-confirm-overwrite (path &optional public)
-  "Ask before replacing PATH or its PUBLIC half, as ssh-keygen does once."
-  (let ((existing (or (probe-file path)
-                      (and public (probe-file public)))))
-    (when existing
-      (if (not (stdin-terminal-p))
-          (keygen-fail "~A already exists" (uiop:native-namestring existing))
-          (let ((answer
-                  (read-prompt-line
-                   (format nil "~A already exists. Overwrite (y/n)? "
-                           (uiop:native-namestring existing)))))
-            (unless (and answer
-                         (plusp (length answer))
-                         (char-equal (char (string-trim
-                                            '(#\Space #\Tab #\Return #\Newline)
-                                            answer)
-                                           0)
-                                     #\y))
-              (keygen-fail "not overwriting ~A"
-                           (uiop:native-namestring existing))))))))
+(defun keygen-confirm-overwrite (path)
+  "Ask before replacing PATH, as ssh-keygen does once.
+
+Returns :YES or :NO.  The question goes to standard output and is asked
+even when standard input is not a terminal; ssh-keygen treats both end of
+input and any non-yes answer as a refusal and exits 1, so :NO covers both.
+Only the private path matters: a stray .pub alone is simply rewritten."
+  (let ((existing (probe-file path)))
+    (if (not existing)
+        :yes
+        (progn
+          (format t "~A already exists.~%Overwrite (y/n)? "
+                  (uiop:native-namestring existing))
+          (finish-output)
+          (let* ((answer (read-prompt-line ""))
+                 (trimmed (and answer
+                               (string-trim
+                                '(#\Space #\Tab #\Return #\Newline)
+                                answer))))
+            (if (and trimmed
+                     (plusp (length trimmed))
+                     (char-equal (char trimmed 0) #\y))
+                :yes
+                :no))))))
 
 (defun keygen-prepare-directory (path)
   (let ((directory (uiop:pathname-directory-pathname path)))
@@ -308,68 +388,220 @@ clear, so a rewrite can preserve the protection."
 
 ;;; ---- operations ----
 
+(defun keygen-check-type-and-bits (type bits)
+  "Validate generation input and return TYPE's wire name.
+
+The checks happen before the overwrite question, as ssh-keygen's do."
+  (let ((name (cl-pnet-ssh:ssh-normalize-key-type type)))
+    (when bits
+      (cond
+        ((string= name "ssh-rsa")
+         (when (< bits cl-pnet-ssh:+ssh-keygen-minimum-rsa-bits+)
+           (keygen-fail "Invalid RSA key length: minimum is ~D bits"
+                        cl-pnet-ssh:+ssh-keygen-minimum-rsa-bits+))
+         (when (> bits cl-pnet-ssh:+ssh-keygen-maximum-rsa-bits+)
+           (keygen-fail "Invalid RSA key length: maximum is ~D bits"
+                        cl-pnet-ssh:+ssh-keygen-maximum-rsa-bits+)))
+        ((and (> (length name) (length "ecdsa-sha2-"))
+              (string= "ecdsa-sha2-" name
+                       :end2 (length "ecdsa-sha2-")))
+         (unless (member bits '(256 384 521))
+           (keygen-fail
+            "Invalid ECDSA key length: valid lengths are 256, 384 or 521 bits")))))
+    name))
+
 (defun keygen-generate (options)
-  (let* ((type (or (getf options :type) "ed25519"))
+  (let* ((type (or (getf options :type)
+                   ;; ssh-keygen reads a bare -b as an RSA request.
+                   (if (getf options :bits) "rsa" "ed25519")))
+         (bits (getf options :bits))
          (path (keygen-path options :default-type type))
          (public (keygen-public-path path))
          (comment (or (getf options :comment) (keygen-default-comment)))
-         (quiet (getf options :quiet))
-         (passphrase (keygen-generation-passphrase options)))
-    (keygen-confirm-overwrite path public)
-    (keygen-prepare-directory path)
+         (quiet (getf options :quiet)))
+    (keygen-check-type-and-bits type bits)
     (unless quiet
       (format t "Generating public/private ~A key pair.~%"
               (keygen-short-type type)))
-    (let ((key (cl-pnet-ssh:ssh-generate-private-key
-                type :num-bits (getf options :bits) :comment comment)))
-      (cl-pnet-ssh:ssh-write-private-key
-       key path
-       :passphrase passphrase
-       :cipher (or (getf options :cipher)
-                   cl-pnet-ssh:+ssh-keygen-default-cipher+)
-       :rounds (or (getf options :rounds) 16))
-      (cl-pnet-ssh:ssh-write-public-key key public :comment comment)
-      (keygen-set-permissions path #o600)
-      (keygen-set-permissions public #o644)
-      (unless quiet
-        (format t "Your identification has been saved in ~A~%"
-                (uiop:native-namestring path))
-        (format t "Your public key has been saved in ~A~%"
-                (uiop:native-namestring public))
-        (let* ((blob (cl-pnet-ssh:ssh-public-key-blob-of key))
-               (fingerprint (cl-pnet-ssh:ssh-key-fingerprint blob)))
-          (format t "The key fingerprint is:~%")
-          (format t "~A ~A~%" fingerprint comment)
-          (format t "The key's randomart image is:~%~A~%"
-                  (cl-pnet-ssh:ssh-key-randomart blob)))))
-    (values)))
+    (unless (eq (keygen-confirm-overwrite path) :yes)
+      (return-from keygen-generate 1))
+    (keygen-prepare-directory path)
+    (let ((passphrase (keygen-generation-passphrase options)))
+      (let ((key (cl-pnet-ssh:ssh-generate-private-key
+                  type :num-bits bits :comment comment)))
+        (cl-pnet-ssh:ssh-write-private-key
+         key path
+         :passphrase passphrase
+         :cipher (or (getf options :cipher)
+                     cl-pnet-ssh:+ssh-keygen-default-cipher+)
+         :rounds (or (getf options :rounds) 16))
+        (cl-pnet-ssh:ssh-write-public-key key public :comment comment)
+        (keygen-set-permissions path #o600)
+        (keygen-set-permissions public #o644)
+        (unless quiet
+          (format t "Your identification has been saved in ~A~%"
+                  (uiop:native-namestring path))
+          (format t "Your public key has been saved in ~A~%"
+                  (uiop:native-namestring public))
+          (let* ((blob (cl-pnet-ssh:ssh-public-key-blob-of key))
+                 (fingerprint (cl-pnet-ssh:ssh-key-fingerprint blob)))
+            (format t "The key fingerprint is:~%")
+            (format t "~A ~A~%" fingerprint comment)
+            (format t "The key's randomart image is:~%~A~%"
+                    (cl-pnet-ssh:ssh-key-randomart blob))))))
+    nil))
 
 (defun keygen-print-public (options)
   (let ((path (keygen-path options)))
     (let ((key (keygen-load-key path
                                 :passphrase (getf options :old-passphrase))))
-      (format t "~A" (cl-pnet-ssh:ssh-public-key-line key)))))
+      (format t "~A" (cl-pnet-ssh:ssh-public-key-line key))))
+  nil)
+
+(defun keygen-fingerprint-string (blob options)
+  (if (getf options :bubblebabble)
+      (cl-pnet-ssh:ssh-key-bubblebabble blob)
+      (cl-pnet-ssh:ssh-key-fingerprint blob (or (getf options :hash) :sha256))))
+
+(defun keygen-print-fingerprint (blob comment options)
+  ;; ssh-keygen prints "no comment" when the file had no comment field at
+  ;; all, but an empty comment from a private key prints as two spaces.
+  (format t "~D ~A ~A (~A)~%"
+          (cl-pnet-ssh:ssh-key-bits blob)
+          (keygen-fingerprint-string blob options)
+          (if comment comment "no comment")
+          (cl-pnet-ssh:ssh-key-type-name blob)))
+
+(defun keygen-fingerprint-private-header (path options)
+  (if (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
+      (keygen-print-fingerprint
+       (cl-pnet-ssh:ssh-private-key-public-blob path) nil options)
+      (let ((key (keygen-load-key path)))
+        (keygen-print-fingerprint
+         (cl-pnet-ssh:ssh-public-key-blob-of key)
+         (or (cl-pnet-ssh:ssh-private-key-comment key) "")
+         options))))
+
+(defun keygen-fingerprint-private (path options)
+  "Print fingerprints for the private key at PATH, as ssh-keygen -l does.
+
+ssh-keygen reads PATH.pub when it exists and otherwise the unencrypted
+public header of the private file, so -l never asks for a passphrase.  Only
+a cleartext key contributes the comment carried in its private section."
+  (let ((public (keygen-public-path path)))
+    (if (probe-file public)
+        (let ((keys (keygen-public-file-keys public)))
+          (if keys
+              (let ((comment (second (first keys))))
+                (keygen-print-fingerprint
+                 (first (first keys))
+                 ;; ssh-keygen substitutes the .pub file name when the
+                 ;; first line there has no comment of its own.
+                 (if (plusp (length comment))
+                     comment
+                     (uiop:native-namestring public))
+                 options))
+              (keygen-fingerprint-private-header path options)))
+        (keygen-fingerprint-private-header path options))))
 
 (defun keygen-fingerprint (options)
   (let* ((path (keygen-path options))
-         (hash (or (getf options :hash) :sha256)))
-    (multiple-value-bind (blob comment)
-        (keygen-file-blob-and-comment
-         path :passphrase (getf options :old-passphrase))
-      ;; ssh-keygen prints "no comment" rather than two spaces when the
-      ;; file has no comment.
-      (format t "~D ~A ~A (~A)~%"
-              (cl-pnet-ssh:ssh-key-bits blob)
-              (cl-pnet-ssh:ssh-key-fingerprint blob hash)
-              (if (plusp (length comment)) comment "no comment")
-              (cl-pnet-ssh:ssh-key-type-name blob)))))
+         (native (uiop:native-namestring path)))
+    (keygen-require-file path)
+    (cond
+      ((keygen-directory-p path)
+       (keygen-fail "~A is not a public key file." native))
+      ((keygen-private-file-p path)
+       (keygen-fingerprint-private path options))
+      (t
+       ;; One file can hold many keys: authorized_keys with options and
+       ;; known_hosts with host patterns both list one key per line.
+       (let ((keys (keygen-public-file-keys path)))
+         (unless keys
+           (keygen-fail "~A is not a public key file." native))
+         (dolist (entry keys)
+           (keygen-print-fingerprint (first entry) (second entry) options)))))
+    nil))
+
+(defun keygen-known-host-line-comment (line)
+  "The comment after the base64 key on known_hosts LINE, or NIL.
+
+The line is already trimmed, so what follows the key type and key is the
+comment, with any inner spacing kept as OpenSSH keeps it."
+  (let ((index 0)
+        (length (length line)))
+    (labels ((space-p (character)
+               (member character '(#\Space #\Tab)))
+             (skip-space ()
+               (loop while (and (< index length)
+                                (space-p (char line index)))
+                     do (incf index)))
+             (skip-field ()
+               (loop while (and (< index length)
+                                (not (space-p (char line index))))
+                     do (incf index))))
+      (skip-space)
+      ;; A @cert-authority or @revoked marker comes before the hosts.
+      (when (and (< index length) (char= (char line index) #\@))
+        (skip-field)
+        (skip-space))
+      (skip-field)                     ; hosts
+      (skip-space)
+      (skip-field)                     ; key type
+      (skip-space)
+      (skip-field)                     ; base64 key
+      (skip-space)
+      (when (< index length)
+        (subseq line index)))))
+
+(defun keygen-find-host (options)
+  "Print the known_hosts entries for -F HOST, as ssh-keygen -F does.
+
+With -l the entry prints HOST TYPE FINGERPRINT [COMMENT] instead of the
+whole line, and -B selects the Bubble Babble form of that fingerprint.
+The \"# Host ... found\" line is left out under -q."
+  (let* ((path (if (getf options :file)
+                   (keygen-pathname (getf options :file))
+                   (merge-pathnames ".ssh/known_hosts"
+                                    (user-homedir-pathname))))
+         (native (uiop:native-namestring path))
+         (host (getf options :find-host))
+         (found nil))
+    (unless (probe-file path)
+      (keygen-fail "Cannot stat ~A: No such file or directory" native))
+    (dolist (entry (cl-pnet-ssh:ssh-load-known-hosts path))
+      (when (cl-pnet-ssh::ssh-known-host-entry-matches-p entry host)
+        (setf found t)
+        (unless (getf options :quiet)
+          (format t "# Host ~A found: line ~D ~A~%"
+                  host
+                  (cl-pnet-ssh::ssh-known-host-entry-line-number entry)
+                  (let ((marker
+                          (cl-pnet-ssh::ssh-known-host-entry-marker entry)))
+                    (cond
+                      ((equal marker "@cert-authority") "CA")
+                      ((equal marker "@revoked") "REVOKED")
+                      (t "")))))
+        (if (getf options :fingerprint)
+            (let* ((line (cl-pnet-ssh::ssh-known-host-entry-line entry))
+                   (blob (cl-pnet-ssh::ssh-known-host-entry-key-blob entry))
+                   (comment (keygen-known-host-line-comment line)))
+              (format t "~A ~A ~A~@[ ~A~]~%"
+                      host
+                      (cl-pnet-ssh:ssh-key-type-name blob)
+                      (keygen-fingerprint-string blob options)
+                      (and comment (plusp (length comment)) comment)))
+            (format t "~A~%" (cl-pnet-ssh::ssh-known-host-entry-line entry)))))
+    (if found 0 1)))
 
 (defun keygen-change-passphrase (options)
-  (let* ((path (keygen-path options))
-         (quiet (getf options :quiet)))
+  (let ((path (keygen-path options)))
     (multiple-value-bind (key passphrase-used)
         (keygen-load-key path :passphrase (getf options :old-passphrase))
       (declare (ignore passphrase-used))
+      ;; ssh-keygen prints these two lines even under -q.
+      (format t "Key has comment '~A'~%"
+              (or (cl-pnet-ssh:ssh-private-key-comment key) ""))
       (let ((new (keygen-new-passphrase options)))
         (cl-pnet-ssh:ssh-write-private-key
          key path
@@ -378,26 +610,44 @@ clear, so a rewrite can preserve the protection."
                      cl-pnet-ssh:+ssh-keygen-default-cipher+)
          :rounds (or (getf options :rounds) 16))
         (keygen-set-permissions path #o600)
-        (unless quiet
-          (format t "Your identification has been saved with the new passphrase.~%"))))
-    (values)))
+        (format t "Your identification has been saved with the new passphrase.~%")))
+    nil))
 
 (defun keygen-change-comment (options)
   (let* ((path (keygen-path options))
          (public (keygen-public-path path)))
+    ;; Like ssh-keygen, -N can name the passphrase that opens the key when
+    ;; -P is absent (the first attempt is always with an empty passphrase).
     (multiple-value-bind (key passphrase-used)
-        (keygen-load-key path :passphrase (getf options :old-passphrase))
-      (let ((comment
-              (or (getf options :comment)
-                  (if (stdin-terminal-p)
-                      (or (read-prompt-line "Enter new comment: ") "")
-                      (keygen-fail "no comment given; use -C"))))
-            ;; A -P given for an unencrypted key names no protection to
-            ;; preserve; rewriting with it would silently encrypt the key.
-            (passphrase
-              (and (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
-                   passphrase-used))
-            (old (cl-pnet-ssh:ssh-private-key-comment key)))
+        (keygen-load-key
+         path
+         :passphrase (or (getf options :old-passphrase)
+                         (getf options :new-passphrase)))
+      (let* ((old (or (cl-pnet-ssh:ssh-private-key-comment key) ""))
+             (given (getf options :comment))
+             (comment
+               (progn
+                 (format t "Old comment: ~A~%" old)
+                 (if (stringp given)
+                     given
+                     (progn
+                       (format t "New comment: ")
+                       (finish-output)
+                       (let ((line (read-prompt-line "")))
+                         (unless line
+                           ;; End of input cancels the change, as it does in
+                           ;; ssh-keygen, and leaves both files untouched.
+                           (return-from keygen-change-comment 1))
+                         line)))))
+             ;; A -P given for an unencrypted key names no protection to
+             ;; preserve; rewriting with it would silently encrypt the key.
+             (passphrase
+               (and (cl-pnet-ssh:ssh-private-key-file-encrypted-p path)
+                    passphrase-used)))
+        (when (string= comment old)
+          ;; ssh-keygen leaves both files alone and says so.
+          (format t "No change to comment~%")
+          (return-from keygen-change-comment 0))
         (setf (cl-pnet-ssh:ssh-private-key-comment key) comment)
         (cl-pnet-ssh:ssh-write-private-key
          key path
@@ -410,11 +660,10 @@ clear, so a rewrite can preserve the protection."
         (cl-pnet-ssh:ssh-write-public-key key public :comment comment)
         (keygen-set-permissions path #o600)
         (keygen-set-permissions public #o644)
-        (format t "Old comment: ~A~%" old)
         (if (plusp (length comment))
             (format t "Comment '~A' applied~%" comment)
             (format t "Comment removed~%"))))
-    (values)))
+    nil))
 
 (defun keygen-run (arguments)
   (let ((options (keygen-parse-arguments arguments)))
@@ -422,28 +671,34 @@ clear, so a rewrite can preserve the protection."
       (keygen-print-usage)
       (return-from keygen-run 0))
     (cond
+      ((getf options :find-host)
+       (keygen-find-host options))
+      ((or (getf options :fingerprint) (getf options :bubblebabble))
+       (keygen-fingerprint options))
+      ((and (getf options :change-passphrase)
+            (getf options :change-comment))
+       (format *error-output* "Can only have one of -p and -c.~%")
+       (keygen-print-usage)
+       1)
       ((getf options :change-passphrase)
        (keygen-change-passphrase options))
       ((getf options :change-comment)
        (keygen-change-comment options))
       ((getf options :print-public)
        (keygen-print-public options))
-      ((getf options :fingerprint)
-       (keygen-fingerprint options))
       (t
-       (keygen-generate options)))
-    0))
+       (keygen-generate options)))))
 
 (defun keygen-main (arguments)
   "Run `burs keygen ARGUMENTS` and return an exit status."
   (handler-case
-      (keygen-run arguments)
+      (or (keygen-run arguments) 0)
     (cl-pnet-ssh:ssh-keygen-error (condition)
       (format *error-output* "burs keygen: ~A~%"
               (cl-pnet-ssh:ssh-error-detail condition))
       (finish-output *error-output*)
-      1)
+      255)
     (error (condition)
       (format *error-output* "burs keygen: ~A~%" condition)
       (finish-output *error-output*)
-      1)))
+      255)))

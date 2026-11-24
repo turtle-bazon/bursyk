@@ -763,6 +763,15 @@ still cannot run these tests."
                                              (second parts)))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+(test bubblebabble-fingerprint-matches-openssh
+  "The -B form is OpenSSH's Bubble Babble over the SHA1 of the key blob."
+  (let ((blob
+          (ssh-base64-octets
+           "AAAAC3NzaC1lZDI1NTE5AAAAIHfwV00gSrZjEiE8/WsyZdbGJkqrjYIhUXNuTkHFLGyF")))
+    (is (string=
+         "xugef-becic-kilat-palis-gyzeh-gisak-ryliv-popir-bileh-hunef-fyxux"
+         (ssh-key-bubblebabble blob)))))
+
 (test openssh-private-key-passphrase-round-trip
   (if (not (ssh-keygen-available-p))
       (skip "no ssh-keygen or POSIX shell")
@@ -8019,7 +8028,10 @@ validated, so -G reports what ssh would and a bad line fails the same way."
                             (ssh-generate-private-key "mldsa44-ed25519"))))))
 
 (test generated-key-rejects-impossible-sizes
-  (signals ssh-keygen-error (ssh-generate-private-key "ed25519" :num-bits 512))
+  ;; ssh-keygen accepts -b for ed25519 and ignores it.
+  (is (string= "ssh-ed25519"
+               (ssh-private-key-type
+                (ssh-generate-private-key "ed25519" :num-bits 512))))
   (signals ssh-keygen-error (ssh-generate-private-key "ecdsa" :num-bits 200))
   (signals ssh-keygen-error (ssh-generate-private-key "rsa" :num-bits 512))
   (signals ssh-keygen-error (ssh-generate-private-key "nonsense")))

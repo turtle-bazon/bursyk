@@ -1422,6 +1422,31 @@ mask afterwards."
 
 ;;; ---- BURS KEYGEN ----
 
+(defun keygen-call (arguments &key (input ""))
+  "VALUES STATUS OUTPUT ERROR for keygen ARGUMENTS, reading INPUT as stdin.
+
+The prompt text goes to the error stream on this implementation, so both
+streams are captured; an empty INPUT stands for end of input."
+  (let ((output (make-string-output-stream))
+        (error-output (make-string-output-stream)))
+    (values (let ((*standard-output* output)
+                  (*error-output* error-output)
+                  (*standard-input* (make-string-input-stream input)))
+              (burs::keygen-main arguments))
+            (get-output-stream-string output)
+            (get-output-stream-string error-output))))
+
+(defun keygen-public-parts (path)
+  "TYPE, BLOB and COMMENT on PATH's first public-key line."
+  (with-open-file (stream path :direction :input)
+    (let* ((line (string-trim '(#\Space #\Tab #\Return #\Newline)
+                              (read-line stream)))
+           (first (position #\Space line))
+           (second (and first (position #\Space line :start (1+ first)))))
+      (values (subseq line 0 first)
+              (subseq line (1+ first) second)
+              (if second (subseq line (1+ second)) "")))))
+
 (test keygen-parses-ssh-keygen-options
   (let ((options (burs::keygen-parse-arguments
                   '("-t" "rsa" "-b2048" "-f/tmp/x" "-N" "pw" "-C" "me" "-q"))))
@@ -1551,7 +1576,218 @@ mask afterwards."
         (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test keygen-fingerprint-format-matches-ssh-keygen
-  ;; -E md5 is lower case, and a key without a comment reads "no comment".
+  ;; -E md5 is lower case.  A bare public key without a comment reads
+  ;; "no comment", while -l on the private path reads the .pub and
+  ;; substitutes its name when that line has no comment, as ssh-keygen
+  ;; does.  Without a .pub an empty private comment prints as two spaces.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (public (burs::keygen-public-path path)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0
+                       (keygen-call
+                        (list "-t" "ed25519" "-f" (namestring path)
+                              "-N" "" "-C" "" "-q")))))
+           ;; Directly on the .pub there is no comment field at all.
+           (multiple-value-bind (status output)
+               (keygen-call
+                (list "-l" "-E" "md5" "-f" (namestring public)))
+             (is (eql 0 status))
+             (is (search "MD5:" output))
+             (is (search "no comment" output))
+             (let* ((start (search "MD5:" output))
+                    (end (position #\Space output :start start)))
+               (is (notany #'upper-case-p
+                           (subseq output (+ start 4) end)))))
+           ;; Through the private path, the empty .pub comment becomes the
+           ;; .pub file name.
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-f" (namestring path)))
+             (is (eql 0 status))
+             (is (search (uiop:native-namestring public) output)))
+           (delete-file public)
+           (multiple-value-bind (status output)
+               (keygen-call (list "-l" "-f" (namestring path)))
+             (is (eql 0 status))
+             (is (not (search "no comment" output)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-fingerprint-walks-every-line-and-prefix
+  ;; -l reads every line.  An authorized_keys prefix keeps its trailing
+  ;; comment, a known_hosts prefix with no comment prints the host, a bare
+  ;; key with no comment prints "no comment", and blank, #, @ and invalid
+  ;; lines are skipped.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (ed (merge-pathnames "id_ed25519" directory))
+         (rsa (merge-pathnames "id_rsa" directory))
+         (ecdsa (merge-pathnames "id_ecdsa" directory))
+         (file (merge-pathnames "keys.txt" directory)))
+    (ensure-directories-exist ed)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring ed)
+                                "-N" "" "-C" "ed@example" "-q")))))
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "rsa" "-b" "2048"
+                                "-f" (namestring rsa)
+                                "-N" "" "-C" "rsa@example" "-q")))))
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ecdsa" "-f" (namestring ecdsa)
+                                "-N" "" "-C" "ecdsa@example" "-q")))))
+           (multiple-value-bind (ed-type ed-blob ed-comment)
+               (keygen-public-parts (burs::keygen-public-path ed))
+             (multiple-value-bind (rsa-type rsa-blob)
+                 (keygen-public-parts (burs::keygen-public-path rsa))
+               (multiple-value-bind (ecdsa-type ecdsa-blob)
+                   (keygen-public-parts (burs::keygen-public-path ecdsa))
+                 (with-open-file
+                     (stream file :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create
+                                  :external-format :utf-8)
+                   (format stream "~%# a comment~%not a key~%")
+                   (format stream "command=\"echo hi\",no-pty ~A ~A ~A~%"
+                           ed-type ed-blob ed-comment)
+                   (format stream "known.example ~A ~A~%"
+                           rsa-type rsa-blob)
+                   (format stream "~A ~A~%" ecdsa-type ecdsa-blob)
+                   (format stream "@cert-authority *.example ~A ~A~%"
+                           ed-type ed-blob))
+                 (multiple-value-bind (status output)
+                     (keygen-call (list "-l" "-f" (namestring file)))
+                   (is (eql 0 status))
+                   (is (= 3 (count #\Newline output)))
+                   (is (search "ed@example" output))
+                   (is (search "known.example" output))
+                   (is (search "no comment" output))
+                   (is (search "(ED25519)" output))
+                   (is (search "(RSA)" output))
+                   (is (search "(ECDSA)" output)))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-fingerprint-errors-match-ssh-keygen
+  ;; A missing file, an empty file and a directory are all ssh-keygen's
+  ;; "not a public key file" failures with status 255.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (missing (merge-pathnames "missing" directory))
+         (empty (merge-pathnames "empty" directory)))
+    (ensure-directories-exist empty)
+    (with-open-file (stream empty :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create)
+      (declare (ignore stream)))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" (namestring missing)))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "No such file or directory" error)))
+           (dolist (path (list empty directory))
+             (multiple-value-bind (status output error)
+                 (keygen-call (list "-l" "-f" (namestring path)))
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search "is not a public key file." error)))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-passphrase-change-reports-and-keeps-comment
+  ;; -p prints both messages even under -q, rewrites only the private key,
+  ;; and keeps the comment.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (public (burs::keygen-public-path path)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "" "-C" "keep@example" "-q")))))
+           (let ((before (with-open-file (stream public)
+                           (read-line stream))))
+             (multiple-value-bind (status output)
+                 (keygen-call
+                  (list "-p" "-P" "" "-N" "new-pw"
+                        "-f" (namestring path) "-q"))
+               (is (eql 0 status))
+               (is (search "Key has comment 'keep@example'" output))
+               (is (search "Your identification has been saved with the new passphrase."
+                           output)))
+             (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p path))
+             (is (string= "keep@example"
+                          (cl-pnet-ssh:ssh-private-key-comment
+                           (cl-pnet-ssh:ssh-load-private-key
+                            path :passphrase "new-pw"))))
+             (with-open-file (stream public)
+               (is (string= before (read-line stream))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-comment-change-prompts-and-stops-at-end-of-input
+  ;; -c names the current comment, prompts with ssh-keygen's "New comment:",
+  ;; and treats end of input as a cancellation with status 1.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (public (burs::keygen-public-path path)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "" "-C" "before" "-q")))))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-f" (namestring path)) :input "")
+             (is (eql 1 status))
+             (is (search "Old comment: before" output))
+             (is (search "New comment: " output)))
+           (is (string= "before"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key path))))
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-f" (namestring path))
+                            :input (format nil "fresh comment~%"))
+             (is (eql 0 status))
+             (is (search "Old comment: before" output))
+             (is (search "Comment 'fresh comment' applied" output)))
+           (is (string= "fresh comment"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key path))))
+           (with-open-file (stream public)
+             (is (search "fresh comment" (read-line stream))))
+           ;; Rewriting with the same comment changes nothing.
+           (multiple-value-bind (status output)
+               (keygen-call (list "-c" "-C" "fresh comment"
+                                  "-f" (namestring path)))
+             (is (eql 0 status))
+             (is (search "No change to comment" output))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-comment-change-accepts-new-passphrase-as-the-opener
+  ;; ssh-keygen uses -N as the passphrase that opens a protected key when
+  ;; -P is absent, and keeps the key protected under it.
   (let* ((directory (merge-pathnames
                      (format nil "burs-keygen-~D-~D/"
                              (get-universal-time) (random 1000000))
@@ -1560,49 +1796,137 @@ mask afterwards."
     (ensure-directories-exist path)
     (unwind-protect
          (progn
-           (let ((*standard-output* (make-broadcast-stream))
-                 (*error-output* (make-broadcast-stream)))
-             (is (eql 0 (burs::keygen-main
-                         (list "-t" "ed25519" "-f" (namestring path)
-                               "-N" "" "-C" "" "-q")))))
-           (let ((line (with-output-to-string (out)
-                         (let ((*standard-output* out))
-                           (burs::keygen-main
-                            (list "-l" "-E" "md5" "-f" (namestring path)))))))
-             (is (search "MD5:" line))
-             (is (search "no comment" line))
-             (let* ((start (search "MD5:" line))
-                    (end (position #\Space line :start start)))
-               (is (notany #'upper-case-p
-                           (subseq line (+ start 4) end))))))
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "pw" "-C" "before" "-q")))))
+           (multiple-value-bind (status output)
+               (keygen-call
+                (list "-c" "-C" "after" "-N" "pw"
+                      "-f" (namestring path)))
+             (is (eql 0 status))
+             (is (search "Comment 'after' applied" output)))
+           (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p path))
+           (is (string= "after"
+                        (cl-pnet-ssh:ssh-private-key-comment
+                         (cl-pnet-ssh:ssh-load-private-key
+                          path :passphrase "pw")))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
-(test keygen-refuses-to-generate-over-an-existing-file
-  ;; With stdin not a terminal there is no question to ask, so the command
-  ;; fails instead of replacing a key somebody may still need.
-  #+(and sbcl (not win32))
-  (progn
-    (let* ((directory (merge-pathnames
-                       (format nil "burs-keygen-~D-~D/"
-                               (get-universal-time) (random 1000000))
-                       (uiop:temporary-directory)))
-           (path (merge-pathnames "id_ed25519" directory)))
-      (ensure-directories-exist path)
-      (unwind-protect
-           (progn
-             (with-open-file (stream path :direction :output
-                                          :if-exists :supersede
-                                          :if-does-not-exist :create)
-               (write-line "existing" stream))
-             ;; The test process runs with a pipe or a terminal on stdin;
-             ;; only assert the non-terminal path when that is the case.
-             (unless (burs::stdin-terminal-p)
-               (let ((*standard-output* (make-broadcast-stream))
-                     (*error-output* (make-broadcast-stream)))
-                 (is (eql 1 (burs::keygen-main
-                             (list "-t" "ed25519" "-f" (namestring path)
-                                   "-q"))))))
+(test keygen-find-host-prints-matching-lines-and-fingerprints
+  ;; -F repeats every matching known_hosts line, and -l turns that into
+  ;; HOST TYPE FINGERPRINT [COMMENT]; -B selects Bubble Babble and -q
+  ;; hides the "# Host ... found" banner.  Marker and hashed lines match too.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (known (merge-pathnames "known_hosts" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" (namestring path)
+                                "-N" "" "-C" "alice@example" "-q")))))
+           (multiple-value-bind (type blob comment)
+               (keygen-public-parts (burs::keygen-public-path path))
+             (let* ((octets (cl-pnet-ssh:ssh-base64-octets blob))
+                    (fingerprint (cl-pnet-ssh:ssh-key-fingerprint octets :sha256))
+                    (bubble (cl-pnet-ssh:ssh-key-bubblebabble octets)))
+               (with-open-file (stream known :direction :output
+                                             :if-exists :supersede
+                                             :if-does-not-exist :create
+                                             :external-format :utf-8)
+                 (format stream "a.example ~A ~A ~A~%" type blob comment)
+                 (format stream "~A ~A ~A~%"
+                         (cl-pnet-ssh::ssh-hashed-known-host "a.example")
+                         type blob)
+                 (format stream "@cert-authority *.example ~A ~A ca@example~%"
+                         type blob))
+               (multiple-value-bind (status output)
+                   (keygen-call (list "-F" "a.example" "-f" (namestring known)))
+                 (is (eql 0 status))
+                 (is (= 6 (count #\Newline output)))
+                 (is (search "# Host a.example found: line 1 " output))
+                 (is (search (format nil "a.example ~A ~A ~A"
+                                     type blob comment)
+                             output)))
+               (multiple-value-bind (status output)
+                   (keygen-call
+                    (list "-F" "a.example" "-l" "-f" (namestring known)))
+                 (is (eql 0 status))
+                 (is (search (format nil "a.example ED25519 ~A alice@example"
+                                     fingerprint)
+                             output))
+                 ;; The hashed line has no comment, so no trailing space.
+                 (is (search (format nil "a.example ED25519 ~A~%"
+                                     fingerprint)
+                             output))
+                 (is (search (format nil "a.example ED25519 ~A ca@example"
+                                     fingerprint)
+                             output))
+                 (is (search "# Host a.example found: line 3 CA" output)))
+               (multiple-value-bind (status output)
+                   (keygen-call
+                    (list "-F" "a.example" "-l" "-B"
+                          "-f" (namestring known)))
+                 (is (eql 0 status))
+                 (is (search (format nil "a.example ED25519 ~A alice@example"
+                                     bubble)
+                             output)))
+               (multiple-value-bind (status output)
+                   (keygen-call
+                    (list "-F" "a.example" "-l" "-q"
+                          "-f" (namestring known)))
+                 (is (eql 0 status))
+                 (is (not (search "# Host" output)))
+                 (is (search fingerprint output)))
+               (multiple-value-bind (status output)
+                   (keygen-call
+                    (list "-F" "absent.invalid" "-f" (namestring known)))
+                 (is (eql 1 status))
+                 (is (zerop (length output)))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-overwrite-question-matches-ssh-keygen
+  ;; The question is asked even without a terminal, and any answer other
+  ;; than y (including end of input) cancels with ssh-keygen's status 1.
+  ;; Only y replaces the key.
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output
+                                        :if-exists :supersede
+                                        :if-does-not-exist :create)
+             (write-line "existing" stream))
+           (multiple-value-bind (status output)
+               (keygen-call
+                (list "-t" "ed25519" "-f" (namestring path) "-N" "" "-q")
+                :input "")
+             (is (eql 1 status))
+             (is (search "already exists." output))
+             (is (search "Overwrite (y/n)?" output)))
+           (dolist (answer (list (format nil "n~%") (format nil "nope~%")
+                                 (format nil "~%")))
+             (multiple-value-bind (status)
+                 (keygen-call
+                  (list "-t" "ed25519" "-f" (namestring path) "-N" "" "-q")
+                  :input answer)
+               (is (eql 1 status)))
              (with-open-file (stream path)
                (is (string= "existing" (read-line stream)))))
-        (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
-    #+(and sbcl win32) (skip "overwrite prompt needs a console"))
+           (multiple-value-bind (status)
+               (keygen-call
+                (list "-t" "ed25519" "-f" (namestring path) "-N" "" "-q")
+                :input (format nil "y~%"))
+             (is (eql 0 status)))
+           (with-open-file (stream path)
+             (is (not (string= "existing" (read-line stream))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))

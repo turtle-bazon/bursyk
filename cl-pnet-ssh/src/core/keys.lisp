@@ -59,6 +59,50 @@ as OpenSSH's sshkey_fingerprint does with force_plain."
         (string-downcase
          (format nil "~{~2,'0x~^:~}" (coerce digest 'list))))))))
 
+(defparameter +bubblebabble-vowels+ "aeiouy"
+  "The vowels in OpenSSH's Bubble Babble alphabet.")
+
+(defparameter +bubblebabble-consonants+ "bcdfghklmnprstvzx"
+  "The consonants in OpenSSH's Bubble Babble alphabet.")
+
+(defun ssh-key-bubblebabble (key-blob)
+  "OpenSSH's Bubble Babble SHA1 fingerprint of KEY-BLOB.
+
+This is the `xigak-nyryk-humil-bosek-sonax' form ssh-keygen -B prints.
+The seed carried between octet pairs is the checksum that makes a typo
+show up as a word that does not decode back to the digest."
+  (let* ((digest (ssh-hash :sha1 (ssh-key-plain-blob key-blob)))
+         (length (length digest))
+         (rounds (1+ (floor length 2)))
+         (output (make-string-output-stream))
+         (seed 1))
+    (write-char #\x output)
+    (dotimes (index rounds)
+      (if (or (< (1+ index) rounds) (oddp length))
+          (let* ((byte (aref digest (* 2 index)))
+                 (first (mod (+ (ldb (byte 2 6) byte) seed) 6))
+                 (middle (ldb (byte 4 2) byte))
+                 (last (mod (+ (ldb (byte 2 0) byte) (floor seed 6)) 6)))
+            (write-char (char +bubblebabble-vowels+ first) output)
+            (write-char (char +bubblebabble-consonants+ middle) output)
+            (write-char (char +bubblebabble-vowels+ last) output)
+            (when (< (1+ index) rounds)
+              (let ((next (aref digest (1+ (* 2 index)))))
+                (write-char (char +bubblebabble-consonants+
+                                  (ldb (byte 4 4) next))
+                            output)
+                (write-char #\- output)
+                (write-char (char +bubblebabble-consonants+
+                                  (ldb (byte 4 0) next))
+                            output)
+                (setf seed (mod (+ (* seed 5) (* byte 7) next) 36)))))
+          (progn
+            (write-char (char +bubblebabble-vowels+ (mod seed 6)) output)
+            (write-char (char +bubblebabble-consonants+ 16) output)
+            (write-char (char +bubblebabble-vowels+ (floor seed 6)) output))))
+    (write-char #\x output)
+    (get-output-stream-string output)))
+
 (defun ssh-key-randomart-title (key-blob)
   "The [TYPE SIZE] title OpenSSH puts over a randomart field."
   (multiple-value-bind (type data)
@@ -797,6 +841,25 @@ without decrypting anything."
         (declare (ignore index))
         (ssh-read-u8 reader))
       (not (string= (ssh-read-text reader) "none")))))
+
+(defun ssh-private-key-public-blob (path)
+  "The public key blob in the openssh-key-v1 header at PATH.
+
+The header sits outside the encrypted section, so a protected key can be
+identified without its passphrase, as ssh-keygen -l does."
+  (let* ((body (ssh-private-key-body (ssh-read-octets-file path)))
+         (magic (ssh-check-key-magic body)))
+    (declare (ignore magic))
+    (let ((reader (ssh-make-reader
+                   body (+ (length +openssh-key-magic+) 1))))
+      (ssh-read-text reader)                 ; cipher
+      (ssh-read-text reader)                 ; kdf
+      (ssh-read-string reader)               ; kdf options
+      (let ((count (ssh-read-u32 reader)))
+        (unless (= count 1)
+          (error 'ssh-protocol-error
+                 :detail "a key file with several keys is unsupported"))
+        (ssh-read-string reader)))))
 
 (defun ssh-public-key-blob-of (key)
   "The public key blob of private KEY, or an agent-backed host key."
