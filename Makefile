@@ -26,8 +26,13 @@ QUICKLISP_SETUP ?= $(HOME)/quicklisp/setup.lisp
 PESEKEY_DIR     ?= $(HOME)/pesekey
 
 # A cold private cache compiles the whole dependency set in one image, which
-# needs more than SBCL's 1 GiB default.  Override LISP_FLAGS to change it.
-LISP_FLAGS ?= --dynamic-space-size 3072
+# needs more than SBCL's 1 GiB default, so the compile pass gets extra heap.
+# The dump pass only loads those fasls, so it keeps SBCL's default heap and
+# each program is dumped from an image sized like its normal runtime instead
+# of like the compiler.  The tests compile and run in one image, so they use
+# LISP_FLAGS too.  Override either to change it.
+LISP_FLAGS      ?= --dynamic-space-size 2048
+DUMP_LISP_FLAGS ?=
 
 PNET_BACKEND ?= puma
 SSH_BACKEND  ?= lisp
@@ -78,6 +83,8 @@ QL_EVAL = --eval '(unless (find-package "QL") (load "$(QUICKLISP_SETUP)"))' \
           --eval '(ql:register-local-projects)'
 
 .PHONY: all build clean clean-cache build-client build-server \
+        build-client-compile build-client-dump \
+        build-server-compile build-server-dump \
         build-burs build-bursyk-server \
         test test-client test-server test-ssh test-ssh-live deps-check \
         matrix matrix-list build-matrix test-matrix
@@ -87,19 +94,41 @@ all: build
 # The two programs, in the default cell: the puma event loop over the pure
 # SSH stack (lisp-puma).  PNET_BACKEND and SSH_BACKEND still pick another
 # cell; the per-cell targets at the end pin one for both programs.
+#
+# Each program builds in two passes.  The compile pass starts a fresh image
+# with the compile heap and compiles the program and every dependency into
+# the private cache; it dumps nothing.  The dump pass finds all those fasls,
+# so it only loads them and saves the executable, and the image that does the
+# saving is the size the program gets when it runs.  The dump pass depends on
+# the compile pass rather than sitting beside it, so even `make -j` cannot run
+# the second half against a half-built cache.
 build: build-client build-server
 
-build-client: deps-check
+build-client: build-client-dump
+
+build-client-dump: build-client-compile
 	@mkdir -p _build "$(FASL_ROOT)"
-	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
+	$(LISP) $(DUMP_LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
 	  --eval '(ql:quickload "bursyk-client")' \
 	  --eval '(asdf:make "bursyk-client")'
 
-build-server: deps-check
+build-client-compile: deps-check
 	@mkdir -p _build "$(FASL_ROOT)"
 	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
+	  --eval '(ql:quickload "bursyk-client")'
+
+build-server: build-server-dump
+
+build-server-dump: build-server-compile
+	@mkdir -p _build "$(FASL_ROOT)"
+	$(LISP) $(DUMP_LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
 	  --eval '(ql:quickload "bursyk-server")' \
 	  --eval '(asdf:make "bursyk-server")'
+
+build-server-compile: deps-check
+	@mkdir -p _build "$(FASL_ROOT)"
+	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
+	  --eval '(ql:quickload "bursyk-server")'
 
 # The names these targets had before the matrix; kept for old scripts.
 build-burs: build-client
