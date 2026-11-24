@@ -188,17 +188,37 @@ non-option arguments, so one before an option does not stop the parse."
 (defun keygen-pathname (name)
   (uiop:parse-native-namestring name))
 
-(defun keygen-path (options &key (default-type "rsa"))
+(defun keygen-path (options &key (default-type "ed25519"))
   "The private key file the options select.
 
-An explicit -f wins; otherwise ~/.ssh/ gets the type's usual name, with RSA
-as the fallback for the operations ssh-keygen applies to an existing key."
+An explicit -f wins; otherwise ~/.ssh/ gets the type's usual name, with
+ed25519 as the fallback for the operations ssh-keygen applies to an
+existing key.  Whether a missing -f is asked for is up to the caller."
   (if (getf options :file)
       (keygen-pathname (getf options :file))
       (merge-pathnames (format nil ".ssh/~A"
                                (keygen-default-name
                                 (or (getf options :type) default-type)))
                        (user-homedir-pathname))))
+
+(defun keygen-ask-path (options &key (default-type "ed25519")
+                                   (prompt "Enter file in which the key is"))
+  "The key file for OPTIONS, asking like ssh-keygen when -f is absent.
+
+The default path is printed in parentheses; an empty answer takes it and
+end of input cancels the operation (NIL).  ssh-keygen writes this prompt to
+standard output, so keep it out of the passphrase chatter on stderr."
+  (if (getf options :file)
+      (keygen-path options)
+      (let* ((path (keygen-path options :default-type default-type))
+             (native (uiop:native-namestring path)))
+        (format t "~A (~A): " prompt native)
+        (finish-output)
+        (let ((line (read-prompt-line "")))
+          (cond
+            ((null line) nil)
+            ((plusp (length line)) (keygen-pathname line))
+            (t path))))))
 
 (defun keygen-public-path (path)
   (keygen-pathname (concatenate 'string (uiop:native-namestring path) ".pub")))
@@ -284,6 +304,56 @@ newline the terminal is not echoing."
   (let ((truename (probe-file path)))
     (and truename (uiop:directory-pathname-p truename))))
 
+(defun keygen-file-readable-p (path)
+  "Whether PATH can be opened for reading, in the POSIX sense."
+  #+(and sbcl (not win32))
+  (ignore-errors
+    (sb-posix:access (uiop:native-namestring path) sb-posix:r-ok))
+  #-(and sbcl (not win32))
+  t)
+
+(defun keygen-load-failure-detail (path)
+  "The ssh-keygen detail for a file that cannot be read as a key, or NIL.
+
+The mode check in KEYGEN-PRIVATE-PERMISSIONS-TOO-OPEN-P runs first, exactly
+as sshkey_perm_ok does, so a directory that the check catches is reported
+as bad permissions; this only covers the paths that get past it."
+  (cond
+    ((keygen-directory-p path) "Is a directory")
+    ((and (probe-file path) (not (keygen-file-readable-p path)))
+     "Permission denied")
+    (t nil)))
+
+(defun keygen-file-error-detail (condition)
+  "The strerror part of a CL FILE-ERROR, without its explanatory prefix."
+  (let* ((text (format nil "~A" condition))
+         (colon (search ": " text :from-end t)))
+    (if colon (subseq text (+ colon 2)) text)))
+
+(defun keygen-private-permissions-too-open-p (path)
+  "Print ssh-keygen's warning and return T when PATH is too permissive.
+
+OpenSSH checks the mode only for files the current user owns, and only on
+systems with POSIX mode bits, so the check does nothing on Windows."
+  #+(and sbcl (not win32))
+  (let ((stat (ignore-errors
+               (sb-posix:stat (uiop:native-namestring path)))))
+    (when (and stat
+               (= (sb-posix:stat-uid stat) (sb-posix:getuid))
+               (plusp (logand (sb-posix:stat-mode stat) #o077)))
+      (format *error-output*
+              "~A~%~A~%~A~%Permissions 0~3,'0O for '~A' are too open.~%~A~%~A~%"
+              "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+              "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @"
+              "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+              (logand (sb-posix:stat-mode stat) #o777)
+              (uiop:native-namestring path)
+              "It is required that your private key files are NOT accessible by others."
+              "This private key will be ignored.")
+      t))
+  #-(and sbcl (not win32))
+  nil)
+
 (defun keygen-load-key (path &key passphrase (prompt "Enter passphrase: ")
                                   (failure :cannot))
   "VALUES KEY PASSPHRASE-USED for the private key at PATH.
@@ -294,15 +364,7 @@ picks its wording for the final error: :CANNOT for -c, :FAILED for -p and
 :LOAD for -y.  PASSPHRASE-USED is the non-empty string the key was opened
 with, or NIL when it was in the clear, so a rewrite can preserve it."
   (keygen-require-file path)
-  (labels ((attempt (candidate)
-             (handler-case
-                 (values (cl-pnet-ssh:ssh-load-private-key
-                          path :passphrase candidate)
-                         (and (stringp candidate) (plusp (length candidate))
-                              candidate))
-               (cl-pnet-ssh:ssh-authentication-error (condition)
-                 (values nil (cl-pnet-ssh:ssh-error-detail condition)))))
-           (report (detail)
+  (labels ((fail-with (detail)
              (let ((native (uiop:native-namestring path)))
                (keygen-fail
                 "~A"
@@ -314,19 +376,46 @@ with, or NIL when it was in the clear, so a rewrite can preserve it."
                    (format nil "Failed to load key ~A: ~A" native detail))
                   (:load
                    (format nil "Load key \"~A\": ~A" native detail)))))))
-    (multiple-value-bind (key used) (attempt "")
-      (if key
-          (values key used)
-          ;; An explicit -P or -N is used as given, even when it is the
-          ;; empty string; only a missing one asks on standard input.
-          (let ((candidate (if (stringp passphrase)
-                               passphrase
-                               (keygen-read-passphrase prompt))))
-            (multiple-value-bind (key detail) (attempt candidate)
-              (if key
-                  (values key
-                          (and (plusp (length candidate)) candidate))
-                  (report detail))))))))
+    (when (keygen-private-permissions-too-open-p path)
+      (fail-with "bad permissions"))
+    (let ((unreadable (keygen-load-failure-detail path)))
+      (when unreadable
+        (fail-with unreadable)))
+    (labels ((attempt (candidate)
+               (handler-case
+                   (values (cl-pnet-ssh:ssh-load-private-key
+                            path :passphrase candidate)
+                           (and (stringp candidate) (plusp (length candidate))
+                                candidate))
+                 (cl-pnet-ssh:ssh-authentication-error (condition)
+                   ;; The wrong passphrase sends us back to the prompt; a
+                   ;; structural problem is fatal, as in ssh-keygen.
+                   (let ((detail (cl-pnet-ssh:ssh-error-detail condition)))
+                     (if (or (search "incorrect passphrase supplied" detail)
+                             (search "passphrase is required" detail))
+                         (values nil detail)
+                         (fail-with detail))))
+                 (cl-pnet-ssh:ssh-protocol-error ()
+                   (fail-with "invalid format"))
+                 (file-error (condition)
+                   (fail-with (keygen-file-error-detail condition)))
+                 (error ()
+                   (fail-with "invalid format"))))
+             (report (detail)
+               (fail-with detail)))
+      (multiple-value-bind (key used) (attempt "")
+        (if key
+            (values key used)
+            ;; An explicit -P or -N is used as given, even when it is the
+            ;; empty string; only a missing one asks on standard input.
+            (let ((candidate (if (stringp passphrase)
+                                 passphrase
+                                 (keygen-read-passphrase prompt))))
+              (multiple-value-bind (key detail) (attempt candidate)
+                (if key
+                    (values key
+                            (and (plusp (length candidate)) candidate))
+                    (report detail)))))))))
 
 (defun keygen-public-line-comment (line)
   (let* ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line))
@@ -481,15 +570,20 @@ The checks happen before the overwrite question, as ssh-keygen's do."
                    ;; given without -t; -b is then simply ignored.
                    "ed25519"))
          (bits (getf options :bits))
-         (path (keygen-path options :default-type type))
-         (public (keygen-public-path path))
+         (bits (getf options :bits))
          (comment (keygen-clamp-comment
                    (or (getf options :comment) (keygen-default-comment))))
-         (quiet (getf options :quiet)))
+         (quiet (getf options :quiet))
+         (path nil))
     (keygen-check-type-and-bits type bits)
     (unless quiet
       ;; ssh-keygen echoes the -t spelling it was given.
       (format t "Generating public/private ~A key pair.~%" type))
+    (setf path
+          (or (keygen-ask-path options :default-type type
+                               :prompt "Enter file in which to save the key")
+              (return-from keygen-generate 1)))
+    (let ((public (keygen-public-path path)))
     (unless (eq (keygen-confirm-overwrite path) :yes)
       (return-from keygen-generate 1))
     (unless (keygen-prepare-directory path quiet)
@@ -528,10 +622,11 @@ The checks happen before the overwrite question, as ssh-keygen's do."
             (format t "~A ~A~%" fingerprint comment)
             (format t "The key's randomart image is:~%~A~%"
                     (cl-pnet-ssh:ssh-key-randomart blob))))))
-    nil))
+      nil)))
 
 (defun keygen-print-public (options)
-  (let ((path (keygen-path options)))
+  (let ((path (or (keygen-ask-path options)
+                  (return-from keygen-print-public 1))))
     (let ((key (keygen-load-key path
                                 :passphrase (getf options :old-passphrase)
                                 :prompt
@@ -588,7 +683,8 @@ a cleartext key contributes the comment carried in its private section."
         (keygen-fingerprint-private-header path options))))
 
 (defun keygen-fingerprint (options)
-  (let* ((path (keygen-path options))
+  (let* ((path (or (keygen-ask-path options)
+                   (return-from keygen-fingerprint 1)))
          (native (uiop:native-namestring path)))
     (keygen-require-file path)
     (cond
@@ -678,7 +774,8 @@ The \"# Host ... found\" line is left out under -q."
     (if found 0 1)))
 
 (defun keygen-change-passphrase (options)
-  (let ((path (keygen-path options)))
+  (let ((path (or (keygen-ask-path options)
+                  (return-from keygen-change-passphrase 1))))
     (multiple-value-bind (key passphrase-used)
         (keygen-load-key path :passphrase (getf options :old-passphrase)
                               :prompt "Enter old passphrase: "
@@ -702,7 +799,8 @@ The \"# Host ... found\" line is left out under -q."
     nil))
 
 (defun keygen-change-comment (options)
-  (let* ((path (keygen-path options))
+  (let* ((path (or (keygen-ask-path options)
+                   (return-from keygen-change-comment 1)))
          (public (keygen-public-path path)))
     ;; Like ssh-keygen, -N can name the passphrase that opens the key when
     ;; -P is absent (the first attempt is always with an empty passphrase).

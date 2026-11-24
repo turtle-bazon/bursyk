@@ -1536,6 +1536,127 @@ streams are captured; an empty INPUT stands for end of input."
                                       (burs::keygen-public-path ecdsa))))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
+(test keygen-refuses-too-open-private-keys
+  ;; ssh-keygen warns and refuses a private key that other users can read.
+  ;; -l still fingerprints from the public file without a warning.
+  #-(and sbcl (not win32)) (skip "POSIX mode bits only")
+  #+(and sbcl (not win32))
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (native (namestring path)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" native "-N" "" "-q")))))
+           (sb-posix:chmod native #o644)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" native))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search "WARNING: UNPROTECTED PRIVATE KEY FILE!" error))
+             (is (search "Permissions 0644 for '" error))
+             (is (search "This private key will be ignored." error))
+             (is (search (format nil "Load key \"~A\": bad permissions"
+                                 native)
+                         error)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-p" "-P" "" "-N" "x" "-f" native))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search (format nil "Failed to load key ~A: bad permissions"
+                                 native)
+                         error)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-c" "-C" "x" "-f" native))
+             (declare (ignore output))
+             (is (eql 255 status))
+             (is (search (format nil "Cannot load private key \"~A\": bad permissions"
+                                 native)
+                         error)))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l" "-f" native))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "ED25519" output)))
+           (sb-posix:chmod native #o600)
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-y" "-f" native))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "ssh-ed25519" output))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-reports-unreadable-and-malformed-keys
+  ;; ssh-keygen says "invalid format" for garbage and the OS message for a
+  ;; directory or an unreadable key, without asking for a passphrase.
+  #-(and sbcl (not win32)) (skip "POSIX file modes only")
+  #+(and sbcl (not win32))
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (garbage (merge-pathnames "garbage" directory))
+         (folder (merge-pathnames "folder/" directory))
+         (unreadable (merge-pathnames "unreadable" directory)))
+    (ensure-directories-exist folder)
+    (dolist (path (list garbage unreadable))
+      (with-open-file (stream path :direction :output
+                                   :if-exists :supersede)
+        (write-string "garbage" stream))
+      (sb-posix:chmod (namestring path) #o600))
+    (sb-posix:chmod (namestring folder) #o700)
+    (sb-posix:chmod (namestring unreadable) #o000)
+    (flet ((call (arguments)
+             (keygen-call arguments)))
+      (unwind-protect
+           (let ((native (namestring garbage)))
+             (multiple-value-bind (status output error)
+                 (call (list "-y" "-f" native))
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search (format nil "Load key \"~A\": invalid format"
+                                   native)
+                           error))
+               (is (not (search "Enter passphrase" error))))
+             (multiple-value-bind (status output error)
+                 (call (list "-p" "-P" "" "-N" "x" "-f" native))
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search (format nil "Failed to load key ~A: invalid format"
+                                   native)
+                           error)))
+             (multiple-value-bind (status output error)
+                 (call (list "-c" "-C" "x" "-f" native))
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search
+                    (format nil "Cannot load private key \"~A\": invalid format"
+                            native)
+                    error)))
+             ;; A 0700 directory gets past the mode check, so loading it
+             ;; reports the system error.
+             (multiple-value-bind (status output error)
+                 (call (list "-y" "-f" (namestring folder)))
+               (declare (ignore output))
+               (is (eql 255 status))
+               (is (search "Is a directory" error)))
+             ;; Root ignores the mode, so only test the unreadable file as
+             ;; an ordinary user.
+             (unless (zerop (sb-posix:getuid))
+               (multiple-value-bind (status output error)
+                   (call (list "-y" "-f" (namestring unreadable)))
+                 (declare (ignore output))
+                 (is (eql 255 status))
+                 (is (search "Permission denied" error)))))
+        (ignore-errors (sb-posix:chmod (namestring unreadable) #o600))
+        (ignore-errors
+          (uiop:delete-directory-tree directory :validate t))))))
+
 (test keygen-comments-are-clamped-like-ssh-keygen
   ;; ssh-keygen copies comments through a KEY_COMMENT_MAX buffer, so both
   ;; -C and a typed -c comment stop at 2048 characters.
@@ -1569,6 +1690,52 @@ streams are captured; an empty INPUT stands for end of input."
              (is (= 2048 (length comment)))
              (is (every (lambda (character) (char= character #\x))
                         comment))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test keygen-asks-for-the-file-when-f-is-absent
+  ;; Without -f ssh-keygen prints the default path and reads stdin: an
+  ;; empty line takes the default, end of input cancels with status 1.
+  #-win32
+  (let* ((directory (merge-pathnames
+                     (format nil "burs-keygen-~D-~D/"
+                             (get-universal-time) (random 1000000))
+                     (uiop:temporary-directory)))
+         (path (merge-pathnames "id_ed25519" directory))
+         (home (merge-pathnames "home/" directory))
+         (native (namestring path))
+         (old-home (uiop:getenv "HOME")))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (is (eql 0 (nth-value
+                       0 (keygen-call
+                          (list "-t" "ed25519" "-f" native
+                                "-N" "" "-q")))))
+           ;; -l asks for the key file and accepts the typed path.
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l") :input (format nil "~A~%" native))
+             (declare (ignore error))
+             (is (eql 0 status))
+             (is (search "Enter file in which the key is (" output))
+             (is (search "id_ed25519): " output))
+             (is (search "ED25519" output)))
+           ;; End of input cancels the prompt.
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-l") :input "")
+             (declare (ignore error))
+             (is (eql 1 status))
+             (is (search "Enter file in which the key is (" output)))
+           ;; An empty answer takes ~/.ssh/id_ed25519, and generation
+           ;; creates ~/.ssh for it.
+           (setf (uiop:getenv "HOME") (namestring home))
+           (multiple-value-bind (status output error)
+               (keygen-call (list "-t" "ed25519" "-N" "" "-q")
+                            :input (format nil "~%"))
+             (declare (ignore output error))
+             (is (eql 0 status)))
+           (is (probe-file (merge-pathnames ".ssh/id_ed25519" home)))
+           (is (probe-file (merge-pathnames ".ssh/id_ed25519.pub" home))))
+      (setf (uiop:getenv "HOME") old-home)
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 (test keygen-writes-a-key-and-public-file
