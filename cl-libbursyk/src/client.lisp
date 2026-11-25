@@ -16,7 +16,8 @@
   (first (ssh-default-private-keys)))
 
 (defun ssh-load-key-signers (private-keys passphrase &key add-to-agent
-                                                         certificate-files-specified)
+                                                         certificate-files-specified
+                                                         passphrase-callback)
   "Signers for PRIVATE-KEYS, each already loaded or a path, in order.
 
 A key with a matching CERT.pub beside it contributes two signers, the plain
@@ -24,14 +25,20 @@ key and then its certificate, as ssh loads both identities for one file.
 ADD-TO-AGENT, when given, is the agent path (or T for SSH_AUTH_SOCK); each
 loaded key is offered to it before being used, as AddKeysToAgent does.
 CERTIFICATE-FILES-SPECIFIED suppresses the KEY-cert.pub lookup, because an
-explicit CertificateFile takes its place."
+explicit CertificateFile takes its place.  PASSPHRASE-CALLBACK, when a key
+file is passphrase-protected and no PASSPHRASE was given, is called with the
+file's path and returns the passphrase or NIL."
   (loop for private-key in (if (listp private-keys)
                                private-keys
                                (list private-keys))
         nconc (let ((key (if (typep private-key 'ssh-private-key)
                              private-key
                              (ssh-load-private-key
-                              private-key :passphrase passphrase))))
+                              private-key
+                              :passphrase
+                              (ssh-load-passphrase
+                               private-key passphrase
+                               passphrase-callback)))))
                 (when add-to-agent
                   (ssh-agent-add-identity
                    key :path add-to-agent
@@ -44,7 +51,8 @@ explicit CertificateFile takes its place."
                  certificate-files-specified))))
 
 (defun ssh-load-key-signer (private-key passphrase &key add-to-agent
-                                                      certificate-files-specified)
+                                                      certificate-files-specified
+                                                      passphrase-callback)
   "PRIVATE-KEY, already loaded or a path, as one signer.
 
 The certificate beside the key wins when there is one; SSH-LOAD-KEY-SIGNERS
@@ -52,7 +60,8 @@ returns the whole identity list, plain key first."
   (car (last (ssh-load-key-signers
               private-key passphrase
               :add-to-agent add-to-agent
-              :certificate-files-specified certificate-files-specified))))
+              :certificate-files-specified certificate-files-specified
+              :passphrase-callback passphrase-callback))))
 
 (defun ssh-default-key-sources (private-key)
   "PRIVATE-KEY when given, else every default identity file that exists."
@@ -69,18 +78,21 @@ returns the whole identity list, plain key first."
                            "or create ~/.ssh/id_ed25519, id_ecdsa or id_rsa")))
 
 (defun ssh-report-key-signers (keys passphrase on-signers on-error
-                               &key add-to-agent certificate-files-specified)
+                               &key add-to-agent certificate-files-specified
+                                 passphrase-callback)
   "Load KEY files and deliver their signers, or report why not."
   (handler-case
       (funcall on-signers
                (ssh-load-key-signers
                 keys passphrase
                 :add-to-agent add-to-agent
-                :certificate-files-specified certificate-files-specified))
+                :certificate-files-specified certificate-files-specified
+                :passphrase-callback passphrase-callback))
     (error (condition) (funcall on-error condition))))
 
 (defun ssh-report-agent-keys (agent keys passphrase on-signers on-error
-                              &key add-to-agent certificate-files-specified)
+                              &key add-to-agent certificate-files-specified
+                                passphrase-callback)
   "Deliver the agent's signers followed by KEY files, tolerating either."
   (ssh-agent-signers
    :path agent
@@ -92,7 +104,9 @@ returns the whole identity list, plain key first."
                                        keys passphrase
                                        :add-to-agent add-to-agent
                                        :certificate-files-specified
-                                       certificate-files-specified)))
+                                       certificate-files-specified
+                                       :passphrase-callback
+                                       passphrase-callback)))
                    (error (condition) (funcall on-error condition))))
    ;; An agent that cannot answer is not fatal while a file remains.
    :on-error (lambda (condition)
@@ -100,7 +114,8 @@ returns the whole identity list, plain key first."
                (ssh-report-key-signers
                 keys passphrase on-signers on-error
                 :add-to-agent add-to-agent
-                :certificate-files-specified certificate-files-specified))))
+                :certificate-files-specified certificate-files-specified
+                :passphrase-callback passphrase-callback))))
 
 (defun ssh-report-agent-signers (agent on-signers on-error)
   "Deliver the agent's signers, or say that it holds no usable key."
@@ -116,7 +131,8 @@ returns the whole identity list, plain key first."
    :on-error on-error))
 
 (defun ssh-resolve-signers (private-key agent passphrase on-signers on-error
-                            &key add-keys-to-agent certificate-files)
+                            &key add-keys-to-agent certificate-files
+                              passphrase-callback)
   "Find the signers authentication may try, in order, without blocking.
 
 The agent's ssh-ed25519 keys are offered first, then the key files, which
@@ -130,7 +146,11 @@ ssh-authentication-error only when nothing is left to try.
 
 CERTIFICATE-FILES are CertificateFile paths.  Each certificate is attached
 to the signer whose key it certifies, file or agent, and the automatic
-KEY-cert.pub lookup is disabled, as in ssh."
+KEY-cert.pub lookup is disabled, as in ssh.
+
+PASSPHRASE-CALLBACK, when a key file is passphrase-protected and no
+PASSPHRASE was given, is called with the file's path and returns the
+passphrase or NIL."
   (let* ((keys (ssh-default-key-sources private-key))
          ;; :NONE is the configuration layer's way of saying the agent is
          ;; off, which is not the same as NIL, "the caller named no agent".
@@ -154,12 +174,14 @@ KEY-cert.pub lookup is disabled, as in ssh."
          (ssh-report-agent-keys agent keys passphrase deliver on-error
                                 :add-to-agent add-to-agent
                                 :certificate-files-specified
-                                certificate-files-specified))
+                                certificate-files-specified
+                                :passphrase-callback passphrase-callback))
         (agent (ssh-report-agent-signers agent deliver on-error))
         (keys (ssh-report-key-signers
                keys passphrase deliver on-error
                :add-to-agent add-to-agent
-               :certificate-files-specified certificate-files-specified))
+               :certificate-files-specified certificate-files-specified
+               :passphrase-callback passphrase-callback))
         (t (funcall on-error (ssh-no-key-condition)))))))
 
 (defun ssh-connect-error (client status)
@@ -609,13 +631,16 @@ build's default offer, which leaves SHA-1 ssh-rsa out."
           (when (and key (ssh-hostbased-key-allowed-p client key))
             (return key)))))))
 
-(defun ssh-resolve-and-connect (client private-key agent passphrase)
+(defun ssh-resolve-and-connect (client private-key agent passphrase
+                                       passphrase-callback)
   "Find CLIENT's signers, then start its connection.
 
 Key files load at once; an agent is asked over its socket without blocking,
 and the SSH connection starts as soon as the signers are known.  A failure
 in either step ends CLIENT through its error callback.  PubkeyAcceptedAlgorithms
-is applied here, before any request names a key the configuration forbade."
+is applied here, before any request names a key the configuration forbade.
+PASSPHRASE-CALLBACK answers for an encrypted key file when no PASSPHRASE
+was given."
   (ssh-client-start-connect-timer client)
   (when (ssh-client-hostbased-authentication client)
     (setf (ssh-client-hostbased-key client)
@@ -647,12 +672,14 @@ is applied here, before any request names a key the configuration forbade."
          (ssh-client-fail client condition)))
    :add-keys-to-agent
    (eq (ssh-client-add-keys-to-agent client) :yes)
-   :certificate-files (ssh-client-certificate-files client))
+   :certificate-files (ssh-client-certificate-files client)
+   :passphrase-callback passphrase-callback)
   client)
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
                              (user (ssh-default-user)) private-key agent
-                             passphrase known-hosts global-known-hosts
+                             passphrase passphrase-callback
+                             known-hosts global-known-hosts
                              (host-key-policy :ask)
                              host-key-callback connect-timeout
                              server-alive-interval (server-alive-count-max 3)
@@ -773,8 +800,11 @@ methods the server offers.  BatchMode suppresses both methods without calling
 their callbacks, as ssh does.
 
 Keys: PRIVATE-KEY is an ssh-private-key or a path, and PASSPHRASE decrypts a
-protected file.  With no PRIVATE-KEY every default identity file that exists
-(~/.ssh/id_ed25519, id_ecdsa, then ~/.ssh/id_rsa) is added.  AGENT (T for
+protected file.  When no PASSPHRASE is given, PASSPHRASE-CALLBACK is called
+for each passphrase-protected key with the key file's path, and returns the
+passphrase or NIL to skip the key.  With no PRIVATE-KEY every default
+identity file that exists (~/.ssh/id_ed25519, id_ecdsa, then
+~/.ssh/id_rsa) is added.  AGENT (T for
 SSH_AUTH_SOCK, or a socket path) offers every key the agent can sign with;
 when both are available the agent's keys are tried first, as OpenSSH does.
 AGENT :NONE turns the agent off, as IdentityAgent none does.
@@ -905,7 +935,7 @@ role-neutral."
                            :forward-x11-trusted forward-x11-trusted
                            :forward-x11-timeout forward-x11-timeout
                            :xauth-location xauth-location)
-   private-key agent passphrase))
+   private-key agent passphrase passphrase-callback))
 
 (defun ssh-client-close (client)
   "Close CLIENT and report every open channel as closed."

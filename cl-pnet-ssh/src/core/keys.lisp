@@ -1684,6 +1684,25 @@ PKCS#8 EncryptedPrivateKeyInfo."
               (not (and (string= cipher "none")
                         (string= kdf "none")))))))))
 
+(defun ssh-load-passphrase (path passphrase passphrase-callback)
+  "PASSPHRASE to load PATH with, consulting PASSPHRASE-CALLBACK if needed.
+
+A given PASSPHRASE wins without asking.  When none was given and PATH is a
+passphrase-protected key, PASSPHRASE-CALLBACK is called with the file's path
+as a string and may return the passphrase, or NIL to leave the key
+unreadable.  An unprotected file, or one that cannot be read at all, never
+calls the callback; the ordinary load then reports the real problem."
+  (cond
+    (passphrase passphrase)
+    ((null passphrase-callback) nil)
+    (t
+     (let ((encrypted
+             (handler-case (ssh-private-key-file-encrypted-p path)
+               (error () nil))))
+       (when encrypted
+         (let ((answer (funcall passphrase-callback (namestring path))))
+           (and (stringp answer) answer)))))))
+
 (defun ssh-private-key-public-blob (path)
   "The public key blob in the openssh-key-v1 header at PATH, or NIL.
 

@@ -631,16 +631,21 @@ certificate that matches no imported key is skipped too."
                                      (ssh-plibssh-public-key-blob key))
                     (ssh-plibssh-copy-certificate key path))))))))))))
 
-(defun ssh-plibssh-load-client-keys (client passphrase)
-  "Import every key CLIENT may offer, in order."
+(defun ssh-plibssh-load-client-keys (client passphrase passphrase-callback)
+  "Import every key CLIENT may offer, in order.
+
+PASSPHRASE decrypts every protected file; with none, PASSPHRASE-CALLBACK is
+asked once per encrypted file, with that file's path."
   (let ((handles
           (iter (for key in (ssh-plibssh-key-sources client))
-            (collect (ssh-plibssh-import-key
-                      (or (ssh-plibssh-key-path key)
-                          (error 'ssh-authentication-error
-                                 :detail
-                                 "a private key has no file path libssh can load"))
-                      passphrase)))))
+            (let ((path (or (ssh-plibssh-key-path key)
+                            (error 'ssh-authentication-error
+                                   :detail
+                                   "a private key has no file path libssh can load"))))
+              (collect (ssh-plibssh-import-key
+                        path
+                        (ssh-load-passphrase
+                         path passphrase passphrase-callback)))))))
     (ssh-plibssh-attach-explicit-certificates client handles)
     (setf (ssh-client-key-handles client) handles
           (ssh-client-key-index client) 0)))
@@ -1096,7 +1101,7 @@ take over, exactly as on a TCP descriptor."
     (ssh-plibssh-client-pump client)
     client))
 
-(defun ssh-plibssh-start-client (client passphrase)
+(defun ssh-plibssh-start-client (client passphrase passphrase-callback)
   "Load CLIENT's keys, then resolve and dial its address off the loop.
 
 A ProxyCommand skips both the resolution and the socket: libssh runs the
@@ -1104,7 +1109,7 @@ helper and hands back a socketpair to watch."
   (ssh-plibssh-start-connect-timer client)
   (handler-case
       (progn
-        (ssh-plibssh-load-client-keys client passphrase)
+        (ssh-plibssh-load-client-keys client passphrase passphrase-callback)
         (ssh-plibssh-client-open client))
     (error (condition) (ssh-client-fail client condition))))
 
@@ -1141,6 +1146,7 @@ transport limitation into the same diagnostic."
                           private-key
                           agent
                           passphrase
+                          passphrase-callback
                           known-hosts
                           global-known-hosts
                           (host-key-policy :ask)
@@ -1336,7 +1342,7 @@ stream on its pipes instead of dialling."
                  :on-close on-close
                  :on-forwarded-tcpip on-forwarded-tcpip
                  :on-forwarded-streamlocal on-forwarded-streamlocal)))
-    (ssh-plibssh-start-client client passphrase)
+    (ssh-plibssh-start-client client passphrase passphrase-callback)
     client))
 
 (defun ssh-client-close (client)

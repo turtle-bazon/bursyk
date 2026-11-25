@@ -10,7 +10,7 @@
 ;;;; PKCS#11, TUN devices) are refused with a diagnostic instead of being
 ;;;; silently ignored.  GSSAPIAuthentication is only a switch for a method this
 ;;;; build lacks, so a config that sets it is ignored as OpenSSH without GSSAPI
-;;;; ignores it; -K, which asks for that method outright, is still refused.
+;;;; ignores it; -K and -k are accepted for the same reason.
 
 ;;; ---- Command line ----
 
@@ -23,6 +23,24 @@
   (finish-output *error-output*)
   (restore-terminal)
   (uiop:quit 255))
+
+(defvar *config-error-reported* nil
+  "Whether a readconf-style configuration diagnostic has been printed.
+
+The library writes each rejected line and the file's terminating summary
+itself when SSH-CONFIG-ERROR-FUNCTION is bound, so the condition that ends
+resolution must not be printed a second time.")
+
+(defun fail-config-error (condition)
+  "Leave after CONDITION stopped configuration resolution.
+
+When the library already printed readconf's lines, only the exit status is
+left to do; otherwise the condition is the whole diagnostic."
+  (if *config-error-reported*
+      (progn
+        (restore-terminal)
+        (uiop:quit 255))
+      (fail "~A" condition)))
 
 (defun unsupported (option &optional (detail "not implemented by this client"))
   (fail "~A is not supported: ~A" option detail))
@@ -518,6 +536,17 @@ OpenSSH; a configuration may still name them when the transport has them."
    cl-pnet-ssh::+ssh-server-ca-signature-algorithm-names+
    :ca-signature-algorithms))
 
+(defun key-algorithm-name-universe (supported)
+  "SUPPORTED plus every key type readconf accepts, for config expansion.
+
+The security-key types are not implemented by this transport, but an
+ssh_config that names them must still load and `ssh -G` must be able to show
+the configured choice rather than failing before the connection."
+  (append supported
+          (remove-if (lambda (name)
+                       (member name supported :test #'string=))
+                     cl-pnet-ssh:+ssh-config-unimplemented-key-names+)))
+
 (defun check-algorithm-list (option value supported &optional all)
   "Reject an algorithm choice this build cannot offer.
 
@@ -665,8 +694,9 @@ runs it through cmd.exe."
 (defun command-line-option (name value)
   "Apply one -o NAME=VALUE to the parsed options."
   (cond
-    ((string-equal name "Port") (setf (getf *options* :port) value))
-    ((string-equal name "User") (setf (getf *options* :user) value))
+    ;; User and Port are left to the resolver, which validates them like
+    ;; readconf and keeps the first value the command line gave them; a
+    ;; dedicated -l or -p is seeded ahead of the -o lines for the same reason.
     ((string-equal name "IdentityFile")
      (push value (getf *options* :identity)))
     ((string-equal name "IdentityAgent") (setf (getf *options* :agent) value))
@@ -683,10 +713,9 @@ runs it through cmd.exe."
     ;; AddressFamily is not copied into *OPTIONS* here: -o values already
     ;; reach the config through RESOLVER-OPTION-LIST, and writing this slot
     ;; would let an -o override the dedicated -4 or -6, which comes first.
-    ((string-equal name "Ciphers") (setf (getf *options* :ciphers) value))
-    ((string-equal name "MACs") (setf (getf *options* :macs) value))
-    ((string-equal name "KexAlgorithms")
-     (setf (getf *options* :kex-algorithms) value))
+    ;; Ciphers, MACs and KexAlgorithms are left to the resolver too: it
+    ;; validates them like readconf, whereas the -c and -m keys belong to
+    ;; the dedicated flags and are checked as command-line options.
     ((string-equal name "Compression")
      (setf (getf *options* :compression)
            (not (member (string-downcase value) '("no" "off") :test #'string=))))
@@ -845,6 +874,18 @@ session down."
   ;; unsupported one always reaches stderr.
   (setf cl-pnet-ssh:*ssh-forced-warning-function*
         (lambda (line)
+          (handler-case
+              (progn
+                (format *error-output* "~A~%" line)
+                (finish-output *error-output*))
+            (error () nil))))
+  ;; readconf prints each rejected configuration line as it parses it, then
+  ;; the file's closing "terminating, N bad configuration options" summary.
+  ;; The library formats those lines; the reporter only writes them.
+  (setf *config-error-reported* nil)
+  (setf cl-pnet-ssh:*ssh-config-error-function*
+        (lambda (line)
+          (setf *config-error-reported* t)
           (handler-case
               (progn
                 (format *error-output* "~A~%" line)
@@ -2840,9 +2881,16 @@ AddressFamily selected, as the asynchronous path does."
      :on-options (lambda (options canonical-host)
                    (setf result options canonical canonical-host))
      :on-error (lambda (condition) (setf failure condition)))
-    (if failure
-        (fail "~A" failure)
-        (values result canonical))))
+    (when failure
+      (fail-config-error failure))
+    ;; ssh.c validates this after reading the configuration, beyond
+    ;; readconf, and its fatality has no file or line prefix.
+    (when (eql 0 (cl-pnet-ssh:ssh-config-options-connection-attempts result))
+      (format *error-output* "Invalid number of ConnectionAttempts~%")
+      (finish-output *error-output*)
+      (restore-terminal)
+      (uiop:quit 255))
+    (values result canonical)))
 
 (defun print-list-option (name values)
   (dolist (value values)
@@ -3059,6 +3107,33 @@ drops it."
         (format t " ~A" value))
       (format t " none"))
   (format t "~%"))
+
+(defun config-escape-char-string (value)
+  "VALUE as readconf's dump_client_config shows EscapeChar.
+
+OpenSSH passes the byte through vis(3) with VIS_WHITE, so a control
+character becomes \\^A, a space \\040, a backslash \\\\ and a high byte
+\\M-x.  NIL is unset, which ssh prints as the default ~."
+  (cond
+    ((eq value :none) "none")
+    ((null value) "~")
+    (t
+     (let* ((byte (logand (if (characterp value) (char-code value) value)
+                          #xff)))
+       (cond
+         ((= (logand byte #o177) #x20)
+          (format nil "\\~3,'0o" byte))
+         ((and (<= 33 byte) (<= byte 126))
+          (if (= byte 92) "\\\\" (string (code-char byte))))
+         ((>= byte 128)
+          (let ((low (logand byte #x7f)))
+            (format nil "\\M-~A"
+                    (cond ((= low 127) "^?")
+                          ((< low 32)
+                           (format nil "^~C" (code-char (+ low 64))))
+                          (t (string (code-char low)))))))
+         ((= byte 127) "\\^?")
+         (t (format nil "\\^~C" (code-char (+ byte 64)))))))))
 
 (defun print-config-options (host options canonical)
   "Print OPTIONS resolved for HOST, whose canonical name is CANONICAL.
@@ -3332,7 +3407,8 @@ and known-hosts files) are printed as this client will actually use them."
               (algorithms
                #'cl-pnet-ssh:ssh-config-options-host-key-algorithms
                (supported-host-key-algorithms) "HostKeyAlgorithms"
-               (supported-host-key-all-algorithms)))
+               (key-algorithm-name-universe
+                (supported-host-key-all-algorithms))))
       (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
         (when alias
           (format t "hostkeyalias ~A~%" alias)))
@@ -3341,7 +3417,8 @@ and known-hosts files) are printed as this client will actually use them."
                #'cl-pnet-ssh:ssh-config-options-hostbased-accepted-algorithms
                (supported-signature-algorithms)
                "HostbasedAcceptedAlgorithms"
-               (supported-signature-all-algorithms)))
+               (key-algorithm-name-universe
+                (supported-signature-all-algorithms))))
       (let ((value (or (getf *options* :agent)
                        (cl-pnet-ssh:ssh-config-options-identity-agent
                         options))))
@@ -3369,7 +3446,8 @@ and known-hosts files) are printed as this client will actually use them."
                #'cl-pnet-ssh:ssh-config-options-ca-signature-algorithms
                (supported-ca-signature-algorithms)
                "CASignatureAlgorithms"
-               (supported-ca-signature-algorithm-names)))
+               (key-algorithm-name-universe
+                (supported-ca-signature-algorithm-names))))
       (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
         (when local
           (format t "localcommand ~A~%" local)))
@@ -3406,7 +3484,8 @@ and known-hosts files) are printed as this client will actually use them."
                #'cl-pnet-ssh:ssh-config-options-pubkey-accepted-algorithms
                (supported-signature-algorithms)
                "PubkeyAcceptedAlgorithms"
-               (supported-signature-all-algorithms)))
+               (key-algorithm-name-universe
+                (supported-signature-all-algorithms))))
       (format t "xauthlocation ~A~%"
               (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
                   "/usr/bin/xauth"))
@@ -3555,9 +3634,7 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "escapechar ~A~%"
               (let ((value (cl-pnet-ssh:ssh-config-options-escape-char
                             options)))
-                (cond ((eq value :none) "none")
-                      ((null value) "~")
-                      (t (format nil "~C" value)))))
+                (config-escape-char-string value)))
       (flet ((ip-qos-name (value)
                (cond
                  ((eq value :none) "none")
@@ -3606,13 +3683,19 @@ and known-hosts files) are printed as this client will actually use them."
 ;;; ---- The target client ----
 
 (defun client-port ()
-  "The -p or -o Port value as a number, when the command line gave one."
+  "The -p value as a number, or NIL when the command line gave none.
+
+A -p is applied while ssh parses its arguments, before any configuration, so
+an unusable value is one bare diagnostic and exit 255, not a readconf error."
   (let ((value (getf *options* :port)))
     (when value
-      (multiple-value-bind (port end) (parse-integer value :junk-allowed t)
-        (if (and port (= end (length value)))
-            port
-            (fail "invalid port ~A" value))))))
+      (let ((port (cl-pnet-ssh:ssh-a2port value)))
+        (unless (and port (plusp port))
+          (format *error-output* "Bad port '~A'~%" value)
+          (finish-output *error-output*)
+          (restore-terminal)
+          (uiop:quit 255))
+        port))))
 
 (defun show-visual-host-key (client)
   "Print the host key randomart when VisualHostKey asks for it."
@@ -3744,7 +3827,7 @@ a controlling terminal refuses instead of blocking."
                            (not *background-child*))
                   (launch-background-child))
                 (check-config-supported client))
-   :on-config-error (lambda (condition) (fail "~A" condition))
+   :on-config-error (lambda (condition) (fail-config-error condition))
    :on-forwarded-tcpip #'forwarded-tcpip-target
    :on-forwarded-streamlocal #'forwarded-streamlocal-target
    :password-callback #'password-authentication-prompt
@@ -3912,7 +3995,7 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
               (cl-pnet-ssh:ssh-config-error (condition)
                 ;; An unreadable -F file and similar problems are command
                 ;; line errors, which ssh reports with status 255.
-                (fail "~A" condition)))
+                (fail-config-error condition)))
             (cl-pnet:event-loop-run)
             (finish *status*))))
     (stream-error (condition)
@@ -3939,7 +4022,7 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
       ;; A bad configuration value can surface outside resolution, when -G
       ;; prints the algorithm lists it has to validate.  ssh treats every
       ;; configuration error as fatal with status 255, not 1.
-      (fail "~A" condition))
+      (fail-config-error condition))
     (error (condition)
       (when (uiop:getenv "BURS_DEBUG")
         (sb-debug:print-backtrace :count 40 :stream *error-output*))

@@ -1604,6 +1604,118 @@ dropped, and a Host block's inactivity does not hide a typo."
                  (cl-pnet-ssh:ssh-config-options-ignored-unknown options))))))
 
 
+(test config-empty-argument-diagnostics
+  "Empty arguments reach readconf's own wording, including the multistate
+errors that print one line before the one they report."
+  (labels ((failure (&rest options)
+           (let ((condition nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config
+               :directives
+               (mapcar #'cl-pnet-ssh::ssh-config-option-line options))
+              "alias"
+              :on-error (lambda (value) (setf condition value)))
+             condition))
+         (detail (&rest options)
+           (let ((condition (apply #'failure options)))
+             (and condition (ssh-error-detail condition)))))
+    (is (equal "empty domain name"
+               (detail (cons "CanonicalDomains" (list "")))))
+    (is (equal "keyword globalknownhostsfile empty argument"
+               (detail (cons "GlobalKnownHostsFile" (list "")))))
+    (is (equal "keyword userknownhostsfile empty argument"
+               (detail (cons "UserKnownHostsFile" (list "")))))
+    (is (equal "keyword logverbose empty argument"
+               (detail (cons "LogVerbose" (list "")))))
+    (is (equal "keyword revokedhostkeys empty argument"
+               (detail (cons "RevokedHostKeys" (list "")))))
+    (is (equal "Missing argument."
+               (detail (cons "EscapeChar" (list "")))))
+    (is (equal "Bad escape character."
+               (detail (cons "EscapeChar" (list "^?")))))
+    (is (equal "Missing argument."
+               (detail (cons "FingerprintHash" (list "")))))
+    (is (equal "Missing argument."
+               (detail (cons "HostBasedAcceptedAlgorithms" (list "")))))
+    (is (equal "Invalid environment name."
+               (detail (cons "SendEnv" (list "")))))
+    (is (equal "unsupported option"
+               (detail (cons "AddKeysToAgent" (list "")))))
+    (is (equal "unsupported option \"\"."
+               (detail (cons "WarnWeakCrypto" (list "")))))
+    (is (equal "unsupported option \"\"."
+               (detail (cons "UpdateHostKeys" (list "")))))
+    (is (equal "unsupported option \"\"."
+               (detail (cons "VerifyHostKeyDNS" (list "")))))
+    (is (equal "Missing argument."
+               (detail (cons "RefuseConnection" (list "")))))
+    (is (string= "invalid channel timeout "
+                 (detail (cons "ChannelTimeout" (list "")))))
+    (is (ssh-config-error-fatal (failure (cons "ChannelTimeout" (list "")))))
+    (is (equal "bad port number in permitremoteopen"
+               (detail (cons "PermitRemoteOpen" (list "")))))
+    (is (ssh-config-error-fatal (failure (cons "PermitRemoteOpen" (list "")))))
+    (is (equal "missing host in permitremoteopen"
+               (detail (cons "PermitRemoteOpen" (list "a/22")))))
+    (is (equal "keyword permitremoteopen \"any\" argument must appear alone."
+               (detail (cons "PermitRemoteOpen" (list "any" "x:1")))))
+    ;; A bare keyword is refused before any keyword-specific handling.
+    (is (equal "no argument after keyword \"port\"" (detail "Port")))))
+
+(test config-checks-inactive-blocks
+  "readconf validates every line and only lets an active block act: an
+inactive Port typo is still an error, while RefuseConnection fires only in
+the active block."
+  (labels ((line (number keyword &rest arguments)
+           (cl-pnet-ssh::%make-ssh-config-line
+            :keyword keyword :args arguments
+            :path #p"/tmp/ssh_config_test" :number number))
+         (resolve-directives (&rest directives)
+           (let ((condition nil) (resolved nil))
+             (ssh-config-resolve
+              (cl-pnet-ssh::%make-ssh-config :directives directives)
+              "alias"
+              :on-options (lambda (value) (setf resolved value))
+              :on-error (lambda (value) (setf condition value)))
+             (values condition resolved))))
+    (multiple-value-bind (condition options)
+        (resolve-directives (line 1 "host" "other") (line 2 "port" "abc"))
+      (is (typep condition 'ssh-config-error))
+      (is (equal "Bad port 'abc'." (ssh-error-detail condition)))
+      (is (null options)))
+    (multiple-value-bind (condition options)
+        (resolve-directives (line 1 "host" "other")
+                            (line 2 "refuseconnection" "yes"))
+      (is (null condition))
+      (is (typep options 'ssh-config-options)))
+    (multiple-value-bind (condition options)
+        (resolve-directives (line 1 "host" "*")
+                            (line 2 "refuseconnection" "yes"))
+      (declare (ignore options))
+      (is (typep condition 'ssh-config-error))
+      (is (equal "RefuseConnection: yes" (ssh-error-detail condition)))
+      (is (ssh-config-error-fatal condition)))))
+
+(test config-structure-directives-rejected-from-o
+  "Host, Include and Match are file structure, so readconf refuses them
+when an -o option tries to supply one."
+  (let ((detail
+          (lambda (option)
+            (let ((condition nil))
+              (ssh-config-resolve
+               (cl-pnet-ssh::ssh-config-add-options
+                (cl-pnet-ssh::%make-ssh-config :directives nil)
+                (list option))
+               "alias"
+               :on-error (lambda (value) (setf condition value)))
+              (and condition (ssh-error-detail condition))))))
+    (is (equal "Host directive not supported as a command-line option"
+               (funcall detail "Host=other")))
+    (is (equal "Include directive not supported as a command-line option"
+               (funcall detail "Include=foo")))
+    (is (equal "Match directive not supported as a command-line option"
+               (funcall detail "Match=all")))))
+
 (test client-version-addendum
   "VersionAddendum parses as the rest of the line, expands its % tokens, and
 leaves the greeting alone for none."
@@ -4385,6 +4497,21 @@ newline")))
 
 
 
+(test passphrase-callback-reaches-client-parameters
+  ;; The callback a caller passes to MAKE-SSH-CLIENT-FROM-CONFIG travels the
+  ;; same path as the password callbacks, so a jump host gets it too.
+  (let ((callback (lambda (path) (declare (ignore path)) "secret")))
+    (is (eq callback
+            (getf (cl-pnet-ssh::ssh-config-client-parameters
+                   "host.example" (facade-options nil)
+                   :passphrase-callback callback)
+                  :passphrase-callback)))
+    (is (eq callback
+            (getf (cl-pnet-ssh::ssh-config-client-overrides
+                   nil nil nil nil nil nil nil nil nil nil nil
+                   :passphrase-callback callback)
+                  :passphrase-callback)))))
+
 (test ssh-config-seconds-parses-bare-and-suffixed-times
   ;; A bare number has no suffix, so the final flush runs after the loop; a
   ;; missing flush there leaves the value at zero without diagnosing it.
@@ -4725,6 +4852,43 @@ path that selects the agent socket to forward."
     (is (null (getf parameters :kex-algorithms)))
     (is (null (getf parameters :host-key-algorithms)))
     (is (null (getf parameters :pubkey-accepted-algorithms)))))
+
+(test security-key-algorithm-names-are-accepted
+  "readconf accepts the sk-* and webauthn-* key types even though this
+transport does not implement them, so a config naming them must load and
+keep the names."
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "HostKeyAlgorithms sk-ssh-ed25519@openssh.com,ssh-ed25519")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "PubkeyAcceptedAlgorithms webauthn-sk-ecdsa-sha2-nistp256@openssh.com")
+                  (cl-pnet-ssh::ssh-config-option-line
+                   "HostbasedAcceptedAlgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"))))
+         (options nil)
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value))
+                        :on-error (lambda (condition) (setf failure condition)))
+    (is (null failure))
+    (is (equal '("sk-ssh-ed25519@openssh.com" "ssh-ed25519")
+               (ssh-config-options-host-key-algorithms options)))
+    (is (equal '("webauthn-sk-ecdsa-sha2-nistp256@openssh.com")
+               (ssh-config-options-pubkey-accepted-algorithms options)))
+    (is (equal '("sk-ecdsa-sha2-nistp256-cert-v01@openssh.com")
+               (ssh-config-options-hostbased-accepted-algorithms options))))
+  ;; CASignatureAlgorithms is the plain-only list, so a -cert name is not a
+  ;; signature algorithm and readconf refuses it.
+  (let ((failure nil))
+    (ssh-config-resolve
+     (cl-pnet-ssh::%make-ssh-config
+      :directives
+      (list (cl-pnet-ssh::ssh-config-option-line
+             "CASignatureAlgorithms sk-ssh-ed25519-cert-v01@openssh.com")))
+     "alias"
+     :on-error (lambda (condition) (setf failure condition)))
+    (is (typep failure 'ssh-config-error))))
 
 ;;; ---- Command-line -o options ----
 
@@ -5481,8 +5645,6 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                   (cl-pnet-ssh::ssh-config-option-line
                    "HostbasedAcceptedAlgorithms ssh-ed25519")
                   (cl-pnet-ssh::ssh-config-option-line
-                   "HostbasedKey /tmp/host_key")
-                  (cl-pnet-ssh::ssh-config-option-line
                    "EnableSSHKeysign yes"))))
          (options nil))
     (ssh-config-resolve config "alias"
@@ -5490,9 +5652,6 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
     (is (eq t (ssh-config-options-hostbased-authentication options)))
     (is (equal '("ssh-ed25519")
                (ssh-config-options-hostbased-accepted-algorithms options)))
-    (is (equal '("/tmp/host_key")
-               (mapcar #'namestring
-                       (ssh-config-options-hostbased-keys options))))
     (is (eq t (ssh-config-options-enable-ssh-keysign options)))))
 
 
@@ -5537,7 +5696,7 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
              (ssh-config-options-escape-char options))))
     (is (char= #\~ (value "EscapeChar ~")))
     (is (eql 1 (value "EscapeChar ^A")))
-    (is (eql 127 (value "EscapeChar ^?")))
+    (is (eql 27 (value "EscapeChar ^[")))
     (is (eq :none (value "EscapeChar none")))
     (is (null (value "Port 22"))))
   (let* ((config
@@ -5545,6 +5704,18 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
             :directives
             (list (cl-pnet-ssh::ssh-config-option-line
                    "EscapeChar too-long"))))
+         (failure nil))
+    (ssh-config-resolve config "alias"
+                        :on-error (lambda (condition)
+                                    (setf failure condition)))
+    (is (typep failure 'ssh-config-error)))
+  ;; readconf's caret form needs a character code of 64..127, so "?" (63)
+  ;; is out of range even though DEL itself is a valid escape character.
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "EscapeChar ^?"))))
          (failure nil))
     (ssh-config-resolve config "alias"
                         :on-error (lambda (condition)
@@ -5668,6 +5839,15 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
             :directives
             (list (cl-pnet-ssh::ssh-config-option-line
                    "FingerprintHash sha1"))))
+         (options nil))
+    (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value)))
+    (is (eq :sha1 (ssh-config-options-fingerprint-hash options))))
+  (let* ((config
+           (cl-pnet-ssh::%make-ssh-config
+            :directives
+            (list (cl-pnet-ssh::ssh-config-option-line
+                   "FingerprintHash nope"))))
          (failure nil))
     (ssh-config-resolve config "alias"
                         :on-error (lambda (condition)
@@ -5823,17 +6003,21 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
     (ssh-config-resolve config "alias"
                         :on-options (lambda (value) (setf options value)))
     (is (null (ssh-config-options-connection-attempts options))))
-  ;; Zero attempts is not a connection policy.
+  ;; readconf stores zero; ssh.c then refuses to connect with it, which is a
+  ;; client-level check rather than a configuration error.
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
             :directives
             (list (cl-pnet-ssh::ssh-config-option-line
                    "ConnectionAttempts 0"))))
-         (failure nil))
+         (failure nil)
+         (options nil))
     (ssh-config-resolve config "alias"
+                        :on-options (lambda (value) (setf options value))
                         :on-error (lambda (condition)
                                     (setf failure condition)))
-    (is (typep failure 'ssh-config-error))))
+    (is (null failure))
+    (is (= 0 (ssh-config-options-connection-attempts options)))))
 
 (test session-type-and-stdin-null-parse
   (let* ((config
@@ -7969,7 +8153,7 @@ the first active value."
       (is (= 50
              (cl-pnet-ssh:ssh-config-options-obscure-keystroke-timing
               options))))
-    (dolist (case '(("ObscureKeystrokeTiming" . "missing argument")
+    (dolist (case '(("ObscureKeystrokeTiming" . "no argument after keyword")
                     ("ObscureKeystrokeTiming yes no" . "invalid arguments")
                     ("ObscureKeystrokeTiming YES" . "unsupported argument")
                     ("ObscureKeystrokeTiming maybe" . "unsupported argument")

@@ -278,6 +278,51 @@ what IdentityAgent none and IdentitiesOnly ask for."
                (is (typep failure 'ssh-authentication-error)))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+(test passphrase-callback-decrypts-key-files
+  "A protected identity asks the callback with its path, an unprotected one
+never asks, and an explicit passphrase wins without asking."
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen or POSIX shell")
+      (let* ((directory
+               (ssh-test-directory "cl-pnet-ssh-passphrase-callback"))
+             (protected (merge-pathnames "locked" directory))
+             (plain (merge-pathnames "open" directory))
+             (asked '())
+             (callback (lambda (path) (push path asked) "secret")))
+        (ensure-directories-exist protected)
+        (unwind-protect
+             (progn
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" "secret"
+                                 "-f" (namestring protected)))
+               (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                                 "-f" (namestring plain)))
+               (is (= 1
+                      (length (cl-pnet-ssh::ssh-load-key-signers
+                               protected nil
+                               :passphrase-callback callback))))
+               (is (equal (list (namestring protected)) asked))
+               ;; An unprotected file is loaded without asking.
+               (setf asked nil)
+               (is (= 1
+                      (length (cl-pnet-ssh::ssh-load-key-signers
+                               plain nil
+                               :passphrase-callback callback))))
+               (is (null asked))
+               ;; A passphrase that was given is used as it stands.
+               (setf asked nil)
+               (is (= 1
+                      (length (cl-pnet-ssh::ssh-load-key-signers
+                               protected "secret"
+                               :passphrase-callback callback))))
+               (is (null asked))
+               ;; Declining leaves the key unreadable, as no passphrase does.
+               (signals ssh-authentication-error
+                 (cl-pnet-ssh::ssh-load-key-signers
+                  protected nil
+                  :passphrase-callback
+                  (lambda (path) (declare (ignore path)) nil))))
+          (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
+
 (test client-builds-a-hostbased-request
   (if (not (ssh-keygen-available-p))
       (skip "no ssh-keygen or POSIX shell")

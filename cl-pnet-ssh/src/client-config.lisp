@@ -146,18 +146,29 @@ list and disables every timeout."
                           (ssh-parse-time (subseq argument (1+ equals))))))))
 
 (defun ssh-config-client-algorithms (options accessor supported option
-                                     &key (all supported))
+                                     &key (all supported) extra-names)
   "OPTIONS' algorithm choice as this build's ordered offer, or NIL for default.
 
 Turning it into a list here means an algorithm this build lacks stops the
 client instead of quietly widening what it offers.  ALL is the set a pattern
-may name when that differs from the default offer."
+may name when that differs from the default offer.  EXTRA-NAMES are valid
+names readconf accepts but this build cannot implement (the security-key key
+types); they are kept so a configuration written for OpenSSH loads, and the
+transport simply never negotiates them."
   (let ((names (funcall accessor options)))
     (when names
-      (ssh-resolve-algorithm-list names supported option :all all))))
+      (let ((all (if extra-names
+                     (append all
+                             (remove-if
+                              (lambda (name)
+                                (member name all :test #'string=))
+                              extra-names))
+                     all)))
+        (ssh-resolve-algorithm-list names supported option :all all)))))
 
 (defun ssh-config-client-parameters (host options
                                      &key user port private-key agent passphrase
+                                       passphrase-callback
                                        known-hosts host-key-policy
                                        host-key-callback proxy-command
                                        resolver canonicalized
@@ -185,6 +196,7 @@ MAKE-SSH-CLIENT's own defaults."
         (reverse (ssh-config-options-certificate-files options))
         :agent (ssh-config-client-agent options agent)
         :passphrase passphrase
+        :passphrase-callback passphrase-callback
         :known-hosts (ssh-config-client-known-hosts options known-hosts)
         :global-known-hosts (ssh-config-client-global-known-hosts options)
         :kex-algorithms
@@ -197,7 +209,8 @@ MAKE-SSH-CLIENT's own defaults."
          options #'ssh-config-options-host-key-algorithms
          (ssh-client-default-algorithms :host-key-algorithms)
          "HostKeyAlgorithms"
-         :all (ssh-client-supported-algorithms :host-key-algorithms))
+         :all (ssh-client-supported-algorithms :host-key-algorithms)
+         :extra-names +ssh-config-unimplemented-key-names+)
         :ciphers
         (ssh-config-client-algorithms
          options #'ssh-config-options-ciphers
@@ -214,7 +227,8 @@ MAKE-SSH-CLIENT's own defaults."
          options #'ssh-config-options-pubkey-accepted-algorithms
          (ssh-client-default-algorithms :signature-algorithms)
          "PubkeyAcceptedAlgorithms"
-         :all (ssh-client-supported-algorithms :signature-algorithms))
+         :all (ssh-client-supported-algorithms :signature-algorithms)
+         :extra-names +ssh-config-unimplemented-key-names+)
         :revoked-host-keys
         (reverse (ssh-config-options-revoked-host-keys options))
         :hash-known-hosts
@@ -234,7 +248,8 @@ MAKE-SSH-CLIENT's own defaults."
          options #'ssh-config-options-hostbased-accepted-algorithms
          (ssh-client-default-algorithms :signature-algorithms)
          "HostbasedAcceptedAlgorithms"
-         :all (ssh-client-supported-algorithms :signature-algorithms))
+         :all (ssh-client-supported-algorithms :signature-algorithms)
+         :extra-names +ssh-config-unimplemented-key-names+)
         :hostbased-keys
         (reverse (ssh-config-options-hostbased-keys options))
         :password-authentication
@@ -282,7 +297,8 @@ MAKE-SSH-CLIENT's own defaults."
          options #'ssh-config-options-ca-signature-algorithms
          (ssh-client-default-algorithms :ca-signature-algorithms)
          "CASignatureAlgorithms"
-         :all (ssh-client-supported-algorithms :ca-signature-algorithms))
+         :all (ssh-client-supported-algorithms :ca-signature-algorithms)
+         :extra-names +ssh-config-unimplemented-key-names+)
         :required-rsa-size
         (or (ssh-config-options-required-rsa-size options)
             +ssh-rsa-minimum-modulus-size+)
@@ -574,6 +590,7 @@ uses whichever of the two it saw first instead of chaining them."
            :private-key (getf parameters :private-key)
            :agent (getf parameters :agent)
            :passphrase (getf parameters :passphrase)
+           :passphrase-callback (getf parameters :passphrase-callback)
            :known-hosts (getf parameters :known-hosts)
            :host-key-policy (getf parameters :host-key-policy)
            :host-key-callback (getf parameters :host-key-callback)
@@ -667,6 +684,7 @@ the destination's user and port do not apply to it."
            :private-key (getf overrides :private-key)
            :agent (getf overrides :agent)
            :passphrase (getf overrides :passphrase)
+           :passphrase-callback (getf overrides :passphrase-callback)
            :known-hosts (getf overrides :known-hosts)
            :host-key-policy (getf overrides :host-key-policy)
            :host-key-callback (getf overrides :host-key-callback)
@@ -760,6 +778,7 @@ in the tunnel's buffers."
                  :private-key (getf overrides :private-key)
                  :agent (getf overrides :agent)
                  :passphrase (getf overrides :passphrase)
+                 :passphrase-callback (getf overrides :passphrase-callback)
                  :known-hosts (getf overrides :known-hosts)
                  :host-key-policy (getf overrides :host-key-policy)
                  :host-key-callback (getf overrides :host-key-callback)
@@ -801,11 +820,13 @@ in the tunnel's buffers."
                                     known-hosts host-key-policy
                                     host-key-callback resolver
                                     password-callback
-                                    kbd-interactive-callback)
+                                    kbd-interactive-callback
+                                    &key passphrase-callback)
   "The explicit command-line answers, as a plist for the chain builder."
   (list :user user :port port
         :private-key private-key :agent agent
         :passphrase passphrase
+        :passphrase-callback passphrase-callback
         :known-hosts known-hosts
         :host-key-policy host-key-policy
         :host-key-callback host-key-callback
@@ -840,6 +861,7 @@ in the tunnel's buffers."
 
 (defun make-ssh-client-from-config
     (host &key config original-host user port private-key agent passphrase
+              passphrase-callback
               known-hosts host-key-policy host-key-callback proxy-jump
               proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close on-forwarded-tcpip
@@ -858,12 +880,15 @@ failures.  RESOLVER dials addresses for the built clients; CANONICAL-RESOLVER
 performs the CanonicalizeHostname lookup, may report a CNAME as its second
 value, and receives the resolved AddressFamily as its :FAMILY keyword.
 PASSWORD-CALLBACK and KBD-INTERACTIVE-CALLBACK reach the built client and
-every ProxyJump hop, as they would in ssh."
+every ProxyJump hop, as they would in ssh.  PASSPHRASE-CALLBACK answers for
+a passphrase-protected identity file, receiving its path and returning the
+passphrase or NIL."
   (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
                      known-hosts host-key-policy host-key-callback resolver
-                     password-callback kbd-interactive-callback))
+                     password-callback kbd-interactive-callback
+                     :passphrase-callback passphrase-callback))
          (finished nil)
          (client nil)
          (on-built (lambda (value)

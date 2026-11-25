@@ -1422,7 +1422,7 @@ cannot apply per connection."
                                (ssh-server-config-line-error
                                 line "Bad RekeyLimit number ~A"
                                 size-argument)))))
-           (when (and (plusp bytes) (< bytes 16))
+           (when (and (/= bytes 0) (< bytes 16))
              (ssh-server-config-line-error line "RekeyLimit too small"))
            (ssh-server-config-set-once config 'rekey-limit bytes)
            (when (second arguments)

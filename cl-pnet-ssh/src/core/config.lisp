@@ -13,6 +13,29 @@
 (defparameter +ssh-config-max-depth+ 16
   "Include nesting limit, matching OpenSSH's own guard.")
 
+(defvar *ssh-config-error-function* nil
+  "A function of one string for readconf-style configuration diagnostics.
+
+readconf writes each rejected line to stderr as it parses it, then a file's
+closing \"terminating, N bad configuration options\" line.  The library calls
+this reporter with those exact strings when it is bound; otherwise callers
+only see the condition SSH-CONFIG-RESOLVE hands to ON-ERROR.")
+
+(defun ssh-config-readconf-message (condition)
+  "CONDITION as the single line readconf would print for its config error.
+
+PATH is the file, or \"command-line\" for an -o option; an error about an
+unknown keyword puts the colon after the path, which is how parse_token
+formats it.  The caller adds the terminating summary for a file."
+  (let ((path (or (ssh-config-error-path condition) "command-line"))
+        (line (or (ssh-config-error-line condition) 0))
+        (detail (ssh-error-detail condition)))
+    (if (ssh-config-error-bare condition)
+        detail
+        (if (ssh-config-error-bad-option condition)
+            (format nil "~A: line ~D: ~A" path line detail)
+            (format nil "~A line ~D: ~A" path line detail)))))
+
 (defparameter +ssh-config-directory+ #p"/etc/ssh/"
   "Where OpenSSH keeps ssh_config and sshd_config; a system configuration's
 relative Include is anchored here.")
@@ -51,7 +74,7 @@ relative Include is anchored here.")
     "forwardx11trusted" "gatewayports" "globalknownhostsfile"
     "globalknownhostsfile2" "gssapiauthentication" "gssapidelegatecredentials"
     "hashknownhosts" "host" "hostbasedacceptedalgorithms" "hostbasedauthentication"
-    "hostbasedkey" "hostbasedkeytypes" "hostkeyalgorithms" "hostkeyalias"
+    "hostbasedkeytypes" "hostkeyalgorithms" "hostkeyalias"
     "hostname" "identitiesonly" "identityagent" "identityfile" "identityfile2"
     "ignoreunknown" "include" "ipqos" "kbdinteractiveauthentication"
     "kbdinteractivedevices" "keepalive" "kerberosauthentication"
@@ -121,7 +144,12 @@ warning reporter's own rule; the option itself never takes effect.")
   ;; what ssh -Z marks "explicit"; the exact value also decides which
   ;; duplicate paths collapse, because readconf's add_identity_file compares
   ;; it too.
-  (userprovided 0))
+  (userprovided 0)
+  ;; True for a line that came from -o, where readconf treats Host, Include
+  ;; and Match as file structure and refuses them.  The flag is set only when
+  ;; the option list is turned into lines, so a caller that builds a line for
+  ;; a file-like block is not affected.
+  (command-line nil))
 
 (defstruct (ssh-config-context (:constructor %make-ssh-config-context))
   (original-host nil)
@@ -618,7 +646,7 @@ case it is an error as it is for VersionAddendum."
 
 (defun ssh-config-path-value (line options context)
   "A path argument with %, $ and ~ expanded."
-  (ssh-config-path-argument (ssh-config-arg line) options context))
+  (ssh-config-path-argument (ssh-config-string-arg line) options context))
 
 (defun ssh-config-include-path (argument &key (user-config t))
   "An Include argument as a pathname, relative ones anchored like OpenSSH.
@@ -673,25 +701,42 @@ relative Include is anchored and whether ~ is allowed in one."
                             (not (char= (char (first tokens) 0) #\#)))
                    (let ((keyword (string-downcase (first tokens))))
                      (if (string= keyword "include")
-                         (dolist (argument (rest tokens))
-                           (when (and (not user-config)
-                                      (plusp (length argument))
-                                      (char= (char argument 0) #\~))
-                             (error 'ssh-config-error
-                                    :path (namestring path)
-                                    :line number
-                                    :keyword "include"
-                                    :detail
-                                    (format nil "a system configuration may not include ~A"
-                                            argument)))
-                           (dolist (file (ssh-config-include-files
-                                          (ssh-config-include-path
-                                           argument :user-config user-config)))
-                             (setf directives
-                                   (nconc directives
+                         (progn
+                           ;; Keep the Include line itself so the resolver
+                           ;; validates its arguments.  An empty one is a bad
+                           ;; configuration option, as in readconf; the files
+                           ;; themselves are expanded here.
+                           (push (%make-ssh-config-line
+                                  :keyword keyword
+                                  :args (rest tokens)
+                                  :raw (ssh-config-line-remainder line)
+                                  :path path
+                                  :number number
+                                  :userprovided (if user-config 2 0))
+                                 directives)
+                           (dolist (argument (rest tokens))
+                             (when (and (not user-config)
+                                        (plusp (length argument))
+                                        (char= (char argument 0) #\~))
+                               (error 'ssh-config-error
+                                      :path (namestring path)
+                                      :line number
+                                      :keyword "include"
+                                      :detail
+                                      (format nil "a system configuration may not include ~A"
+                                              argument)))
+                             (unless (zerop (length argument))
+                               (dolist (file (ssh-config-include-files
+                                              (ssh-config-include-path
+                                               argument :user-config user-config)))
+                                 ;; DIRECTIVES is held reversed, so push each
+                                 ;; included line in turn to keep the file
+                                 ;; content where the Include appeared.
+                                 (dolist (directive
                                           (ssh-config-read-directives
                                            file (1+ depth)
-                                           :user-config user-config)))))
+                                           :user-config user-config))
+                                   (push directive directives))))))
                          (push (%make-ssh-config-line
                                 :keyword keyword
                                 :args (rest tokens)
@@ -776,8 +821,15 @@ Every keyword the file understands works here too, including HostName."
                  (t (list args)))))))))
 
 (defun ssh-config-option-lines (options)
-  "OPTIONS as a list of SSH-CONFIG-LINE, in the order given."
-  (mapcar #'ssh-config-option-line options))
+  "OPTIONS as a list of SSH-CONFIG-LINE, in the order given.
+
+The lines are marked as command-line options, which is what makes readconf
+refuse Host, Include and Match from -o."
+  (mapcar (lambda (option)
+            (let ((line (ssh-config-option-line option)))
+              (setf (ssh-config-line-command-line line) t)
+              line))
+          options))
 
 (defun ssh-config-add-options (config options)
   "CONFIG with the command-line OPTIONS applied before its own directives.
@@ -795,32 +847,186 @@ does that without a temporary file."
 
 ;;; ---- Values ----
 
-(defun ssh-config-line-error (line control &rest arguments)
+(defun %ssh-config-line-error (line detail &key bad-option bare fatal)
+  "An SSH-CONFIG-ERROR for LINE with DETAIL already formatted."
   (make-condition 'ssh-config-error
-                  :detail (apply #'format nil control arguments)
+                  :detail detail
                   :path (and (ssh-config-line-path line)
                              (namestring (ssh-config-line-path line)))
                   :line (ssh-config-line-number line)
-                  :keyword (ssh-config-line-keyword line)))
+                  :keyword (ssh-config-line-keyword line)
+                  :bad-option bad-option
+                  :bare bare
+                  :fatal fatal))
+
+(defun ssh-config-line-error (line control &rest arguments)
+  (apply #'%ssh-config-line-error line
+         (apply #'format nil control arguments) '()))
+
+(defun ssh-config-say (line control &rest arguments)
+  "Write a readconf diagnostic for LINE now, before the final error.
+
+readconf's parse_multistate_value and kex_names_valid print their own line
+and then the caller prints a second one, so the two are separate."
+  (when *ssh-config-error-function*
+    (funcall *ssh-config-error-function*
+             (ssh-config-readconf-message
+              (apply #'ssh-config-line-error line control arguments)))))
 
 (defun ssh-config-arg (line &optional (index 0))
-  "Argument INDEX of LINE, or a config error naming the line."
-  (or (nth index (ssh-config-line-args line))
-      (error (ssh-config-line-error line "requires an argument"))))
+  "Argument INDEX of LINE; empty arguments are returned as empty strings.
+
+readconf treats an absent argument and an empty one differently: the former
+is reported by the caller as \"no argument after keyword\", while each
+directive decides what to say about \"\"."
+  (nth index (ssh-config-line-args line)))
+
+(defun ssh-config-string-arg (line &optional (index 0))
+  "Argument INDEX of LINE as readconf's parse_string accepts one.
+
+A string directive refuses both an absent and an empty argument with
+\"Missing argument.\", so an ssh_config with User \"\" is invalid even
+though the tokenizer preserved the empty word."
+  (let ((value (ssh-config-arg line index)))
+    (when (or (null value) (zerop (length value)))
+      (error (ssh-config-line-error line "Missing argument.")))
+    value))
+
+(defun ssh-config-domain (line value)
+  "VALUE as misc.c's valid_domain(makelower=1) accepts it, or signal.
+
+Returns the lowercased name with a trailing dot removed, which is what
+readconf stores for CanonicalDomains."
+  (let ((length (length value)))
+    (cond
+      ((zerop length)
+       (error (ssh-config-line-error line "empty domain name")))
+      ((not (or (alpha-char-p (char value 0))
+                (digit-char-p (char value 0))
+                (char= (char value 0) #\_)))
+       (error (ssh-config-line-error
+               line "domain name \"~A\" starts with invalid character"
+               value))))
+    (let ((last nil))
+      (loop for character across value
+            for lower = (char-downcase character)
+            do (when (and last (char= last #\.) (char= lower #\.))
+                 (error (ssh-config-line-error
+                         line "domain name \"~A\" contains consecutive separators"
+                         value)))
+               (unless (or (char= lower #\.)
+                           (char= lower #\-)
+                           (alphanumericp lower)
+                           (char= lower #\_))
+                 (error (ssh-config-line-error
+                         line "domain name \"~A\" contains invalid characters"
+                         value)))
+               (setf last lower)))
+    (string-right-trim "." (string-downcase value))))
 
 (defun ssh-config-boolean (line value)
-  (cond ((string-equal value "yes") t)
-        ((string-equal value "no") nil)
-        (t (error (ssh-config-line-error line "expected yes or no, got ~S"
-                                         value)))))
+  "VALUE as a readconf flag; anything else is \"unsupported option\"."
+  (cond ((or (string-equal value "yes") (string-equal value "true")) t)
+        ((or (string-equal value "no") (string-equal value "false")) nil)
+        (t
+         (when (zerop (length value))
+           (ssh-config-say line "missing argument."))
+         (error (ssh-config-line-error line "unsupported option ~S." value)))))
+
+(defun ssh-config-multistate (line value table)
+  "VALUE looked up in TABLE, an alist of name to value, or an error.
+
+readconf's parse_multistate_value prints \"missing argument.\" for an empty
+argument and the caller then prints \"unsupported option\" for the same
+argument, so a bad value is two lines."
+  (let ((entry (assoc value table :test #'string-equal)))
+    (cond
+      (entry (cdr entry))
+      (t
+       (when (zerop (length value))
+         (ssh-config-say line "missing argument."))
+       (error (ssh-config-line-error line "unsupported option ~S." value))))))
 
 (defun ssh-config-integer (line value &key minimum maximum)
-  (let ((number (handler-case (parse-integer value :junk-allowed nil)
-                  (parse-error () nil))))
-    (unless (and number
-                 (or (null minimum) (>= number minimum))
+  "VALUE as readconf's atoi_err reads an integer, 0..INT_MAX.
+
+MINIMUM and MAXIMUM narrow that range for the few keywords that have their
+own bound; going outside any of them is what strtonum calls \"too small\"
+or \"too large\"."
+  (let ((problem (ssh-config-atoi-error value)))
+    (when problem
+      (error (ssh-config-line-error line "integer value ~A." problem))))
+  (let ((number (parse-integer value)))
+    (unless (and (or (null minimum) (>= number minimum))
                  (or (null maximum) (<= number maximum)))
-      (error (ssh-config-line-error line "invalid number ~S" value)))
+      (error (ssh-config-line-error
+              line "integer value ~A."
+              (if (and minimum (< number minimum)) "too small" "too large"))))
+    number))
+
+(defun ssh-a2port-service (name)
+  "NAME's TCP port from the platform services database, or NIL.
+
+a2port falls back to getservbyname, so \"Port ssh\" and \"-p http\" name
+services.  Reading the database directly keeps this portable across the
+platforms this client runs on."
+  (let ((path
+          (if (uiop:os-windows-p)
+              (let ((root (uiop:getenv "SystemRoot")))
+                (and root
+                     (merge-pathnames
+                      "System32/drivers/etc/services"
+                      (uiop:ensure-directory-pathname root))))
+              #p"/etc/services")))
+    (when (and path (probe-file path))
+      (with-open-file (stream path :if-does-not-exist nil)
+        (when stream
+          (loop for line = (read-line stream nil nil)
+                while line
+                do (let ((hash (position #\# line)))
+                     (when hash (setf line (subseq line 0 hash)))
+                     (let ((fields (remove-if (lambda (field)
+                                                (zerop (length field)))
+                                              (uiop:split-string
+                                               line
+                                               :separator '(#\Space #\Tab)))))
+                       (when (and (>= (length fields) 2)
+                                  (or (string= (first fields) name)
+                                      (member name (cddr fields)
+                                              :test #'string=)))
+                         (let* ((slash (position #\/ (second fields)))
+                                (number-text
+                                  (if slash
+                                      (subseq (second fields) 0 slash)
+                                      (second fields)))
+                                (service (and slash
+                                              (subseq (second fields)
+                                                      (1+ slash))))
+                                (number
+                                  (handler-case
+                                      (parse-integer number-text)
+                                    (error () nil))))
+                           (when (and number
+                                      (<= 0 number 65535)
+                                      (or (null service)
+                                          (string-equal service "tcp")))
+                             (return-from ssh-a2port-service number))))))))))))
+
+(defun ssh-a2port (value)
+  "VALUE as OpenSSH's a2port reads it: 0..65535, a TCP service name, or NIL."
+  (let ((number (handler-case (parse-integer value :junk-allowed nil)
+                  (error () nil))))
+    (cond
+      ((and number (<= 0 number 65535)) number)
+      (t (ssh-a2port-service value)))))
+
+(defun ssh-config-port (line value)
+  "VALUE as readconf's a2port reads a port: 1..65535 or \"Bad port\"."
+  (when (zerop (length value))
+    (error (ssh-config-line-error line "Missing argument.")))
+  (let ((number (ssh-a2port value)))
+    (unless (and number (plusp number))
+      (error (ssh-config-line-error line "Bad port '~A'." value)))
     number))
 
 (defun ssh-parse-scaled (value)
@@ -829,21 +1035,20 @@ does that without a temporary file."
 The syntax is digits with an optional decimal fraction and an optional
 B/K/M/G/T/P/E suffix, as OpenSSH's RekeyLimit accepts.  The suffix is a
 power of 1024, case-insensitively, and anything after it is invalid.  A
-negative size is refused: OpenSSH's scan_scaled accepts it, but every
-directive that uses it rejects the result."
+leading minus is accepted, because scan_scaled accepts one; each directive
+then decides whether a negative size is usable."
   (when (and (stringp value) (plusp (length value)))
     (let ((position 0)
-          (length (length value)))
+          (length (length value))
+          (negative nil))
       (loop while (and (< position length)
                        (member (char value position)
                                '(#\Space #\Tab #\Return #\Linefeed)))
             do (incf position))
       (when (and (< position length)
-                 (char= (char value position) #\+))
+                 (member (char value position) '(#\+ #\-)))
+        (setf negative (char= (char value position) #\-))
         (incf position))
-      (when (and (< position length)
-                 (char= (char value position) #\-))
-        (return-from ssh-parse-scaled nil))
       (let ((whole 0)
             (fraction 0)
             (fraction-digits 0)
@@ -886,9 +1091,10 @@ directive that uses it rejects the result."
                          (floor (* fraction multiplier)
                                 (expt 10 fraction-digits))
                          0))))
-            (if (> result (1- (expt 2 63)))
-                nil
-                result)))))))
+            (cond
+              ((> result (1- (expt 2 63))) nil)
+              (negative (- result))
+              (t result))))))))
 
 (defun ssh-config-atoi-error (value)
   "OpenSSH's strtonum diagnostic for VALUE, or NIL when it parses as an int.
@@ -909,6 +1115,8 @@ does not fit an int each read the way ssh reports them."
 
 (defun ssh-config-seconds (line value)
   "A time argument as seconds, :NONE for unlimited, or an error."
+  (when (zerop (length value))
+    (error (ssh-config-line-error line "missing time value.")))
   (if (string-equal value "none")
       :none
       (let ((total 0)
@@ -916,7 +1124,7 @@ does not fit an int each read the way ssh reports them."
             (digits 0))
         (flet ((flush (multiplier)
                  (unless (plusp digits)
-                   (error (ssh-config-line-error line "invalid time ~S" value)))
+                   (error (ssh-config-line-error line "invalid time value.")))
                  (incf total (* number multiplier))
                  (setf number 0 digits 0)))
           (loop for character across value
@@ -931,7 +1139,7 @@ does not fit an int each read the way ssh reports them."
                      ((member character '(#\d #\D)) (flush 86400))
                      ((member character '(#\w #\W)) (flush 604800))
                      (t (error (ssh-config-line-error line
-                                                      "invalid time ~S" value)))))
+                                                      "invalid time value.")))))
           (when (plusp digits) (flush 1)))
         total)))
 
@@ -946,12 +1154,14 @@ not be empty.  INTERVAL uses ssh's time syntax and may be zero, which
 disables that pattern's timeout."
   (let ((equals (position #\= argument)))
     (when (or (null equals) (zerop equals))
-      (error (ssh-config-line-error line "invalid channel timeout ~A"
-                                    argument)))
+      (error (%ssh-config-line-error
+              line (format nil "invalid channel timeout ~A" argument)
+              :fatal t)))
     (let ((seconds (ssh-parse-time (subseq argument (1+ equals)))))
       (unless seconds
-        (error (ssh-config-line-error line "invalid channel timeout ~A"
-                                      argument)))
+        (error (%ssh-config-line-error
+                line (format nil "invalid channel timeout ~A" argument)
+                :fatal t)))
       (values (subseq argument 0 equals) seconds))))
 
 (defun ssh-config-set-once (seen options key thunk)
@@ -1012,7 +1222,7 @@ glob patterns; both arguments are lowercased and matched case-insensitively."
                (when (or (null colon)
                          (= colon (1- (length argument))))
                  (error (ssh-config-line-error
-                         line "invalid permitted CNAME ~S" argument)))
+                         line "Invalid permitted CNAME ~S" argument)))
                (cons (subseq argument 0 colon)
                      (subseq argument (1+ colon)))))))))
 
@@ -1054,6 +1264,8 @@ ORIGINAL-HOST remains the name the user typed, for %n and OriginalHost."
         (matched nil)
         (pattern nil))
     (dolist (argument (ssh-config-line-args line))
+      (when (zerop (length argument))
+        (error (ssh-config-line-error line "keyword host empty argument")))
       (dolist (piece (uiop:split-string argument :separator ","))
         (let ((negated (and (plusp (length piece))
                             (char= (char piece 0) #\!))))
@@ -1188,41 +1400,39 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-hostname options)
                 (ssh-config-expand-variables
-                 (ssh-config-expand-tokens (ssh-config-arg line)
+                 (ssh-config-expand-tokens (ssh-config-string-arg line)
                                            options context))))))
       ((string= keyword "port")
        (ssh-config-set-once
         seen options :port
         (lambda (options)
           (setf (ssh-config-options-port options)
-                (ssh-config-integer line (ssh-config-arg line)
-                                    :minimum 1 :maximum 65535)))))
+                (ssh-config-port line (ssh-config-arg line))))))
       ((string= keyword "user")
        (ssh-config-set-once
         seen options :user
         (lambda (options)
           (setf (ssh-config-options-user options)
-                (ssh-config-expand-variables (ssh-config-arg line))))))
+                (ssh-config-expand-variables
+                 (ssh-config-string-arg line))))))
       ((string= keyword "canonicalizehostname")
        (ssh-config-set-once
         seen options :canonicalize-hostname
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("yes" "no" "always" "true" "false")
-                            :test #'string=)
-              (error (ssh-config-line-error line
-                                            "invalid CanonicalizeHostname ~S"
-                                            value)))
-            (setf (ssh-config-options-canonicalize-hostname options)
-                  (cond ((string= value "always") :always)
-                        ((member value '("true" "yes") :test #'string=) :yes)
-                        (t :no)))))))
+          (setf (ssh-config-options-canonicalize-hostname options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . :yes) ("true" . :yes)
+                   ("no" . :no) ("false" . :no)
+                   ("always" . :always)))))))
       ((string= keyword "canonicaldomains")
-       (ssh-config-set-once
-        seen options :canonical-domains
-        (lambda (options)
-          (setf (ssh-config-options-canonical-domains options)
-                (ssh-config-line-args line)))))
+       (let ((domains (mapcar (lambda (argument)
+                                (ssh-config-domain line argument))
+                              (ssh-config-line-args line))))
+         (ssh-config-set-once
+          seen options :canonical-domains
+          (lambda (options)
+            (setf (ssh-config-options-canonical-domains options) domains)))))
       ((string= keyword "canonicalizemaxdots")
        (ssh-config-set-once
         seen options :canonicalize-max-dots
@@ -1247,7 +1457,8 @@ understand them rather than silently match nothing."
         seen options :host-key-alias
         (lambda (options)
           (setf (ssh-config-options-host-key-alias options)
-                (ssh-config-expand-variables (ssh-config-arg line)))))))))
+                (ssh-config-expand-variables
+                 (ssh-config-string-arg line)))))))))
 
 (defun ssh-config-apply-identity (line options seen context)
   (let ((keyword (ssh-config-line-keyword line)))
@@ -1291,11 +1502,16 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :hostbased-accepted-algorithms
         (lambda (options)
-          (setf (ssh-config-options-hostbased-accepted-algorithms options)
-                (ssh-config-split-list (ssh-config-arg line))))))
-      ((string= keyword "hostbasedkey")
-       (push (ssh-config-path-value line options context)
-             (ssh-config-options-hostbased-keys options)))
+          (let ((value (ssh-config-string-arg line)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-config-config-key-names+
+             :wildcards t
+             :on-bad (lambda (name)
+                       (declare (ignore name))
+                       (error (ssh-config-line-error
+                               line "Bad key types '~A'." value))))
+            (setf (ssh-config-options-hostbased-accepted-algorithms options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "enablesshkeysign")
        (ssh-config-set-once
         seen options :enable-ssh-keysign
@@ -1303,24 +1519,57 @@ understand them rather than silently match nothing."
           (setf (ssh-config-options-enable-ssh-keysign options)
                 (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "addkeystoagent")
+       ;; readconf's oAddKeysToAgent is not a plain multistate: an invalid
+       ;; first word may be a bare lifetime ("5m" means yes), "confirm" may
+       ;; take a lifetime, and its error line carries no argument.
        (ssh-config-set-once
         seen options :add-keys-to-agent
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (setf (ssh-config-options-add-keys-to-agent options)
-                  (cond ((member value '("yes" "true" "on") :test #'string=)
-                         :yes)
-                        ((member value '("no" "false" "off") :test #'string=)
-                         :no)
-                        ((string= value "ask") :ask)
-                        ((string= value "confirm") :confirm)
-                        (t
-                         (error (ssh-config-line-error
-                                 line "invalid AddKeysToAgent ~S" value))))))))))))
+          (let* ((arguments (ssh-config-line-args line))
+                 (raw (first arguments))
+                 (extra (second arguments))
+                 (lower (string-downcase raw))
+                 (state (cond ((member lower '("yes" "true") :test #'string=)
+                               :yes)
+                              ((member lower '("no" "false") :test #'string=)
+                               :no)
+                              ((string= lower "ask") :ask)
+                              ((string= lower "confirm") :confirm)
+                              (t nil))))
+            (cond
+              ((and (eq state :confirm) extra)
+               (unless (ssh-parse-time extra)
+                 (error (ssh-config-line-error line "invalid time value.")))
+               (setf (ssh-config-options-add-keys-to-agent options) :confirm))
+              ((and (null state) (null extra))
+               (when (zerop (length raw))
+                 (ssh-config-say line "missing argument."))
+               (if (and (plusp (length raw)) (ssh-parse-time raw))
+                   (setf (ssh-config-options-add-keys-to-agent options) :yes)
+                   (error (ssh-config-line-error
+                           line "unsupported option"))))
+              ((or (null state) extra)
+               (when (zerop (length raw))
+                 (ssh-config-say line "missing argument."))
+               (error (ssh-config-line-error line "unsupported option")))
+              (t
+               (setf (ssh-config-options-add-keys-to-agent options)
+                     state))))))))))
 
 (defun ssh-config-known-host-paths (line options context)
   "The paths on a known-hosts line; :NONE for the literal none."
-  (let ((values (ssh-config-line-args line)))
+  (let ((values (ssh-config-line-args line))
+        (keyword (ssh-config-line-keyword line)))
+    (dolist (value values)
+      (when (zerop (length value))
+        (error (ssh-config-line-error
+                line "keyword ~A empty argument" keyword))))
+    (when (and (some (lambda (value) (string-equal value "none")) values)
+               (not (and (null (rest values))
+                         (string-equal (first values) "none"))))
+      (error (ssh-config-line-error
+              line "keyword ~A \"none\" argument must appear alone."
+              keyword)))
     (if (and values (string-equal (first values) "none"))
         :none
         (mapcar (lambda (value)
@@ -1355,47 +1604,40 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :update-host-keys
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (setf (ssh-config-options-update-host-keys options)
-                  (cond ((member value '("yes" "true" "on")
-                                 :test #'string=)
-                         :yes)
-                        ((member value '("no" "false" "off")
-                                 :test #'string=)
-                         :no)
-                        ((string= value "ask") :ask)
-                        (t
-                         (error (ssh-config-line-error
-                                 line "invalid UpdateHostKeys ~S" value)))))))))
+          (setf (ssh-config-options-update-host-keys options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . :yes) ("true" . :yes)
+                   ("no" . :no) ("false" . :no)
+                   ("ask" . :ask)))))))
       ((string= keyword "knownhostscommand")
        (ssh-config-set-once
         seen options :known-hosts-command
         (lambda (options)
           (setf (ssh-config-options-known-hosts-command options)
                 (let ((raw (ssh-config-line-raw line)))
-                  (if (and raw (plusp (length raw))) raw value))))))
+                  (if (and raw (plusp (length raw)))
+                      raw
+                      (ssh-config-arg line)))))))
       ((string= keyword "ignoreunknown")
        (let ((arguments (ssh-config-line-args line)))
-         (unless (= 1 (length arguments))
+         (when (> (length arguments) 1)
            (error (ssh-config-line-error
-                   line "IgnoreUnknown takes exactly one argument")))
-         (when (zerop (length (first arguments)))
-           (error (ssh-config-line-error
-                   line "IgnoreUnknown requires an argument")))
+                   line "keyword ignoreunknown extra arguments at end of line")))
          (ssh-config-set-once
           seen options :ignored-unknown
           (lambda (options)
             (setf (ssh-config-options-ignored-unknown options)
-                  (first arguments))))))
+                  (ssh-config-string-arg line))))))
       ((string= keyword "fingerprinthash")
        (ssh-config-set-once
         seen options :fingerprint-hash
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("sha256" "md5") :test #'string=)
-              (error (ssh-config-line-error line
-                                            "invalid FingerprintHash ~S"
-                                            value)))
+          (let ((value (string-downcase (ssh-config-string-arg line))))
+            (unless (member value '("md5" "sha1" "sha256" "sha384" "sha512")
+                            :test #'string=)
+              (error (ssh-config-line-error
+                      line "Invalid hash algorithm ~S." value)))
             (setf (ssh-config-options-fingerprint-hash options)
                   (intern (string-upcase value) :keyword))))))
       ((string= keyword "checkhostip")
@@ -1415,18 +1657,12 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :verify-host-key-dns
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (setf (ssh-config-options-verify-host-key-dns options)
-                  (cond ((member value '("yes" "true" "on")
-                                 :test #'string=)
-                         :yes)
-                        ((member value '("no" "false" "off")
-                                 :test #'string=)
-                         :no)
-                        ((string= value "ask") :ask)
-                        (t
-                         (error (ssh-config-line-error
-                                 line "invalid VerifyHostKeyDNS ~S" value)))))))))
+          (setf (ssh-config-options-verify-host-key-dns options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . :yes) ("true" . :yes)
+                   ("no" . :no) ("false" . :no)
+                   ("ask" . :ask)))))))
       ((string= keyword "visualhostkey")
        (ssh-config-set-once
         seen options :visual-host-key
@@ -1443,6 +1679,15 @@ understand them rather than silently match nothing."
        ;; Unlike most keywords this accumulates, and NONE clears what came
        ;; before it, as ssh's oRevokedHostKeys does.
        (let ((values (ssh-config-line-args line)))
+         (dolist (value values)
+           (when (zerop (length value))
+             (error (ssh-config-line-error
+                     line "keyword revokedhostkeys empty argument"))))
+         (when (and (some (lambda (value) (string-equal value "none")) values)
+                    (not (and (= 1 (length values))
+                              (string-equal (first values) "none"))))
+           (error (ssh-config-line-error
+                   line "keyword revokedhostkeys \"none\" argument must appear alone.")))
          (if (and (= 1 (length values))
                   (string-equal (first values) "none"))
              (setf (ssh-config-options-revoked-host-keys options) nil)
@@ -1453,14 +1698,13 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :strict-host-key-checking
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("yes" "no" "off" "ask" "accept-new")
-                            :test #'string=)
-              (error (ssh-config-line-error line
-                                            "invalid StrictHostKeyChecking ~S"
-                                            value)))
-            (setf (ssh-config-options-strict-host-key-checking options)
-                  value)))))
+          (setf (ssh-config-options-strict-host-key-checking options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . "yes") ("true" . "yes")
+                   ("no" . "no") ("false" . "no")
+                   ("off" . "off") ("ask" . "ask")
+                   ("accept-new" . "accept-new")))))))
       ((string= keyword "connecttimeout")
        (ssh-config-set-once
         seen options :connect-timeout
@@ -1472,18 +1716,15 @@ understand them rather than silently match nothing."
         seen options :connection-attempts
         (lambda (options)
           (setf (ssh-config-options-connection-attempts options)
-                (ssh-config-integer line (ssh-config-arg line)
-                                    :minimum 1)))))
+                (ssh-config-integer line (ssh-config-arg line))))))
       ((string= keyword "addressfamily")
        (ssh-config-set-once
         seen options :address-family
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("any" "inet" "inet6") :test #'string=)
-              (error (ssh-config-line-error line "invalid AddressFamily ~S"
-                                            value)))
-            (setf (ssh-config-options-address-family options)
-                  (intern (string-upcase value) :keyword))))))
+          (setf (ssh-config-options-address-family options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("any" . :any) ("inet" . :inet) ("inet6" . :inet6)))))))
       ((string= keyword "batchmode")
        (ssh-config-set-once
         seen options :batch-mode
@@ -1492,85 +1733,164 @@ understand them rather than silently match nothing."
                 (ssh-config-boolean line (ssh-config-arg line))))))
       ((string= keyword "warnweakcrypto")
        ;; A multistate, not a boolean: readconf also accepts no-pq-kex, which
-       ;; its table maps to the same false value as no, and rejects anything
-       ;; else with "unsupported option".
+       ;; its table maps to the same false value as no, and an empty or
+       ;; unknown word is "missing argument." plus "unsupported option".
        (ssh-config-set-once
         seen options :warn-weak-crypto
         (lambda (options)
-          (let ((value (ssh-config-arg line)))
-            (setf (ssh-config-options-warn-weak-crypto options)
-                  (cond
-                    ((member value '("yes" "true") :test #'string-equal)
-                     :yes)
-                    ((member value '("no" "false" "no-pq-kex")
-                             :test #'string-equal)
-                     :no)
-                    (t
-                     (error (ssh-config-line-error
-                             line "unsupported option ~S" value))))))))))))
+          (setf (ssh-config-options-warn-weak-crypto options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . :yes) ("true" . :yes)
+                   ("no" . :no) ("false" . :no)
+                   ("no-pq-kex" . :no))))))))))
+
+(defun ssh-config-say-bare (text)
+  "Write TEXT to readconf's diagnostic stream with no file or line prefix."
+  (when *ssh-config-error-function*
+    (funcall *ssh-config-error-function* text)))
+
+(defun ssh-config-validate-algorithm-names (line value names
+                                            &key wildcards plain-only on-bad)
+  "Check VALUE against NAMES as readconf validates an algorithm keyword.
+
+A leading '-' is readconf's \"remove\" form and is not validated at all; '+'
+and '^' have already been stripped before ciphers_valid sees the list."
+  (unless (and (plusp (length value)) (char= (char value 0) #\-))
+    (let ((text (if (and (plusp (length value))
+                         (member (char value 0) '(#\+ #\^)))
+                    (subseq value 1)
+                    value)))
+      (dolist (name (uiop:split-string text :separator ","))
+        ;; strsep stops at an empty element, so anything after it is ignored.
+        (when (zerop (length name))
+          (return))
+        (let ((ok
+                (if wildcards
+                    (and (or (not plain-only) (not (search "-cert" name)))
+                         (some (lambda (known)
+                                 (ssh-match-pattern name known))
+                               names))
+                    (member name names :test #'string=))))
+          (unless ok
+            (funcall on-bad name)))))))
+
+(defun ssh-config-check-algorithm-argument (line value message)
+  "Refuse an empty algorithm argument the way readconf's cases do."
+  (when (zerop (length value))
+    (error (ssh-config-line-error line "Missing argument.")))
+  message)
 
 (defun ssh-config-apply-algorithms (line options seen)
   (let ((keyword (ssh-config-line-keyword line)))
-    (cond
+    (flet ((check ()
+             (let ((value (ssh-config-arg line)))
+               (when (zerop (length value))
+                 (error (ssh-config-line-error line "Missing argument.")))
+               value))
+           (bad (message value name)
+             (declare (ignore name))
+             (error (ssh-config-line-error
+                     line "~A" (format nil message value)))))
+      (declare (ignorable #'bad))
+      (cond
       ((string= keyword "ciphers")
        (ssh-config-set-once
         seen options :ciphers
         (lambda (options)
-          (setf (ssh-config-options-ciphers options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-all-ciphers+
+             :on-bad (lambda (name)
+                       (bad "Bad SSH2 cipher spec '~A'." value name)))
+            (setf (ssh-config-options-ciphers options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "macs")
        (ssh-config-set-once
         seen options :macs
         (lambda (options)
-          (setf (ssh-config-options-macs options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-all-macs+
+             :on-bad (lambda (name)
+                       (bad "Bad SSH2 MAC spec '~A'." value name)))
+            (setf (ssh-config-options-macs options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "kexalgorithms")
        (ssh-config-set-once
         seen options :kex-algorithms
         (lambda (options)
-          (setf (ssh-config-options-kex-algorithms options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-kex-real-algorithms+
+             :on-bad (lambda (name)
+                       (ssh-config-say-bare
+                        (format nil "Unsupported KEX algorithm \"~A\"" name))
+                       (bad "Bad SSH2 KexAlgorithms '~A'." value name)))
+            (setf (ssh-config-options-kex-algorithms options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "hostkeyalgorithms")
        (ssh-config-set-once
         seen options :host-key-algorithms
         (lambda (options)
-          (setf (ssh-config-options-host-key-algorithms options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-config-config-key-names+
+             :wildcards t
+             :on-bad (lambda (name)
+                       (bad "Bad key types '~A'." value name)))
+            (setf (ssh-config-options-host-key-algorithms options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "casignaturealgorithms")
        (ssh-config-set-once
         seen options :ca-signature-algorithms
         (lambda (options)
-          (setf (ssh-config-options-ca-signature-algorithms options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-config-config-key-names+
+             :wildcards t :plain-only t
+             :on-bad (lambda (name)
+                       (bad "Bad key types '~A'." value name)))
+            (setf (ssh-config-options-ca-signature-algorithms options)
+                  (ssh-config-split-list value))))))
       ((member keyword '("pubkeyacceptedalgorithms" "pubkeyacceptedkeytypes")
                :test #'string=)
        (ssh-config-set-once
         seen options :pubkey-accepted-algorithms
         (lambda (options)
-          (setf (ssh-config-options-pubkey-accepted-algorithms options)
-                (ssh-config-split-list (ssh-config-arg line))))))
+          (let ((value (check)))
+            (ssh-config-validate-algorithm-names
+             line value +ssh-config-config-key-names+
+             :wildcards t
+             :on-bad (lambda (name)
+                       (bad "Bad key types '~A'." value name)))
+            (setf (ssh-config-options-pubkey-accepted-algorithms options)
+                  (ssh-config-split-list value))))))
       ((string= keyword "compression")
        (ssh-config-set-once
         seen options :compression
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-arg line))))
-            (unless (member value '("yes" "no") :test #'string=)
-              (error (ssh-config-line-error line "invalid Compression ~S"
-                                            value)))
-            (setf (ssh-config-options-compression options)
-                  (string= value "yes"))))))
+          (setf (ssh-config-options-compression options)
+                (ssh-config-multistate
+                 line (ssh-config-arg line)
+                 '(("yes" . t) ("no" . nil)))))))
       ((string= keyword "rekeylimit")
        (let ((arguments (ssh-config-line-args line)))
-         (unless (<= 1 (length arguments) 2)
+         (when (> (length arguments) 2)
            (error (ssh-config-line-error
-                   line "RekeyLimit takes a size and an optional time")))
+                   line "keyword rekeylimit extra arguments at end of line")))
          (let* ((size-argument (first arguments))
-                (bytes (if (string= size-argument "default")
-                           0
-                           (or (ssh-parse-scaled size-argument)
-                               (error (ssh-config-line-error
-                                       line "Bad number ~S" size-argument))))))
-           (when (and (plusp bytes) (< bytes 16))
+                (bytes
+                  (cond
+                    ((zerop (length size-argument))
+                     (error (ssh-config-line-error line "Missing argument.")))
+                    ((string= size-argument "default") 0)
+                    (t
+                     (or (ssh-parse-scaled size-argument)
+                         (error (ssh-config-line-error
+                                 line "Bad number '~A': Invalid argument"
+                                 size-argument)))))))
+           (when (and (/= bytes 0) (< bytes 16))
              (error (ssh-config-line-error line "RekeyLimit too small")))
            (ssh-config-set-once
             seen options :rekey-limit
@@ -1579,15 +1899,12 @@ understand them rather than silently match nothing."
            (when (second arguments)
              (let ((interval-argument (second arguments)))
                (unless (string= interval-argument "none")
-                 (let ((seconds (or (ssh-parse-time interval-argument)
-                                    (error (ssh-config-line-error
-                                            line "invalid time value ~S"
-                                            interval-argument)))))
+                 (let ((seconds (ssh-config-seconds line interval-argument)))
                    (ssh-config-set-once
                     seen options :rekey-interval
                     (lambda (options)
                       (setf (ssh-config-options-rekey-interval options)
-                            seconds)))))))))))))
+                            seconds))))))))))))))
 
 (defparameter +ssh-config-ip-qos-names+
   '(("af11" . #x28) ("af12" . #x30) ("af13" . #x38)
@@ -1613,10 +1930,162 @@ understand them rather than silently match nothing."
        (let ((number (handler-case (parse-integer value)
                        (error () nil))))
          (unless (and number (<= 0 number 255))
-           (error (ssh-config-line-error line "invalid IPQoS ~S" value)))
+           (error (ssh-config-line-error line "Bad IPQoS value: ~A" value)))
          number)))))
 
-(defun ssh-config-apply-session (line options seen)
+(defun ssh-config-forward-field (text start)
+  "One field of a forwarding specification starting at START.
+
+Fields end at an unescaped ':' or the end of TEXT; a backslash quotes the
+next character, and a field starting with '[' runs to the matching ']'.
+A field that contains '/' is a Unix socket path.  The result is
+\(ARG ISPATH NEXT) or NIL when the field is malformed, mirroring
+parse_fwd_field."
+  (let ((length (length text)))
+    (when (>= start length)
+      (return-from ssh-config-forward-field nil))
+    (when (char= (char text start) #\[)
+      (let* ((close (position #\] text :start (1+ start)))
+             (end (and close (1+ close))))
+        (unless (and close
+                     (or (= end length) (char= (char text end) #\:)))
+          (return-from ssh-config-forward-field nil))
+        (let ((argument (subseq text (1+ start) close)))
+          (return-from ssh-config-forward-field
+            (list argument (and (find #\/ argument) t)
+                  (if (= end length) length (1+ end)))))))
+    (let ((argument (make-string-output-stream))
+          (path nil)
+          (index start))
+      (loop while (< index length)
+            for character = (char text index)
+            do (cond
+                 ((char= character #\\)
+                  (incf index)
+                  (when (>= index length)
+                    (return-from ssh-config-forward-field nil))
+                  (write-char (char text index) argument)
+                  (incf index))
+                 ((char= character #\/)
+                  (setf path t)
+                  (write-char character argument)
+                  (incf index))
+                 ((char= character #\:)
+                  (return-from ssh-config-forward-field
+                    (list (get-output-stream-string argument) path
+                          (1+ index))))
+                 (t
+                  (write-char character argument)
+                  (incf index))))
+      (list (get-output-stream-string argument) path length))))
+
+(defun ssh-config-forward-fields (text)
+  "TEXT as a list of (ARG . ISPATH), or NIL when parse_forward would fail."
+  (let ((fields '())
+        (start 0)
+        (length (length text)))
+    (loop while (and (< start length) (< (length fields) 4))
+          do (let ((field (ssh-config-forward-field text start)))
+               (unless field
+                 (return-from ssh-config-forward-fields nil))
+               (push (cons (first field) (second field)) fields)
+               (setf start (third field))))
+    (when (< start length)
+      (return-from ssh-config-forward-fields nil))
+    (nreverse fields)))
+
+(defun ssh-config-forward-port (text)
+  "TEXT as a2port reads it: 0..65535, or -1 for anything else."
+  (handler-case
+      (let ((port (parse-integer text :junk-allowed nil)))
+        (if (<= 0 port 65535) port -1))
+    (error () -1)))
+
+(defun ssh-config-forwarding-valid-p (spec dynamicfwd remotefwd)
+  "Whether SPEC is a forwarding specification parse_forward would accept."
+  (let ((fields (ssh-config-forward-fields spec)))
+    (unless fields
+      (return-from ssh-config-forwarding-valid-p nil))
+    (let* ((count (length fields))
+           (path (lambda (index)
+                   (cdr (nth index fields))))
+           (arg (lambda (index)
+                  (car (nth index fields))))
+           (listen-path nil) (listen-port :unset) (listen-host nil)
+           (connect-path nil) (connect-port :unset) (connect-host nil)
+           (ok t))
+      (cond
+        ((= count 1)
+         (if (funcall path 0)
+             (setf listen-path (funcall arg 0) listen-port :streamlocal)
+             (setf listen-host nil
+                   listen-port (ssh-config-forward-port (funcall arg 0))))
+         (setf connect-host "socks"))
+        ((= count 2)
+         (cond
+           ((and (funcall path 0) (funcall path 1))
+            (setf listen-path (funcall arg 0) listen-port :streamlocal
+                  connect-path (funcall arg 1) connect-port :streamlocal))
+           ((funcall path 1)
+            (setf listen-host nil
+                  listen-port (ssh-config-forward-port (funcall arg 0))
+                  connect-path (funcall arg 1) connect-port :streamlocal))
+           (t
+            (setf listen-host (funcall arg 0)
+                  listen-port (ssh-config-forward-port (funcall arg 1))
+                  connect-host "socks"))))
+        ((= count 3)
+         (cond
+           ((funcall path 0)
+            (setf listen-path (funcall arg 0) listen-port :streamlocal
+                  connect-host (funcall arg 1)
+                  connect-port (ssh-config-forward-port (funcall arg 2))))
+           ((funcall path 2)
+            (setf listen-host (funcall arg 0)
+                  listen-port (ssh-config-forward-port (funcall arg 1))
+                  connect-path (funcall arg 2) connect-port :streamlocal))
+           (t
+            (setf listen-host nil
+                  listen-port (ssh-config-forward-port (funcall arg 0))
+                  connect-host (funcall arg 1)
+                  connect-port (ssh-config-forward-port (funcall arg 2))))))
+        ((= count 4)
+         (setf listen-host (funcall arg 0)
+               listen-port (ssh-config-forward-port (funcall arg 1))
+               connect-host (funcall arg 2)
+               connect-port (ssh-config-forward-port (funcall arg 3))))
+        (t (setf ok nil)))
+      (when ok
+        (if dynamicfwd
+            (unless (member count '(1 2)) (setf ok nil))
+            (progn
+              (unless (member count '(3 4))
+                (unless (or connect-path listen-path)
+                  (setf ok nil)))
+              (when (and (or (eq connect-port :unset)
+                             (and (integerp connect-port)
+                                  (not (plusp connect-port))))
+                         (null connect-path))
+                (setf ok nil)))))
+      (when ok
+        (when (or (and (or (eq listen-port :unset)
+                           (and (integerp listen-port)
+                                (minusp listen-port)))
+                       (null listen-path))
+                  (and (not remotefwd)
+                       (eql listen-port 0)))
+          (setf ok nil)))
+      (when ok
+        (flet ((too-long (value limit)
+                 (and value (>= (length value) limit))))
+          (when (or (too-long connect-host 1025)
+                    (too-long connect-path 108)
+                    (too-long listen-host 1025)
+                    (too-long listen-path 108))
+            (setf ok nil))))
+      ok)))
+
+(defun ssh-config-apply-session (line options seen &key (active t))
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
       ((string= keyword "ipqos")
@@ -1624,8 +2093,9 @@ understand them rather than silently match nothing."
         seen options :ip-qos
         (lambda (options)
           (let ((arguments (ssh-config-line-args line)))
-            (unless (<= 1 (length arguments) 2)
-              (error (ssh-config-line-error line "invalid IPQoS arguments")))
+            (when (> (length arguments) 2)
+              (error (ssh-config-line-error
+                      line "keyword ipqos extra arguments at end of line")))
             (let ((interactive (ssh-config-ip-qos-value
                                 line (first arguments))))
               (setf (ssh-config-options-ip-qos-interactive options)
@@ -1635,6 +2105,9 @@ understand them rather than silently match nothing."
                         (ssh-config-ip-qos-value line (second arguments))
                         interactive)))))))
       ((string= keyword "sendenv")
+       (dolist (argument (ssh-config-line-args line))
+         (when (or (zerop (length argument)) (find #\= argument))
+           (error (ssh-config-line-error line "Invalid environment name."))))
        (setf (ssh-config-options-send-env options)
              (append (ssh-config-options-send-env options)
                      (ssh-config-line-args line))))
@@ -1647,8 +2120,7 @@ understand them rather than silently match nothing."
           (let ((assignments (ssh-config-line-args line)))
             (dolist (assignment assignments)
               (unless (find #\= assignment)
-                (error (ssh-config-line-error line "Invalid SetEnv ~S"
-                                              assignment))))
+                (error (ssh-config-line-error line "Invalid SetEnv."))))
             (setf (ssh-config-options-set-env options)
                   (remove-duplicates
                    assignments
@@ -1664,39 +2136,74 @@ understand them rather than silently match nothing."
        ;; ssh_config's two-word form ("port host:hostport"), which is not
        ;; what the command line's single colon-separated argument looks
        ;; like, so the text is preserved and the caller decides.
-       (let ((value (format nil "~{~A~^ ~}" (ssh-config-line-args line))))
-         (push (cons keyword (ssh-config-line-args line))
-               (ssh-config-options-extra options))
+       (let* ((arguments (ssh-config-line-args line))
+              (first-argument (first arguments))
+              (second-argument (second arguments)))
+         ;; readconf validates each specification as it parses the line, so
+         ;; a bad forward is reported with the line number even for a Host
+         ;; block that does not match.
+         (when (or (null first-argument) (zerop (length first-argument)))
+           (error (ssh-config-line-error line "Missing argument.")))
          (cond
+           ((string= keyword "dynamicforward")
+            (unless (ssh-config-forwarding-valid-p first-argument t nil)
+              (error (ssh-config-line-error
+                      line "Bad forwarding specification."))))
            ((string= keyword "localforward")
-            (push value (ssh-config-options-local-forwards options)))
-           ((string= keyword "remoteforward")
-            (push value (ssh-config-options-remote-forwards options)))
+            (when (or (null second-argument)
+                      (zerop (length second-argument)))
+              (error (ssh-config-line-error line "Missing target argument.")))
+            (unless (ssh-config-forwarding-valid-p
+                     (format nil "~A:~A" first-argument second-argument)
+                     nil nil)
+              (error (ssh-config-line-error
+                      line "Bad forwarding specification."))))
            (t
-            (push value (ssh-config-options-dynamic-forwards options))))))
+            ;; A RemoteForward with a single word is readconf's dynamic
+            ;; form; the server chooses the listening port.
+            (if (or (null second-argument)
+                    (zerop (length second-argument)))
+                (unless (ssh-config-forwarding-valid-p first-argument t t)
+                  (error (ssh-config-line-error
+                          line "Bad forwarding specification.")))
+                (unless (ssh-config-forwarding-valid-p
+                         (format nil "~A:~A" first-argument second-argument)
+                         nil t)
+                  (error (ssh-config-line-error
+                          line "Bad forwarding specification."))))))
+         (let ((value (format nil "~{~A~^ ~}" arguments)))
+           (push (cons keyword arguments)
+                 (ssh-config-options-extra options))
+           (cond
+             ((string= keyword "localforward")
+              (push value (ssh-config-options-local-forwards options)))
+             ((string= keyword "remoteforward")
+              (push value (ssh-config-options-remote-forwards options)))
+             (t
+              (push value (ssh-config-options-dynamic-forwards options)))))))
       ((string= keyword "tag")
        (ssh-config-set-once
         seen options :tag
         (lambda (options)
-          (setf (ssh-config-options-tag options) (ssh-config-arg line)))))
+          (setf (ssh-config-options-tag options)
+                (ssh-config-string-arg line)))))
       ((string= keyword "channeltimeout")
        ;; ssh keeps the first active ChannelTimeout line as a whole, but parses
        ;; every argument on every active line, so a typo in a later line is
        ;; fatal just as it is in ssh.  "none" must stand alone.
        (let ((arguments (ssh-config-line-args line)))
-         (unless arguments
-           (error (ssh-config-line-error
-                   line "ChannelTimeout needs an argument")))
-         (if (string-equal (first arguments) "none")
-             (progn
-               (when (rest arguments)
+         (if (some (lambda (argument) (string-equal argument "none"))
+                   arguments)
+             (if (and (= 1 (length arguments))
+                      (string-equal (first arguments) "none"))
+                 (ssh-config-set-once
+                  seen options :channel-timeouts
+                  (lambda (options)
+                    (setf (ssh-config-options-channel-timeouts options)
+                          :none)))
                  (error (ssh-config-line-error
-                         line "ChannelTimeout \"none\" argument must appear alone")))
-               (ssh-config-set-once
-                seen options :channel-timeouts
-                (lambda (options)
-                  (setf (ssh-config-options-channel-timeouts options)
-                        :none))))
+                         line
+                         "keyword channeltimeout \"none\" argument must appear alone.")))
              (progn
                (dolist (argument arguments)
                  (ssh-config-channel-timeout-pair line argument))
@@ -1749,42 +2256,86 @@ understand them rather than silently match nothing."
                  (ssh-config-canonical-client-keyword keyword))
                 :keyword)
         (lambda (options)
-          (ssh-config-apply-session-value line options keyword)))))))
+          (ssh-config-apply-session-value line options keyword
+                                          :active active)))))))
+
+(defun ssh-config-hpdelim (argument)
+  "Split ARGUMENT as misc.c's hpdelim does.
+
+Returns the host part and the remaining port text.  The host part is NIL
+when hpdelim would reject the argument outright (an unterminated bracket or
+a slash), which readconf reports as \"missing host\"; the port text is NIL
+when no ':' delimiter was present."
+  (cond
+    ((zerop (length argument))
+     (values argument nil))
+    ((char= (char argument 0) #\[)
+     (let ((close (position #\] argument)))
+       (if (null close)
+           (values nil nil)
+           (let ((after (subseq argument (1+ close)))
+                 (host (subseq argument 0 (1+ close))))
+             (cond
+               ((zerop (length after)) (values host nil))
+               ((char= (char after 0) #\:) (values host (subseq after 1)))
+               (t (values nil nil)))))))
+    (t
+     (let ((colon (position #\: argument))
+           (slash (position #\/ argument)))
+       (cond
+         ((and slash (or (null colon) (< slash colon)))
+          (values nil nil))
+         (colon
+          (values (subseq argument 0 colon) (subseq argument (1+ colon))))
+         (t (values argument nil)))))))
+
+(defun ssh-config-clean-hostname (host)
+  "HOST with an IPv6 bracket pair removed, as cleanhostname does."
+  (if (and (>= (length host) 2)
+           (char= (char host 0) #\[)
+           (char= (char host (1- (length host))) #\]))
+      (subseq host 1 (1- (length host)))
+      host))
 
 (defun ssh-config-remote-open-entry (line argument)
-  "One PermitRemoteOpen ARGUMENT as (HOST . PORT), either part :ANY."
-  (let ((colon (position #\: argument :from-end t)))
-    (unless (and colon (plusp colon) (< (1+ colon) (length argument)))
-      (error (ssh-config-line-error line
-                                    "invalid PermitRemoteOpen ~S"
-                                    argument)))
-    (let ((host (subseq argument 0 colon))
-          (port (subseq argument (1+ colon))))
-      (when (and (>= (length host) 2)
-                 (char= (char host 0) #\[)
-                 (char= (char host (1- (length host))) #\]))
-        (setf host (subseq host 1 (1- (length host)))))
-      (cons host
-            (if (string= port "*")
-                :any
-                (let ((value (handler-case
-                                 (parse-integer port)
-                               (error () nil))))
-                  (unless (and value (<= 1 value 65535))
-                    (error (ssh-config-line-error
-                            line "invalid PermitRemoteOpen port ~S" port)))
-                  value))))))
+  "One PermitRemoteOpen ARGUMENT as (HOST . PORT), either part :ANY.
+
+The wording and fatality mirror readconf's oPermitRemoteOpen, which reports
+unparseable hosts and ports through fatal() and so never prints a file
+summary afterwards."
+  (multiple-value-bind (host port)
+      (ssh-config-hpdelim argument)
+    (unless host
+      (error (%ssh-config-line-error
+              line "missing host in permitremoteopen" :fatal t)))
+    (let ((host (ssh-config-clean-hostname host)))
+      (cond
+        ((null port)
+         (error (%ssh-config-line-error
+                 line "bad port number in permitremoteopen" :fatal t)))
+        ((string= port "*")
+         (cons host :any))
+        (t
+         (let ((number (ssh-a2port port)))
+           (unless (and number (plusp number))
+             (error (%ssh-config-line-error
+                     line "bad port number in permitremoteopen" :fatal t)))
+           (cons host number)))))))
+
 
 (defun ssh-config-escape-char-value (value)
-  "VALUE as an escape character, or :NONE."
+  "VALUE as an escape character, or :NONE.
+
+readconf accepts one character, \"none\", or a caret followed by a character
+whose code is 64..127, which it masks to a control code.  That range is what
+makes \"^?\" invalid here, as it is in OpenSSH."
   (cond
     ((string-equal value "none") :none)
-    ((and (= 2 (length value)) (char= (char value 0) #\^))
-     (let ((character (char-upcase (char value 1))))
-       (if (char= character #\?)
-           127
-           (logand (char-code character) #x1f))))
     ((= 1 (length value)) (char value 0))
+    ((and (= 2 (length value))
+          (char= (char value 0) #\^)
+          (<= 64 (char-code (char value 1)) 127))
+     (logand (char-code (char value 1)) 31))
     (t nil)))
 
 (defun ssh-config-tunnel-id (line value)
@@ -1817,7 +2368,8 @@ present."
                      :any)))
     (cons local remote)))
 
-(defun ssh-config-apply-session-value (line options keyword)
+(defun ssh-config-apply-session-value (line options keyword
+                                       &key (active t))
   (let ((value (ssh-config-arg line)))
     (flet ((boolean () (ssh-config-boolean line value))
            (integer (&key minimum maximum)
@@ -1831,7 +2383,8 @@ present."
                (let ((raw (ssh-config-line-raw line)))
                  (if (and raw (plusp (length raw))) raw value))))
         ((string= keyword "bindaddress")
-         (setf (ssh-config-options-bind-address options) value))
+         (setf (ssh-config-options-bind-address options)
+               (ssh-config-string-arg line)))
         ((string= keyword "serveraliveinterval")
          (setf (ssh-config-options-server-alive-interval options)
                (ssh-config-seconds line value)))
@@ -1850,8 +2403,7 @@ present."
             (setf (ssh-config-options-forward-agent options) t
                   (ssh-config-options-forward-agent-sock-path options) value))
            (t
-            (error (ssh-config-line-error line
-                                          "missing ForwardAgent argument")))))
+            (error (ssh-config-line-error line "missing argument.")))))
         ((string= keyword "forwardx11")
          (setf (ssh-config-options-forward-x11 options) (boolean)))
         ((string= keyword "forwardx11trusted")
@@ -1863,18 +2415,22 @@ present."
                (let ((seconds (ssh-config-seconds line value)))
                  (if (eq seconds :none) nil seconds))))
         ((string= keyword "bindinterface")
-         (setf (ssh-config-options-bind-interface options) value))
+         (setf (ssh-config-options-bind-interface options)
+               (ssh-config-string-arg line)))
         ((string= keyword "kbdinteractivedevices")
-         (setf (ssh-config-options-kbd-interactive-devices options) value))
+         (setf (ssh-config-options-kbd-interactive-devices options)
+               (ssh-config-string-arg line)))
         ((member keyword '("pkcs11provider" "smartcarddevice")
                  :test #'string=)
          ;; CLEAR_ON_NONE drops the provider after parsing, so -G prints
          ;; nothing for "none"; :NONE records that decision.
-         (setf (ssh-config-options-pkcs11-provider options)
-               (if (string-equal value "none") :none value)))
+         (let ((value (ssh-config-string-arg line)))
+           (setf (ssh-config-options-pkcs11-provider options)
+                 (if (string-equal value "none") :none value))))
         ((string= keyword "securitykeyprovider")
-         (setf (ssh-config-options-security-key-provider options)
-               (if (string-equal value "none") :none value)))
+         (let ((value (ssh-config-string-arg line)))
+           (setf (ssh-config-options-security-key-provider options)
+                 (if (string-equal value "none") :none value))))
         ((string= keyword "proxyusefdpass")
          (setf (ssh-config-options-proxy-use-fdpass options) (boolean)))
         ((string= keyword "syslogfacility")
@@ -1888,65 +2444,75 @@ present."
                      line "unsupported log facility '~A'" value)))
            (setf (ssh-config-options-syslog-facility options) facility)))
         ((string= keyword "tunnel")
-         (let ((setting (string-downcase value)))
-           (unless (member setting
-                           '("ethernet" "point-to-point" "true" "yes"
-                             "false" "no")
-                           :test #'string=)
-             (error (ssh-config-line-error line
-                                           "unsupported option \"~A\"."
-                                           value)))
-           (setf (ssh-config-options-tunnel options)
-                 (cond ((string= setting "ethernet") :ethernet)
-                       ((string= setting "point-to-point") :point-to-point)
-                       ((member setting '("true" "yes") :test #'string=) :yes)
-                       (t :no)))))
+         (setf (ssh-config-options-tunnel options)
+               (ssh-config-multistate
+                line value
+                '(("ethernet" . :ethernet)
+                  ("point-to-point" . :point-to-point)
+                  ("yes" . :yes) ("true" . :yes)
+                  ("no" . :no) ("false" . :no)))))
         ((string= keyword "tunneldevice")
+         (when (zerop (length value))
+           (error (ssh-config-line-error line "Missing argument.")))
          (setf (ssh-config-options-tunnel-device options)
                (ssh-config-tunnel-device line value)))
         ((string= keyword "xauthlocation")
-         (setf (ssh-config-options-xauth-location options) value))
+         (setf (ssh-config-options-xauth-location options)
+               (ssh-config-string-arg line)))
         ((string= keyword "gatewayports")
          (setf (ssh-config-options-gateway-ports options) (boolean)))
         ((string= keyword "exitonforwardfailure")
          (setf (ssh-config-options-exit-on-forward-failure options)
                (boolean)))
         ((string= keyword "permitremoteopen")
-         ;; The first active line wins; NIL is how "not set" is spelled, so
-         ;; no seen table is needed here.
-         (unless (ssh-config-options-permit-remote-open options)
-           (let ((arguments (ssh-config-line-args line)))
-             (setf (ssh-config-options-permit-remote-open options)
-                   (cond
-                     ((and (= 1 (length arguments))
-                           (string-equal (first arguments) "any"))
-                      :any)
-                     ((and (= 1 (length arguments))
-                           (string-equal (first arguments) "none"))
-                      :none)
-                     (t
-                      (mapcar (lambda (argument)
-                                (ssh-config-remote-open-entry
-                                 line argument))
-                              arguments)))))))
+         ;; The first active line wins, but every argument of every line is
+         ;; parsed, and any/none may only stand alone.  NIL is how "not set"
+         ;; is spelled, so no seen table is needed here.
+         (let* ((arguments (ssh-config-line-args line))
+                (alone (and (= 1 (length arguments))
+                            (member (first arguments) '("any" "none")
+                                    :test #'string-equal)))
+                (value
+                  (cond
+                    (alone
+                     (if (string-equal (first arguments) "any") :any :none))
+                    (t
+                     (dolist (argument arguments)
+                       (when (member argument '("any" "none")
+                                     :test #'string-equal)
+                         (error (ssh-config-line-error
+                                 line
+                                 "keyword permitremoteopen \"~A\" argument must appear alone."
+                                 argument))))
+                     (mapcar (lambda (argument)
+                               (ssh-config-remote-open-entry line argument))
+                             arguments)))))
+           (unless (ssh-config-options-permit-remote-open options)
+             (setf (ssh-config-options-permit-remote-open options) value))))
         ((string= keyword "clearallforwardings")
          (setf (ssh-config-options-clear-all-forwardings options)
                (boolean)))
         ((member keyword '("tcpkeepalive" "keepalive") :test #'string=)
          (setf (ssh-config-options-tcp-keep-alive options) (boolean)))
         ((string= keyword "refuseconnection")
-         ;; ssh treats this as fatal while the active block is read, so a
-         ;; managed configuration can stop a connection before it starts.
-         (error (ssh-config-line-error line "RefuseConnection: ~A" value)))
+         ;; readconf validates the argument on every line, but only an
+         ;; active block makes it fatal, and that fatal() has no summary.
+         (let ((value (ssh-config-string-arg line)))
+           (when active
+             (error (%ssh-config-line-error
+                     line (format nil "RefuseConnection: ~A" value)
+                     :fatal t)))))
         ((string= keyword "requiredrsasize")
          (setf (ssh-config-options-required-rsa-size options)
                (integer)))
         ((string= keyword "streamlocalbindmask")
+         (when (zerop (length value))
+           (error (ssh-config-line-error
+                   line "Missing StreamLocalBindMask argument.")))
          (let ((mask (handler-case (parse-integer value :radix 8)
                        (error () nil))))
            (unless (and mask (<= 0 mask #o777))
-             (error (ssh-config-line-error
-                     line "invalid StreamLocalBindMask ~S" value)))
+             (error (ssh-config-line-error line "Bad mask.")))
            (setf (ssh-config-options-streamlocal-bind-mask options) mask)))
         ((string= keyword "streamlocalbindunlink")
          (setf (ssh-config-options-streamlocal-bind-unlink options)
@@ -1984,56 +2550,78 @@ present."
            (unless (member level '("quiet" "fatal" "error" "info" "verbose"
                                    "debug" "debug1" "debug2" "debug3")
                            :test #'string=)
-             (error (ssh-config-line-error line "invalid LogLevel ~S"
-                                           value)))
+             (error (ssh-config-line-error
+                     line "unsupported log level '~A'" value)))
            (setf (ssh-config-options-log-level options) level)))
         ((string= keyword "logverbose")
+         (dolist (argument (ssh-config-line-args line))
+           (when (zerop (length argument))
+             (error (ssh-config-line-error
+                     line "keyword logverbose empty argument"))))
          (unless (ssh-config-options-log-verbose options)
            (setf (ssh-config-options-log-verbose options)
                  (ssh-config-line-args line))))
         ((string= keyword "escapechar")
-         (let ((value (ssh-config-escape-char-value value)))
+         (let ((value (ssh-config-escape-char-value
+                       (ssh-config-string-arg line))))
            (unless value
-             (error (ssh-config-line-error line "invalid EscapeChar ~S"
-                                           (ssh-config-arg line))))
+             (error (ssh-config-line-error line "Bad escape character.")))
            (setf (ssh-config-options-escape-char options) value)))
         ((string= keyword "enableescapecommandline")
          (setf (ssh-config-options-enable-escape-commandline options)
                (boolean)))
         ((string= keyword "sessiontype")
-         (let ((value (string-downcase value)))
-           (unless (member value '("none" "subsystem" "default")
-                           :test #'string=)
-             (error (ssh-config-line-error line "invalid SessionType ~S"
-                                           value)))
-           (setf (ssh-config-options-session-type options) value)))
+         (setf (ssh-config-options-session-type options)
+               (ssh-config-multistate
+                line value
+                '(("none" . "none") ("subsystem" . "subsystem")
+                  ("default" . "default")))))
         ((string= keyword "stdinnull")
          (setf (ssh-config-options-stdin-null options) (boolean)))
         ((string= keyword "forkafterauthentication")
          (setf (ssh-config-options-fork-after-authentication options)
                (boolean)))
         ((string= keyword "controlmaster")
-         (let ((setting (string-downcase value)))
-           (unless (member setting '("yes" "no" "ask" "auto" "autoask")
-                           :test #'string=)
-             (error (ssh-config-line-error line
-                                           "invalid ControlMaster ~S" value)))
-           (setf (ssh-config-options-control-master options)
-                 (intern (string-upcase setting) :keyword))))
+         (setf (ssh-config-options-control-master options)
+               (ssh-config-multistate
+                line value
+                '(("yes" . :yes) ("true" . :yes)
+                  ("no" . :no) ("false" . :no)
+                  ("ask" . :ask) ("auto" . :auto)
+                  ("autoask" . :autoask)))))
         ((string= keyword "controlpath")
-         (setf (ssh-config-options-control-path options)
-               (if (string-equal value "none") :none value)))
+         (let ((value (ssh-config-string-arg line)))
+           (setf (ssh-config-options-control-path options)
+                 (if (string-equal value "none") :none value))))
         ((string= keyword "controlpersist")
          (setf (ssh-config-options-control-persist options)
                (cond
-                 ((string-equal value "yes") :yes)
-                 ((string-equal value "no") :no)
-                 (t (ssh-config-seconds line value)))))
+                 ((zerop (length value))
+                  (error (ssh-config-line-error
+                          line "Missing ControlPersist argument.")))
+                 ((string= value "no") :no)
+                 ((string= value "false") :no)
+                 ((string= value "yes") :yes)
+                 ((string= value "true") :yes)
+                 (t
+                  (let ((seconds
+                          (handler-case (ssh-config-seconds line value)
+                            (ssh-config-error () nil))))
+                       (unless (and seconds (not (eq seconds :none)))
+                         (error (ssh-config-line-error
+                                 line "Bad ControlPersist argument.")))
+                       seconds)))))
         ((string= keyword "requesttty")
-         (setf (ssh-config-options-request-tty options) (string-downcase value)))
+         (setf (ssh-config-options-request-tty options)
+               (ssh-config-multistate
+                line value
+                '(("yes" . "yes") ("true" . "yes")
+                  ("no" . "no") ("false" . "no")
+                  ("force" . "force") ("auto" . "auto")))))
         ((string= keyword "preferredauthentications")
          (setf (ssh-config-options-preferred-authentications options)
-               (ssh-config-split-list value)))
+               (ssh-config-split-list
+                (ssh-config-string-arg line))))
         ((member keyword '("pubkeyauthentication" "dsaauthentication")
                  :test #'string=)
          ;; DSAAuthentication is the obsolete name ssh still maps to the
@@ -2053,7 +2641,7 @@ present."
                (boolean)))
         ((string= keyword "numberofpasswordprompts")
          (setf (ssh-config-options-number-of-password-prompts options)
-               (integer :minimum 1)))))))
+               (integer)))))))
 
 (defun ssh-config-known-client-keyword-p (keyword)
   "Whether KEYWORD is one ssh's client configuration parser accepts."
@@ -2106,15 +2694,28 @@ deprecated and unsupported notices belong."
         (unless (and ignored
                      (ssh-config-pattern-list-match-p
                       (list ignored) keyword :case-insensitive t))
-          (error (ssh-config-line-error line
-                                        "Bad configuration option: ~A"
-                                        keyword)))))
+          (error (%ssh-config-line-error
+                  line (format nil "Bad configuration option: ~A" keyword)
+                  :bad-option t)))))
     (ssh-config-note-legacy-option line)))
 
-(defun ssh-config-apply-directive (line options seen context)
-  "Apply one non-block directive when the current block is selected."
+(defun ssh-config-apply-directive (line options seen context
+                                   &key (active t))
+  "Apply one non-block directive when the current block is selected.
+
+OPTIONS and SEEN may be throwaway copies when the surrounding block is not
+selected, so validation still runs; ACTIVE says whether this line's own
+block applies, which matters only for the few directives readconf runs its
+side effects on unconditionally."
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
+      ((string= keyword "include")
+       ;; The file contents are already spliced in at load time; the line
+       ;; itself is here so readconf's empty-argument diagnostic survives.
+       (dolist (argument (ssh-config-line-args line))
+         (when (zerop (length argument))
+           (error (ssh-config-line-error
+                   line "keyword include empty argument")))))
       ((member keyword '("hostname" "port" "user" "hostkeyalias"
                          "canonicalizehostname" "canonicaldomains"
                          "canonicalizemaxdots" "canonicalizefallbacklocal"
@@ -2125,7 +2726,7 @@ deprecated and unsupported notices belong."
                          "identityagent"
                          "identitiesonly" "addkeystoagent"
                          "hostbasedauthentication" "hostbasedacceptedalgorithms"
-                         "hostbasedkeytypes" "hostbasedkey"
+                         "hostbasedkeytypes"
                          "enablesshkeysign")
                :test #'string=)
        (ssh-config-apply-identity line options seen context))
@@ -2181,7 +2782,7 @@ deprecated and unsupported notices belong."
                          "skeyauthentication" "tisauthentication"
                          "numberofpasswordprompts")
                :test #'string=)
-       (ssh-config-apply-session line options seen))
+       (ssh-config-apply-session line options seen :active active))
       (t nil))))
 
 ;;; ---- Match ----
@@ -2251,7 +2852,7 @@ only during that pass."
                    (setf stopped t)
                    (funcall on-error
                             (ssh-config-line-error
-                             line "Match all cannot be combined with conditions")))
+                             line "'all' cannot be combined with other Match attributes")))
                   (t
                    (setf result (and result (not negated)))
                    (advance nil))))
@@ -2266,7 +2867,7 @@ only during that pass."
                 (setf stopped t)
                 (funcall on-error
                          (ssh-config-line-error
-                          line "Match ~A requires an argument" keyword)))
+                          line "missing argument for Match '~A'" keyword)))
                ((string= keyword "exec")
                 (if (not result)
                     (advance (cddr remaining))
@@ -2316,6 +2917,7 @@ HOSTNAME to HOST before the pass, as ssh.c does.
 
 Returns CONFIG."
   (let* ((directives (coerce (or (ssh-config-directives config) '()) 'vector))
+         (given options)
          (options (or options (%make-ssh-config-options)))
          (seen (or seen (make-hash-table :test #'equal)))
          (context (%make-ssh-config-context
@@ -2324,60 +2926,157 @@ Returns CONFIG."
                    :port (or port 22)
                    :tag tag
                    :local-addresses local-addresses))
+         (pending nil)
+         (pending-path nil)
+         (pending-count 0)
+         ;; readconf validates every directive even inside a Host block that
+         ;; did not match; only the assignment is skipped.  Sending those
+         ;; lines through a scratch record gives the same diagnostics without
+         ;; letting the values take effect.
+         (scratch-options (%make-ssh-config-options))
+         (scratch-seen (make-hash-table :test #'equal))
          (stopped nil))
+    ;; ssh applies -l and -p while parsing its arguments, before it reads
+    ;; any configuration, so those values win over User and Port lines and
+    ;; over -o.  Seeding the record and the seen table gives that order.
+    (when (null given)
+      (when user
+        (setf (ssh-config-options-user options) user)
+        (setf (gethash :user seen) t))
+      (when port
+        (setf (ssh-config-options-port options) port)
+        (setf (gethash :port seen) t)))
     (labels
-        ((report (condition)
+        ((say (condition)
+           (when *ssh-config-error-function*
+             (funcall *ssh-config-error-function*
+                      (ssh-config-readconf-message condition))))
+         (flush-pending ()
+           ;; readconf marks a file bad only after reading all of it, then
+           ;; fatals with the count.  Nothing after that file is parsed.
+           (when pending
+             (when *ssh-config-error-function*
+               (funcall *ssh-config-error-function*
+                        (format nil
+                                "~A: terminating, ~D bad configuration options"
+                                pending-path pending-count)))
+             (setf stopped t)
+             (when on-error (funcall on-error (first pending)))
+             (setf pending nil pending-path nil pending-count 0)))
+         (report (condition)
            (unless stopped
              (setf stopped t)
              (when on-error (funcall on-error condition))))
+         (line-error (condition)
+           (let ((path (ssh-config-error-path condition)))
+             (cond
+               ;; ssh applies -o before log_init and exits on the first bad
+               ;; one; it has no surrounding file to summarise.
+               ((null path)
+                (say condition)
+                (setf stopped t)
+                (when on-error (funcall on-error condition)))
+               ;; A readconf fatal() prints its one line and leaves at once.
+               ((ssh-config-error-fatal condition)
+                (say condition)
+                (setf stopped t)
+                (when on-error (funcall on-error condition)))
+               ;; match_cfg_line names the bad criterion and its caller then
+               ;; prints "Bad Match condition"; the file is abandoned.
+               ((equal (ssh-config-error-keyword condition) "match")
+                (say condition)
+                (when *ssh-config-error-function*
+                  (funcall *ssh-config-error-function*
+                           (format nil "~A line ~D: Bad Match condition"
+                                   path (ssh-config-error-line condition))))
+                (push condition pending)
+                (incf pending-count)
+                (setf pending-path path)
+                (flush-pending))
+               ;; Another file starts only after the previous one was clean.
+               ((and pending-path (not (equal path pending-path)))
+                (flush-pending))
+               (t
+                (say condition)
+                (unless pending-path (setf pending-path path))
+                (setf pending (nconc pending (list condition)))
+                (incf pending-count)))))
          (complete ()
            (unless stopped
              (when on-options (funcall on-options options))))
          (advance (index parsing)
-           (handler-case
-               (progn
-                 (when stopped (return-from advance nil))
-                 (loop while (< index (length directives))
-                       do (let ((line (aref directives index)))
+           (when stopped (return-from advance nil))
+           (loop while (< index (length directives))
+                 do (let ((line (aref directives index)))
+                      (handler-case
+                          (progn
+                            ;; readconf rejects a bare keyword before it
+                            ;; even looks the name up.
+                            (when (null (ssh-config-line-args line))
+                              (error (ssh-config-line-error
+                                      line "no argument after keyword \"~A\""
+                                      (ssh-config-line-keyword line))))
                             (cond
-                              ((string= (ssh-config-line-keyword line) "host")
-                               (multiple-value-bind (matched pattern skipped)
-                                   (ssh-config-host-block-matches-p
-                                    line options context)
-                                 ;; readconf names the block it applies and,
-                                 ;; when a negation is why it does not, the
-                                 ;; pattern that vetoed it.
-                                 (let ((where
-                                         (if (ssh-config-line-path line)
-                                             (namestring
-                                              (ssh-config-line-path line))
-                                             "command-line")))
-                                   (when skipped
-                                     (ssh-log
-                                      "~A line ~D: Skipping Host block because of negated match for ~A"
-                                      where (ssh-config-line-number line)
-                                      skipped))
-                                   (when matched
-                                     (ssh-log "~A line ~D: Applying options for ~A"
-                                              where (ssh-config-line-number line)
-                                              pattern)))
-                                 (setf parsing matched))
-                               (incf index))
-                              ((string= (ssh-config-line-keyword line) "match")
-                               (return
-                                 (ssh-config-eval-match
-                                  line options context exec-matcher final-pass
-                                  (lambda (matched)
-                                    (advance (1+ index) matched))
-                                  #'report)))
-                              (t
-                               (ssh-config-check-client-keyword line options)
-                               (when parsing
-                                 (ssh-config-apply-directive
-                                  line options seen context))
-                               (incf index)))))
-                 (complete))
-             (error (condition) (report condition)))))
+                            ;; readconf's oHost, oInclude and oMatch refuse
+                            ;; to run from -o: they are file structure, not
+                            ;; settings.
+                            ((and (ssh-config-line-command-line line)
+                                  (member (ssh-config-line-keyword line)
+                                          '("host" "include" "match")
+                                          :test #'string=))
+                             (error (%ssh-config-line-error
+                                     line
+                                     (format nil "~A directive not supported as a command-line option"
+                                             (string-capitalize
+                                              (ssh-config-line-keyword line)))
+                                     :bare t)))
+                            ((string= (ssh-config-line-keyword line) "host")
+                             (multiple-value-bind (matched pattern skipped)
+                                 (ssh-config-host-block-matches-p
+                                  line options context)
+                               ;; readconf names the block it applies and,
+                               ;; when a negation is why it does not, the
+                               ;; pattern that vetoed it.
+                               (let ((where
+                                       (if (ssh-config-line-path line)
+                                           (namestring
+                                            (ssh-config-line-path line))
+                                           "command-line")))
+                                 (when skipped
+                                   (ssh-log
+                                    "~A line ~D: Skipping Host block because of negated match for ~A"
+                                    where (ssh-config-line-number line)
+                                    skipped))
+                                 (when matched
+                                   (ssh-log "~A line ~D: Applying options for ~A"
+                                            where (ssh-config-line-number line)
+                                            pattern)))
+                               (setf parsing matched)))
+                             ((string= (ssh-config-line-keyword line) "match")
+                             (return
+                               (ssh-config-eval-match
+                                line options context exec-matcher final-pass
+                                (lambda (matched)
+                                  (advance (1+ index) matched))
+                                #'line-error)))
+                            (t
+                             (ssh-config-check-client-keyword line options)
+                             (ssh-config-apply-directive
+                              line
+                              (if parsing options scratch-options)
+                              (if parsing seen scratch-seen)
+                              context
+                              :active parsing))))
+                        (ssh-config-error (condition)
+                          (line-error condition))
+                        (error (condition)
+                          (report condition)))
+                      (when stopped (return-from advance nil))
+                      ;; A rejected line is recorded but parsing goes on, so
+                      ;; move past it even when it signaled.
+                      (incf index)))
+           (when pending (flush-pending))
+           (unless stopped (complete))))
       (advance 0 t))
     config))
 

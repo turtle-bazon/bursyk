@@ -190,6 +190,31 @@ ALGORITHMS+ is the set such a name resolves against.")
             "ssh-mldsa44-ed25519-cert"))
   "Every user public-key algorithm this server can enforce a choice from.")
 
+(defparameter +ssh-config-unimplemented-key-names+
+  '("sk-ssh-ed25519@openssh.com"
+    "sk-ssh-ed25519-cert-v01@openssh.com"
+    "sk-ecdsa-sha2-nistp256@openssh.com"
+    "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"
+    "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
+    "webauthn-sk-ecdsa-sha2-nistp256-cert-v01@openssh.com")
+  "Key types readconf accepts but this build's transport cannot implement.
+
+An ssh_config written for OpenSSH may name them; they are kept in a parsed
+algorithm list so the file loads, and the transport simply never negotiates
+one.")
+
+(defparameter +ssh-config-config-key-names+
+  (remove-duplicates
+   (append +ssh-host-key-all-algorithms+
+           +ssh-server-user-key-all-algorithms+
+           +ssh-config-unimplemented-key-names+)
+   :test #'string=)
+  "Every key type name an ssh_config algorithm keyword may spell.
+
+The security-key types are here even though this build cannot use them: an
+ssh_config written for OpenSSH must load, and readconf accepts them.")
+
+
 (defparameter +ssh-server-ca-signature-algorithms+
   '("ssh-ed25519"
     "ecdsa-sha2-nistp256"

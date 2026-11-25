@@ -152,6 +152,13 @@
    #:ssh-config-load
    #:ssh-config-combine
    #:ssh-config-resolve
+   #:ssh-config-readconf-message
+   #:*ssh-config-error-function*
+   #:ssh-config-error-path
+   #:ssh-config-error-line
+   #:ssh-config-error-keyword
+   #:ssh-config-error-bad-option
+   #:ssh-config-error-fatal
    #:ssh-config-canonicalize
    #:ssh-config-canonicalize-host
    #:ssh-config-permitted-cnames-p
@@ -261,6 +268,7 @@
    #:ssh-config-options-rekey-limit
    #:ssh-config-options-rekey-interval
    #:ssh-parse-scaled
+   #:ssh-a2port
    #:ssh-config-options-preferred-authentications
    #:ssh-config-options-pubkey-authentication
    #:ssh-config-options-password-authentication
@@ -623,6 +631,8 @@
    #:+ssh-server-default-kex-algorithms+
    #:+ssh-host-key-algorithms+
    #:+ssh-host-key-all-algorithms+
+   #:+ssh-config-config-key-names+
+   #:+ssh-config-unimplemented-key-names+
    #:+ssh-ciphers+
    #:+ssh-all-ciphers+
    #:+ssh-all-macs+

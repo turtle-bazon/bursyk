@@ -759,8 +759,10 @@ the lines never reach the output."
     ;; here as well would start every -o forward twice.
     (burs::command-line-option "RemoteForward" "/tmp/a /tmp/b")
     (is (null (getf burs::*options* :remote-forward)))
-    (is (equal "2200" (getf burs::*options* :port)))
-    (is (equal "bob" (getf burs::*options* :user)))
+    ;; User and Port are left to the ssh_config resolver, which validates
+    ;; them like readconf and keeps the first value the command line gave.
+    (is (null (getf burs::*options* :port)))
+    (is (null (getf burs::*options* :user)))
     (is (equal '("/tmp/key") (getf burs::*options* :identity)))
     ;; UserKnownHostsFile stays with the resolver: only it expands ~ and
     ;; understands "none", and a raw value here would override the parsed one.
@@ -769,14 +771,21 @@ the lines never reach the output."
     (is (equal "bastion" (getf burs::*options* :jump)))
     (is (equal "nc %h %p" (getf burs::*options* :proxy-command)))))
 
-(test command-line-options-apply-in-the-written-order
+(test command-line-options-keep-the-first-value
   (let ((burs::*options* (empty-options)))
     (dolist (option '("User=first" "Port=2200" "User=last"))
       (push option (getf burs::*options* :options)))
-    (burs::apply-command-line-options)
-    ;; Pushed in reverse, so applying them back restores command-line order.
-    (is (equal "last" (getf burs::*options* :user)))
-    (is (equal "2200" (getf burs::*options* :port)))))
+    ;; Pushed in reverse, so the resolver list is command-line order.  Like
+    ;; readconf, the first value for a keyword is the one that stays.
+    (let ((options nil))
+      (cl-pnet-ssh:ssh-config-resolve
+       (cl-pnet-ssh::ssh-config-add-options
+        (cl-pnet-ssh::%make-ssh-config :directives nil)
+        (burs::resolver-option-list))
+       "alias"
+       :on-options (lambda (value) (setf options value)))
+      (is (equal "first" (cl-pnet-ssh:ssh-config-options-user options)))
+      (is (= 2200 (cl-pnet-ssh:ssh-config-options-port options))))))
 
 (test join-command-keeps-the-arguments-apart
   (is (equal "uname -a" (burs::join-command '("uname" "-a"))))

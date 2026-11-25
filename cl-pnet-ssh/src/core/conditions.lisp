@@ -51,7 +51,11 @@
 (define-condition ssh-config-error (ssh-error)
   ((path :initarg :path :initform nil :reader ssh-config-error-path)
    (line :initarg :line :initform nil :reader ssh-config-error-line)
-   (keyword :initarg :keyword :initform nil :reader ssh-config-error-keyword))
+   (keyword :initarg :keyword :initform nil :reader ssh-config-error-keyword)
+   (bad-option :initarg :bad-option :initform nil
+                :reader ssh-config-error-bad-option)
+   (bare :initarg :bare :initform nil :reader ssh-config-error-bare)
+   (fatal :initarg :fatal :initform nil :reader ssh-config-error-fatal))
   (:report (lambda (condition stream)
              (format stream "SSH config error~@[ in ~A~]~@[ at line ~D~]~
                              ~@[ (~A)~]~@[: ~A~]"
