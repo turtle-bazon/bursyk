@@ -1764,9 +1764,11 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :user
         (lambda (options)
+          ;; readconf stores the spelling as written.  ssh.c expands it only
+          ;; after every file is read, which is also what lets it tell a
+          ;; literal User from one an expansion changed.
           (setf (ssh-config-options-user options)
-                (ssh-config-expand-variables
-                 (ssh-config-string-arg line))))))
+                (ssh-config-string-arg line)))))
       ((string= keyword "canonicalizehostname")
        (ssh-config-set-once
         seen options :canonicalize-hostname

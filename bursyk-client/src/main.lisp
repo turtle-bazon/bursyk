@@ -761,6 +761,13 @@ is resolved on its own record here rather than as part of a larger file."
 (defvar *getopt-user-given* nil
   "Whether ssh's argument loop set a user, including one from the destination.")
 
+(defvar *getopt-user-command-line* nil
+  "Whether the winning user came from -l or the destination.
+
+ssh.c expands a User that came from -o or the configuration file, and
+validates it again when the expansion changed the string, but leaves a
+command-line user alone.")
+
 (defvar *getopt-tag* nil
   "The first -P tag ssh's argument loop keeps, or NIL.")
 
@@ -796,7 +803,7 @@ the values."
         *getopt-session-type* :unset
         *getopt-mux-command* nil)
   (let ((port nil) (port-given nil)
-        (user nil) (user-given nil)
+        (user nil) (user-given nil) (user-command-line nil)
         (host nil)
         (tag nil) (tag-given nil)
         (stdio nil) (mux nil)
@@ -977,7 +984,8 @@ the values."
                     (setf port (or value "") port-given t))))
                (#\l
                 (unless user-given
-                  (setf user (or value "") user-given t)))
+                  (setf user (or value "") user-given t
+                        user-command-line t)))
                (#\P
                 (unless tag-given
                   (setf tag (or value "") tag-given t)))
@@ -1016,6 +1024,10 @@ the values."
              ;; after it are read.
              (multiple-value-bind (resolved-host resolved-user resolved-port)
                  (resolve-destination value user port)
+               ;; Only a destination that actually supplies the user makes it
+               ;; a command-line value; -l or -o may already have won.
+               (when (and (null user) resolved-user)
+                 (setf user-command-line t))
                (setf host resolved-host
                      user resolved-user
                      port resolved-port)
@@ -1040,6 +1052,7 @@ the values."
             *getopt-port-given* port-given
             *getopt-user* user
             *getopt-user-given* user-given
+            *getopt-user-command-line* user-command-line
             *getopt-tag* tag
             *getopt-tag-given* tag-given
             *getopt-tunnel-device* tunnel-device
@@ -4116,10 +4129,21 @@ silences them."
           (setf (cl-pnet-ssh:ssh-config-options-host-key-alias options)
                 (string-downcase alias))))
       (when (and (cl-pnet-ssh:ssh-config-options-user options)
-                 (null (getf *options* :user)))
-        (setf (cl-pnet-ssh:ssh-config-options-user options)
-              (expand (cl-pnet-ssh:ssh-config-options-user options)
-                      :no-user t)))
+                 (not *getopt-user-command-line*))
+        (let* ((original (cl-pnet-ssh:ssh-config-options-user options))
+               (expanded (expand original :no-user t)))
+          (setf (cl-pnet-ssh:ssh-config-options-user options) expanded)
+          ;; ssh.c validates a User that came from -o or the file again when
+          ;; the expansion changed it, so a ${VAR} containing a quote cannot
+          ;; slip through as a remote name.
+          (when (and (not (string= original expanded))
+                     (not (ssh-valid-ruser-p expanded)))
+            (unless quiet
+              (format *error-output*
+                      "remote username contains invalid characters~%")
+              (finish-output *error-output*))
+            (restore-terminal)
+            (uiop:quit 255))))
       (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
         (when (and path (not (eq path :none)) (not (string-equal path "none")))
           (setf (cl-pnet-ssh:ssh-config-options-control-path options)
