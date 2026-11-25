@@ -62,30 +62,29 @@ ssh.c looks for the last at-sign, so `a@b@host' names user `a@b' and host
   (restore-terminal)
   (uiop:quit 255))
 
-(defun resolve-destination (destination)
+(defun resolve-destination (destination &optional user port)
   "DESTINATION as ssh.c takes it: (VALUES HOST USER PORT).
 
 An ssh:// URI is parsed first; otherwise the text is split at its last
 at-sign.  ssh fills options.user and options.port only while they are still
 unset, so -l, -o User, -p and -o Port all win over what the destination
-names.  An empty user, a malformed URI, or a URI with a path reaches
-ssh.c's usage(), which leaves at once."
+names; USER and PORT are those already-decided values.  An empty user, a
+malformed URI, or a URI with a path reaches ssh.c's usage(), which leaves
+at once."
   (multiple-value-bind (kind uri-user uri-host uri-port)
       (cl-pnet-ssh::ssh-config-uri-destination destination)
     (cond
       ((null kind) (destination-usage))
       ((eq kind :uri)
        (values uri-host
-               (or (getf *options* :user) uri-user)
-               (or (getf *options* :port)
+               (or user uri-user)
+               (or port
                    (and (/= uri-port -1) (format nil "~D" uri-port)))))
       (t
-       (multiple-value-bind (host user) (split-destination destination)
-         (when (and user (zerop (length user)))
+       (multiple-value-bind (host split-user) (split-destination destination)
+         (when (and split-user (zerop (length split-user)))
            (destination-usage))
-         (values host
-                 (or (getf *options* :user) user)
-                 (getf *options* :port)))))))
+         (values host (or user split-user) port))))))
 
 ;;; ssh(1)'s option surface, built once as a CLINGON command.  CLINGON parses
 ;;; the clustered and attached forms (-vvT, -p2222, -oPort=22), writes the
@@ -750,6 +749,39 @@ is resolved on its own record here rather than as part of a larger file."
 (defvar *getopt-mux-command* nil
   "The -O command ssh's argument loop leaves, or NIL when none.")
 
+(defvar *getopt-port* nil
+  "The first -p/-o Port spelling ssh's argument loop keeps, or NIL.")
+
+(defvar *getopt-port-given* nil
+  "Whether ssh's argument loop set a port, including one from the destination.")
+
+(defvar *getopt-user* nil
+  "The first -l/-o User/destination user ssh's argument loop keeps.")
+
+(defvar *getopt-user-given* nil
+  "Whether ssh's argument loop set a user, including one from the destination.")
+
+(defvar *getopt-tag* nil
+  "The first -P tag ssh's argument loop keeps, or NIL.")
+
+(defvar *getopt-tag-given* nil
+  "Whether ssh's argument loop set a tag.")
+
+(defvar *getopt-tunnel-device* nil
+  "The last -w device ssh's argument loop decoded, or NIL.")
+
+(defvar *getopt-identities* nil
+  "The -i paths ssh's argument loop found accessible, newest first.")
+
+(defvar *getopt-jump* nil
+  "The ProxyJump ssh's argument loop recorded, or NIL.")
+
+(defvar *getopt-proxy-command* nil
+  "The ProxyCommand ssh's argument loop recorded, or NIL.")
+
+(defvar *getopt-host* nil
+  "The destination host ssh's argument loop resolved, or NIL.")
+
 (defun run-getopt-phase ()
   "Apply ssh(1)'s getopt-time checks and side effects in argv order.
 
@@ -765,6 +797,7 @@ the values."
         *getopt-mux-command* nil)
   (let ((port nil) (port-given nil)
         (user nil) (user-given nil)
+        (host nil)
         (tag nil) (tag-given nil)
         (stdio nil) (mux nil)
         (jump nil) (proxy-command nil)
@@ -957,30 +990,102 @@ the values."
                   (parse-remote-forward (or value ""))))
                (#\D
                 (let ((*forwarding-command-line-kind* "dynamic"))
-                  (parse-dynamic-forward (or value ""))))))))
+                  (parse-dynamic-forward (or value ""))))
+               (t
+                ;; getopt reports an option letter it does not know, then
+                ;; ssh.c's default case prints the usage.  A long spelling
+                ;; this client adds is only unknown when CLINGON has no
+                ;; option of that name; `--port' is ours, `--help' is not.
+                (when (and (or (not (eq kind :long))
+                               (null (find-burs-long-option
+                                      *burs-command* flag)))
+                           (or (not (eq kind :short))
+                               (not (find character
+                                          +command-line-short-options+))))
+                  (format *error-output* "unknown option -- ~A~%"
+                          (if (eq kind :long) #\- character))
+                  (destination-usage)))))))
       (dolist (event (command-line-getopt-events))
-        (handle (getf event :kind) (getf event :flag) (getf event :value)))
-      ;; Publish the first values and the state later stages still need.
-      (when port-given (setf (getf *options* :port) port))
-      (when user-given (setf (getf *options* :user) user))
-      (when tag-given (setf (getf *options* :tag) tag))
-      (when tunnel-device
-        (setf (getf *options* :tunnel-device) tunnel-device))
-      ;; :IDENTITY is kept in reverse command-line order, like the other list
-      ;; slots, so readers reverse it once.
-      (setf (getf *options* :identity) kept)
-      ;; readconf's shared limit counts the -i files, which never reach its
-      ;; own directive stream.
-      (setf cl-pnet-ssh::*ssh-config-identity-count-seed* (length kept))
-      (setf (getf *options* :jump) jump
-            (getf *options* :proxy-command) proxy-command)
-      (setf *getopt-session-type* session-type
+        (let ((kind (getf event :kind))
+              (flag (getf event :flag))
+              (value (getf event :value)))
+          (cond
+            ((eq kind :host)
+             ;; ssh takes the destination between its two getopt passes, so
+             ;; its user and port are in place before the options written
+             ;; after it are read.
+             (multiple-value-bind (resolved-host resolved-user resolved-port)
+                 (resolve-destination value user port)
+               (setf host resolved-host
+                     user resolved-user
+                     port resolved-port)
+               (when user (setf user-given t))
+               (when port (setf port-given t))))
+            ;; getopt refuses to run out of arguments before ssh sees the
+            ;; option at all, and ssh answers with usage().
+            ((and (eq kind :short)
+                  (find flag +command-line-options-with-values+)
+                  (null value))
+             (format *error-output* "option requires an argument -- ~A~%"
+                     flag)
+             (destination-usage))
+            (t
+             (handle kind flag value)))))
+      ;; With no word left for a destination ssh reaches usage().
+      (unless host (destination-usage))
+      ;; Record what publish-getopt-state applies once CLINGON has parsed:
+      ;; the replay runs first, because -Q and -V must answer before a later
+      ;; syntactically broken option is reported.
+      (setf *getopt-port* port
+            *getopt-port-given* port-given
+            *getopt-user* user
+            *getopt-user-given* user-given
+            *getopt-tag* tag
+            *getopt-tag-given* tag-given
+            *getopt-tunnel-device* tunnel-device
+            *getopt-identities* kept
+            *getopt-jump* jump
+            *getopt-proxy-command* proxy-command
+            *getopt-host* host
+            *getopt-session-type* session-type
             *getopt-mux-command* mux))))
+
+(defun publish-getopt-state ()
+  "Apply the first-value decisions ssh's argument loop made.
+
+CLINGON keeps the last value for every option and knows nothing about the
+destination, so its parse is corrected here once it has run."
+  (when *getopt-port-given*
+    (setf (getf *options* :port) *getopt-port*))
+  (when *getopt-user-given*
+    (setf (getf *options* :user) *getopt-user*))
+  (when *getopt-tag-given*
+    (setf (getf *options* :tag) *getopt-tag*))
+  (when *getopt-tunnel-device*
+    (setf (getf *options* :tunnel-device) *getopt-tunnel-device*))
+  ;; :IDENTITY is kept in reverse command-line order, like the other list
+  ;; slots, so readers reverse it once.
+  (setf (getf *options* :identity) *getopt-identities*)
+  ;; readconf's shared limit counts the -i files, which never reach its
+  ;; own directive stream.
+  (setf cl-pnet-ssh::*ssh-config-identity-count-seed*
+        (length *getopt-identities*))
+  (setf (getf *options* :jump) *getopt-jump*
+        (getf *options* :proxy-command) *getopt-proxy-command*
+        (getf *options* :host) *getopt-host*))
 
 (defparameter +command-line-options-with-values+
   "BbcDEeFIiJLlmOopQRSWw"
   "Short options that consume an argument, so the session-type scan can skip
 their value instead of mistaking a leading dash in it for another option.")
+
+(defparameter +command-line-short-options+
+  (concatenate 'string "1246ACGKMNTVXYZafgknqstvxy"
+               +command-line-options-with-values+)
+  "Every option letter ssh(1)'s getopt string accepts.
+
+ssh hands this to getopt(3), so any other letter is reported as an unknown
+option and ends in the usage text.")
 
 (defun command-line-option-parts (line)
   "LINE's keyword and value, split as readconf splits an -o argument."
@@ -5657,13 +5762,18 @@ options are returned so the attach path can reuse them."
         ;; own options and never connects anywhere.
         (when (and arguments (string= (first arguments) "keygen"))
           (uiop:quit (keygen-main (rest arguments))))
+        ;; ssh validates its own flags, and answers -Q and -V, while it is
+        ;; still reading its arguments: a later option that is syntactically
+        ;; incomplete never gets a look.  The replay therefore runs before
+        ;; CLINGON's parse and takes the destination itself, which CLINGON
+        ;; cannot express.
+        (setf *burs-command* (make-burs-command))
+        (run-getopt-phase)
         (multiple-value-bind (destination command)
             (parse-arguments arguments)
+          (declare (ignore destination))
           (apply-command-line-options)
-          ;; ssh validates its own flags as it reads them, so the first bad one
-          ;; in argv order is the message the user sees, and -Q and -V answer
-          ;; where they appear.  Nothing else may run before this.
-          (run-getopt-phase)
+          (publish-getopt-state)
           (setf *background-child*
                 (and (getf *options* :background-child) t))
           ;; -G and -Z leave before anything is dialled, and ssh forks only
@@ -5675,13 +5785,7 @@ options are returned so the attach path can reuse them."
             (launch-background-child))
           (check-supported-options)
           (start-logging)
-          (unless destination
-            (clingon:print-usage *burs-command* *error-output*)
-            (uiop:quit 255))
-          (multiple-value-bind (host user port) (resolve-destination destination)
-            (when user (setf (getf *options* :user) user))
-            (when port (setf (getf *options* :port) port))
-            (setf (getf *options* :host) host)
+          (let ((host *getopt-host*))
             ;; ssh's -N/-s/-W and command-line SessionType rules run while
             ;; the arguments are read, before any configuration file or
             ;; connection, so they come first here too.
