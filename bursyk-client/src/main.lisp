@@ -5702,16 +5702,17 @@ options are returned so the attach path can reuse them."
               (mux-detach-process)
               ;; A daemon has no session of its own; it only listens.
               (setf (getf *options* :control-master) t))
-            ;; ssh checks -O against the configured ControlPath before it
-            ;; dumps public keys or connects.
+            ;; ssh checks -O against the configured ControlPath, and attaches
+            ;; to a running master, before it loads identities or dumps public
+            ;; keys, so `-O check -Z' with no master fails without a dump.
             (let ((mux-options
                     (and *getopt-mux-command*
                          (resolve-multiplex-options host))))
-              (when (getf *options* :dump-public-keys)
-                (dump-public-keys host (and command t)))
               (mux-prepare host (and command (join-command command))
                            (and command t)
-                           mux-options))
+                           mux-options)
+              (when (getf *options* :dump-public-keys)
+                (dump-public-keys host (and command t))))
             (handler-case
                 (start-client host (and command (join-command command))
                               (and command t))
