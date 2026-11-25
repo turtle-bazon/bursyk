@@ -12,10 +12,49 @@
              (format stream "SSH protocol error~@[: ~A~]"
                      (ssh-error-detail condition)))))
 
-(define-condition ssh-connection-error (ssh-error) ()
+(define-condition ssh-algorithm-negotiation-error (ssh-protocol-error)
+  ((reason :initarg :reason :initform nil :reader ssh-negotiation-reason)
+   (peer-offer :initarg :peer-offer :initform nil
+               :reader ssh-negotiation-peer-offer))
+  (:report (lambda (condition stream)
+             (format stream "Unable to negotiate: ~A. Their offer: ~{~A~^,~}"
+                     (ssh-negotiation-reason condition)
+                     (ssh-negotiation-peer-offer condition)))))
+
+(define-condition ssh-connection-error (ssh-error)
+  ((kind :initarg :kind :initform nil :reader ssh-connection-error-kind)
+   (host :initarg :host :initform nil :reader ssh-connection-error-host)
+   (port :initarg :port :initform nil :reader ssh-connection-error-port)
+   (reason :initarg :reason :initform nil :reader ssh-connection-error-reason)
+   ;; The peer's proposal when a key exchange failed to agree on one.
+   (peer-offer :initarg :peer-offer :initform nil
+               :reader ssh-connection-error-peer-offer))
   (:report (lambda (condition stream)
              (format stream "SSH connection error~@[: ~A~]"
                      (ssh-error-detail condition)))))
+
+(defun ssh-resolver-error-text (condition)
+  "CONDITION's lookup failure in getaddrinfo's own words.
+
+ssh prints a failed lookup through ssh_gai_strerror, so a missing name reads
+\"Name or service not known\" rather than the resolver binding's internal
+call description.  CL-PNET-SOCKETS signals a SIMPLE-ERROR whose second format
+argument is the getaddrinfo code; other resolvers' conditions pass through
+unchanged."
+  (let* ((arguments (and (typep condition 'simple-error)
+                         (simple-condition-format-arguments condition)))
+         (code (and arguments (second arguments))))
+    (case code
+      (-1 "Bad value for ai_flags")
+      (-2 "Name or service not known")
+      (-3 "Temporary failure in name resolution")
+      (-4 "Non-recoverable failure in name resolution")
+      (-5 "No address associated with hostname")
+      (-6 "ai_family not supported")
+      (-8 "Servname not supported for ai_socktype")
+      (-9 "ai_socktype not supported")
+      (-10 "Memory allocation failure")
+      (t (princ-to-string condition)))))
 
 (define-condition ssh-unsupported-feature (ssh-connection-error)
   ((feature :initarg :feature :reader ssh-unsupported-feature-name))

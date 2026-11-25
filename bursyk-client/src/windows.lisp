@@ -115,11 +115,10 @@
   "Write PROMPT to stderr and read one line from stdin.
 
 When ECHO is false and stdin is a console, the console's echo bit is cleared
-for the read and restored afterwards.  NIL is returned at end of input, so a
-non-interactive caller can treat a closed stdin as a cancelled prompt rather
-than an empty answer."
-  (format *error-output* "~A" prompt)
-  (finish-output *error-output*)
+for the read and restored afterwards; it is cleared before the prompt is
+written, so an answer arriving with the prompt is not shown either.  NIL is
+returned at end of input, so a non-interactive caller can treat a closed
+stdin as a cancelled prompt rather than an empty answer."
   (let ((handle (and (not echo)
                      (stdin-terminal-p)
                      (c-get-std-handle +std-input-handle+)))
@@ -133,12 +132,23 @@ than an empty answer."
                  (ignore-errors
                   (c-set-console-mode
                    handle (logand mode (lognot +enable-echo-input+)))))))
+           (format *error-output* "~A" prompt)
+           (finish-output *error-output*)
            (read-line *standard-input* nil nil))
       (when saved
         (ignore-errors (c-set-console-mode handle saved)))
       (when (not echo)
         (format *error-output* "~%")
         (finish-output *error-output*)))))
+
+(defun read-tty-line (prompt)
+  "Write PROMPT on the console and read one line, or NIL without a console.
+
+A key passphrase is asked for on the console rather than through stdin, so a
+redirected stdin does not consume the answer and a non-interactive run never
+prompts."
+  (when (stdin-terminal-p)
+    (read-prompt-line prompt :echo nil)))
 
 (defun restore-terminal ()
   "Put the console modes and code pages back the way they were."

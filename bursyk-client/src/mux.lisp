@@ -1862,7 +1862,7 @@ the SSH connection is even attempted."
       (cl-pnet-ssh:ssh-config-error (condition)
         (setf failure condition)))
     (when failure
-      (fail "~A" failure))
+      (fail-config-error failure))
     result))
 
 (defun mux-tty-request-p (options command-given-p)

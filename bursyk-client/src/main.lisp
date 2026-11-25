@@ -61,6 +61,15 @@ left to do; otherwise the condition is the whole diagnostic."
 (defvar *burs-command* nil
   "The command parsed most recently, so MAIN can print its usage.")
 
+(defvar *forwarding-command-line-kind* nil
+  "The -L/-R/-D/-W option whose specification is being parsed, or NIL.
+
+ssh validates a command-line forwarding specification while it reads its
+arguments and prints one bare line, so a parse failure there has to say which
+flag it came from instead of the ssh_config wording used later.  The scanner
+that binds it runs before this file's definition of FORWARDING-FAIL, so the
+declaration lives here.")
+
 (defun burs-flag (key description &key short long)
   (clingon:make-option :flag
                        :key key
@@ -296,7 +305,7 @@ The scan also lower-cases a long option name and expands the
   "The values of KEY in command-line order, or NIL."
   (reverse (clingon:getopt command key)))
 
-(defun apply-parsed-options (command)
+(defun apply-parsed-options (command arguments)
   "Copy COMMAND's values into *OPTIONS*.
 
 Every key is written, even when it is NIL, so a second parse cannot inherit
@@ -333,9 +342,8 @@ the order the old push-based parser kept them in."
             (getf *options* :kex-algorithms) nil
             (getf *options* :compression) (flag :compression)
             (getf *options* :request-tty)
-            (cond ((flag :request-tty-no) :no)
-                  ((flag :request-tty-force) :force)
-                  (t (value :request-tty)))
+            (or (command-line-request-tty-state command arguments)
+                (value :request-tty))
             (getf *options* :forward-agent)
             (cond ((flag :forward-agent) t)
                   ((flag :no-forward-agent) :no)
@@ -395,7 +403,7 @@ model: after the destination everything belongs to the remote command."
                                        (cons destination command-arguments)))))
                  (parsed (clingon:parse-command-line command line))
                  (free (clingon:command-arguments parsed)))
-            (apply-parsed-options parsed)
+            (apply-parsed-options parsed arguments)
             (values (first free) (rest free)))
         (clingon:exit-error (condition)
           ;; --help and --version have already written their answer.
@@ -558,7 +566,547 @@ is for the CBC ciphers."
       (cl-pnet-ssh:ssh-resolve-algorithm-list (split-list value) supported option
                                               :all (or all supported))
     (cl-pnet-ssh:ssh-config-error (condition)
-      (fail "~A" condition))))
+      ;; Resolution has already printed the readconf line.
+      (fail-config-error condition))))
+
+(defun expand-identity-argument (path)
+  "PATH with a leading ~ or ~/ expanded, as ssh's -i does."
+  (if (and (plusp (length path))
+           (char= (char path 0) #\~)
+           (or (= (length path) 1)
+               (member (char path 1) '(#\/ #\\))))
+      (namestring
+       (merge-pathnames
+        (if (= (length path) 1) "" (subseq path 2))
+        (user-homedir-pathname)))
+      path))
+
+(defun fail-command-line-option (control &rest arguments)
+  "readconf's -o diagnostic: bare, before log_init, exit 255.
+
+parse_command_line_options applies each -o in turn and leaves on the first
+rejected one, so there is no file summary after this line."
+  (format *error-output* "~A~%"
+          (cl-pnet-ssh::ssh-log-escape
+           (format nil "command-line line 0: ~?" control arguments)))
+  (finish-output *error-output*)
+  (restore-terminal)
+  (uiop:quit 255))
+
+(defun validate-command-line-config ()
+  "Report a rejected -o option before ssh's own command-line checks.
+
+ssh applies every -o inside its getopt loop, so a bad one leaves before it
+validates the destination or reports an -i problem.  Running the resolver
+over just those lines repeats readconf's per-line handling; only a stopping
+condition is reported here, because notices such as Unsupported option stay
+with the real resolution pass that follows."
+  (let ((options (command-line-option-list)))
+    (when options
+      (let* ((config (cl-pnet-ssh::ssh-config-add-options
+                      (cl-pnet-ssh::%make-ssh-config :directives nil)
+                      options))
+             (failure nil))
+        (let ((cl-pnet-ssh::*ssh-config-error-function*
+                (lambda (line)
+                  (handler-case
+                      (progn
+                        (format *error-output* "~A~%"
+                                (cl-pnet-ssh::ssh-log-escape line))
+                        (finish-output *error-output*))
+                    (error () nil)))))
+          (cl-pnet-ssh::ssh-config-resolve
+           config ""
+           :on-error (lambda (condition) (setf failure condition))))
+        (when failure
+          (restore-terminal)
+          (uiop:quit 255))))))
+
+(defun check-identity-arguments ()
+  "Apply ssh's own -i and -o identity handling while the options are parsed.
+
+Unlike -o IdentityFile, which readconf records and tries later, -i stats the
+file at once: a missing or unreadable one prints
+
+  Warning: Identity file PATH not accessible: REASON.
+
+and is not added at all.  That fprintf happens before log_init, so -q and -E
+do not affect it, and the later authentication never mentions the file.
+Only the -i segment is rewritten: an -o IdentityFile naming the same text is
+a separate readconf entry (userprovided 2 rather than 1) and must survive.
+
+ssh also caps the combined IdentityFile and CertificateFile lists at 100
+while it parses the arguments: a 101st -i is a bare fatal, while a 101st -o
+is readconf's command-line error.  Both lists are built here in argv order
+so the limit, and the fatal's position, match ssh; the count is then given
+to readconf for the file's own entries."
+  (let* ((arguments (getf *options* :identity-arguments))
+         (files (getf *options* :identity))
+         (split (- (length files) (length arguments)))
+         (leading (subseq files 0 split))
+         (kept '())
+         (identities '())
+         (certificates '()))
+    (labels
+        ((identity-limit ()
+           (format *error-output*
+                   "Too many identity files specified (max ~D)~%"
+                   cl-pnet-ssh::+ssh-max-identity-files+)
+           (finish-output *error-output*)
+           (restore-terminal)
+           (uiop:quit 255))
+         (add-identity (path userprovided)
+           ;; add_identity_file checks the cap before looking for a
+           ;; duplicate, so even a repeated path at slot 101 is fatal.
+           (when (>= (length identities)
+                     cl-pnet-ssh::+ssh-max-identity-files+)
+             (if (= userprovided 1)
+                 (identity-limit)
+                 (fail-command-line-option
+                  "Too many identity files specified (max ~D)."
+                  cl-pnet-ssh::+ssh-max-identity-files+)))
+           (unless (find-if (lambda (entry)
+                              (and (= (cdr entry) userprovided)
+                                   (string= (car entry) path)))
+                            identities)
+             (push (cons path userprovided) identities)
+             t))
+         (add-certificate (path)
+           (when (>= (length certificates)
+                     cl-pnet-ssh::+ssh-max-certificate-files+)
+             (fail-command-line-option
+              "Too many certificate files specified (max ~D)."
+              cl-pnet-ssh::+ssh-max-certificate-files+))
+           (unless (member path certificates :test #'string=)
+             (push path certificates))))
+      (dolist (event (command-line-identity-events))
+        (case (first event)
+          (:identity
+           (let ((path (expand-identity-argument (or (second event) ""))))
+             (multiple-value-bind (exists reason)
+                 (cl-pnet-ssh::ssh-stat-reason path)
+               (if exists
+                   (when (add-identity path 1)
+                     (push path kept))
+                   (progn
+                     (format *error-output*
+                             "Warning: Identity file ~A not accessible: ~A.~%"
+                             path reason)
+                     (finish-output *error-output*))))))
+          (:option
+           (multiple-value-bind (keyword value)
+               (command-line-option-parts (or (second event) ""))
+             (cond
+               ((and value (string-equal keyword "IdentityFile"))
+                (add-identity value 2))
+               ((and value (string-equal keyword "CertificateFile"))
+                (add-certificate value)))))))
+      (when arguments
+        ;; :IDENTITY is kept in reverse command-line order, like the other
+        ;; list slots, so every reader reverses it once.
+        (setf (getf *options* :identity)
+              (append leading kept)))
+      ;; readconf's own IdentityFile/CertificateFile limit continues from
+      ;; what the command line already recorded.
+      (setf cl-pnet-ssh::*ssh-config-identity-count-seed* (length kept)
+            cl-pnet-ssh::*ssh-config-certificate-count-seed* 0))))
+
+(defparameter +command-line-options-with-values+
+  "BbcDEeFIiJLlmOopQRSWw"
+  "Short options that consume an argument, so the session-type scan can skip
+their value instead of mistaking a leading dash in it for another option.")
+
+(defun command-line-option-parts (line)
+  "LINE's keyword and value, split as readconf splits an -o argument."
+  (let ((tokens (cl-pnet-ssh::ssh-config-tokenize line)))
+    (values (first tokens)
+            (when (rest tokens)
+              (format nil "~{~A~^ ~}" (rest tokens))))))
+
+(defun command-line-session-type-events ()
+  "The -N, -s, -W, -L, -R, -D and -o arguments of this invocation, in order.
+
+ssh applies those while it reads its arguments, so their order decides both
+which conflict message it prints and whether a later SessionType option is
+ignored because the field is already set.  CLINGON has already collected the
+values by the time this runs, so the raw arguments are the only remaining
+record of that order.  Scanning stops at the destination, as getopt does."
+  (let ((events '())
+        (arguments (uiop:command-line-arguments)))
+    (loop while arguments
+          for argument = (pop arguments)
+          do (cond
+               ((string= argument "--")
+                (return))
+               ((and (> (length argument) 2)
+                     (string= argument "--" :end1 2))
+                (let* ((equals (position #\= argument))
+                       (name (subseq argument 2 equals))
+                       (inline (and equals (subseq argument (1+ equals)))))
+                  (cond
+                    ((string= name "no-command")
+                     (push :no-command events))
+                    ((string= name "subsystem")
+                     (push :subsystem events))
+                    ((string= name "stdio-forward")
+                     (push (list :stdio (or inline (pop arguments))) events))
+                    ((member name '("local-forward" "remote-forward"
+                                    "dynamic-forward")
+                             :test #'string-equal)
+                     (push (list (cond ((string-equal name "local-forward")
+                                        :local)
+                                       ((string-equal name "remote-forward")
+                                        :remote)
+                                       (t :dynamic))
+                                 (or inline (pop arguments)))
+                           events))
+                    ((string= name "option")
+                     (push (list :option (or inline (pop arguments))) events))
+                    ((string= name "jump")
+                     (push (list :jump (or inline (pop arguments))) events)))))
+               ((and (> (length argument) 1)
+                     (char= (char argument 0) #\-))
+                (loop with index = 1
+                      while (< index (length argument))
+                      for character = (char argument index)
+                      do (cond
+                           ((or (char= character #\N) (char= character #\s))
+                            (push (if (char= character #\N)
+                                      :no-command
+                                      :subsystem)
+                                  events)
+                            (incf index))
+                           ((or (char= character #\W) (char= character #\o))
+                            (let ((value (if (< (1+ index) (length argument))
+                                             (subseq argument (1+ index))
+                                             (pop arguments))))
+                              (push (if (char= character #\W)
+                                        (list :stdio value)
+                                        (list :option value))
+                                    events))
+                            (return))
+                           ((find character "LRD")
+                            (let ((value (if (< (1+ index) (length argument))
+                                             (subseq argument (1+ index))
+                                             (pop arguments))))
+                              (push (list (case character
+                                            (#\L :local)
+                                            (#\R :remote)
+                                            (t :dynamic))
+                                          value)
+                                    events))
+                            (return))
+                           ((char= character #\i)
+                            ;; -i is the only identity flag read in argv
+                            ;; order with -o, so its position decides the
+                            ;; order -G prints identityfile lines in.
+                            (let ((value (if (< (1+ index) (length argument))
+                                             (subseq argument (1+ index))
+                                             (pop arguments))))
+                              (push (list :identity value) events))
+                            (return))
+                           ((char= character #\J)
+                            (let ((value (if (< (1+ index) (length argument))
+                                             (subseq argument (1+ index))
+                                             (pop arguments))))
+                              (push (list :jump value) events))
+                            (return))
+                           ((find character +command-line-options-with-values+)
+                            (unless (< (1+ index) (length argument))
+                              (pop arguments))
+                            (return))
+                           (t
+                            (incf index)))))
+               (t
+                ;; getopt stops at the first non-option: the destination.
+                (return))))
+    (nreverse events)))
+
+(defun command-line-identity-events ()
+  "The -i and -o arguments of this invocation, in the order ssh reads them.
+
+Only the identity-related events are kept; -G prints identityfile lines in
+this order, before the configuration file's own entries."
+  (remove-if-not (lambda (event)
+                   (and (consp event)
+                        (member (first event) '(:identity :option))))
+                 (command-line-session-type-events)))
+
+(defparameter +forward-option-keywords+
+  '("localforward" "remoteforward" "dynamicforward")
+  "The ssh_config keywords that add a forwarding line.")
+
+(defun command-line-forward-events ()
+  "The -L, -R, -D and -o forwarding arguments, in the order ssh reads them.
+
+ssh appends every forwarding specification to the matching array while it
+walks its arguments, so the command line's forwards come before the
+configuration file's and -G prints them in that order."
+  (remove-if-not
+   (lambda (event)
+     (case (first event)
+       ((:local :remote :dynamic) t)
+       (:option
+        (multiple-value-bind (keyword value)
+            (command-line-option-parts (or (second event) ""))
+          (and value
+               (member (string-downcase (or keyword ""))
+                       +forward-option-keywords+
+                       :test #'string=))))
+       (t nil)))
+   (command-line-session-type-events)))
+
+(defun request-tty-multistate (value)
+  "The RequestTTY state VALUE names, or NIL when it is not one of them."
+  (cond
+    ((string-equal value "yes") :yes)
+    ((string-equal value "true") :yes)
+    ((string-equal value "no") :no)
+    ((string-equal value "false") :no)
+    ((string-equal value "force") :force)
+    ((string-equal value "auto") :auto)
+    (t nil)))
+
+(defun command-line-request-tty-state (command arguments)
+  "The RequestTTY state the raw ARGUMENTS leave, or NIL if none names one.
+
+ssh's getopt loop applies -t, -T and -o RequestTTY as it reads them, and
+readconf keeps the first RequestTTY it sees, so the order matters: -t flips
+YES to FORCE, -T sets NO, and a later -o RequestTTY cannot override a state
+an earlier one already set.  CLINGON only reports that -t and -T appeared,
+so the arguments are scanned again here."
+  (let ((state nil))
+    (labels ((record (value)
+               ;; readconf keeps the first RequestTTY it obtains.
+               (when (null state)
+                 (multiple-value-bind (keyword setting)
+                     (command-line-option-parts value)
+                   (when (string-equal (or keyword "") "RequestTTY")
+                     (setf state
+                           (request-tty-multistate (or setting "")))))))
+             (scan-short (argument)
+               (loop with length = (length argument)
+                     for index from 1 below length
+                     for character = (char argument index)
+                     do (cond
+                          ((char= character #\t)
+                           (setf state (if (eq state :yes) :force :yes)))
+                          ((char= character #\T)
+                           (setf state :no))
+                          ((char= character #\o)
+                           (if (< (1+ index) length)
+                               (record (subseq argument (1+ index)))
+                               (let ((value (pop arguments)))
+                                 (when value (record value))))
+                           (return))
+                          ((find character +command-line-options-with-values+)
+                           (unless (< (1+ index) length)
+                             (pop arguments))
+                           (return))))))
+      (loop while arguments
+            for argument = (pop arguments)
+            do (cond
+                 ((string= argument "--") (return))
+                 ((and (> (length argument) 2)
+                       (string= argument "--" :end1 2))
+                  (let* ((equals (position #\= argument))
+                         (name (string-downcase
+                                (subseq argument 2 equals)))
+                         (option (find-burs-long-option command name)))
+                    (cond
+                      ((and (null equals)
+                            option
+                            (clingon:option-parameter option))
+                       (pop arguments))
+                      ((string-equal name "request-tty")
+                       (when (null state)
+                         (setf state
+                               (request-tty-multistate
+                                (or (and equals
+                                         (subseq argument (1+ equals)))
+                                    (pop arguments)
+                                    ""))))))))
+                 ((and (> (length argument) 1)
+                       (char= (char argument 0) #\-))
+                  (scan-short argument))
+                 (t
+                  ;; ssh stops reading options at the destination.
+                  (return))))
+      state)))
+
+(defun command-line-identity-entries ()
+  "IdentityFile spellings to print for -G, in ssh's own order.
+
+Each element is a string as ssh would print it: an -i path is shown with ~
+expanded, because parse_cmdline stats the expanded name before recording it,
+while an -o IdentityFile keeps the argument exactly as written.  readconf
+ignores a duplicate with the same userprovided marker, so repeated -i
+arguments and repeated -o arguments each collapse but an -i and an -o naming
+the same file both remain."
+  (let ((entries '())
+        (seen-i '())
+        (seen-o '()))
+    (dolist (event (command-line-identity-events))
+      (cond
+        ((eq (first event) :identity)
+         (let ((path (expand-identity-argument (or (second event) ""))))
+           (when (and (plusp (length path))
+                      (not (member path seen-i :test #'equal))
+                      (cl-pnet-ssh:ssh-file-exists-p (pathname path)))
+             (push path seen-i)
+             (push path entries))))
+        ((eq (first event) :option)
+         (multiple-value-bind (keyword value)
+             (command-line-option-parts (or (second event) ""))
+           (when (and keyword value (string-equal keyword "IdentityFile")
+                      (not (member value seen-o :test #'equal)))
+             (push value seen-o)
+             (push value entries))))))
+    (values (nreverse entries) (nreverse seen-o))))
+
+(defun session-type-value (text)
+  "TEXT as ssh's SessionType value, or NIL when it is not one."
+  (cond ((string-equal text "none") :none)
+        ((string-equal text "subsystem") :subsystem)
+        ((string-equal text "default") :default)
+        (t nil)))
+
+(defun check-session-type-arguments (command-given-p)
+  "Apply ssh's parse-time -N/-s/-W rules and its missing-subsystem check.
+
+-N, -s and a command-line SessionType set one field, and readconf keeps the
+first value it sees, so a later -o SessionType is ignored while a later -N or
+-s conflicts with the value already set.  -W forces the field to none.  These
+fatals all happen before log_init, so they print even under -q.  Afterwards a
+subsystem session with no command name gets ssh's subsystem message and usage
+text, which likewise bypasses the log level."
+  (let ((state :unset)
+        (stdio nil)
+        (fatal nil))
+    (dolist (event (command-line-session-type-events))
+      (unless fatal
+        (cond
+          ((consp event)
+           (case (first event)
+             (:stdio
+              (if stdio
+                  (setf fatal "stdio forward already specified")
+                  (setf stdio t
+                        state :none)))
+             (:option
+              (multiple-value-bind (keyword value)
+                  (command-line-option-parts (or (second event) ""))
+                (when (and keyword (string-equal keyword "SessionType"))
+                  ;; An unusable value is readconf's own diagnostic, raised
+                  ;; when the option is resolved; it never reaches here.
+                  (let ((type (session-type-value value)))
+                    (when (and type (eq state :unset))
+                      (setf state type))))))))
+          ((eq event :no-command)
+           (if (and (not (eq state :unset)) (not (eq state :none)))
+               (setf fatal "Cannot specify -N with -s/SessionType")
+               (setf state :none)))
+          ((eq event :subsystem)
+           (if (and (not (eq state :unset)) (not (eq state :subsystem)))
+               (setf fatal "Cannot specify -s with -N/SessionType")
+               (setf state :subsystem))))))
+    (when fatal
+      (format *error-output* "~A~%" fatal)
+      (finish-output *error-output*)
+      (restore-terminal)
+      (uiop:quit 255))
+    (when (and (not command-given-p) (eq state :subsystem))
+      (format *error-output* "You must specify a subsystem to invoke.~%")
+      (finish-output *error-output*)
+      (clingon:print-usage *burs-command* *error-output*)
+      (restore-terminal)
+      (uiop:quit 255))))
+
+(defun check-proxy-arguments ()
+  "Apply ssh's parse-time ProxyJump/ProxyCommand interaction.
+
+-J refuses to mix with an earlier jump or command and refuses a second -J; an
+-o ProxyJump or ProxyCommand is validated but silently keeps the first of the
+pair, matching readconf's parse_jump/parse_command.  These fatals happen
+before log_init, so -q does not hide them."
+  (let ((jump nil)
+        (command nil))
+    (labels ((fatal (text)
+               (format *error-output* "~A~%" text)
+               (finish-output *error-output*)
+               (restore-terminal)
+               (uiop:quit 255))
+             (record-jump (value &key from-flag)
+               (multiple-value-bind (parsed reason)
+                   (cl-pnet-ssh::ssh-config-parse-proxy-jump value t)
+                 (when reason
+                   (format *error-output* "~A~%"
+                           (cl-pnet-ssh::ssh-log-escape reason)))
+                 (unless parsed
+                   (if from-flag
+                       (fatal "Invalid -J argument")
+                       (fail-command-line-option
+                        "Invalid ProxyJump \"~A\"" value)))
+                 (cond
+                   ;; readconf's "none" short-cut stores only into an empty
+                   ;; jump field, even when a ProxyCommand is present.
+                   ((eq parsed :none)
+                    (when (null jump)
+                      (setf jump :none)))
+                   ((and (null jump) (null command))
+                    (setf jump parsed
+                          command "none"))))))
+      (dolist (event (command-line-session-type-events))
+        (when (consp event)
+          (case (first event)
+            (:jump
+             (when jump
+               (fatal "Only a single -J option is permitted (use commas to separate multiple jump hops)"))
+             (when command
+               (fatal "Cannot specify -J with ProxyCommand"))
+             (record-jump (or (second event) "") :from-flag t))
+            (:option
+             (let* ((text (or (second event) ""))
+                    ;; ProxyJump and ProxyCommand receive the rest of the line
+                    ;; verbatim, so quotes and backslashes must survive the
+                    ;; keyword split.  An open quote is reported by the
+                    ;; resolver as "invalid quotes", before any directive is
+                    ;; applied, so this pass stays silent then.
+                    (remainder (cl-pnet-ssh::ssh-config-line-remainder text))
+                    (valid (nth-value
+                            1 (cl-pnet-ssh::ssh-config-argv-split
+                               remainder :terminate-on-comment t))))
+               (multiple-value-bind (keyword value)
+                   (command-line-option-parts text)
+                 (declare (ignore value))
+                 (cond
+                   ((and keyword (string-equal keyword "ProxyJump"))
+                    (cond
+                      ((not valid) nil)
+                      ;; readconf reports the empty argument before parse_jump
+                      ;; ever sees it, so -o ProxyJump and -o ProxyJump= differ
+                      ;; from a value that merely fails to parse.
+                      ((zerop (length remainder))
+                       (fail-command-line-option
+                        "no argument after keyword \"proxyjump\""))
+                      (t
+                       ;; parse_jump gets str + strspn(str, " \t="), so a
+                       ;; second '=' is dropped together with leading spaces.
+                       (record-jump
+                        (string-left-trim '(#\Space #\Tab #\=)
+                                          remainder)))))
+                   ((and keyword (string-equal keyword "ProxyCommand"))
+                    (when (and valid (null command)
+                               (plusp (length (string-left-trim
+                                               '(#\Space #\Tab #\=)
+                                               remainder))))
+                      (setf command
+                            (string-left-trim '(#\Space #\Tab #\=)
+                                              remainder)))))))))))
+      (setf (getf *options* :jump)
+            (if (eq jump :none) "none" jump)
+            (getf *options* :proxy-command)
+            command))))
 
 (defun check-supported-options ()
   "Fail before connecting on a flag whose feature is not in this build."
@@ -566,10 +1114,24 @@ is for the CBC ciphers."
     (unless (cl-pnet-ssh::ssh-config-escape-char-value
              (getf *options* :escape-char))
       (fail "invalid escape character ~A" (getf *options* :escape-char))))
-  (when (getf *options* :pkcs11)
+  (when (and (getf *options* :pkcs11)
+             (not (getf *options* :print-config)))
     (unsupported "-I" "PKCS#11 keys are not implemented"))
   (when (getf *options* :tunnel)
-    (unsupported "-w" "TUN/TAP forwarding is not implemented"))
+    ;; ssh validates the device while reading the flag, even for -G.
+    (setf (getf *options* :tunnel-device)
+          (handler-case
+              (cl-pnet-ssh::ssh-config-tunnel-device
+               nil (getf *options* :tunnel))
+            (cl-pnet-ssh:ssh-config-error ()
+              (format *error-output* "Bad tun device '~A'~%"
+                      (getf *options* :tunnel))
+              (finish-output *error-output*)
+              (restore-terminal)
+              (uiop:quit 255))))
+    ;; -G only reports the configuration, so it does not need the tunnel.
+    (unless (getf *options* :print-config)
+      (unsupported "-w" "TUN/TAP forwarding is not implemented")))
   (when (getf *options* :protocol-1)
     (fail "SSH protocol v.1 is no longer supported"))
   (when (and (eq (getf *options* :x11-forward) :yes)
@@ -601,20 +1163,24 @@ is for the CBC ciphers."
     (let ((family (getf *options* :address-family)))
       (unless (member family '("inet" "inet6" "any") :test #'string-equal)
         (fail "invalid address family ~A" family))))
-  (when (and (getf *options* :stdio-forward)
-             (getf *options* :subsystem))
-    (fail "-W and -s cannot be combined"))
   ;; Parse the forwarding specifications now, so a typo is a command-line
-  ;; error rather than a surprise after authentication.
+  ;; error rather than a surprise after authentication.  ssh rejects each one
+  ;; while reading the arguments and names the flag it came from.
   (setf (getf *options* :local-forward)
-        (mapcar #'parse-local-forward
-                (reverse (getf *options* :local-forward))))
+        (let ((*forwarding-command-line-kind* "local"))
+          (mapcar #'parse-local-forward
+                  (reverse (getf *options* :local-forward)))))
   (setf (getf *options* :remote-forward)
-        (mapcar #'parse-config-remote-forward
-                (reverse (getf *options* :remote-forward))))
+        (let ((*forwarding-command-line-kind* "remote"))
+          (mapcar #'parse-remote-forward
+                  (reverse (getf *options* :remote-forward)))))
   (setf (getf *options* :dynamic-forward)
-        (mapcar #'parse-dynamic-forward
-                (reverse (getf *options* :dynamic-forward))))
+        (let ((*forwarding-command-line-kind* "dynamic"))
+          (mapcar #'parse-dynamic-forward
+                  (reverse (getf *options* :dynamic-forward)))))
+  (when (getf *options* :stdio-forward)
+    (let ((*forwarding-command-line-kind* "stdio"))
+      (parse-host-port (getf *options* :stdio-forward))))
   (values))
 
 (defun check-config-supported (client)
@@ -661,7 +1227,19 @@ refusal."
       ;; ProxyCommand=- together with it is refused by the client itself.
       (let ((tunnel (cl-pnet-ssh:ssh-config-options-tunnel options)))
         (when (and tunnel (not (eq tunnel :no)))
-          (unsupported "Tunnel" "TUN/TAP forwarding is not implemented"))))))
+          (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
+      ;; A one-word RemoteForward asks the server for a SOCKS proxy.  The
+      ;; forwarding streams work, but this client has no SOCKS server on the
+      ;; server-initiated channel, so say so rather than expose a dead port.
+      (let ((dynamic
+              (find-if (lambda (forward)
+                         (equal (forward-host forward) "socks"))
+                       (mapcar #'parse-config-remote-forward
+                               (cl-pnet-ssh:ssh-config-options-remote-forwards
+                                options)))))
+        (when dynamic
+          (unsupported "RemoteForward"
+                       "remote dynamic (SOCKS) forwarding is not implemented"))))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -698,7 +1276,11 @@ runs it through cmd.exe."
     ;; readconf and keeps the first value the command line gave them; a
     ;; dedicated -l or -p is seeded ahead of the -o lines for the same reason.
     ((string-equal name "IdentityFile")
-     (push value (getf *options* :identity)))
+     ;; readconf stores the argument as written; ~ and tokens are expanded
+     ;; only when the file is loaded, and -G prints the original spelling.
+     ;; The value itself reaches the resolver as an -o line, so nothing has
+     ;; to be recorded here; :IDENTITY holds -i arguments only.
+     nil)
     ((string-equal name "IdentityAgent") (setf (getf *options* :agent) value))
     ((string-equal name "StrictHostKeyChecking")
      (setf (getf *options* :policy)
@@ -731,8 +1313,9 @@ runs it through cmd.exe."
     ((string-equal name "ForwardAgent")
      (when (true-value-p value)
        (setf (getf *options* :forward-agent) t)))
-    ((string-equal name "RequestTTY")
-     (setf (getf *options* :request-tty) (string-downcase value)))
+    ;; RequestTTY is recorded by command-line-request-tty-state from the raw
+    ;; arguments, because -t and -T interleave with -o RequestTTY and readconf
+    ;; keeps only the first RequestTTY it sees.
     ((string-equal name "BindAddress")
      (setf (getf *options* :bind-address) value))
     ;; Forwarding keywords stay with the ssh_config resolver: it already
@@ -788,6 +1371,14 @@ the first value, so a dedicated flag outranks an -o for the same keyword."
       ((:trust) (push "ForwardX11 yes" options)
                 (push "ForwardX11Trusted yes" options))
       ((:no) (push "ForwardX11 no" options)))
+    ;; -J is not an -o line, so its value only exists in *OPTIONS*.  Adding
+    ;; it to the resolved configuration keeps readconf's first-value rule
+    ;; against a file or later -o line, exactly as ssh's getopt loop does.
+    (when (and (getf *options* :jump)
+               (some (lambda (event)
+                       (and (consp event) (eq (first event) :jump)))
+                     (command-line-session-type-events)))
+      (push (format nil "ProxyJump ~A" (getf *options* :jump)) options))
     options))
 
 (defun apply-command-line-options ()
@@ -817,10 +1408,10 @@ off instead of raising: logging is a side channel and must not take the
 session down."
   (when *log-stream*
     (handler-case
-        (progn
-          (if (plusp (getf *options* :verbose 0))
-              (format *log-stream* "debug1: ~?~%" format-string arguments)
-              (format *log-stream* "~?~%" format-string arguments))
+        (let ((line (if (plusp (getf *options* :verbose 0))
+                        (format nil "debug1: ~?" format-string arguments)
+                        (format nil "~?" format-string arguments))))
+          (format *log-stream* "~A~%" (cl-pnet-ssh::ssh-log-escape line))
           (finish-output *log-stream*))
       (error ()
         (setf *log-stream* nil
@@ -869,6 +1460,10 @@ session down."
                       (finish-output stream))
                   (error ()
                     (setf *log-stream* nil)))))))
+  ;; Key files are checked when they are loaded, below the protocol code, so
+  ;; the command line tells the library how its platform judges permissions.
+  (setf cl-pnet-ssh:*ssh-private-key-permission-check*
+        #'private-key-permissions-too-open-p)
   ;; ssh applies a command-line -o while it is still parsing its arguments,
   ;; before -q, -E and -v take effect, so readconf's notice about an
   ;; unsupported one always reaches stderr.
@@ -882,15 +1477,24 @@ session down."
   ;; readconf prints each rejected configuration line as it parses it, then
   ;; the file's closing "terminating, N bad configuration options" summary.
   ;; The library formats those lines; the reporter only writes them.
+  ;; A file's diagnostics are logged after log_init, so -q (LogLevel QUIET)
+  ;; silences them, while readconf's own -o lines are printed during argument
+  ;; parsing and always reach stderr, which is why they name command-line.
   (setf *config-error-reported* nil)
   (setf cl-pnet-ssh:*ssh-config-error-function*
         (lambda (line)
           (setf *config-error-reported* t)
-          (handler-case
-              (progn
-                (format *error-output* "~A~%" line)
-                (finish-output *error-output*))
-            (error () nil)))))
+          (when (or (not (getf *options* :quiet))
+                    (and (>= (length line) 12)
+                         (string= line "command-line" :end1 12)
+                         (or (= (length line) 12)
+                             (member (char line 12) '(#\: #\Space)))))
+            (handler-case
+                (progn
+                  (format *error-output* "~A~%"
+                          (cl-pnet-ssh::ssh-log-escape line))
+                  (finish-output *error-output*))
+              (error () nil))))))
 
 ;;; ---- -Q: algorithm queries ----
 
@@ -1048,6 +1652,8 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
 (defstruct (dynamic-forward (:constructor %make-dynamic-forward))
   bind-address
   bind-port
+  bind-path
+  target-path
   listener)
 
 (defstruct (socks-session (:constructor %make-socks-session))
@@ -1055,9 +1661,34 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
   connection
   (state (cl-pnet-socks:make-socks5-server-state)))
 
+(defun forwarding-fail (spec control &rest arguments)
+  "Report an unusable forwarding SPEC, in ssh's words for the active flag."
+  (if *forwarding-command-line-kind*
+      (progn
+        (format *error-output* "Bad ~A forwarding specification '~A'~%"
+                *forwarding-command-line-kind* spec)
+        (finish-output *error-output*)
+        (restore-terminal)
+        (uiop:quit 255))
+      (apply #'fail control arguments)))
+
+(defun expand-forward-spec (spec)
+  "SPEC with ${NAME} expanded as parse_forward's dollar_expand does.
+
+OpenSSH expands the environment before it decides which fields are socket
+paths, so the expansion can change how many fields the specification has.
+A reference that cannot be expanded is reported with the helper's own
+diagnostic and then rejected like any other bad specification."
+  (or (cl-pnet-ssh::ssh-forward-expand-value spec nil)
+      (forwarding-fail spec "invalid forwarding specification ~A" spec)))
+
 (defun split-forward-fields (text)
-  "TEXT split at colons, keeping a bracketed IPv6 literal whole."
+  "TEXT split at colons, keeping a bracketed IPv6 literal whole.
+
+parse_forward expands ${NAME} first, so the fields come from the expanded
+form while messages still name TEXT as the user wrote it."
   (let ((fields '())
+        (text (expand-forward-spec text))
         (current (make-string-output-stream)))
     (loop with index = 0
           while (< index (length text))
@@ -1066,7 +1697,7 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
                ((char= character #\[)
                 (let ((close (position #\] text :start index)))
                   (unless close
-                    (fail "unterminated '[' in ~A" text))
+                    (forwarding-fail text "unterminated '[' in ~A" text))
                   (write-string (subseq text (1+ index) close) current)
                   (setf index close)))
                ((char= character #\:)
@@ -1078,9 +1709,10 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
                   (return (nreverse fields)))))
 
 (defun forwarding-port (text spec)
-  (multiple-value-bind (port end) (parse-integer text :junk-allowed t)
-    (unless (and port (= end (length text)) (<= 0 port 65535))
-      (fail "invalid port ~S in forwarding specification ~A" text spec))
+  (let ((port (cl-pnet-ssh:ssh-a2port text)))
+    (unless port
+      (forwarding-fail spec "invalid port ~S in forwarding specification ~A"
+                       text spec))
     port))
 
 (defun path-field-p (text)
@@ -1093,13 +1725,18 @@ PLAIN-ONLY drops the certificate spellings, as -Q sig and -Q key-ca-sign do."
 
 OpenSSH's rule is used: a forwarding specification needs a target port or
 socket path, and a listener that is a socket path or a port.  Only a remote
-forward may ask for port 0, which leaves the choice to the server."
-  (unless (or target-path (and port (plusp port)))
-    (fail "~A: forwarding needs a target port or socket path" spec))
+forward may ask for port 0, which leaves the choice to the server.  A
+\"socks\" target is the dynamic form and uses port 0 as its placeholder."
+  (unless (or target-path
+              (and port (plusp port))
+              (and host (string-equal host "socks")))
+    (forwarding-fail spec "~A: forwarding needs a target port or socket path"
+                     spec))
   (unless (or bind-path
               (and bind-port
                    (if remote-p (<= 0 bind-port) (plusp bind-port))))
-    (fail "~A: forwarding needs a listener port or socket path" spec))
+    (forwarding-fail spec "~A: forwarding needs a listener port or socket path"
+                     spec))
   (%make-forward :bind-address bind-address
                  :bind-port bind-port
                  :bind-path bind-path
@@ -1114,6 +1751,19 @@ The fields follow OpenSSH's parse_forward: a field containing a slash is a
 Unix socket path, anything else is an address or port."
   (let ((fields (split-forward-fields spec)))
     (case (length fields)
+      (1
+       ;; A one-word -R is readconf's dynamic remote forward: the server
+       ;; chooses the port and this client exposes SOCKS through it.
+       (destructuring-bind (first) fields
+         (unless remote-p
+           (forwarding-fail spec "invalid forwarding specification ~A" spec))
+         (if (path-field-p first)
+             (make-parsed-forward spec remote-p
+                                  :bind-path first
+                                  :host "socks" :port 0)
+             (make-parsed-forward spec remote-p
+                                  :bind-port (forwarding-port first spec)
+                                  :host "socks" :port 0))))
       (2
        (destructuring-bind (first second) fields
          (cond
@@ -1162,26 +1812,99 @@ Unix socket path, anything else is an address or port."
                               :host host
                               :port (forwarding-port hostport spec))))
       (t
-       (fail "invalid forwarding specification ~A" spec)))))
+       (forwarding-fail spec "invalid forwarding specification ~A" spec)))))
 
 (defun parse-local-forward (spec)
   "SPEC as a FORWARD for ssh's -L forms, including Unix-socket paths."
   (parse-forward-spec spec nil))
 
-(defun parse-remote-forward (spec)
-  "SPEC as a FORWARD for ssh's -R forms, including Unix-socket paths.
+(defun parse-dynamic-remote-forward (spec)
+  "SPEC as parse_forward with dynamicfwd=1 and remotefwd=1 reads it.
 
-A remote forward names the listener on the server (BIND-ADDRESS/BIND-PORT
-or BIND-PATH) and the target this client dials (HOST/PORT or TARGET-PATH)."
-  (parse-forward-spec spec t))
+ssh checks this form after the ordinary one, so a -R argument with one or
+two fields is a remote dynamic forward: the server listens, and this client
+answers the channel with SOCKS.  A two-field target that names a socket path
+is still the streamlocal listen/target pair."
+  (let ((fields (split-forward-fields spec)))
+    (case (length fields)
+      (1
+       (destructuring-bind (first) fields
+         (if (path-field-p first)
+             (make-parsed-forward spec t
+                                  :bind-path first
+                                  :host "socks" :port 0)
+             (make-parsed-forward spec t
+                                  :bind-port (forwarding-port first spec)
+                                  :host "socks" :port 0))))
+      (2
+       (destructuring-bind (first second) fields
+         (cond
+           ((and (path-field-p first) (path-field-p second))
+            (make-parsed-forward spec t
+                                 :bind-path first
+                                 :target-path second))
+           ((path-field-p second)
+            (make-parsed-forward spec t
+                                 :bind-port (forwarding-port first spec)
+                                 :target-path second))
+           (t
+            (make-parsed-forward spec t
+                                 :bind-address first
+                                 :bind-port (forwarding-port second spec)
+                                 :host "socks" :port 0)))))
+      (t
+       (forwarding-fail spec "invalid forwarding specification ~A" spec)))))
+
+(defun parse-remote-forward (spec)
+  "SPEC as a FORWARD for ssh's -R forms, including the dynamic fallback.
+
+ssh tries parse_forward with dynamicfwd=0 and, when that fails, with
+dynamicfwd=1; only a one- or two-field argument can take the second path."
+  (let ((fields (split-forward-fields spec)))
+    (if (or (= 1 (length fields))
+            (and (= 2 (length fields))
+                 (not (path-field-p (second fields)))))
+        (parse-dynamic-remote-forward spec)
+        (parse-forward-spec spec t))))
 
 (defun parse-dynamic-forward (spec)
-  "SPEC as a DYNAMIC-FORWARD for [bind_address:]port."
-  (multiple-value-bind (first second) (split-host-port spec)
-    (if second
-        (%make-dynamic-forward :bind-address (if (plusp (length first)) first nil)
-                               :bind-port (forwarding-port second spec))
-        (%make-dynamic-forward :bind-port (forwarding-port first spec)))))
+  "SPEC as a DYNAMIC-FORWARD for [bind_address:]port or a socket path.
+
+parse_forward takes at most two fields when the dynamic flag is set, and a
+two-field argument treats the first field as the listening address even when
+it contains a slash: only a lone field can be a socket path."
+  (let* ((fields (split-forward-fields spec))
+         (count (length fields)))
+    (case count
+      (1
+       (let ((first (first fields)))
+         (if (path-field-p first)
+             (%make-dynamic-forward :bind-path first)
+             (let ((port (forwarding-port first spec)))
+               (unless (plusp port)
+                 (forwarding-fail spec
+                                  "invalid forwarding specification ~A" spec))
+               (%make-dynamic-forward :bind-port port)))))
+      (2
+       (destructuring-bind (first second) fields
+         (cond
+           ((and (path-field-p first) (path-field-p second))
+            (%make-dynamic-forward :bind-path first :target-path second))
+           ((path-field-p second)
+            ;; listen_host stays empty; a2port names the listening port.
+            (let ((port (forwarding-port first spec)))
+              (unless (plusp port)
+                (forwarding-fail spec
+                                 "invalid forwarding specification ~A" spec))
+              (%make-dynamic-forward :bind-port port :target-path second)))
+           (t
+            (let ((port (forwarding-port second spec)))
+              (unless (plusp port)
+                (forwarding-fail spec
+                                 "invalid forwarding specification ~A" spec))
+              (%make-dynamic-forward :bind-address first :bind-port port))))))
+      (t
+       (forwarding-fail spec "invalid forwarding specification ~A" spec)))))
 
 (defun split-host-port (text)
   "TEXT as (VALUES HOST PORT-STRING), bracketing IPv6 literals."
@@ -1203,42 +1926,46 @@ or BIND-PATH) and the target this client dials (HOST/PORT or TARGET-PATH)."
   "SPEC as (VALUES HOST PORT), or FAIL."
   (multiple-value-bind (host port) (split-host-port spec)
     (unless (and port (plusp (length port)))
-      (fail "~A must be host:port" spec))
+      (forwarding-fail spec "~A must be host:port" spec))
     (values host (forwarding-port port spec))))
 
 (defun parse-config-forward (spec remote-p)
-  "SPEC as a FORWARD for ssh_config's two-word LocalForward/RemoteForward.
+  "SPEC as a FORWARD for ssh_config's LocalForward/RemoteForward.
 
 The listener may be [bind_address:]port or a socket path; the target may be
-host:hostport or a socket path.  A one-word line is taken as the command
-line's colon-separated form."
+host:hostport or a socket path.  A one-word RemoteForward is readconf's
+dynamic form and is parsed with dynamicfwd=1."
   (let ((words (uiop:split-string spec :separator '(#\Space #\Tab))))
-    (if (/= 2 (length words))
-        (parse-forward-spec spec remote-p)
-        (destructuring-bind (listen target) words
-          (let (bind port bind-path host hostport target-path)
-            (if (path-field-p listen)
-                (setf bind-path listen)
-                (multiple-value-bind (first second) (split-host-port listen)
-                  (if second
-                      (setf bind (and (plusp (length first)) first)
-                            port (forwarding-port second spec))
-                      (setf port (forwarding-port first spec)))))
-            (if (path-field-p target)
-                (setf target-path target)
-                (multiple-value-bind (target-host target-port)
-                    (split-host-port target)
-                  (unless (and target-port (plusp (length target-port)))
-                    (fail "~A must be host:port or a socket path" spec))
-                  (setf host target-host
-                        hostport (forwarding-port target-port spec))))
-            (make-parsed-forward spec remote-p
-                                 :bind-address bind
-                                 :bind-port port
-                                 :bind-path bind-path
-                                 :host host
-                                 :port hostport
-                                 :target-path target-path))))))
+    (cond
+      ((and remote-p (/= 2 (length words)))
+       (parse-dynamic-remote-forward spec))
+      ((/= 2 (length words))
+       (parse-forward-spec spec remote-p))
+      (t
+       (destructuring-bind (listen target) words
+         (let (bind port bind-path host hostport target-path)
+           (if (path-field-p listen)
+               (setf bind-path listen)
+               (multiple-value-bind (first second) (split-host-port listen)
+                 (if second
+                     (setf bind (and (plusp (length first)) first)
+                           port (forwarding-port second spec))
+                     (setf port (forwarding-port first spec)))))
+           (if (path-field-p target)
+               (setf target-path target)
+               (multiple-value-bind (target-host target-port)
+                   (split-host-port target)
+                 (unless (and target-port (plusp (length target-port)))
+                   (fail "~A must be host:port or a socket path" spec))
+                 (setf host target-host
+                       hostport (forwarding-port target-port spec))))
+           (make-parsed-forward spec remote-p
+                                :bind-address bind
+                                :bind-port port
+                                :bind-path bind-path
+                                :host host
+                                :port hostport
+                                :target-path target-path)))))))
 
 (defun parse-config-local-forward (spec)
   "SPEC as a FORWARD for ssh_config's two-word LocalForward form."
@@ -1388,7 +2115,7 @@ ordering without adding a request hook to the library."
               (send-pty-request channel)
               (start-winch channel)
               (cond
-                ((subsystem-request-p)
+                ((and (subsystem-request-p) command-given-p)
                  (send-subsystem-request channel command))
                 (command-given-p
                  (send-exec-request channel command))
@@ -1623,7 +2350,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
                      (declare (ignore channel status))
                      (finish *status*))
          :on-error #'session-error))
-  (unless (subsystem-request-p)
+  (unless (and (subsystem-request-p) command-given-p)
     (dolist (name (cl-pnet-ssh:ssh-client-send-env client))
       (let ((value (uiop:getenv name)))
         (when value
@@ -1638,7 +2365,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   (if (request-tty-p client command-given-p)
       (start-pty-session *channel* command command-given-p)
       (cond
-        ((subsystem-request-p)
+        ((and (subsystem-request-p) command-given-p)
          (cl-pnet-ssh:ssh-channel-subsystem *channel* command)
          (start-input *channel*))
         (command-given-p
@@ -2228,7 +2955,8 @@ closed afterwards."
   "CLIENT's LocalCommand as written, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
     (and options
-         (cl-pnet-ssh:ssh-config-options-local-command options))))
+         (cl-pnet-ssh:ssh-config-command-value
+          (cl-pnet-ssh:ssh-config-options-local-command options)))))
 
 (defun permit-local-command-p (client)
   "Whether PermitLocalCommand allows LocalCommand to run."
@@ -2264,38 +2992,108 @@ closed afterwards."
   "CLIENT's RemoteCommand as written, or NIL."
   (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
     (and options
-         (cl-pnet-ssh:ssh-config-options-remote-command options))))
+         (cl-pnet-ssh:ssh-config-command-value
+          (cl-pnet-ssh:ssh-config-options-remote-command options)))))
+
+(defun proxy-jump-target-host (options)
+  "The last ProxyJump hop's host in OPTIONS, or NIL for a direct connection.
+
+readconf answers %j with the parsed jump_host, so this reads the normalised
+spelling back out and drops any user and port."
+  (let ((value (or (and options
+                        (cl-pnet-ssh:ssh-config-options-proxy-jump options))
+                   (getf *options* :jump))))
+    (when (and value (stringp value) (not (string-equal value "none")))
+      (let* ((start (1+ (or (position #\, value :from-end t) -1)))
+             (hop (subseq value start))
+             (at (position #\@ hop))
+             (hop (if at (subseq hop (1+ at)) hop)))
+        (if (and (plusp (length hop)) (char= (char hop 0) #\[))
+            (subseq hop 1 (or (position #\] hop) (length hop)))
+            (let ((colon (position #\: hop)))
+              (if colon (subseq hop 0 colon) hop)))))))
+
+(defun client-percent-values (options alias canonical port user)
+  "ssh.c's DEFAULT_CLIENT_PERCENT_EXPAND_ARGS as an alist of characters."
+  (let* ((local-host (or (machine-instance) "localhost"))
+         (short-host (subseq local-host 0
+                             (or (position #\. local-host)
+                                 (length local-host))))
+         (key-alias (or (and options
+                             (cl-pnet-ssh:ssh-config-options-host-key-alias
+                              options))
+                        alias
+                        ""))
+         (jump (proxy-jump-target-host options)))
+    (list (cons #\h (or canonical ""))
+          (cons #\n (or alias ""))
+          (cons #\p (format nil "~D" (or port 22)))
+          (cons #\r (or user ""))
+          (cons #\u (cl-pnet-ssh:ssh-default-user))
+          (cons #\d (string-right-trim
+                     "/" (namestring (user-homedir-pathname))))
+          (cons #\i (format nil "~D" (sb-posix:getuid)))
+          (cons #\k key-alias)
+          (cons #\j (or jump ""))
+          (cons #\l local-host)
+          (cons #\L short-host)
+          (cons #\C (cl-pnet-ssh::ssh-config-connection-hash
+                     local-host (or canonical "") (or port 22)
+                     (or user "") (or jump ""))))))
+
+(defun expand-client-percent (options alias canonical value
+                              &key port user)
+  "VALUE expanded as ssh.c's percent_expand for RemoteCommand and forwards.
+
+Only % tokens are replaced, so a ${NAME} stays literal.  An unknown token or
+a trailing % dies with vdollar_percent_expand's own line followed by
+percent_expand: failed; both follow the log level, as ssh's fatal() does."
+  (let ((values (client-percent-values options alias canonical
+                                       (or port (client-port) 22)
+                                       (or user
+                                           (and options
+                                                (cl-pnet-ssh:ssh-config-options-user
+                                                 options))
+                                           (getf *options* :user)
+                                           (cl-pnet-ssh:ssh-default-user))))
+        (quiet (getf *options* :quiet)))
+    (labels ((die (message)
+               (unless quiet
+                 (format *error-output* "vdollar_percent_expand: ~A~%"
+                         (cl-pnet-ssh::ssh-log-escape message))
+                 (format *error-output* "percent_expand: failed~%")
+                 (finish-output *error-output*))
+               (restore-terminal)
+               (uiop:quit 255)))
+      (with-output-to-string (out)
+        (loop with length = (length value)
+              for index from 0 below length
+              for character = (char value index)
+              do (cond
+                   ((char/= character #\%)
+                    (write-char character out))
+                   ((>= (1+ index) length)
+                    (die "invalid format"))
+                   (t
+                    (let ((token (char value (1+ index))))
+                      (if (char= token #\%)
+                          (progn (write-char #\% out) (incf index))
+                          (let ((replacement (cdr (assoc token values))))
+                            (unless replacement
+                              (die (format nil "unknown key %~C" token)))
+                            (write-string replacement out)
+                            (incf index)))))))))))
 
 (defun expand-remote-command (client value)
   "VALUE with the ssh % tokens RemoteCommand understands."
-  (let ((host (cl-pnet-ssh:ssh-client-connect-host client))
-        (name (cl-pnet-ssh:ssh-client-host client))
-        (port (or (cl-pnet-ssh:ssh-client-connect-port client) 22))
-        (user (cl-pnet-ssh:ssh-client-user client))
-        (uid (or (uiop:getenv "UID") ""))
-        (local (or (uiop:getenv "HOSTNAME") "")))
-    (with-output-to-string (out)
-      (loop with length = (length value)
-            for index from 0 below length
-            for character = (char value index)
-            do (if (and (char= character #\%)
-                        (< (1+ index) length))
-                   (let ((token (char value (1+ index))))
-                     (case token
-                       (#\% (write-char #\% out) (incf index))
-                       (#\h (princ host out) (incf index))
-                       (#\n (princ name out) (incf index))
-                       (#\p (princ port out) (incf index))
-                       (#\r (princ user out) (incf index))
-                       (#\u (princ (cl-pnet-ssh:ssh-default-user) out)
-                            (incf index))
-                       (#\d (princ (namestring (user-homedir-pathname)) out)
-                            (incf index))
-                       (#\i (princ uid out) (incf index))
-                       (#\l (princ local out) (incf index))
-                       (#\L (princ local out) (incf index))
-                       (t (write-char character out))))
-                   (write-char character out))))))
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client)))
+    (expand-client-percent
+     options
+     (cl-pnet-ssh:ssh-client-host client)
+     (cl-pnet-ssh:ssh-client-connect-host client)
+     value
+     :port (or (cl-pnet-ssh:ssh-client-connect-port client) 22)
+     :user (cl-pnet-ssh:ssh-client-user client))))
 
 (defun config-session-type (client)
   "CLIENT's ssh_config SessionType, or NIL when the file did not name one."
@@ -2342,10 +3140,12 @@ performed, matching ssh: the configured host must match exactly, or be *."
       ((eq permit :none) nil)
       (t
        (some (lambda (entry)
-               (and (or (string= (car entry) "*")
-                        (string= (car entry) host))
-                    (or (eq (cdr entry) :any)
-                        (eql (cdr entry) port))))
+               (let ((permitted-host (second entry))
+                     (permitted-port (third entry)))
+                 (and (or (string= permitted-host "*")
+                          (string= permitted-host host))
+                      (or (eq permitted-port :any)
+                          (eql permitted-port port)))))
              permit)))))
 
 (defun clear-all-forwardings-p (client)
@@ -2593,6 +3393,17 @@ buffered with the tunnel and flushed once the channel is open."
       (t address))))
 
 (defun start-dynamic-forward (client forward)
+  (when (or (dynamic-forward-bind-path forward)
+            (dynamic-forward-target-path forward))
+    ;; The transport can listen on a Unix socket and forward a stream, but
+    ;; this client has no SOCKS server attached to a Unix-socket listener,
+    ;; and readconf's socket-target dynamic form is really a local forward.
+    (unless (getf *options* :quiet)
+      (format *error-output*
+              "burs: dynamic forwarding over a Unix socket is not implemented~%"))
+    (if (exit-on-forward-failure-p client)
+        (finish 255)
+        (return-from start-dynamic-forward nil)))
   (let* ((address (dynamic-bind-address forward))
          (listener
            (cl-pnet:make-tcp-listener
@@ -2772,33 +3583,60 @@ peer that connected to it; NIL refuses the channel."
                      address port)))))
     forward))
 
+(defun expand-forward-for-client (client forward)
+  "FORWARD with its socket paths percent-expanded for CLIENT."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client))
+        (host (cl-pnet-ssh:ssh-client-host client))
+        (canonical (cl-pnet-ssh:ssh-client-connect-host client))
+        (port (cl-pnet-ssh:ssh-client-connect-port client))
+        (user (cl-pnet-ssh:ssh-client-user client)))
+    (when (forward-bind-path forward)
+      (setf (forward-bind-path forward)
+            (expand-client-percent options host canonical
+                                   (forward-bind-path forward)
+                                   :port port :user user)))
+    (when (forward-target-path forward)
+      (setf (forward-target-path forward)
+            (expand-client-percent options host canonical
+                                   (forward-target-path forward)
+                                   :port port :user user))))
+  forward)
+
 (defun start-forwards (client)
   (when (clear-all-forwardings-p client)
     (return-from start-forwards nil))
-  (let ((forwards (append (configured-local-forwards client)
-                          (getf *options* :local-forward)
-                          (configured-remote-forwards client)
-                          (getf *options* :remote-forward)
-                          (configure-dynamic-forwards client)
-                          (getf *options* :dynamic-forward))))
-    ;; ssh refuses every forward once a changed host key was accepted under
-    ;; StrictHostKeyChecking=no: a forwarded port is exactly what a man in
-    ;; the middle wants.
-    (when (and forwards (cl-pnet-ssh:ssh-client-host-key-untrusted-p client))
-      (cl-pnet-ssh::ssh-warn
-       "Port forwarding is disabled to avoid man-in-the-middle attacks.")
-      (when (exit-on-forward-failure-p client)
-        (fail "Error: forwarding disabled due to host key check failure"))
-      (return-from start-forwards nil)))
-  (dolist (forward (append (configured-local-forwards client)
-                           (getf *options* :local-forward)))
-    (start-local-forward client forward))
-  (dolist (forward (append (configured-remote-forwards client)
-                           (getf *options* :remote-forward)))
-    (start-remote-forward client forward))
-  (dolist (forward (append (configure-dynamic-forwards client)
-                           (getf *options* :dynamic-forward)))
-    (start-dynamic-forward client forward)))
+  (let* ((local (mapcar (lambda (forward)
+                          (expand-forward-for-client client forward))
+                        (append (configured-local-forwards client)
+                                (getf *options* :local-forward))))
+         (remote (mapcar (lambda (forward)
+                           (expand-forward-for-client client forward))
+                         (append (configured-remote-forwards client)
+                                 (getf *options* :remote-forward))))
+         (dynamic (append (mapcar (lambda (forward)
+                                    (expand-forward-for-client client
+                                                               forward))
+                                  (configure-dynamic-forwards client))
+                          (mapcar (lambda (forward)
+                                    (expand-forward-for-client client forward))
+                                  (getf *options* :dynamic-forward)))))
+    (let ((forwards (append local remote dynamic)))
+      ;; ssh refuses every forward once a changed host key was accepted under
+      ;; StrictHostKeyChecking=no: a forwarded port is exactly what a man in
+      ;; the middle wants.
+      (when (and forwards
+                 (cl-pnet-ssh:ssh-client-host-key-untrusted-p client))
+        (cl-pnet-ssh::ssh-warn
+         "Port forwarding is disabled to avoid man-in-the-middle attacks.")
+        (when (exit-on-forward-failure-p client)
+          (fail "Error: forwarding disabled due to host key check failure"))
+        (return-from start-forwards nil)))
+    (dolist (forward local)
+      (start-local-forward client forward))
+    (dolist (forward remote)
+      (start-remote-forward client forward))
+    (dolist (forward dynamic)
+      (start-dynamic-forward client forward))))
 
 (defun stop-dynamic-forwards ()
   (dolist (forward *dynamic-forwards*)
@@ -2857,8 +3695,275 @@ AddressFamily selected, as the asynchronous path does."
             (funcall on-success address)))
     (error (condition) (funcall on-error condition))))
 
-(defun resolve-config-options (host)
-  "HOST's ssh_config as SSH-CONFIG-OPTIONS and its canonical name, in order."
+(defun session-type-none-options-p (options)
+  "Whether OPTIONS' SessionType asks for forwards only, like -N."
+  (string= (or (cl-pnet-ssh:ssh-config-options-session-type options)
+               "default")
+           "none"))
+
+(defun background-without-command-p (options command-given-p)
+  "Whether ssh would refuse to fork here, in ssh.c's own terms.
+
+\"Cannot fork into background without a command to execute.\" guards -f and
+ForkAfterAuthentication: a command, a RemoteCommand, -N/-W/SessionType none
+or a subsystem request all give the forked session something to do."
+  (and (or (getf *options* :background)
+           (cl-pnet-ssh:ssh-config-options-fork-after-authentication options))
+       (not command-given-p)
+       (null (cl-pnet-ssh:ssh-config-command-value
+              (cl-pnet-ssh:ssh-config-options-remote-command options)))
+       (not (getf *options* :no-command))
+       (not (getf *options* :stdio-forward))
+       (not (session-type-none-options-p options))))
+
+(defun check-resolved-options (options command-given-p)
+  "Run ssh.c's post-configuration checks, which readconf does not make.
+
+Both are fatal with status 255 and neither carries a file or line prefix.
+Like every message after log_init they are silent under -q."
+  (flet ((say (text)
+           (unless (getf *options* :quiet)
+             (format *error-output* "~A~%" text)
+             (finish-output *error-output*))
+           (restore-terminal)
+           (uiop:quit 255)))
+    (when (eql 0 (cl-pnet-ssh:ssh-config-options-connection-attempts options))
+      (say "Invalid number of ConnectionAttempts"))
+    (when (background-without-command-p options command-given-p)
+      (say "Cannot fork into background without a command to execute."))))
+
+(defun check-forward-agent-socket (options)
+  "Warn when ForwardAgent names a socket path that does not exist.
+
+readconf accepts anything that is not a boolean as an agent socket path, and
+fill_default_options stats it before -G prints or the connection starts; the
+loss is reported at ERROR level, so -q hides the line but the connection
+still goes ahead."
+  (let ((path (and options
+                   (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                    options))))
+    (when path
+      (multiple-value-bind (exists reason)
+          (cl-pnet-ssh::ssh-stat-reason path)
+        (unless exists
+          (cl-pnet-ssh:ssh-warn "Cannot forward agent socket path \"~A\": ~A"
+                                path reason))))))
+
+(defparameter +ssh-invalid-hostname-characters+ "'`\"$\\;&<>|(){},"
+  "Characters ssh_valid_hostname refuses in a command-line host name.")
+
+(defparameter +ssh-invalid-ruser-characters+ "'`\";&<>|(){}$\\"
+  "Characters ssh_valid_ruser refuses in a command-line user name.")
+
+(defun ssh-control-character-p (character)
+  (or (< (char-code character) 32)
+      (= (char-code character) 127)))
+
+(defun ssh-valid-hostname-p (string)
+  "Whether STRING passes readconf's ssh_valid_hostname.
+
+Only the host given on the command line is checked; HostName from the
+configuration file is used as written."
+  (and (plusp (length string))
+       (not (char= (char string 0) #\-))
+       (loop for character across string
+             never (or (ssh-control-character-p character)
+                       (char= character #\Space)
+                       (find character +ssh-invalid-hostname-characters+
+                             :test #'char=)))))
+
+(defun ssh-valid-ruser-p (string)
+  "Whether STRING passes readconf's ssh_valid_ruser."
+  (and (plusp (length string))
+       (not (char= (char string 0) #\-))
+       (loop for index from 0 below (length string)
+             for character = (char string index)
+             never (or (ssh-control-character-p character)
+                       (find character +ssh-invalid-ruser-characters+
+                             :test #'char=)
+                       ;; A dash may not start a whitespace-separated word,
+                       ;; so an option-looking token cannot hide in a name.
+                       (and (char= character #\Space)
+                            (< (1+ index) (length string))
+                            (char= (char string (1+ index)) #\-))))))
+
+(defun command-line-user ()
+  "The user ssh has chosen before it reads any configuration file.
+
+-l and an explicit user@host win; otherwise the first -o User value, which
+readconf applies while it reads the option, is the one it validates."
+  (or (getf *options* :user)
+      (loop for line in (command-line-option-list)
+            do (multiple-value-bind (keyword value)
+                   (command-line-option-parts line)
+                 (when (and keyword value
+                            (string-equal keyword "User"))
+                   (return value))))))
+
+(defun check-command-line-identity (host)
+  "Run ssh.c's pre-configuration user and host validation.
+
+Both checks run before log_init, so -q does not hide them and their fatal
+messages carry no program prefix."
+  (flet ((say (text)
+           (format *error-output* "~A~%" text)
+           (finish-output *error-output*)
+           (restore-terminal)
+           (uiop:quit 255)))
+    (let ((user (command-line-user)))
+      (when (and user (not (ssh-valid-ruser-p user)))
+        (say "remote username contains invalid characters")))
+    (unless (ssh-valid-hostname-p host)
+      (say "hostname contains invalid characters"))))
+
+(defun client-expansion-context (host)
+  "The % token context ssh.c builds before its string expansions."
+  (cl-pnet-ssh::%make-ssh-config-context
+   :original-host host
+   :user (getf *options* :user)
+   :port (client-port)))
+
+(defun expand-client-option-variables (options host)
+  "Run ssh.c's default_client_percent_dollar_expand over OPTIONS.
+
+ssh expands these strings after readconf and before -G or connecting.  An
+unset ${NAME} is a fatal \"invalid environment variable expansion\"; a
+malformed expansion or an unknown % token dies inside percent_dollar_expand
+with \"percent_dollar_expand: failed\".  Both follow the log level, so -q
+silences them."
+  (let ((context (client-expansion-context host))
+        (quiet (getf *options* :quiet)))
+    (labels ((die (message kind)
+               (unless quiet
+                 (format *error-output* "vdollar_percent_expand: ~A~%"
+                         (cl-pnet-ssh::ssh-log-escape message))
+                 (format *error-output* "~A~%"
+                         (if (eq kind :missing-env)
+                             "invalid environment variable expansion"
+                             "percent_dollar_expand: failed"))
+                 (finish-output *error-output*))
+               (restore-terminal)
+               (uiop:quit 255))
+             (die-tilde (user)
+               (unless quiet
+                 (format *error-output* "tilde_expand: No such user ~A~%"
+                         (cl-pnet-ssh::ssh-log-escape user))
+                 (finish-output *error-output*))
+               (restore-terminal)
+               (uiop:quit 255))
+             (expand (value &key no-user tilde)
+               ;; ssh.c tilde-expands path options before the percent and
+               ;; environment expansion, so a leading ~ is gone by then.
+               (let ((text (namestring value)))
+                 (when tilde
+                   (multiple-value-bind (expanded user)
+                       (cl-pnet-ssh::ssh-config-expand-tilde text)
+                     (if user
+                         (die-tilde user)
+                         (setf text expanded))))
+                 (multiple-value-bind (expanded message kind)
+                     (cl-pnet-ssh::ssh-config-percent-dollar-expand
+                      text options context :no-user no-user)
+                   (when message (die message kind))
+                   expanded))))
+      ;; ssh.c's order: HostKeyAlias is tidied first, then User, ControlPath,
+      ;; IdentityAgent, RevokedHostKeys, ForwardAgent's socket path,
+      ;; VersionAddendum, the user's known-hosts files, then SetEnv values.
+      ;; GlobalKnownHostsFile is not expanded.
+      (let ((alias (cl-pnet-ssh:ssh-config-options-host-key-alias options)))
+        (when alias
+          (setf (cl-pnet-ssh:ssh-config-options-host-key-alias options)
+                (string-downcase alias))))
+      (when (and (cl-pnet-ssh:ssh-config-options-user options)
+                 (null (getf *options* :user)))
+        (setf (cl-pnet-ssh:ssh-config-options-user options)
+              (expand (cl-pnet-ssh:ssh-config-options-user options)
+                      :no-user t)))
+      (let ((path (cl-pnet-ssh:ssh-config-options-control-path options)))
+        (when (and path (not (eq path :none)) (not (string-equal path "none")))
+          (setf (cl-pnet-ssh:ssh-config-options-control-path options)
+                (expand path :tilde t))))
+      (let ((agent (cl-pnet-ssh:ssh-config-options-identity-agent options)))
+        (when (and agent (not (member agent '(:none :environment))))
+          (setf (cl-pnet-ssh:ssh-config-options-identity-agent options)
+                (pathname (expand agent :tilde t)))))
+      (setf (cl-pnet-ssh:ssh-config-options-revoked-host-keys options)
+            (mapcar (lambda (path) (pathname (expand path :tilde t)))
+                    (cl-pnet-ssh:ssh-config-options-revoked-host-keys
+                     options)))
+      (let ((path (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
+                   options)))
+        (when path
+          (setf (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path options)
+                (expand path :tilde t))))
+      (let ((text (cl-pnet-ssh:ssh-config-options-version-addendum options)))
+        (when text
+          (setf (cl-pnet-ssh:ssh-config-options-version-addendum options)
+                (expand text))))
+      (let ((paths (cl-pnet-ssh:ssh-config-options-known-hosts options)))
+        (when (listp paths)
+          (setf (cl-pnet-ssh:ssh-config-options-known-hosts options)
+                (mapcar (lambda (path) (pathname (expand path :tilde t)))
+                        paths))))
+      (setf (cl-pnet-ssh:ssh-config-options-set-env options)
+            (mapcar (lambda (assignment)
+                      (let ((equals (position #\= assignment)))
+                        (if equals
+                            (concatenate
+                             'string
+                             (subseq assignment 0 (1+ equals))
+                             (expand (subseq assignment (1+ equals))))
+                            assignment)))
+                    (cl-pnet-ssh:ssh-config-options-set-env options)))
+      options)))
+
+(defun expand-hostname-percent (value host)
+  "VALUE with ssh.c's HostName expansion applied.
+
+ssh.c calls percent_expand with only %h mapped, so every other token is
+fatal there rather than at configuration time.  The two lines come from
+log.c, so -q silences them, and the exit status stays 255."
+  (labels ((die (message)
+             (unless (getf *options* :quiet)
+               (format *error-output* "vdollar_percent_expand: ~A~%"
+                       (cl-pnet-ssh::ssh-log-escape message))
+               (format *error-output* "percent_expand: failed~%")
+               (finish-output *error-output*))
+             (restore-terminal)
+             (uiop:quit 255)))
+    (let ((out (make-string-output-stream))
+          (length (length value))
+          (index 0))
+      (loop while (< index length)
+            do (let ((character (char value index)))
+                 (cond
+                   ((char/= character #\%)
+                    (write-char character out)
+                    (incf index))
+                   ((>= (1+ index) length)
+                    (die "invalid format"))
+                   (t
+                    (let ((token (char value (1+ index))))
+                      (case token
+                        (#\h (write-string host out))
+                        (#\% (write-char #\% out))
+                        (t (die (format nil "unknown key %~C" token))))
+                      (incf index 2))))))
+      (get-output-stream-string out))))
+
+(defun prepare-client-hostname (options host)
+  "Apply ssh.c's post-readconf HostName tidy-up to OPTIONS."
+  (let ((value (cl-pnet-ssh:ssh-config-options-hostname options)))
+    (when value
+      (setf (cl-pnet-ssh:ssh-config-options-hostname options)
+            (expand-hostname-percent value host)))))
+
+(defun resolve-config-options (host &key command-given-p)
+  "HOST's ssh_config as SSH-CONFIG-OPTIONS and its canonical name, in order.
+
+COMMAND-GIVEN-P says whether a remote command was named; ssh.c's own checks
+after reading the configuration need it."
+  (check-config-file)
   (let ((result nil)
         (canonical nil)
         (failure nil)
@@ -2870,7 +3975,9 @@ AddressFamily selected, as the asynchronous path does."
                ;; they have to be folded in before the file is resolved.
                (resolver-option-list))
             (cl-pnet-ssh:ssh-config-error (condition)
-              (fail "~A" condition)))))
+              ;; Client-source validation reports readconf's own line before
+              ;; signalling, so only an unreported condition needs printing.
+              (fail-config-error condition)))))
     (cl-pnet-ssh:ssh-config-canonicalize
      source host
      :original-host host
@@ -2878,30 +3985,64 @@ AddressFamily selected, as the asynchronous path does."
      :port (client-port)
      :exec-matcher #'match-exec
      :resolver #'synchronous-canonical-resolver
+     :prepare-options (lambda (options) (prepare-client-hostname options host))
      :on-options (lambda (options canonical-host)
                    (setf result options canonical canonical-host))
      :on-error (lambda (condition) (setf failure condition)))
     (when failure
       (fail-config-error failure))
-    ;; ssh.c validates this after reading the configuration, beyond
-    ;; readconf, and its fatality has no file or line prefix.
-    (when (eql 0 (cl-pnet-ssh:ssh-config-options-connection-attempts result))
-      (format *error-output* "Invalid number of ConnectionAttempts~%")
-      (finish-output *error-output*)
-      (restore-terminal)
-      (uiop:quit 255))
+    (check-resolved-options result command-given-p)
+    (expand-client-option-variables result host)
+    (check-forward-agent-socket result)
     (values result canonical)))
 
 (defun print-list-option (name values)
   (dolist (value values)
     (format t "~A ~A~%" name value)))
 
-(defun print-config (host)
+(defun print-config (host &optional command-given-p)
   (multiple-value-bind (options canonical)
-      (resolve-config-options host)
+      (resolve-config-options host :command-given-p command-given-p)
     (print-config-options host options canonical))
   (finish-output)
   (uiop:quit 0))
+
+(defun expand-identity-path (path options host)
+  "PATH with its % tokens and leading ~ expanded, as a key loader opens it.
+
+readconf records an IdentityFile spelling exactly as written, so -G repeats
+it; the expansion happens when the file is actually loaded.  HOST,
+IdentityFile and the command-line user answer %h, %n and %r."
+  (let* ((context (cl-pnet-ssh::%make-ssh-config-context
+                   :original-host host
+                   :user (getf *options* :user)
+                   :port (client-port)))
+         (name (namestring path))
+         (text (multiple-value-bind (expanded unknown)
+                   (cl-pnet-ssh::ssh-config-expand-tilde name)
+                 (when unknown
+                   (unless (getf *options* :quiet)
+                     (format *error-output* "tilde_expand: No such user ~A~%"
+                             (cl-pnet-ssh::ssh-log-escape unknown))
+                     (finish-output *error-output*))
+                   (restore-terminal)
+                   (uiop:quit 255))
+                 expanded)))
+    (multiple-value-bind (expanded message kind)
+        (cl-pnet-ssh::ssh-config-percent-dollar-expand
+         text options context)
+      (when message
+        (unless (getf *options* :quiet)
+          (format *error-output* "vdollar_percent_expand: ~A~%"
+                  (cl-pnet-ssh::ssh-log-escape message))
+          (format *error-output* "~A~%"
+                  (if (eq kind :missing-env)
+                      "invalid environment variable expansion"
+                      "percent_dollar_expand: failed"))
+          (finish-output *error-output*))
+        (restore-terminal)
+        (uiop:quit 255))
+      expanded)))
 
 (defun dump-public-key-blob (path)
   "PATH's public key blob, as ssh -Z loads one.
@@ -2964,7 +4105,8 @@ the rest are reordered among the slots they occupy."
                   (prog1 (first next) (setf next (rest next)))))
             entries)))
 
-(defun dump-public-key-identities (host &optional (stream *standard-output*))
+(defun dump-public-key-identities (host &optional (stream *standard-output*)
+                                            command-given-p)
   "Print the keys authentication would offer for HOST, as ssh -Z does.
 
 Mirrors OpenSSH's pubkey_prepare: CertificateFile certificates first, then
@@ -2974,14 +4116,13 @@ file that cannot be read is still listed with an empty type and fingerprint;
 only a -i path that does not exist at all is dropped, as ssh's option parser
 drops it."
   (multiple-value-bind (options canonical)
-      (resolve-config-options host)
+      (resolve-config-options host :command-given-p command-given-p)
     (declare (ignore canonical))
     (let* ((explicit
              (loop for path in (reverse
                                 (getf *options* :identity-arguments))
-                   for name = (cl-pnet-ssh::ssh-config-expand-home
-                               (namestring path))
-                   when (probe-file name)
+                   for name = (expand-identity-path path options host)
+                   when (cl-pnet-ssh:ssh-file-exists-p name)
                      collect name))
            (configured
              (reverse
@@ -3000,17 +4141,22 @@ drops it."
                 cl-pnet-ssh::+ssh-default-identity-names+)))
            (files '()))
       (labels ((add (name blob explicit-p)
-                 "Add (NAME BLOB EXPLICIT-P) unless that pair is already there."
-                 (unless (find-if (lambda (entry)
-                                    (and (string= (first entry) name)
-                                         (eql (third entry) explicit-p)))
-                                  files)
+                 "Add (NAME BLOB EXPLICIT-P) unless that pair is already there.
+
+                 An IdentityFile of \"none\" is a placeholder readconf records
+                 but load_public_identity_files skips with strcasecmp, so -Z
+                 never lists it."
+                 (unless (or (string-equal name "none")
+                             (find-if (lambda (entry)
+                                        (and (string= (first entry) name)
+                                             (eql (third entry) explicit-p)))
+                                      files))
                    (push (list name blob explicit-p) files))))
         (dolist (name explicit)
           (add name (dump-public-key-blob name) 1))
         (loop for path in configured
               for explicit-p in configured-userprovided
-              for name = (namestring path)
+              for name = (expand-identity-path path options host)
               do (add name (dump-public-key-blob name) explicit-p))
         (dolist (name defaults)
           (add name (dump-public-key-blob name) 0)))
@@ -3044,7 +4190,7 @@ drops it."
                         (reverse
                          (cl-pnet-ssh:ssh-config-options-certificate-files-userprovided
                           options))
-                      for name = (namestring path)
+                      for name = (expand-identity-path path options host)
                       for blob = (dump-public-certificate-blob name)
                       when (and blob
                                 (cl-pnet-ssh::ssh-certificate-blob-p blob))
@@ -3093,9 +4239,9 @@ drops it."
             (dump-public-key-line stream (first entry) (second entry)
                                   (third entry) nil)))))))
 
-(defun dump-public-keys (host)
+(defun dump-public-keys (host &optional command-given-p)
   "Print the public keys and exit, as ssh -Z does."
-  (dump-public-key-identities host)
+  (dump-public-key-identities host *standard-output* command-given-p)
   (finish-output)
   (uiop:quit 0))
 
@@ -3135,6 +4281,189 @@ character becomes \\^A, a space \\040, a backslash \\\\ and a high byte
          ((= byte 127) "\\^?")
          (t (format nil "\\^~C" (code-char (+ byte 64)))))))))
 
+(defun proxy-jump-numeric-host-p (host)
+  "Whether -G wraps HOST in brackets, as ssh's numeric-address test does."
+  (or (find #\: host)
+      (and (plusp (length host))
+           (every (lambda (character)
+                    (find character "1234567890."))
+                  host))))
+
+(defun format-proxy-jump-hop (hop)
+  "One ProxyJump hop with a numeric host bracketed, as ssh -G prints it."
+  (let* ((at (position #\@ hop))
+         (user (and at (subseq hop 0 (1+ at))))
+         (hostpart (if at (subseq hop (1+ at)) hop)))
+    (if (and (plusp (length hostpart))
+             (char= (char hostpart 0) #\[))
+        hop
+        (let* ((colon (position #\: hostpart))
+               (host (if colon (subseq hostpart 0 colon) hostpart))
+               (port (if colon (subseq hostpart colon) "")))
+          (if (proxy-jump-numeric-host-p host)
+              (format nil "~A[~A]~A" (or user "") host port)
+              hop)))))
+
+(defun format-proxy-jump (value)
+  "VALUE's hops, numeric hosts bracketed, joined with commas."
+  (let ((hops (cond ((listp value) value)
+                    ((stringp value)
+                     (uiop:split-string value :separator ","))
+                    (t nil))))
+    (format nil "~{~A~^,~}" (mapcar #'format-proxy-jump-hop hops))))
+
+(defstruct (dump-forward (:constructor %make-dump-forward))
+  kind
+  listen-address listen-port listen-path
+  host port target-path)
+
+(defun dump-forward-endpoint (address port path)
+  "One forwarding endpoint, formatted as dump_cfg_forwards prints it."
+  (cond (path path)
+        (address (format nil "[~A]:~A" address port))
+        (t (format nil "~A" port))))
+
+(defun dump-forward-from-forward (kind forward)
+  (%make-dump-forward
+   :kind kind
+   :listen-address (forward-bind-address forward)
+   :listen-port (forward-bind-port forward)
+   :listen-path (forward-bind-path forward)
+   :host (forward-host forward)
+   :port (forward-port forward)
+   :target-path (forward-target-path forward)))
+
+(defun dump-forward-from-dynamic (forward)
+  (%make-dump-forward
+   :kind :dynamic
+   :listen-address (dynamic-forward-bind-address forward)
+   :listen-port (dynamic-forward-bind-port forward)
+   :listen-path (dynamic-forward-bind-path forward)
+   :target-path (dynamic-forward-target-path forward)))
+
+(defun dump-forward-from-option (keyword value)
+  "A dump record for ssh_config KEYWORD with VALUE, as -o or a file wrote it."
+  (let ((value (or (cl-pnet-ssh::ssh-forward-expand-value value nil) value)))
+    (cond
+      ((string= keyword "localforward")
+       (dump-forward-from-forward :local (parse-config-local-forward value)))
+      ((string= keyword "remoteforward")
+       (dump-forward-from-forward :remote (parse-config-remote-forward value)))
+      (t
+       ;; DynamicForward takes [bind_address:]port or a socket path.
+       (if (path-field-p value)
+           (%make-dump-forward :kind :dynamic :listen-path value)
+           (dump-forward-from-dynamic (parse-dynamic-forward value)))))))
+
+(defun dump-forward-record (record)
+  "The dump record for one command-line forwarding EVENT."
+  (case (first record)
+    (:local
+     (dump-forward-from-forward :local (parse-local-forward (second record))))
+    (:remote
+     (dump-forward-from-forward :remote (parse-remote-forward (second record))))
+    (:dynamic
+     (dump-forward-from-dynamic (parse-dynamic-forward (second record))))
+    (:option
+     (multiple-value-bind (keyword value)
+         (command-line-option-parts (second record))
+       (dump-forward-from-option (string-downcase (or keyword "")) value)))
+    (t nil)))
+
+(defun expand-forward-path (options host canonical path)
+  "PATH with ssh.c's percent_expand, or NIL when PATH is NIL.
+
+ssh.c expands LocalForward and RemoteForward listen/connect paths after
+readconf and before -G or connecting, so %d and friends have already turned
+into their values in the dump."
+  (and path
+       (expand-client-percent
+        options host canonical path
+        :port (or (cl-pnet-ssh:ssh-config-options-port options)
+                  (client-port)
+                  22)
+        :user (or (cl-pnet-ssh:ssh-config-options-user options)
+                  (getf *options* :user)
+                  (cl-pnet-ssh:ssh-default-user)))))
+
+(defun expand-dump-forward-paths (record options host canonical)
+  "RECORD with its socket paths expanded, as ssh.c does before -G."
+  (setf (dump-forward-listen-path record)
+        (expand-forward-path options host canonical
+                             (dump-forward-listen-path record))
+        (dump-forward-target-path record)
+        (expand-forward-path options host canonical
+                             (dump-forward-target-path record)))
+  record)
+
+(defun forward-dump-records (options host canonical)
+  "The forwarding records -G prints, with ssh.c's path expansions applied.
+
+Building the records up front matters: ssh.c expands RemoteCommand and the
+forwarding paths before dump_client_config, so a bad % token leaves no
+partial dump behind."
+  (mapcar (lambda (record)
+            (expand-dump-forward-paths record options host canonical))
+          (append
+           (mapcar #'dump-forward-record (command-line-forward-events))
+           (loop for entry in (reverse
+                               (cl-pnet-ssh::ssh-config-options-extra options))
+                 when (eq (second entry) :file)
+                   collect (dump-forward-from-option
+                            (first entry)
+                            (format nil "~{~A~^ ~}" (cddr entry)))))))
+
+(defun print-forward-dump (records)
+  "Print the forwarding lines of -G exactly as readconf dumps them.
+
+readconf keeps one array per direction, so the dynamic entries come first
+(including a local forward whose target is a socket path), then every local
+forward, then every remote forward, each array in the order the arguments and
+configuration lines were read."
+  (dolist (record records)
+    (when (or (eq (dump-forward-kind record) :dynamic)
+              (and (eq (dump-forward-kind record) :local)
+                   (null (dump-forward-host record))))
+      (format t "dynamicforward ~A~%"
+              (dump-forward-endpoint
+               (dump-forward-listen-address record)
+               (dump-forward-listen-port record)
+               (dump-forward-listen-path record)))))
+  (dolist (record records)
+    (cond
+      ((eq (dump-forward-kind record) :local)
+       (format t "localforward ~A ~A~%"
+               (dump-forward-endpoint
+                (dump-forward-listen-address record)
+                (dump-forward-listen-port record)
+                (dump-forward-listen-path record))
+               (dump-forward-endpoint
+                (dump-forward-host record)
+                (dump-forward-port record)
+                (dump-forward-target-path record))))
+      ;; A dynamic forward with a socket target sits in readconf's local
+      ;; array without a connect host, so it is dumped twice: once as a
+      ;; dynamic forward and once as a local one.
+      ((and (eq (dump-forward-kind record) :dynamic)
+            (dump-forward-target-path record))
+       (format t "localforward ~A ~A~%"
+               (dump-forward-endpoint
+                (dump-forward-listen-address record)
+                (dump-forward-listen-port record)
+                (dump-forward-listen-path record))
+               (dump-forward-target-path record)))))
+  (dolist (record records)
+    (when (eq (dump-forward-kind record) :remote)
+      (format t "remoteforward ~A ~A~%"
+              (dump-forward-endpoint
+               (dump-forward-listen-address record)
+               (dump-forward-listen-port record)
+               (dump-forward-listen-path record))
+              (dump-forward-endpoint
+               (dump-forward-host record)
+               (dump-forward-port record)
+               (dump-forward-target-path record))))))
+
 (defun print-config-options (host options canonical)
   "Print OPTIONS resolved for HOST, whose canonical name is CANONICAL.
 
@@ -3142,9 +4471,25 @@ The field set, order and spellings follow OpenSSH 10.6's dump_client_config,
 so a script that reads `ssh -G` finds the same configuration from burs.
 Values where this build makes a different choice (its own algorithm offers
 and known-hosts files) are printed as this client will actually use them."
-  (let ((hostname (or canonical
-                      (cl-pnet-ssh:ssh-config-options-hostname options)
-                      host)))
+  (let* ((hostname (or canonical
+                       (cl-pnet-ssh:ssh-config-options-hostname options)
+                       host))
+         ;; ssh.c expands RemoteCommand and every forwarding path before it
+         ;; dumps anything, so a bad % token here must leave no output.
+         (remote (cl-pnet-ssh:ssh-config-command-value
+                  (cl-pnet-ssh:ssh-config-options-remote-command options)))
+         (remote-expanded (and remote
+                               (expand-client-percent
+                                options host hostname remote
+                                :port (or (cl-pnet-ssh:ssh-config-options-port
+                                           options)
+                                          (client-port)
+                                          22)
+                                :user (or (cl-pnet-ssh:ssh-config-options-user
+                                           options)
+                                          (getf *options* :user)
+                                          (cl-pnet-ssh:ssh-default-user)))))
+         (forward-records (forward-dump-records options host hostname)))
     (flet ((yes-no (value) (if value "yes" "no"))
            (true-false (value) (if value "true" "false"))
            (paths (values) (mapcar #'namestring values))
@@ -3267,10 +4612,25 @@ and known-hosts files) are printed as this client will actually use them."
                       :no)
                   "false"
                   "true"))
-      (format t "requesttty ~A~%"
-              (or (tty-setting-name (getf *options* :request-tty))
-                  (cl-pnet-ssh:ssh-config-options-request-tty options)
-                  "auto"))
+      (let ((setting (or (getf *options* :request-tty)
+                         (cl-pnet-ssh:ssh-config-options-request-tty
+                          options))))
+        ;; 10.6 prints the first spelling of RequestTTY's multistate table.
+        (format t "requesttty ~A~%"
+                (cond
+                  ((null setting) "auto")
+                  ((eq setting :yes) "true")
+                  ((eq setting :no) "false")
+                  ((eq setting :force) "force")
+                  ((eq setting :auto) "auto")
+                  ((stringp setting)
+                   (case (request-tty-multistate setting)
+                     (:yes "true")
+                     (:no "false")
+                     (:force "force")
+                     (:auto "auto")
+                     (t (string-downcase setting))))
+                  (t (string-downcase (princ-to-string setting))))))
       (format t "sessiontype ~A~%"
               (or (cl-pnet-ssh:ssh-config-options-session-type options)
                   "default"))
@@ -3283,14 +4643,22 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "streamlocalbindunlink ~A~%"
               (yes-no (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
                        options)))
+      ;; -G prints the first spelling of the multistate table that matches
+      ;; the value, so yes/true both become "true" and no/off both "false".
       (format t "stricthostkeychecking ~A~%"
-              (or (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
-                   options)
-                  (case (getf *options* :policy)
-                    (:insecure "no")
-                    (:accept-new "accept-new")
-                    (:ask "ask")
-                    (t "ask"))))
+              (let ((value
+                      (cl-pnet-ssh:ssh-config-options-strict-host-key-checking
+                       options)))
+                (cond
+                  ((null value)
+                   (case (getf *options* :policy)
+                     (:insecure "false")
+                     (:accept-new "accept-new")
+                     (:ask "ask")
+                     (t "ask")))
+                  ((member value '("no" "off") :test #'string-equal) "false")
+                  ((member value '("yes" "true") :test #'string-equal) "true")
+                  (t value))))
       ;; TCPKeepAlive's multistate prints true/false in 10.6.
       (format t "tcpkeepalive ~A~%"
               (true-false
@@ -3303,8 +4671,9 @@ and known-hosts files) are printed as this client will actually use them."
                 ((getf *options* :tunnel) "point-to-point")
                 (t (case (cl-pnet-ssh:ssh-config-options-tunnel options)
                      (:ethernet "ethernet")
-                     (:point-to-point "point-to-point")
-                     ((:yes) "true")
+                     ;; SSH_TUNMODE_DEFAULT is SSH_TUNMODE_POINTOPOINT, and
+                     ;; the dump names the first table entry with that value.
+                     ((:point-to-point :yes) "point-to-point")
                      (t "false")))))
       (format t "verifyhostkeydns ~A~%"
               (case (cl-pnet-ssh:ssh-config-options-verify-host-key-dns
@@ -3314,14 +4683,10 @@ and known-hosts files) are printed as this client will actually use them."
               (yes-no (cl-pnet-ssh:ssh-config-options-visual-host-key
                        options)))
       ;; 10.6 prints true/false/ask here, and turns UpdateHostKeys off by
-      ;; default when UserKnownHostsFile was named explicitly.
+      ;; default when VerifyHostKeyDNS asks for DNS keys or the user's
+      ;; known-hosts list was changed from the single default file.
       (format t "updatehostkeys ~A~%"
-              (case (or (cl-pnet-ssh:ssh-config-options-update-host-keys
-                         options)
-                        (if (cl-pnet-ssh:ssh-config-options-known-hosts
-                             options)
-                            :no
-                            :yes))
+              (case (cl-pnet-ssh:ssh-config-update-host-keys-default options)
                 (:yes "true")
                 (:ask "ask")
                 (t "false")))
@@ -3419,15 +4784,16 @@ and known-hosts files) are printed as this client will actually use them."
                "HostbasedAcceptedAlgorithms"
                (key-algorithm-name-universe
                 (supported-signature-all-algorithms))))
-      (let ((value (or (getf *options* :agent)
-                       (cl-pnet-ssh:ssh-config-options-identity-agent
-                        options))))
+      (let ((value (or (cl-pnet-ssh:ssh-config-options-identity-agent options)
+                       (getf *options* :agent))))
         (when value
           (format t "identityagent ~A~%"
                   (case value
                     (:none "none")
                     (:environment "SSH_AUTH_SOCK")
-                    (t value)))))
+                    (t (if (stringp value)
+                           (cl-pnet-ssh::ssh-config-expand-home value)
+                           value))))))
       (let ((ignored (cl-pnet-ssh:ssh-config-options-ignored-unknown options)))
         (when ignored
           (format t "ignoreunknown ~A~%" ignored)))
@@ -3448,11 +4814,14 @@ and known-hosts files) are printed as this client will actually use them."
                "CASignatureAlgorithms"
                (key-algorithm-name-universe
                 (supported-ca-signature-algorithm-names))))
-      (let ((local (cl-pnet-ssh:ssh-config-options-local-command options)))
+      (let ((local (cl-pnet-ssh:ssh-config-command-value
+                    (cl-pnet-ssh:ssh-config-options-local-command options))))
         (when local
           (format t "localcommand ~A~%" local)))
-      (let ((remote (cl-pnet-ssh:ssh-config-options-remote-command options)))
+      (let ((remote remote-expanded))
         (when remote
+          ;; ssh.c expands RemoteCommand with percent_expand before -G, so
+          ;; %h is the final canonical host and ${NAME} stays literal.
           (format t "remotecommand ~A~%" remote)))
       (format t "loglevel ~A~%"
               (string-upcase
@@ -3489,8 +4858,9 @@ and known-hosts files) are printed as this client will actually use them."
       (format t "xauthlocation ~A~%"
               (or (cl-pnet-ssh:ssh-config-options-xauth-location options)
                   "/usr/bin/xauth"))
-      (let ((command (cl-pnet-ssh:ssh-config-options-known-hosts-command
-                      options)))
+      (let ((command (cl-pnet-ssh:ssh-config-command-value
+                      (cl-pnet-ssh:ssh-config-options-known-hosts-command
+                       options))))
         (when command
           (format t "knownhostscommand ~A~%" command)))
       (let ((tag (or (getf *options* :tag)
@@ -3506,32 +4876,37 @@ and known-hosts files) are printed as this client will actually use them."
                     "")))
 
       ;; Forwarding lines.
-      (print-list-option
-       "dynamicforward"
-       (reverse (cl-pnet-ssh:ssh-config-options-dynamic-forwards options)))
-      (print-list-option
-       "localforward"
-       (reverse (cl-pnet-ssh:ssh-config-options-local-forwards options)))
-      (print-list-option
-       "remoteforward"
-       (reverse (cl-pnet-ssh:ssh-config-options-remote-forwards options)))
+      (print-forward-dump forward-records)
 
       ;; String arrays.
-      (let ((files (or (reverse
-                        (cl-pnet-ssh:ssh-config-options-identity-files
-                         options))
-                       (reverse (getf *options* :identity)))))
-        (if files
-            (print-list-option "identityfile" (paths files))
-            (dolist (name cl-pnet-ssh::+ssh-default-identity-names+)
-              (format t "identityfile ~~/.ssh/~A~%" name))))
+      ;;
+      ;; -i, -o IdentityFile and the file's own entries are printed in the
+      ;; order ssh recorded them: the command line in argv order (an -i
+      ;; spelling is expanded, an -o one is left as written) and then the
+      ;; configuration file's entries.  A duplicate the resolver already
+      ;; dropped does not reappear here.
+      (multiple-value-bind (command-line option-spellings)
+          (command-line-identity-entries)
+        (let* ((configured
+                 (reverse
+                  (cl-pnet-ssh:ssh-config-options-identity-files options)))
+               (from-file
+                 (loop for path in configured
+                       for name = (namestring path)
+                       unless (member name option-spellings :test #'string=)
+                         collect name))
+               (files (append command-line from-file)))
+          (if files
+              (print-list-option "identityfile" files)
+              (dolist (name cl-pnet-ssh::+ssh-default-identity-names+)
+                (format t "identityfile ~~/.ssh/~A~%" name)))))
+      (print-list-oneline
+       "canonicaldomains"
+       (cl-pnet-ssh:ssh-config-options-canonical-domains options))
       (print-list-option
        "certificatefile"
        (paths (reverse
                (cl-pnet-ssh:ssh-config-options-certificate-files options))))
-      (print-list-oneline
-       "canonicaldomains"
-       (cl-pnet-ssh:ssh-config-options-canonical-domains options))
       (print-list-oneline
        "globalknownhostsfile"
        (let ((files (cl-pnet-ssh:ssh-config-options-global-known-hosts
@@ -3573,19 +4948,27 @@ and known-hosts files) are printed as this client will actually use them."
            ((eq permit :none) (list "none"))
            ((or (null permit) (eq permit :any)) (list "any"))
            (t (mapcar (lambda (entry)
-                        (format nil "~A:~A"
-                                (car entry)
-                                (if (eq (cdr entry) :any)
-                                    "*"
-                                    (cdr entry))))
+                        ;; readconf stores the argument as written and -G
+                        ;; reprints it, so the raw spelling is what we keep.
+                        (first entry))
                       permit)))))
-      (format t "addkeystoagent ~A~%"
-              (case (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
-                     options)
-                (:yes "true")
-                (:ask "ask")
-                (:confirm "confirm")
-                (t "false")))
+      (let ((state (cl-pnet-ssh:ssh-config-options-add-keys-to-agent
+                    options))
+            (lifespan
+              (cl-pnet-ssh:ssh-config-options-add-keys-to-agent-lifespan
+               options)))
+        (if (and lifespan (plusp lifespan))
+            ;; readconf prints the lifetime and, only for "confirm", the
+            ;; word before it.
+            (format t "addkeystoagent~A ~D~%"
+                    (if (eq state :confirm) " confirm" "")
+                    lifespan)
+            (format t "addkeystoagent ~A~%"
+                    (case state
+                      (:yes "true")
+                      (:ask "ask")
+                      (:confirm "confirm")
+                      (t "false")))))
       (format t "forwardagent ~A~%"
               (let* ((cli (getf *options* :forward-agent))
                      (path
@@ -3607,7 +4990,9 @@ and known-hosts files) are printed as this client will actually use them."
                       (cl-pnet-ssh:ssh-config-options-connect-timeout
                        options)))
                 (if (integerp value) (format nil "~D" value) "none")))
-      (let ((device (cl-pnet-ssh:ssh-config-options-tunnel-device options)))
+      (let ((device (or (getf *options* :tunnel-device)
+                        (cl-pnet-ssh:ssh-config-options-tunnel-device
+                         options))))
         (format t "tunneldevice ~A:~A~%"
                 (if device
                     (if (eq (car device) :any) "any" (car device))
@@ -3630,6 +5015,9 @@ and known-hosts files) are printed as this client will actually use them."
         (format t "controlpersist ~A~%"
                 (cond ((or (null persist) (eq persist :no)) "no")
                       ((eq persist :yes) "yes")
+                      ;; readconf dumps the flag whenever the timeout is
+                      ;; zero, so both "yes" and a bare 0 print yes.
+                      ((eql persist 0) "yes")
                       (t (format nil "~D" persist)))))
       (format t "escapechar ~A~%"
               (let ((value (cl-pnet-ssh:ssh-config-options-escape-char
@@ -3640,7 +5028,8 @@ and known-hosts files) are printed as this client will actually use them."
                  ((eq value :none) "none")
                  (t (or (car (rassoc value cl-pnet-ssh::+ssh-config-ip-qos-names+
                                      :test #'eql))
-                        (format nil "0x~2,'0x" value))))))
+                        (string-downcase
+                         (format nil "0x~2,'0x" value)))))))
         (format t "ipqos ~A ~A~%"
                 (ip-qos-name
                  (cl-pnet-ssh:ssh-config-options-ip-qos-interactive options))
@@ -3659,20 +5048,18 @@ and known-hosts files) are printed as this client will actually use them."
 
       ;; ProxyCommand and ProxyJump share one line: ssh prints the jump
       ;; specification when there is one, otherwise the command, and
-      ;; nothing when neither is configured.
-      (let ((jump (or (let ((value
-                             (cl-pnet-ssh:ssh-config-options-proxy-jump
-                              options)))
-                        (cond ((null value) nil)
-                              ((listp value) (format nil "~{~A~^,~}" value))
-                              (t value)))
-                      (getf *options* :jump))))
+      ;; nothing when neither is configured.  readconf's "none" is cleared
+      ;; before the dump, so it falls through to the command.
+      (let ((jump (cl-pnet-ssh:ssh-config-command-value
+                   (or (cl-pnet-ssh:ssh-config-options-proxy-jump options)
+                       (getf *options* :jump)))))
         (if jump
             (format t "proxyjump ~A~%" jump)
-            (let ((command (or (cl-pnet-ssh:ssh-config-options-proxy-command
-                                options)
-                               (getf *options* :proxy-command))))
-              (when (and command (not (string-equal command "none")))
+            (let ((command (cl-pnet-ssh:ssh-config-command-value
+                            (or (cl-pnet-ssh:ssh-config-options-proxy-command
+                                 options)
+                                (getf *options* :proxy-command)))))
+              (when command
                 (format t "proxycommand ~A~%" command))))))))
 
 ;;; ---- Entry point ----
@@ -3721,8 +5108,10 @@ of calling back in the middle of authentication."
   (let ((banner (cl-pnet-ssh:ssh-client-banner client)))
     (when banner
       (setf (cl-pnet-ssh:ssh-client-banner client) nil)
-      (format *error-output* "~A" banner)
-      (finish-output *error-output*))))
+      ;; input_userauth_banner prints only at INFO or above, so -q drops it.
+      (unless (getf *options* :quiet)
+        (format *error-output* "~A" banner)
+        (finish-output *error-output*)))))
 
 (defun read-keyboard-interactive-answers (name instruction prompts)
   "Ask each of PROMPTS, a list of (TEXT ECHO-P), and return the answers.
@@ -3743,6 +5132,60 @@ or WINDOWS.LISP."
         (unless answer
           (return nil))
         (push answer answers)))))
+
+(defun private-key-permissions-too-open-p (path)
+  "Whether PATH is a key file ssh refuses because others may read it.
+
+The rules are OpenSSH's: on Unix only a file owned by the current user is
+checked and any group or other permission bit is too much; on Windows the
+ACL must admit nobody but its owner, Administrators, SYSTEM or
+TrustedInstaller.  The warning goes through SSH-WARN, so -q silences it and
+-E sends it to the log, as ssh's error() does."
+  #+win32
+  (when (handler-case (windows-acl-too-open-p path) (error () t))
+    (dolist (line
+             (list
+              "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+              "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @"
+              "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+              (format nil "Permissions for '~A' are too open."
+                      (uiop:native-namestring path))
+              "It is required that your private key files are NOT accessible by others."
+              "This private key will be ignored."))
+      (cl-pnet-ssh:ssh-warn "~A" line))
+    t)
+  #+(and sbcl (not win32))
+  (let ((stat (ignore-errors
+               (sb-posix:stat (uiop:native-namestring path)))))
+    (when (and stat
+               (= (sb-posix:stat-uid stat) (sb-posix:getuid))
+               (plusp (logand (sb-posix:stat-mode stat) #o077)))
+      (dolist (line
+               (list
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+                "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @"
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+                (format nil "Permissions 0~3,'0O for '~A' are too open."
+                        (logand (sb-posix:stat-mode stat) #o777)
+                        (uiop:native-namestring path))
+                "It is required that your private key files are NOT accessible by others."
+                "This private key will be ignored."))
+        (cl-pnet-ssh:ssh-warn "~A" line))
+      t))
+  #-(or win32 (and sbcl (not win32)))
+  nil)
+
+(defun key-passphrase-prompt (path)
+  "Ask for PATH's passphrase the way ssh's load_identity_file does.
+
+ssh reads the answer from the controlling terminal, so a redirected stdin is
+not treated as an answer here either; without a terminal there is no prompt
+and the key stays unusable.  The text, including its 100-character limit on
+the file name, is ssh's own.  The library asks again after a wrong answer
+and stops on an empty one."
+  (read-tty-line
+   (format nil "Enter passphrase for key '~A': "
+           (subseq path 0 (min (length path) 100)))))
 
 (defun password-authentication-prompt (client prompt)
   "Ask for a password the way ssh's password method does."
@@ -3800,8 +5243,77 @@ a controlling terminal refuses instead of blocking."
                             (finish-output stream)))))))))))
         (error () nil)))))
 
+(defun report-missing-identity-files (options host)
+  "Report an identity file that does not exist, as ssh does.
+
+readconf marks every IdentityFile from a user configuration and from -o as
+userprovided, so load_identity_file logs each stat failure at INFO.  A -i
+argument is checked earlier, while the options are parsed, and never reaches
+this list.  The path is expanded as the loader expands it, because readconf
+records the spelling as written.  Identity files load before this client
+dials, so the line appears before host-key warnings rather than during
+authentication."
+  (dolist (path (reverse
+                 (cl-pnet-ssh:ssh-config-options-identity-files options)))
+    (let ((name (expand-identity-path path options host)))
+      (unless (string-equal (namestring path) "none")
+        (multiple-value-bind (exists reason)
+            (cl-pnet-ssh::ssh-stat-reason name)
+          (unless exists
+            (cl-pnet-ssh:ssh-warn "no such identity: ~A: ~A"
+                                  name reason)))))))
+
+(defun config-open-error-reason (condition)
+  "The strerror-like tail of a CONFIG file open failure.
+
+SBCL writes the same reason either after \": \" on one line or after a
+trailing \":\" and a newline, depending on the pathname, so take everything
+after the last colon and trim the whitespace around it."
+  (let* ((text (princ-to-string condition))
+         (colon (search ":" text :from-end t)))
+    (if colon
+        (string-trim '(#\Space #\Tab #\Newline #\Return)
+                     (subseq text (1+ colon)))
+        text)))
+
+(defun check-config-file ()
+  "Leave as ssh does when its explicit -F file cannot be read.
+
+ssh.c calls fatal(\"Can't open user config file %.100s: %.100s\") after
+log_init, so LogLevel QUIET keeps the line back but the status is still 255.
+-F none asks for no file at all and is never checked."
+  (let ((config (getf *options* :config)))
+    (when (and (stringp config)
+               (not (string-equal config "none")))
+      (let ((failure
+              (cond
+                ;; SBCL merges "" with the default pathname, which would
+                ;; make it name the current directory; readconf sees ENOENT.
+                ((zerop (length config)) "No such file or directory")
+                ;; fopen() does not glob, so a name with wildcard characters
+                ;; is simply absent; SBCL would signal while building the
+                ;; pathname instead.
+                ((wild-pathname-p (pathname config))
+                 "No such file or directory")
+                (t
+                 (handler-case
+                     (progn
+                       (with-open-file (stream config :direction :input)
+                         (declare (ignore stream)))
+                       nil)
+                   (error (condition) condition))))))
+        (when failure
+          (unless (getf *options* :quiet)
+            (format *error-output* "Can't open user config file ~A: ~A~%"
+                    (subseq config 0 (min 100 (length config)))
+                    (config-open-error-reason failure))
+            (finish-output *error-output*))
+          (restore-terminal)
+          (uiop:quit 255))))))
+
 (defun start-client (host command command-given-p)
   "Run COMMAND on HOST, letting the library follow ~/.ssh/config for it."
+  (check-config-file)
   (cl-pnet-ssh:make-ssh-client-from-config
    host
    :config (getf *options* :config)
@@ -3819,6 +5331,13 @@ a controlling terminal refuses instead of blocking."
    ;; ServerAliveInterval, ...) work too.
    :options (resolver-option-list)
    :exec-matcher #'match-exec
+   ;; ssh.c's own post-configuration checks run before anything dials, so a
+   ;; bad ConnectionAttempts or a pointless -f is fatal even for -G.
+   :validate-options
+   (lambda (options canonical)
+     (check-resolved-options options command-given-p)
+     (check-forward-agent-socket options)
+     (report-missing-identity-files options canonical))
    :on-client (lambda (client)
                 (setf *client* client)
                 (apply-config-log-level client)
@@ -3833,6 +5352,7 @@ a controlling terminal refuses instead of blocking."
    :password-callback #'password-authentication-prompt
    :kbd-interactive-callback
    #'keyboard-interactive-authentication-prompt
+   :passphrase-callback #'key-passphrase-prompt
    :on-open
    (lambda (client)
      (if *mux-daemon*
@@ -3878,12 +5398,6 @@ a controlling terminal refuses instead of blocking."
            (let ((background (or (getf *options* :background)
                                  (config-fork-after-authentication-p client)
                                  *background-child*)))
-             (when (and background
-                        (not command-given-p)
-                        (not (getf *options* :no-command))
-                        (not (session-type-none-p client))
-                        (null (config-remote-command client)))
-               (fail "Cannot fork into background without a command to execute."))
              (when background
                (background-ready)))
            (cond
@@ -3893,26 +5407,67 @@ a controlling terminal refuses instead of blocking."
                 (start-stdio-forward client target port)))
              ((or (getf *options* :no-command) (session-type-none-p client)) nil)
              (t
-              (when (and (subsystem-request-p) (not command-given-p))
-                (fail "SessionType subsystem requires a subsystem name"))
               (start-session client command command-given-p))))))
    :on-error (lambda (client condition)
                (show-banner client)
                ;; ssh reports a refused authentication as "user@host:
                ;; Permission denied (methods)." with the server's own list,
                ;; and only says something else when it never got that far.
-               (let ((offered
-                       (and (typep condition
-                                   'cl-pnet-ssh:ssh-authentication-error)
-                            (cl-pnet-ssh:ssh-client-auth-offered-methods
-                             client))))
-                 (if offered
-                     (format *error-output*
-                             "~A@~A: Permission denied (~{~A~^,~}).~%"
-                             (cl-pnet-ssh:ssh-client-user client)
-                             (cl-pnet-ssh:ssh-client-host client)
-                             offered)
-                     (format *error-output* "burs: ~A~%" condition)))
+               ;; A host key refusal is fatal("Host key verification failed.")
+               ;; in ssh.  All of these are log messages, so LogLevel QUIET
+               ;; (-q) silences them and only the exit status remains.
+               (unless (getf *options* :quiet)
+                 (cond
+                   ((typep condition 'cl-pnet-ssh:ssh-host-key-error)
+                    (format *error-output* "Host key verification failed.~%"))
+                   ((typep condition 'cl-pnet-ssh:ssh-connection-error)
+                    ;; ssh reports these through error(), with the configured
+                    ;; host name rather than the address it dialled.
+                    (let ((kind (cl-pnet-ssh:ssh-connection-error-kind
+                                 condition))
+                          (host (cl-pnet-ssh:ssh-connection-error-host
+                                 condition))
+                          (reason (or (cl-pnet-ssh:ssh-connection-error-reason
+                                       condition)
+                                      (princ-to-string condition))))
+                      (case kind
+                        (:negotiate
+                         ;; ssh's sshpkt_vfatal names the address and port it
+                         ;; dialled and the peer's proposal, with no prefix.
+                         (format *error-output*
+                                 "Unable to negotiate with ~A port ~D: ~A. Their offer: ~{~A~^,~}~%"
+                                 host
+                                 (cl-pnet-ssh:ssh-connection-error-port
+                                  condition)
+                                 reason
+                                 (cl-pnet-ssh:ssh-connection-error-peer-offer
+                                  condition)))
+                        (:resolve
+                         (format *error-output*
+                                 "burs: Could not resolve hostname ~A: ~A~%"
+                                 host reason))
+                        (:connect
+                         (format *error-output*
+                                 "burs: connect to host ~A port ~D: ~A~%"
+                                 host
+                                 (cl-pnet-ssh:ssh-connection-error-port
+                                  condition)
+                                 reason))
+                        (t
+                         (format *error-output* "burs: ~A~%" condition)))))
+                   (t
+                    (let ((offered
+                            (and (typep condition
+                                        'cl-pnet-ssh:ssh-authentication-error)
+                                 (cl-pnet-ssh:ssh-client-auth-offered-methods
+                                  client))))
+                      (if offered
+                          (format *error-output*
+                                  "~A@~A: Permission denied (~{~A~^,~}).~%"
+                                  (cl-pnet-ssh:ssh-client-user client)
+                                  (cl-pnet-ssh:ssh-client-host client)
+                                  offered)
+                          (format *error-output* "burs: ~A~%" condition))))))
                (finish 255))
    :on-close (lambda (client reason)
                (declare (ignore client reason))
@@ -3933,7 +5488,9 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
                  (background-child-arguments))
            :input nil
            :output :stream
-           :error-output nil)))
+           ;; The child's own fatal messages are the user's only explanation
+           ;; when it never reaches authentication, so let them through.
+           :error-output *error-output*)))
     (let* ((stream (uiop:process-info-output process))
            (line (read-line stream nil nil)))
       (if (equal line "BURS-AUTH-OK")
@@ -3956,10 +5513,17 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
             (print-version)
             (uiop:quit 0))
           (apply-command-line-options)
+          (validate-command-line-config)
+          (check-identity-arguments)
+          (check-proxy-arguments)
           (setf *background-child*
                 (and (getf *options* :background-child) t))
+          ;; -G and -Z leave before anything is dialled, and ssh forks only
+          ;; after the connection is authenticated, so neither has a child.
           (when (and (getf *options* :background)
-                     (not *background-child*))
+                     (not *background-child*)
+                     (not (getf *options* :print-config))
+                     (not (getf *options* :dump-public-keys)))
             (launch-background-child))
           (check-supported-options)
           (start-logging)
@@ -3971,22 +5535,28 @@ BURS-AUTH-OK on stdout once it is authenticated, then detaches its stdio."
           (multiple-value-bind (host user) (split-destination destination)
             (when user (setf (getf *options* :user) user))
             (setf (getf *options* :host) host)
-            (when (and (getf *options* :subsystem) (null command))
-              (fail "-s requires a subsystem name"))
-            (when (and (getf *options* :stdio-forward) command)
-              (fail "-W cannot be combined with a remote command"))
+            ;; ssh's -N/-s/-W and command-line SessionType rules run while
+            ;; the arguments are read, before any configuration file or
+            ;; connection, so they come first here too.
+            (check-session-type-arguments (and command t))
+            ;; ssh validates the command-line host and user before it reads
+            ;; any configuration, so even -G fails on a bad name.
+            (check-command-line-identity host)
             ;; -G wins when both are given: ssh dumps the configuration
             ;; before it reaches the public key dump.
             (when (getf *options* :print-config)
-              (print-config host))
+              (print-config host (and command t)))
             (when (getf *options* :dump-public-keys)
-              (dump-public-keys host))
+              (dump-public-keys host (and command t)))
             (setf *mux-daemon*
                   (and (getf *options* :control-master-daemon) t))
             (when *mux-daemon*
               (mux-detach-process)
               ;; A daemon has no session of its own; it only listens.
               (setf (getf *options* :control-master) t))
+            ;; mux-config-options reads the configuration before the client
+            ;; exists, so an unreadable -F file must be reported here first.
+            (check-config-file)
             (mux-prepare host (and command (join-command command))
                          (and command t))
             (handler-case

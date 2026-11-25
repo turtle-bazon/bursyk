@@ -56,15 +56,31 @@ NoHostAuthenticationForLocalhost decide identically on either transport."
 
 ;;; ---- TCP connection ----
 
+(defun ssh-plibssh-resolution-error (host condition)
+  "CLIENT's lookup failure for HOST, in ssh's getaddrinfo wording."
+  (let ((reason (ssh-resolver-error-text condition)))
+    (make-condition 'ssh-connection-error
+                    :kind :resolve
+                    :host host
+                    :reason reason
+                    :detail (format nil "could not resolve ~A: ~A"
+                                    host reason))))
+
 (defun ssh-plibssh-client-connect-failed (client errno)
-  (ssh-client-fail
-   client
-   (make-condition 'ssh-connection-error
-                   :detail (format nil "could not connect to ~A:~D (~A)"
-                                   (ssh-client-connect-host client)
-                                   (or (ssh-client-connect-port client)
-                                       (ssh-client-port client))
-                                   (cl-pnet-sockets:c-strerror errno)))))
+  (let ((reason (cl-pnet-sockets:c-strerror errno)))
+    (ssh-client-fail
+     client
+     (make-condition 'ssh-connection-error
+                     :kind :connect
+                     :host (ssh-client-connect-host client)
+                     :port (or (ssh-client-connect-port client)
+                               (ssh-client-port client))
+                     :reason reason
+                     :detail (format nil "could not connect to ~A:~D (~A)"
+                                     (ssh-client-connect-host client)
+                                     (or (ssh-client-connect-port client)
+                                         (ssh-client-port client))
+                                     reason)))))
 
 (defun ssh-plibssh-client-check-connect (client)
   "The connect socket is writable: see whether the kernel connected it."
@@ -186,19 +202,13 @@ backend does; the connected descriptor is then handed to libssh."
                           client original
                           (dial original
                                 (lambda (condition)
-                                  (ssh-client-fail
-                                   client
-                                   (make-condition
-                                    'ssh-connection-error
-                                    :detail (format nil "could not resolve ~A: ~A"
-                                                    original condition)))))
+                                  (ssh-client-fail client
+                                                  (ssh-plibssh-resolution-error
+                                                   original condition))))
                           (lambda (condition)
-                            (ssh-client-fail
-                             client
-                             (make-condition
-                              'ssh-connection-error
-                              :detail (format nil "could not resolve ~A: ~A"
-                                              original condition))))))
+                            (ssh-client-fail client
+                                            (ssh-plibssh-resolution-error
+                                             original condition)))))
                        (ssh-client-fail
                         client
                         (make-condition
@@ -215,19 +225,13 @@ backend does; the connected descriptor is then handed to libssh."
                client original
                (dial original
                      (lambda (condition)
-                       (ssh-client-fail
-                        client
-                        (make-condition
-                         'ssh-connection-error
-                         :detail (format nil "could not resolve ~A: ~A"
-                                         original condition)))))
+                       (ssh-client-fail client
+                                       (ssh-plibssh-resolution-error
+                                        original condition))))
                (lambda (condition)
-                 (ssh-client-fail
-                  client
-                  (make-condition
-                   'ssh-connection-error
-                   :detail (format nil "could not resolve ~A: ~A"
-                                   original condition))))))))))
+                 (ssh-client-fail client
+                                 (ssh-plibssh-resolution-error
+                                  original condition)))))))))
   client)
 
 (defun ssh-plibssh-client-open (client)
@@ -495,7 +499,7 @@ socket in the interval as the proof of life OpenSSH looks for."
   (iter (for name in '("id_ed25519" "id_ecdsa" "id_rsa"))
     (let ((path (merge-pathnames (format nil ".ssh/~A" name)
                                  (user-homedir-pathname))))
-      (when (probe-file path) (collect path)))))
+      (when (ssh-file-exists-p path) (collect path)))))
 
 (defun ssh-plibssh-default-key-path ()
   "The first default identity file that exists, or NIL."
@@ -536,7 +540,7 @@ certificate would authenticate as its owner.  A mismatch is an error rather
 than a quiet fallback to the plain key, matching ssh."
   (let ((certificate-path
           (concatenate 'string (namestring path) "-cert.pub")))
-    (when (probe-file certificate-path)
+    (when (ssh-file-exists-p certificate-path)
       (let* ((blob (ssh-public-key-file-blob certificate-path))
              (certificate (and blob (ssh-certificate-parse blob))))
         (unless (and certificate
@@ -583,7 +587,7 @@ the key type cannot be used."
           (ssh-plibssh-attach-certificate
            (cffi:mem-ref pointer :pointer) path)
           (error 'ssh-authentication-error
-                 :detail (format nil "could not load ~A" path))))))
+                 :detail "invalid format")))))
 
 (defun ssh-plibssh-key-sources (client)
   "The private keys CLIENT may offer, in order.
@@ -635,17 +639,46 @@ certificate that matches no imported key is skipped too."
   "Import every key CLIENT may offer, in order.
 
 PASSPHRASE decrypts every protected file; with none, PASSPHRASE-CALLBACK is
-asked once per encrypted file, with that file's path."
+asked once per encrypted file, with that file's path, up to
+NumberOfPasswordPrompts times.  A key libssh cannot import is skipped with
+ssh's own diagnostics: silent when it is missing or left locked, an SSH-WARN
+\"Load key\" line otherwise."
   (let ((handles
           (iter (for key in (ssh-plibssh-key-sources client))
             (let ((path (or (ssh-plibssh-key-path key)
                             (error 'ssh-authentication-error
                                    :detail
                                    "a private key has no file path libssh can load"))))
-              (collect (ssh-plibssh-import-key
-                        path
-                        (ssh-load-passphrase
-                         path passphrase passphrase-callback)))))))
+              (multiple-value-bind (resolved locked)
+                  (ssh-load-passphrase
+                   path passphrase passphrase-callback
+                   :attempts
+                   (or (ssh-client-number-of-password-prompts client) 3))
+                (let ((handle
+                        (cond
+                          ((and *ssh-private-key-permission-check*
+                                (funcall *ssh-private-key-permission-check*
+                                         path))
+                           (ssh-warn "Load key \"~A\": ~A"
+                                     path "bad permissions")
+                           nil)
+                          (locked nil)
+                          (t
+                           (handler-case
+                               (ssh-plibssh-import-key path resolved)
+                             (ssh-unsupported-feature (condition)
+                               ;; A transport limitation is not a bad key:
+                               ;; the caller selected ML-DSA and has to hear
+                               ;; why it cannot be used.
+                               (error condition))
+                             (error (condition)
+                               (unless (ssh-quiet-key-load-error-p
+                                        path condition)
+                                 (ssh-warn "Load key \"~A\": ~A"
+                                           path (ssh-key-load-error-text
+                                                 condition)))
+                               nil))))))
+                  (when handle (collect handle))))))))
     (ssh-plibssh-attach-explicit-certificates client handles)
     (setf (ssh-client-key-handles client) handles
           (ssh-client-key-index client) 0)))

@@ -81,27 +81,72 @@ would."
 OpenSSH uses SSH_AUTH_SOCK unless IdentityAgent or IdentitiesOnly says
 otherwise, so an identity file alone does not disable the agent.  The
 returned :NONE means no agent at all; it is distinct from NIL, which a
-transport reads as "ask the environment when no key was named"."
-  (cond
-    ((null explicit)
-     (if (ssh-config-options-identities-only options)
-         :none
-         (let ((value (ssh-config-options-identity-agent options)))
-           (case value
-             (:none :none)
-             (:environment t)
-             ((nil) (or (and (uiop:getenv "SSH_AUTH_SOCK") t) :none))
-             (t value)))))
-    ((eq explicit :none) :none)
-    ((and (stringp explicit) (string-equal explicit "none")) :none)
-    ((and (stringp explicit) (string-equal explicit "SSH_AUTH_SOCK")) t)
-    (t explicit)))
+transport reads as "ask the environment when no key was named".  A legacy
+IdentityAgent of $NAME names the environment variable holding the socket,
+as ssh.c's post-configuration handling does."
+  (labels ((legacy-agent (value)
+             (let ((name (namestring value)))
+               (if (and (plusp (length name))
+                        (char= (char name 0) #\$)
+                        (or (= (length name) 1)
+                            (char/= (char name 1) #\{)))
+                   (or (uiop:getenv (subseq name 1)) :none)
+                   value))))
+    (cond
+      ((null explicit)
+       (if (ssh-config-options-identities-only options)
+           :none
+           (let ((value (ssh-config-options-identity-agent options)))
+             (case value
+               (:none :none)
+               (:environment t)
+               ((nil) (or (and (uiop:getenv "SSH_AUTH_SOCK") t) :none))
+               (t (legacy-agent value))))))
+      ((eq explicit :none) :none)
+      ((and (stringp explicit) (string-equal explicit "none")) :none)
+      ((and (stringp explicit) (string-equal explicit "SSH_AUTH_SOCK")) t)
+      (t explicit))))
 
-(defun ssh-config-client-identities (options explicit)
-  "The private keys to offer, EXPLICIT or every IdentityFile in order."
-  (or explicit
-      (let ((files (ssh-config-options-identity-files options)))
-        (when files (reverse files)))))
+(defun ssh-config-client-identity-path (path options
+                                       &key host user port)
+  "PATH as a loader opens it: % tokens, then a leading ~, expanded.
+
+readconf stores an IdentityFile or CertificateFile spelling exactly as
+written, so the expansion ssh does before loading happens here.  HOST, USER
+and PORT answer %h, %r and %p when the caller knows them.  The result keeps
+PATH's own type, so a caller that passed a string gets a string back."
+  (let* ((context (%make-ssh-config-context
+                   :original-host host :user user :port (or port 22)))
+         (text (multiple-value-bind (expanded unknown)
+                   (ssh-config-expand-tilde (namestring path))
+                 (declare (ignore unknown))
+                 (or expanded (namestring path))))
+         (text (ssh-config-expand-tokens text options context))
+         (name (ssh-config-expand-variables text)))
+    (if (stringp path) name (pathname name))))
+
+(defun ssh-config-client-identities (options explicit
+                                     &key host user port)
+  "The private keys to offer, EXPLICIT followed by every IdentityFile.
+
+ssh adds -i and command-line -o IdentityFile values while it parses its
+arguments, before it reads any file, so the configuration's own IdentityFile
+entries come after them rather than replacing them.  Duplicates are dropped
+only within EXPLICIT, as readconf's userprovided check does.  Every spelling
+is expanded as the loader expands it, after the duplicates are gone."
+  (labels ((expand (path)
+             (ssh-config-client-identity-path
+              path options :host host :user user :port port))
+           (expand-all (paths) (mapcar #'expand paths)))
+    (let ((files (let ((configured
+                         (ssh-config-options-identity-files options)))
+                   (when configured
+                     (expand-all (reverse configured)))))
+          (keys (expand-all (remove-duplicates explicit :test #'equal))))
+      (cond
+        ((null keys) files)
+        ((null files) keys)
+        (t (append keys files))))))
 
 (defun ssh-config-client-known-hosts (options explicit)
   "The user known_hosts files, EXPLICIT or the config's.
@@ -179,11 +224,14 @@ transport simply never negotiates them."
 USER and PORT win over the file; the remaining keywords are explicit
 overrides.  NIL leaves the decision to the config and then to
 MAKE-SSH-CLIENT's own defaults."
-  (list :host host
-        :connect-host (or (ssh-config-options-hostname options) host)
-        :host-key-host (or (ssh-config-options-host-key-alias options)
-                           (ssh-config-options-hostname options)
-                           host)
+  (let* ((hostname (or (ssh-config-options-hostname options) host))
+         ;; A numeric HostName is canonicalised before use, as ssh does
+         ;; after readconf; the client keeps a name for the resolver.
+         (hostname (or (ssh-canonical-address-string hostname) hostname)))
+    (list :host host
+          :connect-host hostname
+          :host-key-host (or (ssh-config-options-host-key-alias options)
+                             hostname)
         :host-key-alias (ssh-config-options-host-key-alias options)
         :no-host-authentication-for-localhost
         (ssh-config-options-no-host-authentication-for-localhost options)
@@ -191,9 +239,15 @@ MAKE-SSH-CLIENT's own defaults."
         :user (or user (ssh-config-options-user options) (ssh-default-user))
         :version-addendum
         (ssh-config-client-version-addendum options host :user user :port port)
-        :private-key (ssh-config-client-identities options private-key)
+        :private-key (ssh-config-client-identities
+                      options private-key
+                      :host host :user user :port port)
         :certificate-files
-        (reverse (ssh-config-options-certificate-files options))
+        (mapcar (lambda (path)
+                  (ssh-config-client-identity-path
+                   path options :host host :user user :port port))
+                (reverse
+                 (ssh-config-options-certificate-files options)))
         :agent (ssh-config-client-agent options agent)
         :passphrase passphrase
         :passphrase-callback passphrase-callback
@@ -234,7 +288,8 @@ MAKE-SSH-CLIENT's own defaults."
         :hash-known-hosts
         (ssh-config-options-hash-known-hosts options)
         :known-hosts-command
-        (ssh-config-options-known-hosts-command options)
+        (ssh-config-command-value
+         (ssh-config-options-known-hosts-command options))
         :add-keys-to-agent
         (or (ssh-config-options-add-keys-to-agent options) :no)
         :forward-x11 (ssh-config-options-forward-x11 options)
@@ -277,8 +332,7 @@ MAKE-SSH-CLIENT's own defaults."
         :canonicalize-fallback-local
         (ssh-config-options-canonicalize-fallback-local options)
         :update-host-keys
-        (or (ssh-config-options-update-host-keys options)
-            (if (ssh-config-options-known-hosts options) :no :yes))
+        (ssh-config-update-host-keys-default options)
         :fingerprint-hash
         (or (ssh-config-options-fingerprint-hash options) :sha256)
         :visual-host-key (ssh-config-options-visual-host-key options)
@@ -338,7 +392,7 @@ MAKE-SSH-CLIENT's own defaults."
         :forward-agent (ssh-config-options-forward-agent options)
         :forward-agent-sock-path
         (ssh-config-options-forward-agent-sock-path options)
-        :resolver resolver))
+        :resolver resolver)))
 
 ;;; ---- ProxyJump descriptors ----
 
@@ -866,7 +920,7 @@ in the tunnel's buffers."
               proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close on-forwarded-tcpip
               on-forwarded-streamlocal resolver canonical-resolver
-              password-callback kbd-interactive-callback)
+              password-callback kbd-interactive-callback validate-options)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -882,7 +936,9 @@ value, and receives the resolved AddressFamily as its :FAMILY keyword.
 PASSWORD-CALLBACK and KBD-INTERACTIVE-CALLBACK reach the built client and
 every ProxyJump hop, as they would in ssh.  PASSPHRASE-CALLBACK answers for
 a passphrase-protected identity file, receiving its path and returning the
-passphrase or NIL."
+passphrase or NIL.  VALIDATE-OPTIONS, when given, is called with the resolved
+OPTIONS and the canonical host before the client is built, so a program can
+apply the checks ssh.c makes on top of readconf and leave before dialling."
   (let* ((source (ssh-config-client-source config options))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
@@ -909,6 +965,8 @@ passphrase or NIL."
                     (null (ssh-config-proxy-jumps options proxy-jump))))
      :on-options
      (lambda (options canonical-host)
+       (when validate-options
+         (funcall validate-options options canonical-host))
        (ssh-config-build-client source canonical-host options
                                 proxy-jump proxy-command
                                 exec-matcher overrides on-open on-error

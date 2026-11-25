@@ -249,16 +249,32 @@ its KEXINIT when the connection came up."
     (setf (ssh-client-rekeying client) t
           (ssh-client-keys-sent client) nil
           (ssh-client-keys-received client) nil))
-  (let ((offers (ssh-parse-kexinit-payload payload)))
+  (let* ((offers (ssh-parse-kexinit-payload payload))
+         (negotiated
+           (handler-case
+               (ssh-negotiate
+                offers
+                :kex-algorithms (ssh-client-kex-algorithms client)
+                :host-key-algorithms
+                (ssh-client-host-key-algorithms client)
+                :ciphers (ssh-client-ciphers client)
+                :macs (ssh-client-macs client)
+                :compressions (ssh-client-compression-offer client))
+             (ssh-algorithm-negotiation-error (condition)
+               ;; ssh reports the first proposal it could not agree on and
+               ;; names the address it dialled, then exits.
+               (error 'ssh-connection-error
+                      :kind :negotiate
+                      :host (or (ssh-client-remote-address client)
+                                (ssh-client-connect-host client)
+                                (ssh-client-host client))
+                      :port (or (ssh-client-connect-port client)
+                                (ssh-client-port client))
+                      :reason (ssh-negotiation-reason condition)
+                      :peer-offer (ssh-negotiation-peer-offer condition)
+                      :detail (princ-to-string condition))))))
     (setf (ssh-client-server-kexinit client) payload
-          (ssh-client-negotiated client)
-          (ssh-negotiate offers
-                         :kex-algorithms (ssh-client-kex-algorithms client)
-                         :host-key-algorithms
-                         (ssh-client-host-key-algorithms client)
-                         :ciphers (ssh-client-ciphers client)
-                         :macs (ssh-client-macs client)
-                         :compressions (ssh-client-compression-offer client))
+          (ssh-client-negotiated client) negotiated
           ;; Strict KEX is negotiated once.  A rekey's KEXINIT leaves the
           ;; marker out, but the connection stays strict, so neither side may
           ;; forget it or the sequence resets at NEWKEYS stop matching.

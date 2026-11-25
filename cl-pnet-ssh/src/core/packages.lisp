@@ -30,6 +30,7 @@
    #:ssh-log
    #:*ssh-warning-function*
    #:ssh-warn
+   #:*ssh-private-key-permission-check*
    #:*ssh-forced-warning-function*
    #:ssh-warn-always
    ;; channels
@@ -176,6 +177,7 @@
    #:ssh-config-options-identity-files-userprovided
    #:ssh-config-options-identity-agent
    #:ssh-config-options-add-keys-to-agent
+   #:ssh-config-options-add-keys-to-agent-lifespan
    #:ssh-config-options-hostbased-authentication
    #:ssh-config-options-hostbased-accepted-algorithms
    #:ssh-config-options-hostbased-keys
@@ -194,6 +196,8 @@
    #:ssh-config-options-known-hosts-command
    #:ssh-config-options-ignored-unknown
    #:ssh-config-options-update-host-keys
+   #:ssh-config-command-value
+   #:ssh-config-update-host-keys-default
    #:ssh-config-options-fingerprint-hash
    #:ssh-config-options-visual-host-key
    #:ssh-config-options-check-host-ip
@@ -457,6 +461,8 @@
    #:ssh-private-key-comment-octets
    #:ssh-private-key-path
    #:ssh-load-private-key
+   #:ssh-file-exists-p
+   #:ssh-key-load-error-text
    ;; key generation and OpenSSH key files (BURS KEYGEN)
    #:ssh-generate-private-key
    #:ssh-normalize-key-type
@@ -534,7 +540,16 @@
    #:ssh-error
    #:ssh-error-detail
    #:ssh-protocol-error
+   #:ssh-algorithm-negotiation-error
+   #:ssh-negotiation-reason
+   #:ssh-negotiation-peer-offer
    #:ssh-connection-error
+   #:ssh-connection-error-kind
+   #:ssh-connection-error-host
+   #:ssh-connection-error-port
+   #:ssh-connection-error-reason
+   #:ssh-connection-error-peer-offer
+   #:ssh-resolver-error-text
    #:ssh-authentication-error
    #:ssh-host-key-error
    #:ssh-host-key-error-fingerprint

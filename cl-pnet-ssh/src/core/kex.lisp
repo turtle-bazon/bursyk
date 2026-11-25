@@ -335,7 +335,12 @@ An agent-backed key cannot sign synchronously; the KEX path asks the agent."
 :STRICT is true when the peer offered OpenSSH's strict-KEX marker, which
 makes both sides reset packet sequence numbers at NEWKEYS.  The keyword
 arguments override this build's lists, for ssh_config Ciphers and friends.
-Compression is chosen separately for each direction, as RFC 4253 requires."
+Compression is chosen separately for each direction, as RFC 4253 requires.
+
+A proposal with no common name signals SSH-ALGORITHM-NEGOTIATION-ERROR naming
+the peer's offer, as OpenSSH reports the first choice it cannot make.  A MAC
+is not chosen for a direction whose cipher already authenticates the packet,
+so MACs that the peer does not offer are harmless beside an AEAD cipher."
   (let* ((kex-algorithms (or kex-algorithms +ssh-kex-algorithms+))
          (host-key-algorithms (or host-key-algorithms
                                   +ssh-host-key-algorithms+))
@@ -349,34 +354,62 @@ Compression is chosen separately for each direction, as RFC 4253 requires."
          (cipher-c2s (ssh-choose-algorithm ciphers
                                            (getf server-kexinit :ciphers-c2s)))
          (cipher-s2c (ssh-choose-algorithm ciphers
-                                           (getf server-kexinit :ciphers-s2c)))
-         (mac-c2s (ssh-choose-algorithm macs
-                                        (getf server-kexinit :macs-c2s)))
-         (mac-s2c (ssh-choose-algorithm macs
+                                           (getf server-kexinit :ciphers-s2c))))
+    (flet ((fail (reason offer)
+             (error 'ssh-algorithm-negotiation-error
+                    :detail reason :reason reason :peer-offer offer)))
+      ;; OpenSSH's order: kex, host key, then each direction's cipher, MAC
+      ;; and compression, server-to-client first.
+      (unless kex
+        (fail "no matching key exchange method found"
+              (getf server-kexinit :kex)))
+      (unless host-key
+        (fail "no matching host key type found"
+              (getf server-kexinit :host-keys)))
+      (unless cipher-s2c
+        (fail "no matching cipher found"
+              (getf server-kexinit :ciphers-s2c)))
+      (unless (or (ssh-cipher-aead-p cipher-s2c)
+                  (ssh-choose-algorithm macs
                                         (getf server-kexinit :macs-s2c)))
-         (compression-c2s (ssh-choose-algorithm
-                           compressions
-                           (getf server-kexinit :compressions-c2s)))
-         (compression-s2c (ssh-choose-algorithm
-                           compressions
-                           (getf server-kexinit :compressions-s2c))))
-    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c
-                 compression-c2s compression-s2c)
-      (error 'ssh-protocol-error
-             :detail (format nil "no common algorithm (we offer kex ~{~A~^,~}; host key ~{~A~^,~}; cipher ~{~A~^,~}; mac ~{~A~^,~}; compression ~{~A~^,~})"
-                             kex-algorithms host-key-algorithms ciphers macs
-                             compressions)))
-    (list :kex kex :host-key host-key
-          :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
-          :mac-c2s mac-c2s :mac-s2c mac-s2c
-          :compression-c2s compression-c2s
-          :compression-s2c compression-s2c
-          :strict (member "kex-strict-s-v00@openssh.com"
-                          (getf server-kexinit :kex) :test #'string=)
-          :guess-wrong (and (getf server-kexinit :first-kex-packet-follows)
-                            (not (and (string= (first (getf server-kexinit :kex)) kex)
-                                      (string= (first (getf server-kexinit :host-keys))
-                                               host-key)))))))
+        (fail "no matching MAC found" (getf server-kexinit :macs-s2c)))
+      (unless (ssh-choose-algorithm compressions
+                                    (getf server-kexinit :compressions-s2c))
+        (fail "no matching compression method found"
+              (getf server-kexinit :compressions-s2c)))
+      (unless cipher-c2s
+        (fail "no matching cipher found"
+              (getf server-kexinit :ciphers-c2s)))
+      (unless (or (ssh-cipher-aead-p cipher-c2s)
+                  (ssh-choose-algorithm macs
+                                        (getf server-kexinit :macs-c2s)))
+        (fail "no matching MAC found" (getf server-kexinit :macs-c2s)))
+      (unless (ssh-choose-algorithm compressions
+                                    (getf server-kexinit :compressions-c2s))
+        (fail "no matching compression method found"
+              (getf server-kexinit :compressions-c2s)))
+      (list :kex kex :host-key host-key
+            :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
+            :mac-c2s (unless (ssh-cipher-aead-p cipher-c2s)
+                       (ssh-choose-algorithm macs
+                                             (getf server-kexinit :macs-c2s)))
+            :mac-s2c (unless (ssh-cipher-aead-p cipher-s2c)
+                       (ssh-choose-algorithm macs
+                                             (getf server-kexinit :macs-s2c)))
+            :compression-c2s (ssh-choose-algorithm
+                              compressions
+                              (getf server-kexinit :compressions-c2s))
+            :compression-s2c (ssh-choose-algorithm
+                              compressions
+                              (getf server-kexinit :compressions-s2c))
+            :strict (member "kex-strict-s-v00@openssh.com"
+                            (getf server-kexinit :kex) :test #'string=)
+            :guess-wrong (and (getf server-kexinit :first-kex-packet-follows)
+                              (not (and (string= (first (getf server-kexinit :kex))
+                                                 kex)
+                                        (string= (first (getf server-kexinit
+                                                              :host-keys))
+                                                 host-key))))))))
 
 ;;; ---- Exchange hash and key derivation ----
 
@@ -499,9 +532,15 @@ not the two ends.  The cipher names ride along so the caller can install
 the right framing for each direction."
   (let ((cipher-c2s (getf negotiated :cipher-c2s))
         (cipher-s2c (getf negotiated :cipher-s2c))
-        (mac-c2s (ssh-mac-key-length (getf negotiated :mac-c2s)))
-        (mac-s2c (ssh-mac-key-length (getf negotiated :mac-s2c))))
-    (unless (and cipher-c2s cipher-s2c mac-c2s mac-s2c)
+        (mac-c2s (and (getf negotiated :mac-c2s)
+                      (ssh-mac-key-length (getf negotiated :mac-c2s))))
+        (mac-s2c (and (getf negotiated :mac-s2c)
+                      (ssh-mac-key-length (getf negotiated :mac-s2c)))))
+    ;; An AEAD cipher ignores the MAC entirely, so no MAC is negotiated for
+    ;; its direction; every other cipher needs one.
+    (unless (and cipher-c2s cipher-s2c
+                 (or mac-c2s (ssh-cipher-aead-p cipher-c2s))
+                 (or mac-s2c (ssh-cipher-aead-p cipher-s2c)))
       (error 'ssh-protocol-error :detail "unsupported session algorithms"))
     (flet ((derive (letter length)
              (ssh-derive-key shared exchange-hash session-id letter length
@@ -521,9 +560,9 @@ the right framing for each direction."
             :encrypt-cipher (if server cipher-s2c cipher-c2s)
             :decrypt-cipher (if server cipher-c2s cipher-s2c)
             :encrypt-mac-key (derive (if server #\F #\E)
-                                     (if server mac-s2c mac-c2s))
+                                     (or (if server mac-s2c mac-c2s) 0))
             :decrypt-mac-key (derive (if server #\E #\F)
-                                     (if server mac-c2s mac-s2c))
+                                     (or (if server mac-c2s mac-s2c) 0))
             :encrypt-mac (ssh-mac-name-keyword
                           (if server (getf negotiated :mac-s2c)
                               (getf negotiated :mac-c2s)))

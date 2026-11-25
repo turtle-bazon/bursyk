@@ -1007,6 +1007,68 @@ still cannot run these tests."
                                              (second parts)))))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+(test key-load-error-text-matches-ssh
+  "A failed load names the reason the way ssh's Load key line does."
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-load-error"))
+         (garbage (merge-pathnames "garbage" directory)))
+    (ensure-directories-exist garbage)
+    (unwind-protect
+         (progn
+           (with-open-file (stream garbage :direction :output
+                                           :if-exists :supersede)
+             (write-line "not a key" stream))
+           (is (string= "invalid format"
+                        (ssh-key-load-error-text
+                         (handler-case (ssh-load-private-key garbage)
+                           (error (condition) condition)))))
+           (is (string= "Is a directory"
+                        (ssh-key-load-error-text
+                         (handler-case
+                             (ssh-load-private-key
+                              (uiop:pathname-directory-pathname garbage))
+                           (error (condition) condition))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test address-literal-recognition
+  "Only real numeric addresses skip resolution.
+
+BURZAY treats any colon as an IPv6 literal; a name such as \"a:b\" has to
+reach the system resolver so it fails as a lookup, like ssh's getaddrinfo."
+  (is (cl-pnet-ssh::ssh-address-literal-p "127.0.0.1"))
+  (is (cl-pnet-ssh::ssh-address-literal-p "::1"))
+  (is (cl-pnet-ssh::ssh-address-literal-p "2001:db8::1"))
+  (is (cl-pnet-ssh::ssh-address-literal-p "::ffff:192.0.2.1"))
+  (is (not (cl-pnet-ssh::ssh-address-literal-p "a:b")))
+  (is (not (cl-pnet-ssh::ssh-address-literal-p "::g")))
+  (is (not (cl-pnet-ssh::ssh-address-literal-p "1:2:3:4:5:6:7:8:9")))
+  (is (not (cl-pnet-ssh::ssh-address-literal-p "1::2::3")))
+  (is (not (cl-pnet-ssh::ssh-address-literal-p "example.com"))))
+
+(test numeric-address-canonicalisation
+  "getnameinfo's spelling replaces every accepted numeric form.
+
+ssh canonicalises a numeric host with resolve_addr() before printing or
+dialling it, so short, octal and hexadecimal IPv4 spellings all become the
+dotted quad and an expanded IPv6 literal is compressed."
+  (dolist (case '(("127.1" . "127.0.0.1")
+                  ("0x7f000001" . "127.0.0.1")
+                  ("2130706433" . "127.0.0.1")
+                  ("0177.0.0.1" . "127.0.0.1")
+                  ("192.168.1" . "192.168.0.1")
+                  ("0" . "0.0.0.0")
+                  ("0x0" . "0.0.0.0")
+                  ("::1" . "::1")
+                  ("0:0:0:0:0:0:0:1" . "::1")
+                  ("2001:DB8::0001" . "2001:db8::1")
+                  ("::ffff:7f00:1" . "::ffff:127.0.0.1")
+                  ("::102:304" . "::1.2.3.4")))
+    (is (string= (cdr case)
+                 (cl-pnet-ssh::ssh-canonical-address-string (car case)))))
+  ;; A name must reach the resolver untouched: nothing here may look it up.
+  (dolist (name '("localhost" "not-an-address" "dead.beef" "1e2.example.com"
+                  "256.1" "999.1" "0x100000000" "1.2.3.4.5" "a:b"))
+    (is (null (cl-pnet-ssh::ssh-canonical-address-string name)))))
+
 (test bubblebabble-fingerprint-matches-openssh
   "The -B form is OpenSSH's Bubble Babble over the SHA1 of the key blob."
   (let ((blob
@@ -1696,6 +1758,73 @@ the active block."
       (is (equal "RefuseConnection: yes" (ssh-error-detail condition)))
       (is (ssh-config-error-fatal condition)))))
 
+(test config-fixed-argument-directives-reject-extra-words
+  "process_config_line ends by rejecting words left after a fixed-argument
+directive, while a looping directive accepts them all."
+  (labels ((line (keyword &rest arguments)
+             (cl-pnet-ssh::%make-ssh-config-line
+              :keyword keyword :args arguments
+              :path #p"/tmp/ssh_config_test" :number 1))
+           (resolve (keyword &rest arguments)
+             (let ((condition nil))
+               (ssh-config-resolve
+                (cl-pnet-ssh::%make-ssh-config
+                 :directives (list (apply #'line keyword arguments)))
+                "alias"
+                :on-error (lambda (value) (setf condition value)))
+               condition)))
+    (let ((condition (resolve "user" "bob" "extra")))
+      (is (typep condition 'ssh-config-error))
+      (is (equal "keyword user extra arguments at end of line"
+                 (ssh-error-detail condition))))
+    (is (null (resolve "user" "bob")))
+    ;; Directives that loop over their arguments keep accepting them all.
+    (is (null (resolve "sendenv" "A" "B")))
+    (is (null (resolve "userknownhostsfile" "a" "b")))
+    ;; LocalForward takes one word for its dynamic remote form or two for a
+    ;; target, but never three.
+    (is (null (resolve "localforward" "80" "h:90")))
+    (let ((condition (resolve "localforward" "80" "h:90" "x")))
+      (is (equal "keyword localforward extra arguments at end of line"
+                 (ssh-error-detail condition))))
+    ;; The directive's own diagnostic comes first: leftover words do not
+    ;; mask a rejected value.
+    (let ((condition (resolve "user" "" "extra")))
+      (is (equal "Missing argument." (ssh-error-detail condition))))
+    ;; readconf validates an inactive Host block's lines too.
+    (let ((condition nil))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives (list (line "host" "other")
+                          (line "port" "22" "33")))
+       "alias"
+       :on-error (lambda (value) (setf condition value)))
+      (is (equal "keyword port extra arguments at end of line"
+                 (ssh-error-detail condition))))))
+
+(test config-invalid-quotes-precede-the-match-evaluator
+  "readconf rejects an open quote before the directive switch, so a Match
+line does not also report \"Bad Match condition\"."
+  (let ((messages '()) (condition nil))
+    (let ((cl-pnet-ssh::*ssh-config-error-function*
+           (lambda (text) (push text messages))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "match" :args (list "\"all")
+               :path #p"/tmp/ssh_config_test" :number 1
+               :invalid-quotes t)))
+       "alias"
+       :on-error (lambda (value) (setf condition value))))
+    (setf messages (nreverse messages))
+    (is (typep condition 'ssh-config-error))
+    (is (equal "/tmp/ssh_config_test line 1: invalid quotes"
+               (first messages)))
+    (is (notany (lambda (message)
+                  (search "Bad Match condition" message))
+                messages))))
+
 (test config-structure-directives-rejected-from-o
   "Host, Include and Match are file structure, so readconf refuses them
 when an -o option tries to supply one."
@@ -1715,6 +1844,191 @@ when an -o option tries to supply one."
                (funcall detail "Include=foo")))
     (is (equal "Match directive not supported as a command-line option"
                (funcall detail "Match=all")))))
+
+(test config-agent-paths-validate-environment-expansion
+  "readconf runs dollar_expand on IdentityAgent and ForwardAgent as it reads
+each line, whether or not the block is active, and keeps a legacy $NAME
+spelling raw for ssh to resolve at use time."
+  (labels ((resolve (&rest directives)
+             (let ((condition nil) (options nil) (messages '()))
+               (let ((cl-pnet-ssh::*ssh-config-error-function*
+                       (lambda (text) (push text messages))))
+                 (ssh-config-resolve
+                  (cl-pnet-ssh::%make-ssh-config :directives directives)
+                  "alias"
+                  :on-options (lambda (value) (setf options value))
+                  :on-error (lambda (value) (setf condition value))))
+               (values condition options (nreverse messages))))
+           (line (number keyword &rest arguments)
+             (cl-pnet-ssh::%make-ssh-config-line
+              :keyword keyword :args arguments
+              :path #p"/tmp/ssh_config_test" :number number)))
+    (multiple-value-bind (condition options messages)
+        (resolve (line 1 "identityagent" "${NOPE}/a"))
+      (declare (ignore options))
+      (is (equal "Invalid environment expansion ${NOPE}/a."
+                 (ssh-error-detail condition)))
+      ;; The helper's own diagnostic comes first; the line error and the
+      ;; file summary follow through the same reporter.
+      (is (equal "vdollar_percent_expand: env var ${NOPE} has no value"
+                 (first messages))))
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "identityagent" "$HOME/a"))
+      (declare (ignore options))
+      (is (equal "Invalid environment name $HOME/a."
+                 (ssh-error-detail condition))))
+    ;; An inactive Host block still validates the line.
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "host" "other")
+                 (line 2 "forwardagent" "${NOPE}/a"))
+      (declare (ignore options))
+      (is (equal "Invalid environment expansion ${NOPE}/a."
+                 (ssh-error-detail condition))))
+    ;; $NAME is accepted and stored as written; the agent lookup expands it.
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "identityagent" "$HOME"))
+      (is (null condition))
+      (is (equal "$HOME"
+                 (namestring
+                  (cl-pnet-ssh:ssh-config-options-identity-agent options))))
+      (is (equal (uiop:getenv "HOME")
+                 (namestring
+                  (cl-pnet-ssh::ssh-config-client-agent options nil)))))))
+
+(test config-unbalanced-quotes-reject-the-line
+  "readconf runs argv_split on the text after the keyword before it applies
+anything, so an open quote rejects the line whichever directive it names."
+  (labels ((resolve (option)
+             (let ((condition nil) (messages '()))
+               (let ((cl-pnet-ssh::*ssh-config-error-function*
+                       (lambda (text) (push text messages))))
+                 (ssh-config-resolve
+                  (cl-pnet-ssh::ssh-config-add-options
+                   (cl-pnet-ssh::%make-ssh-config :directives nil)
+                   (list option))
+                  "alias"
+                  :on-error (lambda (value) (setf condition value))))
+               (values condition (nreverse messages)))))
+    (multiple-value-bind (condition messages) (resolve "User \"bob")
+      (is (typep condition 'ssh-config-error))
+      (is (equal "command-line line 0: invalid quotes" (first messages))))
+    ;; The quote has to be open at the end; a balanced value is fine, and a
+    ;; backslash-escaped quote does not end the group.
+    (multiple-value-bind (condition messages) (resolve "User \"bob\"")
+      (is (null condition))
+      (is (null messages)))
+    (multiple-value-bind (condition messages) (resolve "User bob\\\"")
+      (is (null condition))
+      (is (null messages)))))
+
+(test log-escape-matches-log-c-strnvis
+  "logit() runs strnvis(LOG_STDERR_VIS) over every message, so a backslash
+doubles and a control or high byte becomes an octal escape while the safe
+whitespace passes through."
+  (is (equal "a\\\\b" (cl-pnet-ssh::ssh-log-escape "a\\b")))
+  (is (equal "a\\001b"
+             (cl-pnet-ssh::ssh-log-escape
+              (format nil "a~Cb" (code-char 1)))))
+  (is (equal "a\\177b"
+             (cl-pnet-ssh::ssh-log-escape
+              (format nil "a~Cb" (code-char #x7f)))))
+  ;; Tab, newline, carriage return, backspace and bell are all safe.
+  (is (equal (format nil "a~Cb" #\Tab)
+             (cl-pnet-ssh::ssh-log-escape
+              (format nil "a~Cb" #\Tab))))
+  ;; The encoding works on bytes, so a character above #xFF is its UTF-8
+  ;; octets, each escaped.
+  (is (equal "\\303\\251"
+             (cl-pnet-ssh::ssh-log-escape
+              (string (code-char #xe9))))))
+
+(test config-known-host-lists-keep-their-spellings
+  "readconf stores both known-hosts lists as written; ssh.c expands ${},
+% tokens and ~ in the user's list only, after the file is read."
+  (labels ((resolve (&rest directives)
+             (let ((condition nil) (options nil))
+               (ssh-config-resolve
+                (cl-pnet-ssh::%make-ssh-config :directives directives)
+                "alias"
+                :on-options (lambda (value) (setf options value))
+                :on-error (lambda (value) (setf condition value)))
+               (values condition options)))
+           (line (number keyword &rest arguments)
+             (cl-pnet-ssh::%make-ssh-config-line
+              :keyword keyword :args arguments
+              :path #p"/tmp/ssh_config_test" :number number)))
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "globalknownhostsfile" "${HOME}/k"))
+      (is (null condition))
+      (is (equal "${HOME}/k"
+                 (namestring
+                  (first (cl-pnet-ssh:ssh-config-options-global-known-hosts
+                          options))))))
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "userknownhostsfile" "${HOME}/k"))
+      (is (null condition))
+      (is (equal "${HOME}/k"
+                 (namestring
+                  (first (cl-pnet-ssh:ssh-config-options-known-hosts
+                          options))))))
+    (multiple-value-bind (condition options)
+        (resolve (line 1 "userknownhostsfile" "~/k"))
+      (is (null condition))
+      (is (equal "~/k"
+                 (namestring
+                  (first (cl-pnet-ssh:ssh-config-options-known-hosts
+                          options))))))))
+
+(test config-tilde-expansion-matches-ssh
+  "ssh's tilde_expand() keeps a trailing slash for a bare ~ or ~user and
+rejects an account that does not exist."
+  (labels ((home () (namestring (user-homedir-pathname)))
+           (user () (uiop:getenv "USER"))
+           (expand (path)
+             (multiple-value-bind (expanded unknown)
+                 (cl-pnet-ssh::ssh-config-expand-tilde path)
+               (values expanded unknown))))
+    (is (equal (home) (expand "~")))
+    (is (equal (home) (expand "~/")))
+    (is (equal (concatenate 'string (home) "x") (expand "~/x")))
+    ;; A passwd entry's directory has no trailing slash, so ssh adds one.
+    (when (and (user) (plusp (length (user))))
+      (let ((expanded (expand (concatenate 'string "~" (user)))))
+        (is (equal (home) expanded))
+        (is (equal (concatenate 'string (home) "x")
+                   (expand (concatenate 'string "~" (user) "/x"))))))
+    (multiple-value-bind (expanded unknown)
+        (expand "~burs_no_such_user_xyz/x")
+      (is (null expanded))
+      (is (equal "burs_no_such_user_xyz" unknown)))
+    ;; A name without a leading ~ is left alone.
+    (is (equal "/tmp/x" (expand "/tmp/x")))))
+
+(test config-percent-dollar-expansion
+  "ssh.c expands % tokens and ${NAME}; a missing variable and a bad token
+are different failures."
+  (let ((options (cl-pnet-ssh::%make-ssh-config-options
+                  :hostname "server" :user "bob" :port 2222))
+        (context (cl-pnet-ssh::%make-ssh-config-context
+                  :original-host "alias" :user "bob" :port 2222)))
+    (multiple-value-bind (expanded message kind)
+        (cl-pnet-ssh::ssh-config-percent-dollar-expand
+         "%h:%p:%n:%%" options context)
+      (is (equal "server:2222:alias:%" expanded))
+      (is (null message))
+      (is (null kind)))
+    (multiple-value-bind (expanded message kind)
+        (cl-pnet-ssh::ssh-config-percent-dollar-expand
+         "%r" options context :no-user t)
+      (is (null expanded))
+      (is (equal "unknown key %r" message))
+      (is (eq :syntax kind)))
+    (multiple-value-bind (expanded message kind)
+        (cl-pnet-ssh::ssh-config-percent-dollar-expand
+         "${BURS_UNSET_XYZ}" options context)
+      (is (null expanded))
+      (is (equal "env var ${BURS_UNSET_XYZ} has no value" message))
+      (is (eq :missing-env kind)))))
 
 (test client-version-addendum
   "VersionAddendum parses as the rest of the line, expands its % tokens, and
@@ -4569,7 +4883,15 @@ newline")))
   (is (eq t (cl-pnet-ssh::ssh-config-client-agent (facade-options nil) "SSH_AUTH_SOCK")))
   ;; IdentitiesOnly turns the environment's agent off.
   (is (eq :none (cl-pnet-ssh::ssh-config-client-agent
-                 (facade-options '(:identities-only t)) nil))))
+                 (facade-options '(:identities-only t)) nil)))
+  ;; A legacy $NAME IdentityAgent names the environment variable holding
+  ;; the socket, and an unset variable disables the agent.
+  (is (equal (uiop:getenv "HOME")
+             (namestring
+              (cl-pnet-ssh::ssh-config-client-agent
+               (facade-options '(:identity-agent "$HOME")) nil))))
+  (is (eq :none (cl-pnet-ssh::ssh-config-client-agent
+                 (facade-options '(:identity-agent "$BURS_UNSET_XYZ")) nil))))
 
 (test facade-client-identities-keep-the-file-order
   (let ((options (facade-options
@@ -4605,6 +4927,33 @@ newline")))
              (mapcar #'namestring
                      (cl-pnet-ssh::ssh-config-client-known-hosts
                       (facade-options nil) '("/given"))))))
+
+(test facade-proxy-jump-parses-like-readconf
+  ;; parse_jump walks the hops right to left, so the rightmost failure is the
+  ;; one reported, and a URI host goes through valid_domain: consecutive dots
+  ;; are refused while a single trailing dot is accepted and stripped.
+  (multiple-value-bind (dump reason)
+      (cl-pnet-ssh::ssh-config-parse-proxy-jump "a,ssh://host.:22" t)
+    (is (equal "a,host:22" dump))
+    (is (null reason)))
+  (multiple-value-bind (dump reason)
+      (cl-pnet-ssh::ssh-config-parse-proxy-jump "ssh://host.." t)
+    (is (null dump))
+    (is (null reason)))
+  (multiple-value-bind (dump reason)
+      (cl-pnet-ssh::ssh-config-parse-proxy-jump "bad user,bad2 user" t)
+    (is (null dump))
+    (is (equal "parse_jump: invalid hostname \"bad2 user\"" reason)))
+  ;; Without strict only the syntax is checked, so a rejected-by-policy
+  ;; hostname still parses.
+  (multiple-value-bind (dump reason)
+      (cl-pnet-ssh::ssh-config-parse-proxy-jump "bad_user" nil)
+    (is (equal "bad_user" dump))
+    (is (null reason)))
+  (multiple-value-bind (dump reason)
+      (cl-pnet-ssh::ssh-config-parse-proxy-jump "none" t)
+    (is (eq :none dump))
+    (is (null reason))))
 
 (test facade-proxy-jumps-let-the-command-line-win
   (let ((options (facade-options '(:proxy-jump "from-config.example"))))
@@ -5666,12 +6015,29 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
              (ssh-config-resolve config "alias"
                                  :on-options
                                  (lambda (value) (setf options value)))
-             (ssh-config-options-add-keys-to-agent options))))
+             (ssh-config-options-add-keys-to-agent options)))
+         (lifespan (line)
+           (let* ((config
+                    (cl-pnet-ssh::%make-ssh-config
+                     :directives
+                     (list (cl-pnet-ssh::ssh-config-option-line line))))
+                  (options nil))
+             (ssh-config-resolve config "alias"
+                                 :on-options
+                                 (lambda (value) (setf options value)))
+             (ssh-config-options-add-keys-to-agent-lifespan options))))
     (is (eq :yes (value "AddKeysToAgent yes")))
     (is (eq :no (value "AddKeysToAgent no")))
     (is (eq :ask (value "AddKeysToAgent ask")))
     (is (eq :confirm (value "AddKeysToAgent confirm")))
-    (is (null (value "Port 22"))))
+    (is (null (value "Port 22")))
+    (is (= 0 (lifespan "AddKeysToAgent yes")))
+    ;; A bare lifetime is the yes form; only confirm takes a lifetime word.
+    (is (= 300 (lifespan "AddKeysToAgent 5m")))
+    (is (eq :yes (value "AddKeysToAgent 5m")))
+    (is (= 3600 (lifespan "AddKeysToAgent confirm 1h")))
+    (is (eq :confirm (value "AddKeysToAgent confirm 1h")))
+    (is (= 0 (lifespan "AddKeysToAgent confirm 0"))))
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config
             :directives
@@ -5930,7 +6296,9 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
          (options nil))
     (ssh-config-resolve config "alias"
                         :on-options (lambda (value) (setf options value)))
-    (is (equal '(("example.org" . 80) ("::1" . 2222) ("*" . :any))
+    (is (equal '(("example.org:80" "example.org" 80)
+                 ("[::1]:2222" "::1" 2222)
+                 ("*:*" "*" :any))
                (ssh-config-options-permit-remote-open options))))
   (flet ((value (line)
            (let* ((config
@@ -6234,7 +6602,7 @@ so a malformed duplicate is a configuration error rather than ignored."
             :directives
             (list (cl-pnet-ssh::ssh-config-option-line "Host other")
                   (cl-pnet-ssh::ssh-config-option-line
-                   "RefuseConnection not for you")
+                   "RefuseConnection \"not for you\"")
                   (cl-pnet-ssh::ssh-config-option-line "Host alias")
                   (cl-pnet-ssh::ssh-config-option-line "Port 2222"))))
          (failure nil)
@@ -8920,3 +9288,92 @@ pattern when one is why it does not apply the block."
                                  (ssh-keygen (list "-y" "-P" "pw" "-f"
                                                    (namestring locked)))))))
               (ignore-errors (uiop:delete-directory-tree directory :validate t))))))))
+
+;;; ---- algorithm negotiation diagnostics ----
+
+(test negotiation-reports-the-first-failed-proposal
+  "A failed choice names the peer's offer the way ssh's packet.c does."
+  (labels ((offer (&key (kex cl-pnet-ssh:+ssh-kex-algorithms+)
+                        (host-keys cl-pnet-ssh:+ssh-host-key-algorithms+)
+                        (ciphers cl-pnet-ssh:+ssh-ciphers+)
+                        (macs cl-pnet-ssh:+ssh-macs+)
+                        (compressions '("none")))
+             (list :kex kex :host-keys host-keys
+                   :ciphers-c2s ciphers :ciphers-s2c ciphers
+                   :macs-c2s macs :macs-s2c macs
+                   :compressions-c2s compressions
+                   :compressions-s2c compressions))
+           (failure (server &rest args)
+             (handler-case
+                 (progn (apply #'cl-pnet-ssh::ssh-negotiate server args) nil)
+               (cl-pnet-ssh:ssh-algorithm-negotiation-error (condition)
+                 condition))))
+    (let ((condition (failure (offer :kex '("nope-kex")))))
+      (is (string= "no matching key exchange method found"
+                   (cl-pnet-ssh:ssh-negotiation-reason condition)))
+      (is (equal '("nope-kex")
+                 (cl-pnet-ssh:ssh-negotiation-peer-offer condition)))
+      (is (typep condition 'cl-pnet-ssh:ssh-protocol-error)))
+    (let ((condition (failure (offer :host-keys '("ssh-rsa")))))
+      (is (string= "no matching host key type found"
+                   (cl-pnet-ssh:ssh-negotiation-reason condition)))
+      (is (equal '("ssh-rsa")
+                 (cl-pnet-ssh:ssh-negotiation-peer-offer condition))))
+    (let ((condition (failure (offer :ciphers '("aes128-cbc")))))
+      (is (string= "no matching cipher found"
+                   (cl-pnet-ssh:ssh-negotiation-reason condition)))
+      (is (equal '("aes128-cbc")
+                 (cl-pnet-ssh:ssh-negotiation-peer-offer condition))))
+    (let ((condition (failure (offer :compressions '("zlib")))))
+      (is (string= "no matching compression method found"
+                   (cl-pnet-ssh:ssh-negotiation-reason condition)))
+      (is (equal '("zlib")
+                 (cl-pnet-ssh:ssh-negotiation-peer-offer condition))))
+    ;; The kex is chosen before everything else, whatever else is wrong.
+    (let ((condition (failure (offer :kex '("nope-kex")
+                                     :ciphers '("aes128-cbc")))))
+      (is (string= "no matching key exchange method found"
+                   (cl-pnet-ssh:ssh-negotiation-reason condition))))))
+
+(test aead-cipher-ignores-the-mac-list
+  "A MAC the peer does not offer is harmless beside an AEAD cipher.
+
+OpenSSH skips choose_mac() when the chosen cipher authenticates the packet,
+so MACs=hmac-md5 still connects with chacha20-poly1305."
+  (let* ((server
+           (list :kex cl-pnet-ssh:+ssh-kex-algorithms+
+                 :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
+                 :ciphers-c2s cl-pnet-ssh:+ssh-ciphers+
+                 :ciphers-s2c cl-pnet-ssh:+ssh-ciphers+
+                 :macs-c2s '("hmac-md5") :macs-s2c '("hmac-md5")
+                 :compressions-c2s '("none") :compressions-s2c '("none")))
+         (negotiated
+           (cl-pnet-ssh::ssh-negotiate
+            server
+            :kex-algorithms cl-pnet-ssh:+ssh-kex-algorithms+
+            :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
+            :ciphers cl-pnet-ssh:+ssh-ciphers+
+            :compressions '("none"))))
+    (is (string= "chacha20-poly1305@openssh.com"
+                 (getf negotiated :cipher-c2s)))
+    (is (null (getf negotiated :mac-c2s)))
+    (is (null (getf negotiated :mac-s2c))))
+  ;; With a cipher that is not AEAD the same offer is a missing MAC.
+  (let ((condition
+          (handler-case
+              (cl-pnet-ssh::ssh-negotiate
+               (list :kex cl-pnet-ssh:+ssh-kex-algorithms+
+                     :host-keys cl-pnet-ssh:+ssh-host-key-algorithms+
+                     :ciphers-c2s '("aes128-ctr") :ciphers-s2c '("aes128-ctr")
+                     :macs-c2s '("hmac-md5") :macs-s2c '("hmac-md5")
+                     :compressions-c2s '("none") :compressions-s2c '("none"))
+               :kex-algorithms cl-pnet-ssh:+ssh-kex-algorithms+
+               :host-key-algorithms cl-pnet-ssh:+ssh-host-key-algorithms+
+               :ciphers '("aes128-ctr")
+               :compressions '("none"))
+            (cl-pnet-ssh:ssh-algorithm-negotiation-error (condition)
+              condition))))
+    (is (string= "no matching MAC found"
+                 (cl-pnet-ssh:ssh-negotiation-reason condition)))
+    (is (equal '("hmac-md5")
+               (cl-pnet-ssh:ssh-negotiation-peer-offer condition)))))

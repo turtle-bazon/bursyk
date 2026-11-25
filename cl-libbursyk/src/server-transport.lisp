@@ -242,13 +242,16 @@ differ, which compression exposes immediately."
          (compression-s2c (ssh-choose-algorithm
                            (getf client-kexinit :compressions-s2c)
                            compressions)))
-    (unless (and kex host-key cipher-c2s cipher-s2c mac-c2s mac-s2c
-                 compression-c2s compression-s2c)
+    (unless (and kex host-key cipher-c2s cipher-s2c
+                 compression-c2s compression-s2c
+                 (or mac-c2s (ssh-cipher-aead-p cipher-c2s))
+                 (or mac-s2c (ssh-cipher-aead-p cipher-s2c)))
       (error 'ssh-protocol-error
              :detail "no common algorithm for the server"))
     (list :kex kex :host-key host-key
           :cipher-c2s cipher-c2s :cipher-s2c cipher-s2c
-          :mac-c2s mac-c2s :mac-s2c mac-s2c
+          :mac-c2s (unless (ssh-cipher-aead-p cipher-c2s) mac-c2s)
+          :mac-s2c (unless (ssh-cipher-aead-p cipher-s2c) mac-s2c)
           :compression-c2s compression-c2s
           :compression-s2c compression-s2c
           :ext-info (and (member "ext-info-c" (getf client-kexinit :kex)

@@ -59,6 +59,124 @@ A non-keyword symbol may name a function, so it is treated as one."
        (or (functionp resolver)
            (and (symbolp resolver) (not (keywordp resolver))))))
 
+(defun ssh-ipv4-literal-p (text)
+  "Whether TEXT is a dotted-quad IPv4 address."
+  (let ((parts (uiop:split-string text :separator ".")))
+    (and (= (length parts) 4)
+         (every (lambda (part)
+                  (and (plusp (length part))
+                       (<= (length part) 3)
+                       (every #'digit-char-p part)
+                       (<= (parse-integer part) 255)))
+                parts))))
+
+(defun ssh-ipv6-hex-field-p (text)
+  "Whether TEXT is one 16-bit group of an IPv6 literal."
+  (and (plusp (length text))
+       (<= (length text) 4)
+       (every (lambda (character) (digit-char-p character 16)) text)))
+
+(defun ssh-ipv6-field-count (text)
+  "The 16-bit groups TEXT accounts for, or NIL when TEXT is malformed.
+
+TEXT is a non-empty run of ':'-separated fields; a trailing dotted quad
+counts as the two groups it stands for."
+  (if (zerop (length text))
+      0
+      (let* ((fields (uiop:split-string text :separator ":"))
+             (last (car (last fields))))
+        (if (find #\. last)
+            (and (ssh-ipv4-literal-p last)
+                 (loop for field in (butlast fields)
+                       always (ssh-ipv6-hex-field-p field))
+                 (+ (1- (length fields)) 2))
+            (and (loop for field in fields
+                       always (ssh-ipv6-hex-field-p field))
+                 (length fields))))))
+
+(defun ssh-ipv6-literal-p (text)
+  "Whether TEXT is an IPv6 literal such as ::1 or 2001:db8::1."
+  (and (stringp text)
+       (find #\: text)
+       (let ((double (search "::" text)))
+         (when (or (null double)
+                   (null (search "::" text :start2 (+ double 2))))
+           (let* ((head (if double (subseq text 0 double) text))
+                  (tail (if double (subseq text (+ double 2)) ""))
+                  (head-count (ssh-ipv6-field-count head))
+                  (tail-count (ssh-ipv6-field-count tail)))
+             (and head-count tail-count
+                  (if double
+                      (< (+ head-count tail-count) 8)
+                      (= (+ head-count tail-count) 8))))))))
+
+(defun ssh-address-literal-p (host)
+  "Whether HOST is a real numeric address.
+
+BURZAY treats any colon as an IPv6 literal, so the client re-checks the
+literal before short-circuiting resolution: a name such as \"a:b\" has to
+reach the system resolver and fail there, as ssh's getaddrinfo call does."
+  (and (stringp host)
+       (plusp (length host))
+       (or (ssh-ipv4-literal-p host)
+           (ssh-ipv6-literal-p host))))
+
+(defun ssh-inet-number (text)
+  "TEXT as one inet_aton component, or NIL.
+
+inet_aton, and so getaddrinfo with AI_NUMERICHOST, reads a leading 0x as
+hexadecimal, a leading 0 as octal and anything else as decimal."
+  (when (plusp (length text))
+    (cond
+      ((and (> (length text) 2)
+            (char= (char text 0) #\0)
+            (member (char text 1) '(#\x #\X)))
+       (let ((digits (subseq text 2)))
+         (when (and (plusp (length digits))
+                    (every (lambda (character) (digit-char-p character 16))
+                           digits))
+           (parse-integer digits :radix 16))))
+      ((and (> (length text) 1) (char= (char text 0) #\0))
+       (let ((digits (subseq text 1)))
+         (when (every (lambda (character) (digit-char-p character 8)) digits)
+           (parse-integer digits :radix 8))))
+      ((every #'digit-char-p text)
+       (parse-integer text))
+      (t nil))))
+
+(defun ssh-ipv4-inet-aton-p (text)
+  "Whether TEXT is an IPv4 address in any spelling inet_aton accepts.
+
+\"127.1\", \"2130706433\", \"0x7f000001\" and \"0177.0.0.1\" all name
+127.0.0.1, and ssh prints them that way because resolve_addr() canonicalises
+a numeric host with getnameinfo(NI_NUMERICHOST).  A value that does not fit
+the octets is not an address and must not be handed to the resolver: glibc
+would look a name such as \"999.1\" up in DNS."
+  (and (stringp text)
+       (let* ((parts (uiop:split-string text :separator "."))
+              (numbers (mapcar #'ssh-inet-number parts))
+              (count (length parts)))
+         (and (<= 1 count 4)
+              (every #'identity numbers)
+              (loop for number in (butlast numbers)
+                    always (< number 256))
+              (< (car (last numbers)) (ash 1 (* 8 (- 5 count))))))))
+
+(defun ssh-canonical-address-string (host)
+  "HOST in the numeric form ssh prints, or NIL when it is a name.
+
+ssh canonicalises a numeric host before printing or dialling it, so a
+short or hexadecimal spelling is shown as the dotted quad the system
+resolver reads.  A name is left alone: nothing here may trigger a DNS
+lookup that ssh would not make."
+  (when (and (stringp host)
+             (plusp (length host))
+             (or (find #\: host)
+                 (ssh-ipv4-inet-aton-p host)))
+    (handler-case
+        (cl-pnet-sockets:lookup-host-canonical host)
+      (error () nil))))
+
 (defun ssh-client-resolve-host (client host on-success on-error)
   "Resolve HOST for CLIENT, honouring AddressFamily when it can.
 
@@ -70,11 +188,23 @@ chooses the family itself; the address it returns is still checked against
 CLIENT's AddressFamily before dialling.  HOST is left alone when it is
 already a numeric address, just as BURZAY does."
   (let ((resolver (ssh-client-resolver client)))
-    (if (ssh-client-resolver-function-p resolver)
-        (funcall resolver host on-success on-error)
-        (burzay:resolve-host host on-success on-error
-                             :resolver resolver
-                             :family (ssh-client-address-family client)))))
+    (cond
+      ((and (burzay:numeric-address-p host)
+            (not (ssh-address-literal-p host)))
+       ;; A numeric answer is reached without the network, so asking the
+       ;; system resolver here cannot stall the loop.
+       (handler-case
+           (funcall on-success
+                    (cl-pnet-sockets:lookup-host-canonical
+                     host :family (ssh-client-address-family client)))
+         (error (condition)
+           (funcall on-error condition))))
+      ((ssh-client-resolver-function-p resolver)
+       (funcall resolver host on-success on-error))
+      (t
+       (burzay:resolve-host host on-success on-error
+                            :resolver resolver
+                            :family (ssh-client-address-family client))))))
 
 (defun ssh-client-bind-address-resolved-p (client remote-address)
   "Whether CLIENT's source address is ready for REMOTE-ADDRESS's family.

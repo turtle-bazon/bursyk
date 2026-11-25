@@ -97,18 +97,66 @@ must already know that stdin is a terminal."
             (when (and rows columns)
               (values rows columns))))))))
 
+(defun run-tty-stty (&rest arguments)
+  "Run stty with ARGUMENTS on the controlling terminal; its output, or NIL.
+
+Unlike RUN-STTY this does not depend on stdin being the terminal, so it also
+works while stdin carries a file to the remote side.  A child whose stdin is
+opened separately lands in its own process group, and a terminal setting
+change from a background group is stopped with SIGTTOU, so the redirection
+belongs to a shell that stays in our group."
+  (handler-case
+      (string-trim
+       '(#\Newline #\Return)
+       (call-with-deferrable-signals-unblocked
+        (lambda ()
+          (uiop:run-program
+           (list "sh" "-c"
+                 (format nil "stty ~{~A~^ ~} < /dev/tty" arguments))
+           :input :interactive :output :string :error-output nil))))
+    (error () nil)))
+
+(defun read-tty-line (prompt)
+  "Write PROMPT on the controlling terminal and read one line, or NIL.
+
+ssh asks for a key passphrase with read_passphrase, which opens /dev/tty
+rather than trusting stdin: a redirected stdin is still a prompt, and no
+terminal at all means no prompt.  Echo is off while the answer is typed, and
+a carriage return first puts the prompt over any type-ahead, as OpenSSH does."
+  (let ((fd (c-open "/dev/tty" 2 0)))
+    (when (>= fd 0)
+      (let ((stream
+              (sb-sys:make-fd-stream fd :input t :output t
+                                        :buffering :line :auto-close t)))
+        (unwind-protect
+             (let ((saved (run-tty-stty "-g")))
+               (unwind-protect
+                    (progn
+                      (write-char #\Return stream)
+                      (finish-output stream)
+                      (when saved (run-tty-stty "-echo"))
+                      (format stream "~A" prompt)
+                      (finish-output stream)
+                      (read-line stream nil nil))
+                 (when saved (run-tty-stty saved))
+                 (format stream "~%")
+                 (finish-output stream)))
+          (close stream))))))
+
 (defun read-prompt-line (prompt &key (echo t))
   "Write PROMPT to stderr and read one line from stdin.
 
 When ECHO is false and stdin is a terminal, the typed characters are not
-echoed.  NIL is returned at end of input, so a non-interactive caller can
-treat a closed stdin as a cancelled prompt rather than an empty answer."
-  (format *error-output* "~A" prompt)
-  (finish-output *error-output*)
+echoed; the terminal stops echoing before the prompt is written, so an
+answer that arrives with the prompt is not shown either.  NIL is returned at
+end of input, so a non-interactive caller can treat a closed stdin as a
+cancelled prompt rather than an empty answer."
   (let ((saved (and (not echo) (stdin-terminal-p) (run-stty "-g"))))
     (unwind-protect
          (progn
            (when saved (run-stty "-echo"))
+           (format *error-output* "~A" prompt)
+           (finish-output *error-output*)
            (read-line *standard-input* nil nil))
       (when saved
         (run-stty saved))
@@ -240,9 +288,38 @@ decoder before the parser sees it."
   *standard-input*)
 
 (defun stop-stdin ()
+  (setf *stdin-stopped* t)
   (when *stdin-watcher*
     (cl-pnet:fd-unwatch *stdin-watcher*)
     (setf *stdin-watcher* nil)))
+
+(defun stdin-thread (channel)
+  "Read an unwatchable stdin until EOF, handing every chunk to the loop.
+
+A regular file and /dev/null have no poll method, so the kernel refuses to
+register them; their reads complete at once and CALL-ON-LOOP keeps the
+chunks in the order they were read."
+  (loop
+    (when *stdin-stopped* (return))
+    (multiple-value-bind (octets count error)
+        (cl-pnet-sockets:read-octets 0 65536)
+      (declare (ignore error))
+      (cond
+        ((plusp count)
+         (cl-pnet:call-on-loop
+          (lambda ()
+            (unless *stdin-stopped*
+              (feed-keystrokes
+               channel (if *escape-char* (escape-filter octets) octets))))))
+        ((zerop count)
+         (cl-pnet:call-on-loop
+          (lambda ()
+            (unless *stdin-stopped*
+              (finish-keystrokes channel)
+              (handler-case (cl-pnet-ssh:ssh-channel-eof channel)
+                (error () nil)))))
+         (return))
+        (t nil)))))
 
 (defun stdin-readable (channel)
   "Move whatever stdin has to CHANNEL; end the input at real EOF.
@@ -263,11 +340,23 @@ answer ENOTSOCK.  A count of -1 means nothing is ready yet, not EOF."
       (t nil))))
 
 (defun start-stdin (channel)
-  (setf *stdin-watcher*
-        (cl-pnet:fd-watch
-         0
-         :on-readable
-         (lambda (watcher)
-           (declare (ignore watcher))
-           (handler-case (stdin-readable channel)
-             (error () (stop-stdin)))))))
+  "Feed CHANNEL from stdin, by a watch or, when that is impossible, a thread.
+
+A terminal, pipe or socket can be watched; a regular file or /dev/null
+cannot, and ssh treats those as ordinary input, so they are read on their own
+thread rather than reported as a broken descriptor."
+  (setf *stdin-stopped* nil)
+  (handler-case
+      (setf *stdin-watcher*
+            (cl-pnet:fd-watch
+             0
+             :on-readable
+             (lambda (watcher)
+               (declare (ignore watcher))
+               (handler-case (stdin-readable channel)
+                 (error () (stop-stdin))))))
+    (error ()
+      (setf *stdin-watcher* nil
+            *stdin-thread*
+            (bt:make-thread (lambda () (stdin-thread channel))
+                            :name "burs stdin")))))

@@ -13,6 +13,22 @@
 (defparameter +ssh-config-max-depth+ 16
   "Include nesting limit, matching OpenSSH's own guard.")
 
+(defparameter +ssh-max-identity-files+ 100
+  "SSH_MAX_IDENTITY_FILES: readconf refuses more IdentityFile entries.")
+
+(defparameter +ssh-max-certificate-files+ 100
+  "SSH_MAX_CERTIFICATE_FILES: readconf refuses more CertificateFile entries.")
+
+(defvar *ssh-config-identity-count-seed* 0
+  "Command-line -i entries a caller has already recorded.
+
+ssh processes -i while it parses its arguments, so those files occupy the
+first identity slots before readconf sees an -o or a file line.  A caller
+that parses -i itself binds this so the shared 100-file limit counts them.")
+
+(defvar *ssh-config-certificate-count-seed* 0
+  "Command-line entries counted before readconf's certificate-file limit.")
+
 (defvar *ssh-config-error-function* nil
   "A function of one string for readconf-style configuration diagnostics.
 
@@ -149,7 +165,12 @@ warning reporter's own rule; the option itself never takes effect.")
   ;; and Match as file structure and refuses them.  The flag is set only when
   ;; the option list is turned into lines, so a caller that builds a line for
   ;; a file-like block is not affected.
-  (command-line nil))
+  (command-line nil)
+  ;; True when the argument text leaves a quote open.  readconf runs
+  ;; argv_split() on the remainder after the keyword for every directive and
+  ;; reports "invalid quotes" before the directive is applied, so the line is
+  ;; kept and the parser raises the error in its proper place.
+  (invalid-quotes nil))
 
 (defstruct (ssh-config-context (:constructor %make-ssh-config-context))
   (original-host nil)
@@ -185,7 +206,10 @@ warning reporter's own rule; the option itself never takes effect.")
   (hostbased-keys '())
   (enable-ssh-keysign nil)
   ;; AddKeysToAgent: :YES adds keys loaded from files to the agent.
+  ;; The lifespan is the optional lifetime in seconds ("confirm 5m" or a
+  ;; bare "5m"); zero means unlimited.
   (add-keys-to-agent nil)
+  (add-keys-to-agent-lifespan 0)
   ;; HostKeyAlias: the name known_hosts is checked and written under.
   (host-key-alias nil)
   (identities-only nil)
@@ -369,6 +393,39 @@ one.")
       (uiop:getenv "LOGNAME")
       "root"))
 
+(defun ssh-config-command-value (value)
+  "VALUE as a command string, or NIL when unset or the literal none.
+
+readconf clears LocalCommand, RemoteCommand, ProxyCommand and
+KnownHostsCommand when the argument is \"none\" (option_clear_or_none), so
+the literal spelling means no command even though the keyword was present."
+  (cond ((null value) nil)
+        ((eq value :none) nil)
+        ((and (stringp value)
+              (string-equal (string-trim '(#\Space #\Tab) value) "none"))
+         nil)
+        (t value)))
+
+(defun ssh-config-update-host-keys-default (options)
+  "The UpdateHostKeys value readconf fills in when no line set one.
+
+YES only when VerifyHostKeyDNS is unset or explicitly no (readconf tests
+verify_host_key_dns <= 0, so both yes and ask disable it) and the user's
+known-hosts list is absent or the single default spelling
+~/.ssh/known_hosts.  The test runs before ssh.c expands those paths, which
+is why the raw spelling matters here."
+  (or (ssh-config-options-update-host-keys options)
+      (let ((dns (ssh-config-options-verify-host-key-dns options))
+            (files (ssh-config-options-known-hosts options)))
+        (if (and (or (null dns) (eq dns :no))
+                 (or (null files)
+                     (and (consp files)
+                          (null (rest files))
+                          (string= (namestring (first files))
+                                   "~/.ssh/known_hosts"))))
+            :yes
+            :no))))
+
 ;;; ---- Tokens ----
 
 (defun ssh-config-whitespace-p (character)
@@ -390,7 +447,8 @@ so \"SetEnv LANG=en_US.UTF-8\" is one assignment and not two tokens."
   (let ((tokens '())
         (token (make-string-output-stream))
         (started nil)
-        (quote nil))
+        (quote nil)
+        (equals-skipped nil))
     (labels ((emit-token ()
                (when started
                  (push (get-output-stream-string token) tokens)
@@ -413,12 +471,20 @@ so \"SetEnv LANG=en_US.UTF-8\" is one assignment and not two tokens."
                     (t
                      (write-char character token)
                      (setf started t))))
-                 ((or (ssh-config-whitespace-p character)
-                      ;; A '=' after the keyword has begun a second token is
-                      ;; part of that value.
-                      (and (char= character #\=)
-                           (or (null tokens) (not started))))
+                 ((ssh-config-whitespace-p character)
                   (emit-token))
+                 ;; Exactly one '=' separates the keyword from its value,
+                 ;; whether it follows the keyword directly or after
+                 ;; whitespace.  A second '=' already belongs to the value,
+                 ;; so -o User== keeps the leading '=' for readconf.
+                 ((and (char= character #\=)
+                       (null tokens))
+                  (emit-token)
+                  (setf equals-skipped t))
+                 ((and (char= character #\=)
+                       (not started)
+                       (not equals-skipped))
+                  (setf equals-skipped t))
                  ((or (char= character #\') (char= character #\"))
                   (setf quote character started t))
                  ((char= character #\\)
@@ -453,6 +519,60 @@ ProxyCommand's arguments to the shell exactly as written."
                                       (1+ end)
                                       end)))
         "")))
+
+(defun ssh-config-argv-split (text &key terminate-on-comment)
+  "TEXT as an argument list, split the way misc.c's argv_split does.
+
+Quotes group words and are removed, a backslash escapes only a quote, a
+backslash, or (outside quotes) a space, and whitespace outside quotes ends a
+word.  A '#' at the start of a word begins a comment when
+TERMINATE-ON-COMMENT.  Returns (values ARGUMENTS OK); OK is NIL when a quote
+is still open at the end, which readconf reports as \"invalid quotes\"."
+  (let ((arguments '())
+        (length (length text))
+        (index 0)
+        (ok t))
+    (loop while (and ok (< index length))
+          do (let ((character (char text index)))
+               (cond
+                 ((member character '(#\Space #\Tab))
+                  (incf index))
+                 ((and terminate-on-comment (char= character #\#))
+                  (return))
+                 (t
+                  (let ((token (make-string-output-stream))
+                        (quote nil)
+                        (finished nil))
+                    (loop while (and (not finished) (< index length))
+                          do (let ((c (char text index)))
+                               (cond
+                                 ((char= c #\\)
+                                  (if (and (< (1+ index) length)
+                                           (let ((next (char text (1+ index))))
+                                             (or (char= next #\')
+                                                 (char= next #\")
+                                                 (char= next #\\)
+                                                 (and (null quote)
+                                                      (char= next #\Space)))))
+                                      (progn
+                                        (incf index)
+                                        (write-char (char text index) token))
+                                      (write-char c token)))
+                                 ((and (null quote)
+                                       (member c '(#\Space #\Tab)))
+                                  (setf finished t))
+                                 ((and (null quote)
+                                       (member c '(#\" #\')))
+                                  (setf quote c))
+                                 ((and quote (char= c quote))
+                                  (setf quote nil))
+                                 (t
+                                  (write-char c token)))
+                               (incf index)))
+                    (when quote
+                      (setf ok nil))
+                    (push (get-output-stream-string token) arguments))))))
+    (values (if ok (nreverse arguments) nil) ok)))
 
 ;;; ---- Globs ----
 
@@ -535,53 +655,174 @@ the caller can treat the '[' literally."
      (namestring (merge-pathnames (subseq path 2) (user-homedir-pathname))))
     (t path)))
 
+(defun ssh-config-tilde-user-home (user)
+  "USER's home directory from the local password database, or NIL.
+
+ssh's tilde_expand() calls getpwnam; the password file answers the same
+question for the accounts this client is likely to name."
+  (and (plusp (length user))
+       (handler-case
+           (with-open-file (stream "/etc/passwd" :if-does-not-exist nil)
+             (when stream
+               (loop for line = (read-line stream nil nil)
+                     while line
+                     for fields = (uiop:split-string line :separator ":")
+                     when (and (>= (length fields) 6)
+                               (string= (first fields) user))
+                       return (sixth fields))))
+         (error () nil))))
+
+(defun ssh-config-expand-tilde (path)
+  "PATH with a leading ~ or ~USER replaced, as tilde_expand() does.
+
+Returns (values EXPANDED NIL) on success or (values NIL USER) when USER
+does not exist.  The directory always keeps a trailing slash, which is how
+ssh spells the result for \"~\" and \"~user\"."
+  (if (or (zerop (length path)) (char/= (char path 0) #\~))
+      (values path nil)
+      (let* ((slash (position #\/ path))
+             (user (subseq path 1 (or slash (length path))))
+             (rest (if slash (string-left-trim "/" (subseq path slash)) ""))
+             (home (if (string= user "")
+                       (namestring (user-homedir-pathname))
+                       (ssh-config-tilde-user-home user))))
+        (if (null home)
+            (values nil user)
+            (values (concatenate 'string
+                                 (if (and (plusp (length home))
+                                          (char= (char home (1- (length home)))
+                                                #\/))
+                                     home
+                                     (concatenate 'string home "/"))
+                                 rest)
+                    nil)))))
+
 (defun ssh-config-expand-variables (value)
-  "Expand $NAME and ${NAME} from the environment, leaving unknown names."
+  "Expand ${NAME} from the environment, leaving an unknown NAME literal.
+
+OpenSSH's percent_dollar_expand substitutes only the braced form; a bare
+$NAME stays literal except for IdentityAgent and ForwardAgent, which read it
+as an environment variable name.  A reference that cannot be resolved is
+left as written here; the caller that cares rejects it."
   (with-output-to-string (out)
     (loop with length = (length value)
           for index from 0 below length
           for character = (char value index)
-          do (if (char= character #\$)
-                 (let* ((braced (and (< (1+ index) length)
-                                     (char= (char value (1+ index)) #\{)))
-                        (start (+ index (if braced 2 1)))
-                        (end (and braced (position #\} value :start start)))
-                        (stop (or end
-                                  (position-if (lambda (c)
-                                                 (or (ssh-config-whitespace-p c)
-                                                     (member c '(#\/ #\: #\,))))
-                                               value :start start)
-                                  length)))
-                   (if (< start stop)
-                       (let ((name (subseq value start stop))
-                             (replacement (and (< start stop)
-                                               (uiop:getenv
-                                                (subseq value start stop)))))
+          do (if (and (char= character #\$)
+                      (< (1+ index) length)
+                      (char= (char value (1+ index)) #\{))
+                 (let* ((start (+ index 2))
+                        (end (position #\} value :start start)))
+                   (if (and end (< start end))
+                       (let ((replacement (uiop:getenv
+                                           (subseq value start end))))
                          (if replacement
                              (progn (write-string replacement out)
-                                    (setf index (if end end (1- stop))))
-                             (write-char character out)))
+                                    (setf index end))
+                             (progn (write-string value out :start index
+                                                  :end (1+ end))
+                                    (setf index end))))
                        (write-char character out)))
                  (write-char character out)))))
 
+(defun ssh-config-variable-expansion-problem (value)
+  "OpenSSH's dollar_expand() diagnostic for VALUE, or NIL when it is fine.
+
+Only the braced ${NAME} form is expanded, so a value without \"${\" is
+always fine.  A missing closing brace, an empty name and an unset variable
+are the three failures."
+  (loop with start = 0
+        for open = (search "${" value :start2 start)
+        while open
+        do (let* ((name-start (+ open 2))
+                  (end (position #\} value :start name-start)))
+             (cond
+               ((null end)
+                (return (format nil
+                                "environment variable '~A' missing closing '}'"
+                                (subseq value name-start))))
+               ((= end name-start)
+                (return "zero-length environment variable"))
+               ((null (uiop:getenv (subseq value name-start end)))
+                (return (format nil "env var ${~A} has no value"
+                                (subseq value name-start end))))
+               (t (setf start (1+ end)))))))
+
+(defun ssh-config-valid-environment-name-p (name)
+  "Whether NAME is a valid environment variable name, as readconf checks one."
+  (and (plusp (length name))
+       (loop for character across name
+             always (or (alphanumericp character)
+                        (char= character #\_)))))
+
+(defun ssh-config-report-diagnostic (line text)
+  "Write one of dollar_expand()'s own diagnostics for LINE.
+
+An -o option is parsed before log_init, so its diagnostic always reaches
+stderr; a configuration file's goes through the log reporter, which honours
+-q.  LINE is NIL for a command-line flag such as -L, whose diagnostics
+also bypass the log."
+  (if (or (null line) (ssh-config-line-command-line line))
+      (progn (format *error-output* "~A~%" (ssh-log-escape text))
+             (finish-output *error-output*))
+      (when *ssh-config-error-function*
+        (funcall *ssh-config-error-function* text))))
+
+(defun ssh-forward-expand-value (value line)
+  "VALUE with ${NAME} expanded as parse_forward's dollar_expand does.
+
+Reports the helper's own diagnostic for LINE and answers NIL when VALUE
+cannot be expanded; otherwise the expanded string is returned.  A bare
+$NAME is left alone, as dollar_expand leaves it."
+  (let ((problem (ssh-config-variable-expansion-problem value)))
+    (when problem
+      (ssh-config-report-diagnostic
+       line (format nil "vdollar_percent_expand: ~A" problem))
+      (return-from ssh-forward-expand-value nil)))
+  (ssh-config-expand-variables value))
+
+(defun ssh-config-validate-agent-path (line value)
+  "Reject VALUE as readconf validates IdentityAgent and ForwardAgent.
+
+readconf runs dollar_expand() while it reads the line, before checking
+whether the block is active, and reports the helper's diagnostic followed by
+its own \"Invalid environment expansion\" error.  A legacy $NAME argument is
+then checked as an environment variable name."
+  (let ((problem (ssh-config-variable-expansion-problem value)))
+    (when problem
+      (ssh-config-report-diagnostic
+       line (format nil "vdollar_percent_expand: ~A" problem))
+      (error (ssh-config-line-error
+              line "Invalid environment expansion ~A." value))))
+  (when (and (plusp (length value))
+             (char= (char value 0) #\$)
+             (or (= (length value) 1)
+                 (char/= (char value 1) #\{))
+             (not (ssh-config-valid-environment-name-p (subseq value 1))))
+    (error (ssh-config-line-error
+            line "Invalid environment name ~A." value))))
+
+
 (defun ssh-config-connection-hash (local-host host port user jump-host)
-  "The %C value: SHA-1 over the connection's identity, as lowercase hex."
-  (format nil "~{~2,'0x~}"
-          (coerce
-           (ssh-hash :sha1
-                     (ssh-string-octets
-                      (format nil "~A~A~A~A~A"
-                              local-host host port user jump-host)))
-           'list)))
+  "The %C value: SHA-1 over the connection's identity, as lowercase hex.
 
-(defun ssh-config-expand-tokens (value options context &key strict jump-host)
-  "Expand the OpenSSH % tokens VALUE may contain.
+FORMAT's ~X directive writes A-F in upper case, while ssh uses the
+lower-case spelling, so the result is downcased."
+  (string-downcase
+   (format nil "~{~2,'0x~}"
+           (coerce
+            (ssh-hash :sha1
+                      (ssh-string-octets
+                       (format nil "~A~A~A~A~A"
+                               local-host host port user jump-host)))
+            'list))))
 
-%h is the configured HostName, %n the host as written, and the rest follow
-ssh: %p port, %r remote user, %u local user, %d home, %i uid, %k
-HostKeyAlias, %j jump host, %l and %L the local name, %C the connection
-hash.  An unknown token is copied literally unless STRICT is set, in which
-case it is an error as it is for VersionAddendum."
+(defun ssh-config-token-values (options context &key jump-host)
+  "The % token replacements ssh uses, as an alist keyed by token character.
+
+The values follow DEFAULT_CLIENT_PERCENT_EXPAND_ARGS: %h is the configured
+HostName, %n the host as written, and the rest are the connection's own
+names, the local host and user, and the connection hash."
   (let* ((context-host (or (ssh-config-context-original-host context) ""))
          (host (or (ssh-config-options-hostname options) context-host))
          (user (or (ssh-config-options-user options)
@@ -597,8 +838,35 @@ case it is an error as it is for VersionAddendum."
          (short-host (subseq local-host 0
                              (or (position #\. local-host)
                                  (length local-host))))
-         (key-alias (or (ssh-config-options-host-key-alias options) ""))
+         (key-alias (or (ssh-config-options-host-key-alias options)
+                        context-host
+                        ""))
          (jump (or jump-host "")))
+    (list (cons #\h host)
+          (cons #\n context-host)
+          (cons #\p (format nil "~D" port))
+          (cons #\r user)
+          (cons #\u local-user)
+          (cons #\d (string-right-trim
+                     "/" (namestring (user-homedir-pathname))))
+          (cons #\i (or (uiop:getenv "UID") ""))
+          (cons #\k key-alias)
+          (cons #\j jump)
+          (cons #\l local-host)
+          (cons #\L short-host)
+          (cons #\C (ssh-config-connection-hash
+                     local-host host port user jump)))))
+
+(defun ssh-config-expand-tokens (value options context &key strict jump-host)
+  "Expand the OpenSSH % tokens VALUE may contain.
+
+%h is the configured HostName, %n the host as written, and the rest follow
+ssh: %p port, %r remote user, %u local user, %d home, %i uid, %k
+HostKeyAlias, %j jump host, %l and %L the local name, %C the connection
+hash.  An unknown token is copied literally unless STRICT is set, in which
+case it is an error as it is for VersionAddendum."
+  (let ((values (ssh-config-token-values options context
+                                         :jump-host jump-host)))
     (with-output-to-string (out)
       (loop with length = (length value)
             for index from 0 below length
@@ -606,43 +874,97 @@ case it is an error as it is for VersionAddendum."
             do (if (and (char= character #\%)
                         (< (1+ index) length))
                    (let ((token (char value (1+ index))))
-                     (case token
-                       (#\% (write-char #\% out) (incf index))
-                       (#\h (princ host out) (incf index))
-                       (#\n (princ context-host out) (incf index))
-                       (#\p (princ port out) (incf index))
-                       (#\r (princ user out) (incf index))
-                       (#\u (princ local-user out) (incf index))
-                       (#\d (princ (string-right-trim
-                                    "/" (namestring (user-homedir-pathname)))
-                                   out)
-                            (incf index))
-                       (#\i (princ (or (uiop:getenv "UID") "") out) (incf index))
-                       (#\k (princ key-alias out) (incf index))
-                       (#\j (princ jump out) (incf index))
-                       (#\l (princ local-host out) (incf index))
-                       (#\L (princ short-host out) (incf index))
-                       (#\C (princ (ssh-config-connection-hash
-                                    local-host host port user jump)
-                                   out)
-                            (incf index))
-                       (t (if strict
+                     (if (char= token #\%)
+                         (progn (write-char #\% out) (incf index))
+                         (let ((replacement (cdr (assoc token values))))
+                           (cond
+                             (replacement
+                              (write-string replacement out)
+                              (incf index))
+                             (strict
                               (error 'ssh-config-error
                                      :detail
                                      (format nil
                                              "unknown percent token %~A in ~S"
-                                             token value))
-                              (write-char character out)))))
+                                             token value)))
+                             (t (write-char character out))))))
                    (write-char character out))))))
 
+(defun ssh-config-percent-dollar-expand (value options context &key no-user)
+  "VALUE expanded as ssh.c's default_client_percent_dollar_expand does.
+
+Returns (values EXPANDED NIL NIL) on success, or (values NIL MESSAGE KIND)
+where KIND is :MISSING-ENV for an unset ${NAME} and :SYNTAX for anything
+vdollar_percent_expand treats as a parse error.  The two kinds matter
+because ssh reports them with different fatals.  NO-USER leaves %r and %C
+unknown, as DEFAULT_CLIENT_PERCENT_EXPAND_ARGS_NOUSER does for User."
+  (block expand
+    (let ((values (ssh-config-token-values options context)))
+      (with-output-to-string (out)
+        (loop with length = (length value)
+              for index from 0 below length
+              for character = (char value index)
+              do (cond
+                   ((and (char= character #\$)
+                         (< (1+ index) length)
+                         (char= (char value (1+ index)) #\{))
+                    (let* ((start (+ index 2))
+                           (end (position #\} value :start start)))
+                      (cond
+                        ((null end)
+                         (return-from expand
+                           (values nil
+                                   (format nil
+                                           "environment variable '~A' missing closing '}'"
+                                           (subseq value start))
+                                   :syntax)))
+                        ((= end start)
+                         (return-from expand
+                           (values nil "zero-length environment variable"
+                                   :syntax)))
+                        (t
+                         (let* ((name (subseq value start end))
+                                (replacement (uiop:getenv name)))
+                           (unless replacement
+                             (return-from expand
+                               (values nil
+                                       (format nil
+                                               "env var ${~A} has no value"
+                                               name)
+                                       :missing-env)))
+                           (write-string replacement out)
+                           (setf index end))))))
+                   ((char= character #\%)
+                    (cond
+                      ((>= (1+ index) length)
+                       (return-from expand
+                         (values nil "invalid format" :syntax)))
+                      ((char= (char value (1+ index)) #\%)
+                       (write-char #\% out)
+                       (incf index))
+                      (t
+                       (let* ((token (char value (1+ index)))
+                              (replacement
+                                (and (not (and no-user
+                                               (member token '(#\r #\C))))
+                                     (cdr (assoc token values)))))
+                         (unless replacement
+                           (return-from expand
+                             (values nil
+                                     (format nil "unknown key %~A" token)
+                                     :syntax)))
+                         (write-string replacement out)
+                         (incf index)))))
+                   (t (write-char character out))))))))
+
 (defun ssh-config-path-argument (value options context)
-  "VALUE as a pathname with %, $ and ~ expanded."
+  "VALUE as a pathname with %, $ and ~ expanded.
+
+A relative path stays relative: readconf stores it as written and the file
+is opened against the process's own directory, not the home directory."
   (let ((value (ssh-config-expand-variables
                 (ssh-config-expand-tokens value options context))))
-    (let ((value (ssh-config-expand-home value)))
-      (if (ssh-config-absolute-path-p value)
-          (pathname value)
-          (merge-pathnames value (user-homedir-pathname))))))
+    (pathname (ssh-config-expand-home value))))
 
 (defun ssh-config-path-value (line options context)
   "A path argument with %, $ and ~ expanded."
@@ -689,13 +1011,28 @@ relative Include is anchored and whether ~ is allowed in one."
            :detail "Include nesting is too deep"))
   (unless (probe-file path)
     (return-from ssh-config-read-directives '()))
+  ;; readconf's loop simply ends when getline() fails, so a path that opens
+  ;; but cannot be read (a directory, for one) is an empty configuration.
+  ;; ssh -F /tmp therefore connects with the built-in defaults instead of
+  ;; reporting an error.
+  (when (uiop:directory-exists-p path)
+    (return-from ssh-config-read-directives '()))
   (let ((directives '())
         (number 0))
     (with-open-file (stream path :direction :input :external-format :utf-8)
       (loop for line = (read-line stream nil nil)
             while line
             do (incf number)
-               (let ((tokens (ssh-config-tokenize line)))
+               (let* ((tokens (ssh-config-tokenize line))
+                      (remainder (and tokens (ssh-config-line-remainder line)))
+                      ;; readconf runs argv_split() on the text after the
+                      ;; keyword before it applies anything, so an open quote
+                      ;; rejects the line no matter which directive it names.
+                      (invalid (and remainder
+                                    (not (nth-value
+                                          1 (ssh-config-argv-split
+                                             remainder
+                                             :terminate-on-comment t))))))
                  (when (and tokens
                             (plusp (length (first tokens)))
                             (not (char= (char (first tokens) 0) #\#)))
@@ -705,44 +1042,49 @@ relative Include is anchored and whether ~ is allowed in one."
                            ;; Keep the Include line itself so the resolver
                            ;; validates its arguments.  An empty one is a bad
                            ;; configuration option, as in readconf; the files
-                           ;; themselves are expanded here.
+                           ;; themselves are expanded here.  A line with an
+                           ;; open quote never reaches the include handling,
+                           ;; because argv_split() failed first.
                            (push (%make-ssh-config-line
                                   :keyword keyword
                                   :args (rest tokens)
-                                  :raw (ssh-config-line-remainder line)
+                                  :raw remainder
                                   :path path
                                   :number number
+                                  :invalid-quotes invalid
                                   :userprovided (if user-config 2 0))
                                  directives)
-                           (dolist (argument (rest tokens))
-                             (when (and (not user-config)
-                                        (plusp (length argument))
-                                        (char= (char argument 0) #\~))
-                               (error 'ssh-config-error
-                                      :path (namestring path)
-                                      :line number
-                                      :keyword "include"
-                                      :detail
-                                      (format nil "a system configuration may not include ~A"
-                                              argument)))
-                             (unless (zerop (length argument))
-                               (dolist (file (ssh-config-include-files
-                                              (ssh-config-include-path
-                                               argument :user-config user-config)))
-                                 ;; DIRECTIVES is held reversed, so push each
-                                 ;; included line in turn to keep the file
-                                 ;; content where the Include appeared.
-                                 (dolist (directive
-                                          (ssh-config-read-directives
-                                           file (1+ depth)
-                                           :user-config user-config))
-                                   (push directive directives))))))
+                           (unless invalid
+                             (dolist (argument (rest tokens))
+                               (when (and (not user-config)
+                                          (plusp (length argument))
+                                          (char= (char argument 0) #\~))
+                                 (error 'ssh-config-error
+                                        :path (namestring path)
+                                        :line number
+                                        :keyword "include"
+                                        :detail
+                                        (format nil "a system configuration may not include ~A"
+                                                argument)))
+                               (unless (zerop (length argument))
+                                 (dolist (file (ssh-config-include-files
+                                                (ssh-config-include-path
+                                                 argument :user-config user-config)))
+                                   ;; DIRECTIVES is held reversed, so push each
+                                   ;; included line in turn to keep the file
+                                   ;; content where the Include appeared.
+                                   (dolist (directive
+                                            (ssh-config-read-directives
+                                             file (1+ depth)
+                                             :user-config user-config))
+                                     (push directive directives)))))))
                          (push (%make-ssh-config-line
                                 :keyword keyword
                                 :args (rest tokens)
-                                :raw (ssh-config-line-remainder line)
+                                :raw remainder
                                 :path path
                                 :number number
+                                :invalid-quotes invalid
                                 :userprovided (if user-config 2 0))
                                directives)))))))
     (nreverse directives)))
@@ -784,7 +1126,7 @@ preserves the same precedence."
 OPTION is the text ssh itself accepts after -o, either \"Keyword value\" or
 \"Keyword=value\", or a cons of a keyword and its argument (or arguments).
 Every keyword the file understands works here too, including HostName."
-  (flet ((line (keyword args &optional raw)
+  (flet ((line (keyword args &optional raw invalid-quotes)
            (unless (plusp (length keyword))
              (error 'ssh-config-error :detail "an -o option has no keyword"))
            (%make-ssh-config-line
@@ -793,18 +1135,21 @@ Every keyword the file understands works here too, including HostName."
             ;; -o goes through process_config_line with SSHCONF_USERCONF, so
             ;; readconf records it as 2, the same as a user config file.
             :userprovided 2
+            :invalid-quotes invalid-quotes
             :raw (or raw
                      (format nil "~{~A~^ ~}"
                              (mapcar (lambda (arg) (princ-to-string arg))
                                      args))))))
     (etypecase option
       (string
-       (let ((tokens (ssh-config-tokenize option)))
+       (let* ((tokens (ssh-config-tokenize option))
+              (remainder (ssh-config-line-remainder option)))
          (unless tokens
            (error 'ssh-config-error
                   :detail (format nil "empty -o option ~S" option)))
-         (line (first tokens) (rest tokens)
-               (ssh-config-line-remainder option))))
+         (line (first tokens) (rest tokens) remainder
+               (not (nth-value 1 (ssh-config-argv-split
+                                  remainder :terminate-on-comment t))))))
       (cons
        (let ((keyword (etypecase (car option)
                         (string (car option))
@@ -848,13 +1193,17 @@ does that without a temporary file."
 ;;; ---- Values ----
 
 (defun %ssh-config-line-error (line detail &key bad-option bare fatal)
-  "An SSH-CONFIG-ERROR for LINE with DETAIL already formatted."
+  "An SSH-CONFIG-ERROR for LINE with DETAIL already formatted.
+
+LINE may be NIL for a value the command line supplies, which has neither a
+path nor a line number to report."
   (make-condition 'ssh-config-error
                   :detail detail
-                  :path (and (ssh-config-line-path line)
+                  :path (and line
+                             (ssh-config-line-path line)
                              (namestring (ssh-config-line-path line)))
-                  :line (ssh-config-line-number line)
-                  :keyword (ssh-config-line-keyword line)
+                  :line (and line (ssh-config-line-number line))
+                  :keyword (and line (ssh-config-line-keyword line))
                   :bad-option bad-option
                   :bare bare
                   :fatal fatal))
@@ -931,7 +1280,7 @@ readconf stores for CanonicalDomains."
         (t
          (when (zerop (length value))
            (ssh-config-say line "missing argument."))
-         (error (ssh-config-line-error line "unsupported option ~S." value)))))
+         (error (ssh-config-line-error line "unsupported option \"~A\"." value)))))
 
 (defun ssh-config-multistate (line value table)
   "VALUE looked up in TABLE, an alist of name to value, or an error.
@@ -945,7 +1294,7 @@ argument, so a bad value is two lines."
       (t
        (when (zerop (length value))
          (ssh-config-say line "missing argument."))
-       (error (ssh-config-line-error line "unsupported option ~S." value))))))
+       (error (ssh-config-line-error line "unsupported option \"~A\"." value))))))
 
 (defun ssh-config-integer (line value &key minimum maximum)
   "VALUE as readconf's atoi_err reads an integer, 0..INT_MAX.
@@ -1392,16 +1741,19 @@ understand them rather than silently match nothing."
 ;;; ---- Applying directives ----
 
 (defun ssh-config-apply-address (line options seen context)
+  (declare (ignore context))
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
       ((string= keyword "hostname")
        (ssh-config-set-once
         seen options :hostname
         (lambda (options)
+          ;; readconf stores HostName exactly as written.  ssh.c expands
+          ;; only %h in it, at connection time, and lowercases the result;
+          ;; $ and ${} are never expanded.  The caller does that through
+          ;; SSH-CONFIG-CANONICALIZE's :PREPARE-OPTIONS.
           (setf (ssh-config-options-hostname options)
-                (ssh-config-expand-variables
-                 (ssh-config-expand-tokens (ssh-config-string-arg line)
-                                           options context))))))
+                (ssh-config-string-arg line)))))
       ((string= keyword "port")
        (ssh-config-set-once
         seen options :port
@@ -1456,35 +1808,89 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :host-key-alias
         (lambda (options)
+          ;; HostKeyAlias gets no expansion at all; ssh only lowercases it
+          ;; after reading the configuration.
           (setf (ssh-config-options-host-key-alias options)
-                (ssh-config-expand-variables
-                 (ssh-config-string-arg line)))))))))
+                (ssh-config-string-arg line))))))))
 
-(defun ssh-config-apply-identity (line options seen context)
+(defun ssh-config-path-duplicate-p (paths flags value userprovided)
+  "Whether PATHS already names VALUE with the same USERPROVIDED marker.
+
+readconf's add_identity_file ignores a second entry with the same spelling
+and the same userprovided value, so -i duplicates and -o duplicates collapse
+while an -i and an -o naming the same file both survive.  The check compares
+the strings as written: ~ is only expanded when the file is loaded."
+  (loop for path in paths
+        for flag in flags
+        thereis (and (eql flag userprovided)
+                     (string= (namestring path) value))))
+
+(defun ssh-config-apply-identity (line options seen context &key (active t))
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
       ((member keyword '("identityfile" "identityfile2") :test #'string=)
        ;; IdentityFile2 is OpenSSH's obsolete spelling of IdentityFile; it
        ;; still names an identity and joins the same ordered list.
-       (push (ssh-config-path-value line options context)
-             (ssh-config-options-identity-files options))
-       (push (ssh-config-line-userprovided line)
-             (ssh-config-options-identity-files-userprovided options)))
+       ;;
+       ;; The path is kept as written.  ssh prints it unchanged in -G and
+       ;; only expands ~ and tokens when it loads the file, so expanding it
+       ;; here would show the wrong spelling and lose readconf's duplicate
+       ;; check.
+       (let ((value (ssh-config-string-arg line))
+             (userprovided (ssh-config-line-userprovided line)))
+         (when (and active
+                    (>= (+ *ssh-config-identity-count-seed*
+                           (length (ssh-config-options-identity-files options)))
+                        +ssh-max-identity-files+))
+           (error (ssh-config-line-error
+                   line "Too many identity files specified (max ~D)."
+                   +ssh-max-identity-files+)))
+         (unless (ssh-config-path-duplicate-p
+                  (ssh-config-options-identity-files options)
+                  (ssh-config-options-identity-files-userprovided options)
+                  value userprovided)
+           (push (pathname value)
+                 (ssh-config-options-identity-files options))
+           (push userprovided
+                 (ssh-config-options-identity-files-userprovided options)))))
       ((string= keyword "certificatefile")
-       (push (ssh-config-path-value line options context)
-             (ssh-config-options-certificate-files options))
-       (push (ssh-config-line-userprovided line)
-             (ssh-config-options-certificate-files-userprovided options)))
+       (let ((value (ssh-config-string-arg line))
+             (userprovided (ssh-config-line-userprovided line)))
+         (when (and active
+                    (>= (+ *ssh-config-certificate-count-seed*
+                           (length
+                            (ssh-config-options-certificate-files options)))
+                        +ssh-max-certificate-files+))
+           (error (ssh-config-line-error
+                   line "Too many certificate files specified (max ~D)."
+                   +ssh-max-certificate-files+)))
+         (unless (ssh-config-path-duplicate-p
+                  (ssh-config-options-certificate-files options)
+                  (ssh-config-options-certificate-files-userprovided options)
+                  value userprovided)
+           (push (pathname value)
+                 (ssh-config-options-certificate-files options))
+           (push userprovided
+                 (ssh-config-options-certificate-files-userprovided options)))))
       ((string= keyword "identityagent")
-       (ssh-config-set-once
-        seen options :identity-agent
-        (lambda (options)
-          (setf (ssh-config-options-identity-agent options)
-                (let ((value (ssh-config-arg line)))
+       (let ((raw (ssh-config-arg line)))
+         ;; readconf reports an empty argument with its own capitalised
+         ;; wording, before any environment checks.
+         (when (zerop (length raw))
+           (error (ssh-config-line-error line "Missing argument.")))
+         ;; readconf validates the argument before it checks whether the
+         ;; value is already set, so a later bad line is still an error.
+         (ssh-config-validate-agent-path line raw)
+         (ssh-config-set-once
+          seen options :identity-agent
+          (lambda (options)
+            (setf (ssh-config-options-identity-agent options)
                   (cond
-                    ((string-equal value "none") :none)
-                    ((string-equal value "SSH_AUTH_SOCK") :environment)
-                    (t (ssh-config-path-value line options context))))))))
+                    ((string-equal raw "none") :none)
+                    ((string-equal raw "SSH_AUTH_SOCK") :environment)
+                    ;; readconf stores the spelling; ssh.c expands ~ and
+                    ;; ${} and % tokens after the whole file is read.
+                    (t (pathname raw))))))))
       ((string= keyword "identitiesonly")
        (ssh-config-set-once
         seen options :identities-only
@@ -1535,29 +1941,42 @@ understand them rather than silently match nothing."
                                :no)
                               ((string= lower "ask") :ask)
                               ((string= lower "confirm") :confirm)
-                              (t nil))))
+                              (t nil)))
+                 (lifespan 0))
             (cond
               ((and (eq state :confirm) extra)
-               (unless (ssh-parse-time extra)
-                 (error (ssh-config-line-error line "invalid time value.")))
-               (setf (ssh-config-options-add-keys-to-agent options) :confirm))
+               (let ((seconds (ssh-parse-time extra)))
+                 (unless seconds
+                   (error (ssh-config-line-error line "invalid time value.")))
+                 (setf lifespan seconds
+                       (ssh-config-options-add-keys-to-agent options) :confirm)))
               ((and (null state) (null extra))
                (when (zerop (length raw))
                  (ssh-config-say line "missing argument."))
-               (if (and (plusp (length raw)) (ssh-parse-time raw))
-                   (setf (ssh-config-options-add-keys-to-agent options) :yes)
-                   (error (ssh-config-line-error
-                           line "unsupported option"))))
+               (let ((seconds (and (plusp (length raw))
+                                   (ssh-parse-time raw))))
+                 (if seconds
+                     (setf lifespan seconds
+                           (ssh-config-options-add-keys-to-agent options) :yes)
+                     (error (ssh-config-line-error
+                             line "unsupported option")))))
               ((or (null state) extra)
                (when (zerop (length raw))
                  (ssh-config-say line "missing argument."))
                (error (ssh-config-line-error line "unsupported option")))
               (t
                (setf (ssh-config-options-add-keys-to-agent options)
-                     state))))))))))
+                     state)))
+            (setf (ssh-config-options-add-keys-to-agent-lifespan options)
+                  lifespan))))))))
 
 (defun ssh-config-known-host-paths (line options context)
-  "The paths on a known-hosts line; :NONE for the literal none."
+  "The paths on a known-hosts line; :NONE for the literal none.
+
+readconf stores these spellings exactly as written.  ssh.c later expands
+tilde, % tokens and ${} in the user's list but leaves GlobalKnownHostsFile
+alone; the caller applies that difference."
+  (declare (ignore options context))
   (let ((values (ssh-config-line-args line))
         (keyword (ssh-config-line-keyword line)))
     (dolist (value values)
@@ -1572,14 +1991,7 @@ understand them rather than silently match nothing."
               keyword)))
     (if (and values (string-equal (first values) "none"))
         :none
-        (mapcar (lambda (value)
-                  (let ((value (ssh-config-expand-variables
-                                (ssh-config-expand-tokens value options context))))
-                    (let ((value (ssh-config-expand-home value)))
-                      (if (ssh-config-absolute-path-p value)
-                          (pathname value)
-                          (merge-pathnames value (user-homedir-pathname))))))
-                values))))
+        (mapcar #'pathname values))))
 
 (defun ssh-config-apply-policy (line options seen context)
   (let ((keyword (ssh-config-line-keyword line)))
@@ -1588,7 +2000,8 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :known-hosts
         (lambda (options)
-          (let ((paths (ssh-config-known-host-paths line options context)))
+          (let ((paths (ssh-config-known-host-paths
+                        line options context)))
             ;; NONE is distinct from unset: the default names two files,
             ;; while "none" names none.
             (setf (ssh-config-options-known-hosts options)
@@ -1616,9 +2029,10 @@ understand them rather than silently match nothing."
         (lambda (options)
           (setf (ssh-config-options-known-hosts-command options)
                 (let ((raw (ssh-config-line-raw line)))
-                  (if (and raw (plusp (length raw)))
-                      raw
-                      (ssh-config-arg line)))))))
+                  (let ((text (if (and raw (plusp (length raw)))
+                                  raw
+                                  (ssh-config-arg line))))
+                    (if (string-equal text "none") :none text)))))))
       ((string= keyword "ignoreunknown")
        (let ((arguments (ssh-config-line-args line)))
          (when (> (length arguments) 1)
@@ -1633,11 +2047,12 @@ understand them rather than silently match nothing."
        (ssh-config-set-once
         seen options :fingerprint-hash
         (lambda (options)
-          (let ((value (string-downcase (ssh-config-string-arg line))))
+          (let* ((argument (ssh-config-string-arg line))
+                 (value (string-downcase argument)))
             (unless (member value '("md5" "sha1" "sha256" "sha384" "sha512")
                             :test #'string=)
               (error (ssh-config-line-error
-                      line "Invalid hash algorithm ~S." value)))
+                      line "Invalid hash algorithm \"~A\"." argument)))
             (setf (ssh-config-options-fingerprint-hash options)
                   (intern (string-upcase value) :keyword))))))
       ((string= keyword "checkhostip")
@@ -1692,7 +2107,9 @@ understand them rather than silently match nothing."
                   (string-equal (first values) "none"))
              (setf (ssh-config-options-revoked-host-keys options) nil)
              (dolist (value values)
-               (push (ssh-config-path-argument value options context)
+               ;; readconf stores each spelling; ssh.c expands ~, ${} and
+               ;; % tokens once the whole configuration is read.
+               (push (pathname value)
                      (ssh-config-options-revoked-host-keys options))))))
       ((string= keyword "stricthostkeychecking")
        (ssh-config-set-once
@@ -1995,11 +2412,8 @@ parse_fwd_field."
     (nreverse fields)))
 
 (defun ssh-config-forward-port (text)
-  "TEXT as a2port reads it: 0..65535, or -1 for anything else."
-  (handler-case
-      (let ((port (parse-integer text :junk-allowed nil)))
-        (if (<= 0 port 65535) port -1))
-    (error () -1)))
+  "TEXT as a2port reads it: 0..65535, a TCP service name, or -1."
+  (or (ssh-a2port text) -1))
 
 (defun ssh-config-forwarding-valid-p (spec dynamicfwd remotefwd)
   "Whether SPEC is a forwarding specification parse_forward would accept."
@@ -2020,7 +2434,11 @@ parse_fwd_field."
              (setf listen-path (funcall arg 0) listen-port :streamlocal)
              (setf listen-host nil
                    listen-port (ssh-config-forward-port (funcall arg 0))))
-         (setf connect-host "socks"))
+         ;; A one-word RemoteForward is readconf's dynamic form: the server
+         ;; picks the listening port and the client speaks SOCKS to it, which
+         ;; parse_forward records as the "socks" target on port 0.
+         (setf connect-host "socks"
+               connect-port (if remotefwd 0 :unset)))
         ((= count 2)
          (cond
            ((and (funcall path 0) (funcall path 1))
@@ -2065,7 +2483,8 @@ parse_fwd_field."
               (when (and (or (eq connect-port :unset)
                              (and (integerp connect-port)
                                   (not (plusp connect-port))))
-                         (null connect-path))
+                         (null connect-path)
+                         (not (equal connect-host "socks")))
                 (setf ok nil)))))
       (when ok
         (when (or (and (or (eq listen-port :unset)
@@ -2087,6 +2506,14 @@ parse_fwd_field."
 
 (defun ssh-config-apply-session (line options seen &key (active t))
   (let ((keyword (ssh-config-line-keyword line)))
+    (when (string= keyword "forwardagent")
+      ;; readconf validates a socket-path argument on every line, before the
+      ;; first-value test; yes/no/true/false are the flag forms and skip it.
+      (let ((argument (ssh-config-arg line)))
+        (when (and (plusp (length argument))
+                   (not (member argument '("yes" "true" "no" "false")
+                                :test #'string-equal)))
+          (ssh-config-validate-agent-path line argument))))
     (cond
       ((string= keyword "ipqos")
        (ssh-config-set-once
@@ -2146,33 +2573,60 @@ parse_fwd_field."
            (error (ssh-config-line-error line "Missing argument.")))
          (cond
            ((string= keyword "dynamicforward")
-            (unless (ssh-config-forwarding-valid-p first-argument t nil)
-              (error (ssh-config-line-error
-                      line "Bad forwarding specification."))))
+            (let ((expanded (ssh-forward-expand-value first-argument line)))
+              (unless (and expanded
+                           (ssh-config-forwarding-valid-p expanded t nil))
+                (error (ssh-config-line-error
+                        line "Bad forwarding specification.")))
+              (setf arguments (list expanded))))
            ((string= keyword "localforward")
             (when (or (null second-argument)
                       (zerop (length second-argument)))
               (error (ssh-config-line-error line "Missing target argument.")))
-            (unless (ssh-config-forwarding-valid-p
-                     (format nil "~A:~A" first-argument second-argument)
-                     nil nil)
-              (error (ssh-config-line-error
-                      line "Bad forwarding specification."))))
+            (let ((expanded (ssh-forward-expand-value
+                             (format nil "~A:~A" first-argument second-argument)
+                             line)))
+              (unless (and expanded
+                           (ssh-config-forwarding-valid-p expanded nil nil))
+                (error (ssh-config-line-error
+                        line "Bad forwarding specification.")))
+              (setf arguments
+                    (list (or (ssh-forward-expand-value first-argument line)
+                              first-argument)
+                          (or (ssh-forward-expand-value second-argument line)
+                              second-argument)))))
            (t
             ;; A RemoteForward with a single word is readconf's dynamic
             ;; form; the server chooses the listening port.
             (if (or (null second-argument)
                     (zerop (length second-argument)))
-                (unless (ssh-config-forwarding-valid-p first-argument t t)
-                  (error (ssh-config-line-error
-                          line "Bad forwarding specification.")))
-                (unless (ssh-config-forwarding-valid-p
-                         (format nil "~A:~A" first-argument second-argument)
-                         nil t)
-                  (error (ssh-config-line-error
-                          line "Bad forwarding specification."))))))
+                (let ((expanded (ssh-forward-expand-value first-argument line)))
+                  (unless (and expanded
+                               (ssh-config-forwarding-valid-p expanded t t))
+                    (error (ssh-config-line-error
+                            line "Bad forwarding specification.")))
+                  (setf arguments (list expanded)))
+                (let ((expanded (ssh-forward-expand-value
+                                 (format nil "~A:~A" first-argument
+                                         second-argument)
+                                 line)))
+                  (unless (and expanded
+                               (ssh-config-forwarding-valid-p expanded nil t))
+                    (error (ssh-config-line-error
+                            line "Bad forwarding specification.")))
+                  (setf arguments
+                        (list (or (ssh-forward-expand-value first-argument line)
+                                  first-argument)
+                              (or (ssh-forward-expand-value second-argument line)
+                                  second-argument)))))))
          (let ((value (format nil "~{~A~^ ~}" arguments)))
-           (push (cons keyword arguments)
+           ;; ssh keeps forward lines in one array per direction, in the order
+           ;; readconf saw them.  The source is recorded too: -G prints the
+           ;; command line's forwards before the configuration file's, and an
+           ;; -o line sits at its own position among the dedicated flags.
+           (push (list* keyword
+                        (if (ssh-config-line-command-line line) :option :file)
+                        arguments)
                  (ssh-config-options-extra options))
            (cond
              ((string= keyword "localforward")
@@ -2298,11 +2752,12 @@ when no ':' delimiter was present."
       host))
 
 (defun ssh-config-remote-open-entry (line argument)
-  "One PermitRemoteOpen ARGUMENT as (HOST . PORT), either part :ANY.
+  "One PermitRemoteOpen ARGUMENT as (RAW HOST . PORT), either part :ANY.
 
 The wording and fatality mirror readconf's oPermitRemoteOpen, which reports
 unparseable hosts and ports through fatal() and so never prints a file
-summary afterwards."
+summary afterwards.  RAW is kept because readconf stores the argument as
+written and -G reprints it unchanged."
   (multiple-value-bind (host port)
       (ssh-config-hpdelim argument)
     (unless host
@@ -2314,13 +2769,13 @@ summary afterwards."
          (error (%ssh-config-line-error
                  line "bad port number in permitremoteopen" :fatal t)))
         ((string= port "*")
-         (cons host :any))
+         (list argument host :any))
         (t
          (let ((number (ssh-a2port port)))
            (unless (and number (plusp number))
              (error (%ssh-config-line-error
                      line "bad port number in permitremoteopen" :fatal t)))
-           (cons host number)))))))
+           (list argument host number)))))))
 
 
 (defun ssh-config-escape-char-value (value)
@@ -2368,6 +2823,272 @@ present."
                      :any)))
     (cons local remote)))
 
+(defun ssh-config-url-decode (text)
+  "TEXT decoded as misc.c's urldecode, or NIL when it holds a bad escape."
+  (let ((out (make-string-output-stream))
+        (length (length text))
+        (index 0))
+    (loop while (< index length)
+          for character = (char text index)
+          do (cond
+               ((char= character #\+)
+                (write-char #\Space out)
+                (incf index))
+               ((char= character #\%)
+                (if (and (< (+ index 2) length)
+                         (digit-char-p (char text (1+ index)) 16)
+                         (digit-char-p (char text (+ index 2)) 16))
+                    (let ((value (parse-integer text :start (1+ index)
+                                                :end (+ index 3)
+                                                :radix 16)))
+                      (when (zerop value)
+                        (return-from ssh-config-url-decode nil))
+                      (write-char (code-char value) out)
+                      (incf index 3))
+                    (return-from ssh-config-url-decode nil)))
+               (t
+                (write-char character out)
+                (incf index))))
+    (get-output-stream-string out)))
+
+(defun ssh-config-valid-uri-domain-p (text)
+  "Whether TEXT passes misc.c's valid_domain(name, 0)."
+  (and (plusp (length text))
+       (let ((first (char-downcase (char text 0))))
+         (or (alpha-char-p first)
+             (digit-char-p first)
+             (char= first #\_)))
+       (let ((last nil))
+         (loop for character across text
+               for lower = (char-downcase character)
+               always (progn
+                        (when (and last (char= last #\.) (char= lower #\.))
+                          (return nil))
+                        (unless (or (char= lower #\.)
+                                    (char= lower #\-)
+                                    (alphanumericp lower)
+                                    (char= lower #\_))
+                          (return nil))
+                        (setf last lower))))))
+
+(defun ssh-config-hpdelim2 (text)
+  "TEXT split as misc.c's hpdelim2.
+
+Returns (values HOST TAIL DELIMITER); DELIMITER is NIL at the end, #\\: or
+#\\/.  Returns NIL when a bracket is unterminated."
+  (if (and (plusp (length text)) (char= (char text 0) #\[))
+      (let ((close (position #\] text)))
+        (unless close
+          (return-from ssh-config-hpdelim2 nil))
+        (let ((host (subseq text 0 (1+ close)))
+              (after (subseq text (1+ close))))
+          (cond
+            ((zerop (length after))
+             (values host nil nil))
+            ((member (char after 0) '(#\: #\/))
+             (values host (subseq after 1) (char after 0)))
+            (t nil))))
+      (let ((colon (position #\: text))
+            (slash (position #\/ text)))
+        (cond
+          ((null colon)
+           (if slash
+               (values (subseq text 0 slash) (subseq text (1+ slash)) #\/)
+               (values text nil nil)))
+          ((and slash (< slash colon))
+           (values (subseq text 0 slash) (subseq text (1+ slash)) #\/))
+          (t
+           (values (subseq text 0 colon) (subseq text (1+ colon)) #\:))))))
+
+(defun ssh-config-uri-destination (text)
+  "TEXT as parse_ssh_uri: (values KIND USER HOST PORT).
+
+KIND is :URI on success, :NOT-URI when TEXT does not start with ssh://, and
+NIL when the URI is malformed.  The scheme is case-sensitive, the host must
+be a valid domain, and a path after the port is rejected."
+  (unless (and (>= (length text) 6)
+               (string= text "ssh://" :end1 6 :end2 6))
+    (return-from ssh-config-uri-destination
+      (values :not-uri nil nil nil)))
+  (let ((rest (subseq text 6))
+        (user nil))
+    ;; Optional userinfo, up to the first @.
+    (let ((at (position #\@ rest)))
+      (when at
+        (let ((userinfo (subseq rest 0 at)))
+          (setf rest (subseq rest (1+ at)))
+          (let ((semicolon (position #\; userinfo)))
+            (when semicolon
+              (setf userinfo (subseq userinfo 0 semicolon))))
+          (when (zerop (length userinfo))
+            (return-from ssh-config-uri-destination (values nil nil nil nil)))
+          (setf user (ssh-config-url-decode userinfo))
+          (unless user
+            (return-from ssh-config-uri-destination (values nil nil nil nil))))))
+    (when (zerop (length rest))
+      (return-from ssh-config-uri-destination (values nil nil nil nil)))
+    (multiple-value-bind (hostpart tail delimiter)
+        (ssh-config-hpdelim2 rest)
+      (unless (and hostpart (plusp (length hostpart)))
+        (return-from ssh-config-uri-destination (values nil nil nil nil)))
+      (let ((host (ssh-config-clean-hostname hostpart))
+            (port -1))
+        ;; valid_domain() judges the name as written, then strips one
+        ;; trailing dot, so "host." is accepted but "host.." is not.
+        (unless (ssh-config-valid-uri-domain-p host)
+          (return-from ssh-config-uri-destination (values nil nil nil nil)))
+        (when (and (plusp (length host))
+                   (char= (char host (1- (length host))) #\.))
+          (setf host (subseq host 0 (1- (length host)))))
+        (when tail
+          (cond
+            ((eq delimiter #\/)
+             ;; A bare path is not allowed.
+             (return-from ssh-config-uri-destination (values nil nil nil nil)))
+            ((plusp (length tail))
+             (let ((slash (position #\/ tail)))
+               (when slash
+                 (return-from ssh-config-uri-destination
+                   (values nil nil nil nil)))
+               (let ((number (ssh-a2port tail)))
+                 (unless (and number (plusp number))
+                   (return-from ssh-config-uri-destination
+                     (values nil nil nil nil)))
+                 (setf port number))))))
+        (values :uri user host port)))))
+
+(defun ssh-config-user-host-port (text)
+  "TEXT as misc.c's parse_user_host_port: (values OK USER HOST PORT)."
+  (let ((rest text)
+        (user nil))
+    (let ((at (position #\@ rest :from-end t)))
+      (when at
+        (let ((candidate (subseq rest 0 at)))
+          (when (zerop (length candidate))
+            (return-from ssh-config-user-host-port (values nil nil nil nil)))
+          (setf user candidate
+                rest (subseq rest (1+ at))))))
+    (multiple-value-bind (hostpart tail delimiter)
+        (ssh-config-hpdelim2 rest)
+      (unless (and hostpart (plusp (length hostpart)))
+        (return-from ssh-config-user-host-port (values nil nil nil nil)))
+      (when (eq delimiter #\/)
+        ;; hpdelim refuses a slash.
+        (return-from ssh-config-user-host-port (values nil nil nil nil)))
+      (let ((host (ssh-config-clean-hostname hostpart))
+            (port -1))
+        (when (and tail (plusp (length tail)))
+          (let ((number (ssh-a2port tail)))
+            (unless (and number (plusp number))
+              (return-from ssh-config-user-host-port (values nil nil nil nil)))
+            (setf port number)))
+        (values t user host port)))))
+
+(defparameter +ssh-config-jump-hostname-refusals+ "'`\"$\\;&<>|(){},"
+  "Characters readconf's ssh_valid_hostname refuses, besides whitespace.")
+
+(defparameter +ssh-config-jump-user-refusals+ "'`\";&<>|(){}$\\"
+  "Characters readconf's ssh_valid_ruser refuses.")
+
+(defun ssh-config-jump-hostname-p (host)
+  "Whether HOST passes ssh_valid_hostname."
+  (and (plusp (length host))
+       (char/= (char host 0) #\-)
+       (loop for character across host
+             never (or (find character +ssh-config-jump-hostname-refusals+)
+                       (ssh-config-whitespace-p character)
+                       (< (char-code character) 32)))))
+
+(defun ssh-config-jump-user-p (user)
+  "Whether USER passes ssh_valid_ruser."
+  (and (plusp (length user))
+       (char/= (char user 0) #\-)
+       (loop for index from 0 below (length user)
+             for character = (char user index)
+             never (or (< (char-code character) 32)
+                       (find character +ssh-config-jump-user-refusals+)
+                       (and (ssh-config-whitespace-p character)
+                            (< (1+ index) (length user))
+                            (char= (char user (1+ index)) #\-))))))
+
+(defun ssh-config-jump-dump-hop (user host port)
+  "One parsed ProxyJump hop as readconf's dump prints it."
+  (let ((bracket (or (find #\: host)
+                     (and (plusp (length host))
+                          (every (lambda (character)
+                                   (find character "1234567890."))
+                                 host)))))
+    (format nil "~@[~A@~]~A~A~A~A"
+            user
+            (if bracket "[" "")
+            host
+            (if bracket "]" "")
+            (if (and (integerp port) (plusp port))
+                (format nil ":~D" port)
+                ""))))
+
+(defun ssh-config-parse-proxy-jump (value strict)
+  "VALUE as readconf's parse_jump with STRICT, as -G would print it.
+
+Returns (values DUMP-SPELLING REASON).  DUMP-SPELLING is NIL when a hop is
+invalid, and REASON is then the parse_jump diagnostic strict validation
+would print.  The literal none returns :NONE.  Earlier hops keep their
+original spelling, matching how readconf stores jump_extra; only the last
+hop is parsed and reprinted.  readconf walks the list right to left, which
+decides both which hop is stored and which failure is reported first."
+  (when (string-equal value "none")
+    (return-from ssh-config-parse-proxy-jump (values :none nil)))
+  (let* ((hash (position #\# value))
+         (orig (string-right-trim '(#\Space #\Tab #\Return #\Newline)
+                                  (if hash (subseq value 0 hash) value))))
+    (when (zerop (length orig))
+      (return-from ssh-config-parse-proxy-jump (values nil nil)))
+    (let* ((last-comma (position #\, orig :from-end t))
+           (prefix (and last-comma (subseq orig 0 last-comma)))
+           (hops (loop with start = 0
+                       for comma = (position #\, orig :start start)
+                       collect (subseq orig start comma)
+                       while comma
+                       do (setf start (1+ comma)))))
+      (when (some #'zerop (mapcar #'length hops))
+        (return-from ssh-config-parse-proxy-jump (values nil nil)))
+      (let ((stored nil))
+        (dolist (hop (reverse hops))
+          (let ((parsed
+                  (multiple-value-bind (kind uri-user uri-host uri-port)
+                      (ssh-config-uri-destination hop)
+                    (if (eq kind :not-uri)
+                        (multiple-value-list
+                         (ssh-config-user-host-port hop))
+                        (list kind uri-user uri-host uri-port)))))
+            (destructuring-bind (ok user host port) parsed
+              (when (or (null ok) (null host))
+                (return-from ssh-config-parse-proxy-jump (values nil nil)))
+              (when strict
+                (unless (ssh-config-jump-hostname-p host)
+                  (return-from ssh-config-parse-proxy-jump
+                    (values nil
+                            (format nil "parse_jump: invalid hostname \"~A\""
+                                    host))))
+                (when (and user (not (ssh-config-jump-user-p user)))
+                  (return-from ssh-config-parse-proxy-jump
+                    (values nil
+                            (format nil "parse_jump: invalid username \"~A\""
+                                    user)))))
+              ;; The rightmost hop is jump_host; the others are only
+              ;; syntax-checked, as readconf's first-pass does.
+              (unless stored
+                (setf stored (list user host (or port -1)))))))
+        (let ((user (first stored))
+              (host (second stored))
+              (port (third stored)))
+          (values
+           (if prefix
+               (format nil "~A,~A" prefix
+                       (ssh-config-jump-dump-hop user host port))
+               (ssh-config-jump-dump-hop user host port))
+           nil))))))
+
 (defun ssh-config-apply-session-value (line options keyword
                                        &key (active t))
   (let ((value (ssh-config-arg line)))
@@ -2376,12 +3097,38 @@ present."
              (ssh-config-integer line value :minimum minimum :maximum maximum)))
       (cond
         ((string= keyword "proxyjump")
-         (setf (ssh-config-options-proxy-jump options) value))
+         (let* ((raw (or (ssh-config-line-raw line) value))
+                (text (string-left-trim '(#\Space #\Tab #\= #\Return) raw)))
+           (multiple-value-bind (parsed reason)
+               (ssh-config-parse-proxy-jump
+                text (ssh-config-line-command-line line))
+             (when reason
+               (ssh-config-report-diagnostic line reason))
+             (unless parsed
+               (error (ssh-config-line-error
+                       line "Invalid ProxyJump \"~A\"" text)))
+           ;; readconf's parse_jump keeps the first jump or command; the
+           ;; literal "none" may still be stored when a ProxyCommand came
+           ;; first, because fill_default_options clears it later.
+           (cond
+             ((and (eq parsed :none)
+                   active
+                   (null (ssh-config-options-proxy-jump options)))
+              (setf (ssh-config-options-proxy-jump options) :none))
+             ((and active
+                   (null (ssh-config-options-proxy-jump options))
+                   (null (ssh-config-options-proxy-command options)))
+              (setf (ssh-config-options-proxy-jump options) parsed
+                    (ssh-config-options-proxy-command options) "none"))))))
         ((string= keyword "proxycommand")
-         (ssh-config-arg line)
-         (setf (ssh-config-options-proxy-command options)
-               (let ((raw (ssh-config-line-raw line)))
-                 (if (and raw (plusp (length raw))) raw value))))
+         ;; parse_command stores the remainder verbatim, and only the first
+         ;; ProxyCommand or ProxyJump wins (the latter stores "none").
+         (unless (ssh-config-options-proxy-command options)
+           (let ((raw (ssh-config-line-raw line)))
+             (setf (ssh-config-options-proxy-command options)
+                   (let ((text (if (and raw (plusp (length raw))) raw value)))
+                     (string-left-trim '(#\Space #\Tab #\= #\Return)
+                                       text))))))
         ((string= keyword "bindaddress")
          (setf (ssh-config-options-bind-address options)
                (ssh-config-string-arg line)))
@@ -2509,8 +3256,17 @@ present."
          (when (zerop (length value))
            (error (ssh-config-line-error
                    line "Missing StreamLocalBindMask argument.")))
-         (let ((mask (handler-case (parse-integer value :radix 8)
-                       (error () nil))))
+         ;; readconf uses strtol(arg, &end, 8): leading octal digits count
+         ;; and any trailing junk is ignored, so "5m" is 05 and "50%" is 050.
+         (let* ((end (or (position-if-not
+                          (lambda (character)
+                            (digit-char-p character 8))
+                          value)
+                         (length value)))
+                (digits (subseq value 0 end))
+                (mask (and (plusp (length digits))
+                           (ignore-errors
+                             (parse-integer digits :radix 8)))))
            (unless (and mask (<= 0 mask #o777))
              (error (ssh-config-line-error line "Bad mask.")))
            (setf (ssh-config-options-streamlocal-bind-mask options) mask)))
@@ -2523,13 +3279,22 @@ present."
          (unless (ssh-config-options-local-command options)
            (setf (ssh-config-options-local-command options)
                  (let ((raw (ssh-config-line-raw line)))
-                   (if (and raw (plusp (length raw))) raw value)))))
+                   (let ((text (if (and raw (plusp (length raw))) raw value)))
+                     (if (string-equal (string-trim '(#\Space #\Tab) text)
+                                       "none")
+                         :none
+                         text))))))
         ((string= keyword "remotecommand")
-         ;; The first active line wins; NIL is how "not set" is spelled.
+         ;; The first active line wins; :NONE is how the literal "none" is
+         ;; kept so a later line cannot replace it before readconf clears it.
          (unless (ssh-config-options-remote-command options)
            (setf (ssh-config-options-remote-command options)
                  (let ((raw (ssh-config-line-raw line)))
-                   (if (and raw (plusp (length raw))) raw value)))))
+                   (let ((text (if (and raw (plusp (length raw))) raw value)))
+                     (if (string-equal (string-trim '(#\Space #\Tab) text)
+                                       "none")
+                         :none
+                         text))))))
         ((string= keyword "versionaddendum")
          ;; The whole rest of the line is the comment, spaces included, up to
          ;; a '#' as in ssh.  "none" is an explicit empty value, distinct from
@@ -2699,6 +3464,70 @@ deprecated and unsupported notices belong."
                   :bad-option t)))))
     (ssh-config-note-legacy-option line)))
 
+(defparameter +ssh-config-fixed-argument-keywords+
+  '(;; address and identity settings
+    ("hostname" . 1) ("port" . 1) ("user" . 1) ("hostkeyalias" . 1)
+    ("canonicalizehostname" . 1) ("canonicalizemaxdots" . 1)
+    ("canonicalizefallbacklocal" . 1)
+    ("identityfile" . 1) ("identityfile2" . 1) ("certificatefile" . 1)
+    ("identityagent" . 1) ("identitiesonly" . 1) ("addkeystoagent" . 2)
+    ("hostbasedauthentication" . 1) ("hostbasedacceptedalgorithms" . 1)
+    ("hostbasedkeytypes" . 1) ("enablesshkeysign" . 1)
+    ;; known-hosts and policy settings
+    ("hashknownhosts" . 1) ("updatehostkeys" . 1) ("fingerprinthash" . 1)
+    ("visualhostkey" . 1) ("checkhostip" . 1) ("verifyhostkeydns" . 1)
+    ("nohostauthenticationforlocalhost" . 1) ("stricthostkeychecking" . 1)
+    ("connecttimeout" . 1) ("connectionattempts" . 1) ("addressfamily" . 1)
+    ("batchmode" . 1) ("ignoreunknown" . 1) ("warnweakcrypto" . 1)
+    ;; algorithms
+    ("ciphers" . 1) ("macs" . 1) ("kexalgorithms" . 1)
+    ("hostkeyalgorithms" . 1) ("pubkeyacceptedalgorithms" . 1)
+    ("pubkeyacceptedkeytypes" . 1) ("casignaturealgorithms" . 1)
+    ("compression" . 1) ("rekeylimit" . 2)
+    ;; session settings
+    ("bindaddress" . 1) ("serveraliveinterval" . 1)
+    ("serveralivecountmax" . 1) ("forwardagent" . 1) ("forwardx11" . 1)
+    ("forwardx11trusted" . 1) ("forwardx11timeout" . 1)
+    ("bindinterface" . 1) ("kbdinteractivedevices" . 1)
+    ("pkcs11provider" . 1) ("smartcarddevice" . 1)
+    ("securitykeyprovider" . 1) ("proxyusefdpass" . 1)
+    ("syslogfacility" . 1) ("tunnel" . 1) ("tunneldevice" . 1)
+    ("xauthlocation" . 1) ("gatewayports" . 1) ("ipqos" . 2)
+    ("exitonforwardfailure" . 1) ("clearallforwardings" . 1)
+    ("tcpkeepalive" . 1) ("keepalive" . 1) ("refuseconnection" . 1)
+    ("requiredrsasize" . 1) ("permitlocalcommand" . 1) ("escapechar" . 1)
+    ("enableescapecommandline" . 1) ("loglevel" . 1) ("sessiontype" . 1)
+    ("stdinnull" . 1) ("forkafterauthentication" . 1)
+    ("controlmaster" . 1) ("controlpath" . 1) ("controlpersist" . 1)
+    ("streamlocalbindmask" . 1) ("streamlocalbindunlink" . 1)
+    ("requesttty" . 1) ("tag" . 1) ("localforward" . 2)
+    ("remoteforward" . 2) ("dynamicforward" . 1)
+    ("preferredauthentications" . 1) ("pubkeyauthentication" . 1)
+    ("passwordauthentication" . 1) ("kbdinteractiveauthentication" . 1)
+    ("dsaauthentication" . 1) ("challengeresponseauthentication" . 1)
+    ("skeyauthentication" . 1) ("tisauthentication" . 1)
+    ("numberofpasswordprompts" . 1))
+  "Keywords process_config_line reads a fixed number of arguments from.
+
+Every other directive either loops over its arguments or takes the rest of
+the line verbatim.  readconf checks for leftover words once the directive
+has been applied, so a rejected value reports its own diagnostic instead.")
+
+(defun ssh-config-check-extra-arguments (line)
+  "Reject the words left after a fixed-argument directive, as readconf does.
+
+process_config_line ends with \"if (ac > 0) error(... extra arguments at end
+of line)\", so User bob extra is a bad option while SendEnv a b is not.  The
+check runs after the directive so a bad first value keeps its own message."
+  (let ((arity (cdr (assoc (ssh-config-line-keyword line)
+                           +ssh-config-fixed-argument-keywords+
+                           :test #'string=))))
+    (when (and arity
+               (> (length (ssh-config-line-args line)) arity))
+      (error (ssh-config-line-error
+              line "keyword ~A extra arguments at end of line"
+              (ssh-config-line-keyword line))))))
+
 (defun ssh-config-apply-directive (line options seen context
                                    &key (active t))
   "Apply one non-block directive when the current block is selected.
@@ -2706,7 +3535,14 @@ deprecated and unsupported notices belong."
 OPTIONS and SEEN may be throwaway copies when the surrounding block is not
 selected, so validation still runs; ACTIVE says whether this line's own
 block applies, which matters only for the few directives readconf runs its
-side effects on unconditionally."
+side effects on unconditionally.
+
+readconf checks for leftover words only after the directive has run, so a
+bad value reports its own diagnostic first."
+  (prog1 (ssh-config-apply-directive-body line options seen context active)
+    (ssh-config-check-extra-arguments line)))
+
+(defun ssh-config-apply-directive-body (line options seen context active)
   (let ((keyword (ssh-config-line-keyword line)))
     (cond
       ((string= keyword "include")
@@ -2729,7 +3565,7 @@ side effects on unconditionally."
                          "hostbasedkeytypes"
                          "enablesshkeysign")
                :test #'string=)
-       (ssh-config-apply-identity line options seen context))
+       (ssh-config-apply-identity line options seen context :active active))
       ((member keyword '("userknownhostsfile" "globalknownhostsfile"
                          "hashknownhosts" "knownhostscommand"
                          "updatehostkeys"
@@ -3016,6 +3852,24 @@ Returns CONFIG."
                               (error (ssh-config-line-error
                                       line "no argument after keyword \"~A\""
                                       (ssh-config-line-keyword line))))
+                            ;; argv_split() runs after parse_token() found
+                            ;; the keyword, so the keyword's own notices come
+                            ;; first and the open quote is then the line's one
+                            ;; bad option.  Nothing is applied either way.
+                            (when (ssh-config-line-invalid-quotes line)
+                              (handler-case
+                                  (ssh-config-check-client-keyword line options)
+                                (ssh-config-error (condition) (say condition)))
+                              ;; readconf reports the open quote before the
+                              ;; directive switch, so a Match line rejected
+                              ;; here must not gain "Bad Match condition".
+                              (error (make-condition
+                                      'ssh-config-error
+                                      :detail "invalid quotes"
+                                      :path (and (ssh-config-line-path line)
+                                                 (namestring
+                                                  (ssh-config-line-path line)))
+                                      :line (ssh-config-line-number line))))
                             (cond
                             ;; readconf's oHost, oInclude and oMatch refuse
                             ;; to run from -o: they are file structure, not
@@ -3223,7 +4077,7 @@ ssh.c calls this `direct`: no ProxyCommand and no ProxyJump."
 (defun ssh-config-canonicalize
     (config host
      &key original-host user port tag exec-matcher local-addresses
-       (resolver #'burzay:resolve-host-canonical) direct
+       (resolver #'burzay:resolve-host-canonical) direct prepare-options
        on-options on-error)
   "Resolve CONFIG for HOST, canonicalize the name, and re-read if needed.
 
@@ -3257,15 +4111,20 @@ the same family the connection will dial."
                   :on-error on-error))
                (finish options canonical)))
          (first-pass (options)
+           ;; ssh.c tidies the resolved options before canonicalisation;
+           ;; PREPARE-OPTIONS is where it expands %h in HostName.
+           (when prepare-options
+             (funcall prepare-options options))
            (let* ((input (or (ssh-config-options-hostname options) host))
                   (direct
                     (cond ((functionp direct) (funcall direct options))
                           ((null direct) (ssh-config-options-direct-p options))
                           (t direct)))
                   (effective
-                    (if (and input (not (burzay:numeric-address-p input)))
-                        (string-downcase input)
-                        input)))
+                    (or (ssh-canonical-address-string input)
+                        (if (and input (not (burzay:numeric-address-p input)))
+                            (string-downcase input)
+                            input))))
              (ssh-config-canonicalize-host
               effective options direct
               ;; The name is resolved in the family the connection will

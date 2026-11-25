@@ -323,6 +323,12 @@ CLI's decision and at the plist it filled."
   (multiple-value-bind (destination command options)
       (parse '("-t" "host"))
     (declare (ignore destination command))
+    ;; As in ssh, one -t asks for a tty (REQUEST_TTY_YES) and a second one
+    ;; forces it (REQUEST_TTY_FORCE).
+    (is (eq :yes (getf options :request-tty))))
+  (multiple-value-bind (destination command options)
+      (parse '("-tt" "host"))
+    (declare (ignore destination command))
     (is (eq :force (getf options :request-tty))))
   (multiple-value-bind (destination command options)
       (parse '("-T" "host"))
@@ -331,7 +337,7 @@ CLI's decision and at the plist it filled."
   (multiple-value-bind (destination command options)
       (parse '("--request-tty=no" "host"))
     (declare (ignore destination command))
-    (is (equal "no" (getf options :request-tty)))))
+    (is (eq :no (getf options :request-tty)))))
 
 (test repeated-options-keep-command-line-order
   (multiple-value-bind (destination command options)
@@ -475,8 +481,14 @@ CLI's decision and at the plist it filled."
                  :port 2200
                  :connect-port 2200
                  :user "bob")))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options
+           :port 2200 :user "bob"))
     (is (equal "real.example 2200 bob alias %"
-               (burs::expand-remote-command client "%h %p %r %n %%")))))
+               (burs::expand-remote-command client "%h %p %r %n %%")))
+    ;; %k falls back to the alias and %j is empty without a jump host.
+    (is (equal "alias "
+               (burs::expand-remote-command client "%k %j")))))
 
 (test permit-remote-open-matches
   (flet ((allowed (permit host port)
@@ -489,13 +501,13 @@ CLI's decision and at the plist it filled."
     (is (allowed nil "example.org" 80))
     (is (allowed :any "example.org" 80))
     (is (not (allowed :none "example.org" 80)))
-    (let ((permit '(("example.org" . 80))))
+    (let ((permit '(("example.org:80" "example.org" 80))))
       (is (allowed permit "example.org" 80))
       (is (not (allowed permit "example.org" 81)))
       (is (not (allowed permit "other.example" 80)))
       ;; A streamlocal path only matches a port wildcard.
       (is (not (allowed permit "/tmp/sock" :streamlocal))))
-    (let ((permit '(("example.org" . 80) ("*" . :any))))
+    (let ((permit '(("example.org:80" "example.org" 80) ("*:*" "*" :any))))
       ;; *:* permits any other destination, including a socket path.
       (is (allowed permit "other.example" 22))
       (is (allowed permit "/tmp/sock" :streamlocal)))))
@@ -728,7 +740,105 @@ the lines never reach the output."
     (is (= 1080 (burs::dynamic-forward-bind-port forward))))
   (let ((forward (burs::parse-dynamic-forward "[::1]:1080")))
     (is (equal "::1" (burs::dynamic-forward-bind-address forward)))
-    (is (= 1080 (burs::dynamic-forward-bind-port forward)))))
+    (is (= 1080 (burs::dynamic-forward-bind-port forward))))
+  ;; A socket path listens locally as a streamlocal SOCKS proxy.
+  (let ((forward (burs::parse-dynamic-forward "/tmp/d.sock")))
+    (is (equal "/tmp/d.sock" (burs::dynamic-forward-bind-path forward)))
+    (is (null (burs::dynamic-forward-bind-port forward)))))
+
+(test remote-dynamic-forward-specifications-parse
+  ;; A one-word -R is the dynamic form: the server listens and the client
+  ;; speaks SOCKS, which readconf records as the "socks" target on port 0.
+  (let ((forward (burs::parse-remote-forward "8080")))
+    (is (= 8080 (burs::forward-bind-port forward)))
+    (is (equal "socks" (burs::forward-host forward)))
+    (is (= 0 (burs::forward-port forward))))
+  (let ((forward (burs::parse-remote-forward "/tmp/r.sock")))
+    (is (equal "/tmp/r.sock" (burs::forward-bind-path forward)))
+    (is (equal "socks" (burs::forward-host forward))))
+  ;; ssh retries a two-field -R with dynamicfwd=1.
+  (let ((forward (burs::parse-remote-forward "8080:1080")))
+    (is (equal "8080" (burs::forward-bind-address forward)))
+    (is (= 1080 (burs::forward-bind-port forward)))
+    (is (equal "socks" (burs::forward-host forward))))
+  ;; a2port falls back to the TCP services database.
+  (let ((forward (burs::parse-remote-forward "8080:socks")))
+    (is (= 1080 (burs::forward-bind-port forward)))
+    (is (equal "socks" (burs::forward-host forward))))
+  ;; The same one-word form in a configuration file or an -o line.
+  (let ((forward (burs::parse-config-remote-forward "8080")))
+    (is (= 8080 (burs::forward-bind-port forward)))
+    (is (equal "socks" (burs::forward-host forward))))
+  (let ((forward (burs::parse-config-remote-forward "8080:1080")))
+    (is (equal "8080" (burs::forward-bind-address forward)))
+    (is (equal "socks" (burs::forward-host forward))))
+  ;; A three-field configuration line stays invalid: readconf treats the
+  ;; single word as the dynamic form, which takes at most two fields.
+  (is (null (cl-pnet-ssh::ssh-config-forwarding-valid-p
+             "8080:localhost:80" t t))))
+
+(test forwarding-service-ports-match-a2port
+  (let ((forward (burs::parse-local-forward "8080:localhost:http")))
+    (is (= 80 (burs::forward-port forward))))
+  (let ((forward (burs::parse-local-forward "http:localhost:80")))
+    (is (= 80 (burs::forward-bind-port forward)))))
+
+(test dynamic-forward-field-rules-match-parse-forward
+  ;; A two-field dynamic specification always treats its first field as the
+  ;; listening address, even when that field contains a slash.
+  (let ((forward (burs::parse-dynamic-forward "/home/turtle:8080")))
+    (is (equal "/home/turtle" (burs::dynamic-forward-bind-address forward)))
+    (is (= 8080 (burs::dynamic-forward-bind-port forward)))
+    (is (null (burs::dynamic-forward-bind-path forward))))
+  (let ((forward (burs::parse-dynamic-forward ":8080")))
+    (is (equal "" (burs::dynamic-forward-bind-address forward)))
+    (is (= 8080 (burs::dynamic-forward-bind-port forward))))
+  ;; A socket target keeps the local array entry: the dump prints both the
+  ;; dynamic forward and the local one readconf derives from it.
+  (let ((forward (burs::parse-dynamic-forward "8080:/tmp/x")))
+    (is (= 8080 (burs::dynamic-forward-bind-port forward)))
+    (is (equal "/tmp/x" (burs::dynamic-forward-target-path forward))))
+  (let ((forward (burs::parse-dynamic-forward "/a:/b")))
+    (is (equal "/a" (burs::dynamic-forward-bind-path forward)))
+    (is (equal "/b" (burs::dynamic-forward-target-path forward))))
+  ;; parse_forward's dynamic branch accepts one or two fields only; the
+  ;; library's validator is the non-exiting way to check that boundary.
+  (dolist (spec '("1:2:3" "1:2:3:4" "0" "127.0.0.1:0" "65536"))
+    (is (null (cl-pnet-ssh::ssh-config-forwarding-valid-p spec t nil))
+        spec))
+  (dolist (spec '("8080" "65535" "/tmp/d.sock" "[::1]:1080" "8080:/tmp/x"
+                  "/a:/b" ":8080"))
+    (is (cl-pnet-ssh::ssh-config-forwarding-valid-p spec t nil)
+        spec)))
+
+(test forward-specifications-expand-environment-variables
+  ;; parse_forward runs dollar_expand before it classifies the fields.
+  (is (equal (format nil "~A/s" (uiop:getenv "HOME"))
+             (burs::dynamic-forward-bind-path
+              (burs::parse-dynamic-forward "${HOME}/s"))))
+  (let ((forward (burs::parse-local-forward "a${HOME}b:/tmp/x")))
+    (is (equal (format nil "a~Ab" (uiop:getenv "HOME"))
+               (burs::forward-bind-path forward)))
+    (is (equal "/tmp/x" (burs::forward-target-path forward)))))
+
+(test forward-dump-endpoints-match-readconf
+  (is (equal "[localhost]:80"
+             (burs::dump-forward-endpoint "localhost" 80 nil)))
+  (is (equal "80" (burs::dump-forward-endpoint nil 80 nil)))
+  (is (equal "/tmp/x"
+             (burs::dump-forward-endpoint nil nil "/tmp/x"))))
+
+(test tunnel-device-parses-without-a-configuration-line
+  ;; -w is validated like a2tun before -G prints anything, so the same
+  ;; reader has to work without a line to blame.
+  (is (equal '(4 . 5) (cl-pnet-ssh::ssh-config-tunnel-device nil "4:5")))
+  (is (equal '(4 . :any) (cl-pnet-ssh::ssh-config-tunnel-device nil "4")))
+  (is (equal '(:any . :any)
+             (cl-pnet-ssh::ssh-config-tunnel-device nil "any:any")))
+  (is (typep (handler-case
+                 (progn (cl-pnet-ssh::ssh-config-tunnel-device nil "x:y") nil)
+               (cl-pnet-ssh:ssh-config-error (condition) condition))
+             'cl-pnet-ssh:ssh-config-error)))
 
 (test stdio-forward-parses-host-and-port
   (multiple-value-bind (host port)
@@ -763,7 +873,10 @@ the lines never reach the output."
     ;; them like readconf and keeps the first value the command line gave.
     (is (null (getf burs::*options* :port)))
     (is (null (getf burs::*options* :user)))
-    (is (equal '("/tmp/key") (getf burs::*options* :identity)))
+    ;; IdentityFile also stays with the resolver: readconf keeps the spelling
+    ;; as written, so -G can print it unchanged, and expands it only when the
+    ;; file is loaded.
+    (is (null (getf burs::*options* :identity)))
     ;; UserKnownHostsFile stays with the resolver: only it expands ~ and
     ;; understands "none", and a raw value here would override the parsed one.
     (is (null (getf burs::*options* :known-hosts)))
@@ -3076,3 +3189,23 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
            (with-open-file (stream path)
              (is (not (string= "existing" (read-line stream))))))
       (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(test command-line-name-validation
+  "The command line rejects what ssh_valid_hostname and ssh_valid_ruser do."
+  (is (burs::ssh-valid-hostname-p "example.com"))
+  (is (burs::ssh-valid-hostname-p "::1"))
+  (is (burs::ssh-valid-hostname-p "127.0.0.1"))
+  (is (not (burs::ssh-valid-hostname-p "")))
+  (is (not (burs::ssh-valid-hostname-p "-host")))
+  (is (not (burs::ssh-valid-hostname-p "a b")))
+  (is (not (burs::ssh-valid-hostname-p "a,b")))
+  (is (not (burs::ssh-valid-hostname-p "a;b")))
+  (is (not (burs::ssh-valid-hostname-p "a`b")))
+  (is (burs::ssh-valid-ruser-p "a b"))
+  (is (burs::ssh-valid-ruser-p "a--b"))
+  (is (burs::ssh-valid-ruser-p "ab-"))
+  (is (not (burs::ssh-valid-ruser-p "")))
+  (is (not (burs::ssh-valid-ruser-p "-x")))
+  (is (not (burs::ssh-valid-ruser-p "a -b")))
+  (is (not (burs::ssh-valid-ruser-p "a;b")))
+  (is (not (burs::ssh-valid-ruser-p "a$b"))))

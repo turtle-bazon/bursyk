@@ -17,7 +17,8 @@
 
 (defun ssh-load-key-signers (private-keys passphrase &key add-to-agent
                                                          certificate-files-specified
-                                                         passphrase-callback)
+                                                         passphrase-callback
+                                                         passphrase-attempts)
   "Signers for PRIVATE-KEYS, each already loaded or a path, in order.
 
 A key with a matching CERT.pub beside it contributes two signers, the plain
@@ -27,32 +28,61 @@ loaded key is offered to it before being used, as AddKeysToAgent does.
 CERTIFICATE-FILES-SPECIFIED suppresses the KEY-cert.pub lookup, because an
 explicit CertificateFile takes its place.  PASSPHRASE-CALLBACK, when a key
 file is passphrase-protected and no PASSPHRASE was given, is called with the
-file's path and returns the passphrase or NIL."
+file's path and returns the passphrase or NIL; PASSPHRASE-ATTEMPTS bounds
+how often it is asked, as NumberOfPasswordPrompts does.
+
+A key that cannot be loaded is skipped the way ssh skips one: a missing file
+and a key left locked are silent, anything else is an SSH-WARN \"Load key\"
+line, and the remaining keys are still offered."
   (loop for private-key in (if (listp private-keys)
                                private-keys
                                (list private-keys))
-        nconc (let ((key (if (typep private-key 'ssh-private-key)
-                             private-key
-                             (ssh-load-private-key
-                              private-key
-                              :passphrase
-                              (ssh-load-passphrase
-                               private-key passphrase
-                               passphrase-callback)))))
-                (when add-to-agent
-                  (ssh-agent-add-identity
-                   key :path add-to-agent
-                   :on-error (lambda (condition)
-                               (ssh-log
-                                "could not add a key to the agent: ~A"
-                                condition))))
-                (ssh-private-key-signers
-                 key :certificate-files-specified
-                 certificate-files-specified))))
+        nconc (let ((key
+                      (cond
+                        ((typep private-key 'ssh-private-key) private-key)
+                        ((and *ssh-private-key-permission-check*
+                              (ssh-file-exists-p private-key)
+                              (funcall *ssh-private-key-permission-check*
+                                       private-key))
+                         ;; ssh refuses a key others may read, after the
+                         ;; warning the check itself prints.
+                         (ssh-warn "Load key \"~A\": ~A"
+                                   private-key "bad permissions")
+                         nil)
+                        (t
+                         (multiple-value-bind (resolved locked)
+                             (ssh-load-passphrase
+                              private-key passphrase
+                              passphrase-callback
+                              :attempts passphrase-attempts)
+                           (unless locked
+                             (handler-case
+                                 (ssh-load-private-key
+                                  private-key :passphrase resolved)
+                               (error (condition)
+                                 (unless (ssh-quiet-key-load-error-p
+                                          private-key condition)
+                                   (ssh-warn "Load key \"~A\": ~A"
+                                             private-key
+                                             (ssh-key-load-error-text
+                                              condition)))
+                                 nil))))))))
+                (when key
+                  (when add-to-agent
+                    (ssh-agent-add-identity
+                     key :path add-to-agent
+                     :on-error (lambda (condition)
+                                 (ssh-log
+                                  "could not add a key to the agent: ~A"
+                                  condition))))
+                  (ssh-private-key-signers
+                   key :certificate-files-specified
+                   certificate-files-specified)))))
 
 (defun ssh-load-key-signer (private-key passphrase &key add-to-agent
                                                       certificate-files-specified
-                                                      passphrase-callback)
+                                                      passphrase-callback
+                                                      passphrase-attempts)
   "PRIVATE-KEY, already loaded or a path, as one signer.
 
 The certificate beside the key wins when there is one; SSH-LOAD-KEY-SIGNERS
@@ -61,7 +91,8 @@ returns the whole identity list, plain key first."
               private-key passphrase
               :add-to-agent add-to-agent
               :certificate-files-specified certificate-files-specified
-              :passphrase-callback passphrase-callback))))
+              :passphrase-callback passphrase-callback
+              :passphrase-attempts passphrase-attempts))))
 
 (defun ssh-default-key-sources (private-key)
   "PRIVATE-KEY when given, else every default identity file that exists."
@@ -79,7 +110,7 @@ returns the whole identity list, plain key first."
 
 (defun ssh-report-key-signers (keys passphrase on-signers on-error
                                &key add-to-agent certificate-files-specified
-                                 passphrase-callback)
+                                 passphrase-callback passphrase-attempts)
   "Load KEY files and deliver their signers, or report why not."
   (handler-case
       (funcall on-signers
@@ -87,12 +118,13 @@ returns the whole identity list, plain key first."
                 keys passphrase
                 :add-to-agent add-to-agent
                 :certificate-files-specified certificate-files-specified
-                :passphrase-callback passphrase-callback))
+                :passphrase-callback passphrase-callback
+                :passphrase-attempts passphrase-attempts))
     (error (condition) (funcall on-error condition))))
 
 (defun ssh-report-agent-keys (agent keys passphrase on-signers on-error
                               &key add-to-agent certificate-files-specified
-                                passphrase-callback)
+                                passphrase-callback passphrase-attempts)
   "Deliver the agent's signers followed by KEY files, tolerating either."
   (ssh-agent-signers
    :path agent
@@ -106,7 +138,9 @@ returns the whole identity list, plain key first."
                                        :certificate-files-specified
                                        certificate-files-specified
                                        :passphrase-callback
-                                       passphrase-callback)))
+                                       passphrase-callback
+                                       :passphrase-attempts
+                                       passphrase-attempts)))
                    (error (condition) (funcall on-error condition))))
    ;; An agent that cannot answer is not fatal while a file remains.
    :on-error (lambda (condition)
@@ -115,7 +149,8 @@ returns the whole identity list, plain key first."
                 keys passphrase on-signers on-error
                 :add-to-agent add-to-agent
                 :certificate-files-specified certificate-files-specified
-                :passphrase-callback passphrase-callback))))
+                :passphrase-callback passphrase-callback
+                :passphrase-attempts passphrase-attempts))))
 
 (defun ssh-report-agent-signers (agent on-signers on-error)
   "Deliver the agent's signers, or say that it holds no usable key."
@@ -132,7 +167,7 @@ returns the whole identity list, plain key first."
 
 (defun ssh-resolve-signers (private-key agent passphrase on-signers on-error
                             &key add-keys-to-agent certificate-files
-                              passphrase-callback)
+                              passphrase-callback passphrase-attempts)
   "Find the signers authentication may try, in order, without blocking.
 
 The agent's ssh-ed25519 keys are offered first, then the key files, which
@@ -150,7 +185,7 @@ KEY-cert.pub lookup is disabled, as in ssh.
 
 PASSPHRASE-CALLBACK, when a key file is passphrase-protected and no
 PASSPHRASE was given, is called with the file's path and returns the
-passphrase or NIL."
+passphrase or NIL; PASSPHRASE-ATTEMPTS bounds how often it is asked."
   (let* ((keys (ssh-default-key-sources private-key))
          ;; :NONE is the configuration layer's way of saying the agent is
          ;; off, which is not the same as NIL, "the caller named no agent".
@@ -175,13 +210,15 @@ passphrase or NIL."
                                 :add-to-agent add-to-agent
                                 :certificate-files-specified
                                 certificate-files-specified
-                                :passphrase-callback passphrase-callback))
+                                :passphrase-callback passphrase-callback
+                                :passphrase-attempts passphrase-attempts))
         (agent (ssh-report-agent-signers agent deliver on-error))
         (keys (ssh-report-key-signers
                keys passphrase deliver on-error
                :add-to-agent add-to-agent
                :certificate-files-specified certificate-files-specified
-               :passphrase-callback passphrase-callback))
+               :passphrase-callback passphrase-callback
+               :passphrase-attempts passphrase-attempts))
         (t (funcall on-error (ssh-no-key-condition)))))))
 
 (defun ssh-connect-error (client status)
@@ -206,6 +243,13 @@ passphrase or NIL."
         (ssh-client-fail
          client
          (make-condition 'ssh-connection-error
+                         :kind :connect
+                         :host (ssh-client-connect-host client)
+                         :port (or (ssh-client-connect-port client)
+                                   (ssh-client-port client))
+                         :reason (if (integerp status)
+                                     (cl-pnet-sockets:c-strerror status)
+                                     (princ-to-string status))
                          :detail (format nil "could not connect to ~A:~D (~A)"
                                          (ssh-client-connect-host client)
                                          (or (ssh-client-connect-port client)
@@ -213,12 +257,16 @@ passphrase or NIL."
                                          status))))))
 
 (defun ssh-resolution-error (client condition)
-  (ssh-client-fail
-   client
-   (make-condition 'ssh-connection-error
-                   :detail (format nil "could not resolve ~A: ~A"
-                                   (ssh-client-connect-host client)
-                                   condition))))
+  (let ((reason (cl-pnet-ssh:ssh-resolver-error-text condition)))
+    (ssh-client-fail
+     client
+     (make-condition 'ssh-connection-error
+                     :kind :resolve
+                     :host (ssh-client-connect-host client)
+                     :reason reason
+                     :detail (format nil "could not resolve ~A: ~A"
+                                     (ssh-client-connect-host client)
+                                     reason)))))
 
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
@@ -252,6 +300,9 @@ passphrase or NIL."
           (ssh-client-fail
            client
            (make-condition 'ssh-connection-error
+                           :kind :connect
+                           :host (ssh-client-connect-host client)
+                           :port port
                            :detail (format nil "could not connect to ~A:~D"
                                            (ssh-client-connect-host client)
                                            port))))))
@@ -624,7 +675,7 @@ build's default offer, which leaves SHA-1 ssh-rsa out."
   (let ((paths (append (ssh-client-hostbased-keys client)
                        (mapcar #'pathname +ssh-hostbased-default-key-paths+))))
     (dolist (path paths)
-      (when (probe-file path)
+      (when (ssh-file-exists-p path)
         (let ((key (handler-case
                        (ssh-load-private-key path)
                      (error () nil))))
@@ -640,7 +691,11 @@ and the SSH connection starts as soon as the signers are known.  A failure
 in either step ends CLIENT through its error callback.  PubkeyAcceptedAlgorithms
 is applied here, before any request names a key the configuration forbade.
 PASSPHRASE-CALLBACK answers for an encrypted key file when no PASSPHRASE
-was given."
+was given, once per attempt, and is not consulted in batch mode.
+
+A key file that cannot be offered is skipped, as ssh skips one, so a session
+with no usable key still reaches the server and reports the methods it would
+have accepted instead of a local error."
   (ssh-client-start-connect-timer client)
   (when (ssh-client-hostbased-authentication client)
     (setf (ssh-client-hostbased-key client)
@@ -648,22 +703,12 @@ was given."
   (ssh-resolve-signers
    private-key agent passphrase
    (lambda (signers)
-     (let ((signers (ssh-filter-signers
-                     signers
-                     (ssh-client-pubkey-accepted-algorithms client)
-                     :minimum-rsa-size (ssh-client-required-rsa-size client))))
-       (if (and (null signers)
-                (null (ssh-client-hostbased-key client))
-                (null (ssh-client-password-callback client))
-                (null (ssh-client-kbd-interactive-callback client)))
-           (ssh-client-fail
-            client
-            (make-condition
-             'ssh-authentication-error
-             :detail "no key matches PubkeyAcceptedAlgorithms or RequiredRSASize"))
-           (progn
-             (setf (ssh-client-signers client) signers)
-             (ssh-open-connection client)))))
+     (setf (ssh-client-signers client)
+           (ssh-filter-signers
+            signers
+            (ssh-client-pubkey-accepted-algorithms client)
+            :minimum-rsa-size (ssh-client-required-rsa-size client)))
+     (ssh-open-connection client))
    (lambda (condition)
      (if (or (ssh-client-hostbased-key client)
              (ssh-client-password-callback client)
@@ -673,7 +718,9 @@ was given."
    :add-keys-to-agent
    (eq (ssh-client-add-keys-to-agent client) :yes)
    :certificate-files (ssh-client-certificate-files client)
-   :passphrase-callback passphrase-callback)
+   :passphrase-callback
+   (and (not (ssh-client-batch-mode client)) passphrase-callback)
+   :passphrase-attempts (or (ssh-client-number-of-password-prompts client) 3))
   client)
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port

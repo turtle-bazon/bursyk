@@ -315,12 +315,13 @@ never asks, and an explicit passphrase wins without asking."
                                protected "secret"
                                :passphrase-callback callback))))
                (is (null asked))
-               ;; Declining leaves the key unreadable, as no passphrase does.
-               (signals ssh-authentication-error
-                 (cl-pnet-ssh::ssh-load-key-signers
-                  protected nil
-                  :passphrase-callback
-                  (lambda (path) (declare (ignore path)) nil))))
+               ;; Declining leaves the key unreadable, as no passphrase does:
+               ;; the key is skipped rather than reported, like ssh.
+               (is (null
+                    (cl-pnet-ssh::ssh-load-key-signers
+                     protected nil
+                     :passphrase-callback
+                     (lambda (path) (declare (ignore path)) nil)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test client-builds-a-hostbased-request
@@ -1271,8 +1272,10 @@ flag at a rekey would make the two sides count packets differently."
                  (is (equal "curve25519-sha256@libssh.org"
                             (getf negotiated :kex)))
                  (is (equal "rsa-sha2-512" (getf negotiated :host-key)))
-                 (is (equal "hmac-sha2-512"
-                            (getf negotiated :mac-c2s)))))
+                 ;; chacha20-poly1305 authenticates the packet itself, so
+                 ;; choose_mac() is skipped and no MAC is negotiated even
+                 ;; though KEXINIT still advertises the configured list.
+                 (is (null (getf negotiated :mac-c2s)))))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test server-host-keys-obey-required-rsa-size

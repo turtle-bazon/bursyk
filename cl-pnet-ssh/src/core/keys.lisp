@@ -37,6 +37,63 @@
       (read-sequence out stream)
       out)))
 
+(defun ssh-file-exists-p (path)
+  "Whether PATH exists, never signalling on a wild or malformed name.
+
+PROBE-FILE signals on a pathname containing glob characters, while ssh's
+stat() reports ENOENT for the literal string; a caller telling those apart is
+not worth a Lisp error."
+  (not (null (ignore-errors (probe-file path)))))
+
+(defun ssh-stat-reason (path)
+  "Values: T and NIL when PATH can be stat'ed, else NIL and the strerror text.
+
+ssh checks identity files and agent sockets with stat() and prints the errno
+text, so a path inside a directory the process cannot search reports
+\"Permission denied\" rather than \"No such file or directory\".  SBCL's
+SB-POSIX exposes the errno; elsewhere PROBE-FILE's answer is the best
+approximation."
+  (let ((name (if (stringp path) path (namestring path))))
+    #+(and sbcl (not win32))
+    (handler-case
+        (progn (sb-posix:stat name) (values t nil))
+      (sb-posix:syscall-error (condition)
+        (values nil (sb-int:strerror
+                     (sb-posix:syscall-errno condition))))
+      (error () (values nil "No such file or directory")))
+    #-(and sbcl (not win32))
+    (if (ignore-errors (probe-file (pathname name)))
+        (values t nil)
+        (values nil "No such file or directory"))))
+
+(defun ssh-file-condition-reason (condition)
+  "CONDITION's operating-system reason alone.
+
+SBCL's file conditions render the pathname or stream before the strerror
+text, while ssh prints only the reason: \"Is a directory\", \"Permission
+denied\"."
+  (cond
+    ((typep condition 'sb-int:simple-file-error)
+     (or (ignore-errors (slot-value condition 'sb-kernel::message))
+         (princ-to-string condition)))
+    ((typep condition 'sb-int:simple-stream-error)
+     (let ((arguments (and (typep condition 'simple-condition)
+                           (simple-condition-format-arguments condition))))
+       (let ((reason (car (last arguments))))
+         (if (stringp reason) reason (princ-to-string condition)))))
+    (t (princ-to-string condition))))
+
+(defun ssh-key-load-error-text (condition)
+  "CONDITION's reason in the words ssh's Load key line uses.
+
+A key file that does not parse is \"invalid format\" for every malformed
+shape, which is the one string sshkey_load_private_type returns for them."
+  (cond
+    ((typep condition 'ssh-protocol-error) "invalid format")
+    ((typep condition 'ssh-error)
+     (or (ssh-error-detail condition) (princ-to-string condition)))
+    (t (ssh-file-condition-reason condition))))
+
 (defun ssh-octets-base64 (octets)
   (cl-base64:usb8-array-to-base64-string octets))
 
@@ -1684,24 +1741,91 @@ PKCS#8 EncryptedPrivateKeyInfo."
               (not (and (string= cipher "none")
                         (string= kdf "none")))))))))
 
-(defun ssh-load-passphrase (path passphrase passphrase-callback)
-  "PASSPHRASE to load PATH with, consulting PASSPHRASE-CALLBACK if needed.
+(defvar *ssh-private-key-permission-check* nil
+  "A function of a private key path that reports too-open permissions.
 
-A given PASSPHRASE wins without asking.  When none was given and PATH is a
-passphrase-protected key, PASSPHRASE-CALLBACK is called with the file's path
-as a string and may return the passphrase, or NIL to leave the key
-unreadable.  An unprotected file, or one that cannot be read at all, never
-calls the callback; the ordinary load then reports the real problem."
+It prints ssh's UNPROTECTED PRIVATE KEY FILE warning through SSH-WARN and
+returns true when the key must be ignored.  The command line binds it because
+the rules are POSIX mode bits on Unix and ACLs on Windows, neither of which
+belongs in the protocol code.")
+
+(defparameter +ssh-default-passphrase-attempts+ 3
+  "How often a key's passphrase is asked for, as NumberOfPasswordPrompts is 3.")
+
+(defun ssh-private-key-load-error (path passphrase)
+  "The condition PATH fails to load with PASSPHRASE, or NIL when it opens."
+  (handler-case
+      (progn (ssh-load-private-key path :passphrase passphrase) nil)
+    (error (condition) condition)))
+
+(defun ssh-locked-key-error-p (condition)
+  "Whether CONDITION means a protected key stayed locked rather than broken.
+
+A missing or wrong passphrase is what ssh reports only at debug level; every
+other load failure earns its \"Load key\" line."
+  (and (typep condition 'ssh-error)
+       (let ((detail (or (ssh-error-detail condition) "")))
+         (or (search "the private key is encrypted" detail)
+             (search "incorrect passphrase supplied" detail)))))
+
+(defun ssh-quiet-key-load-error-p (path condition)
+  "Whether a failed load of PATH is something ssh reports only in debug.
+
+ssh stays silent when an identity file does not exist (\"no such identity\"
+is debug3); a protected key left locked never reaches here, because
+SSH-LOAD-PASSPHRASE reports that separately.  Every other reason earns
+ssh's \"Load key\" line."
+  (declare (ignore condition))
+  (not (ssh-file-exists-p path)))
+
+(defun ssh-load-passphrase (path passphrase passphrase-callback
+                            &key
+                              (attempts +ssh-default-passphrase-attempts+))
+  "PASSPHRASE to load PATH with, and whether PATH is a locked protected key.
+
+A given PASSPHRASE wins without asking.  Otherwise PATH is tried with the
+empty passphrase first, as ssh does, so a key with an empty one never
+prompts.  When that fails and PATH is passphrase-protected,
+PASSPHRASE-CALLBACK is called with the file's path as a string up to
+ATTEMPTS times (ssh's NumberOfPasswordPrompts); each answer is tried here,
+so a wrong one is asked again and an empty or NIL answer gives up on the
+key.  An unprotected file, or one that cannot be read at all, never calls
+the callback; the ordinary load then reports the real problem.
+
+The first value is the passphrase that opened PATH, or NIL.  The second is
+true when PATH is protected and no working passphrase was found, which ssh
+passes over silently; NIL with a NIL passphrase leaves the ordinary load to
+report why PATH is unusable."
   (cond
-    (passphrase passphrase)
-    ((null passphrase-callback) nil)
+    (passphrase (values passphrase nil))
     (t
      (let ((encrypted
              (handler-case (ssh-private-key-file-encrypted-p path)
                (error () nil))))
-       (when encrypted
-         (let ((answer (funcall passphrase-callback (namestring path))))
-           (and (stringp answer) answer)))))))
+       (if (not encrypted)
+           (values nil nil)
+           (let ((error (ssh-private-key-load-error path "")))
+             (cond
+               ((null error) (values "" nil))
+               ;; A broken key is the ordinary load's to report, with its
+               ;; real reason, rather than an invitation to try passphrases.
+               ((not (ssh-locked-key-error-p error)) (values nil nil))
+               ((null passphrase-callback) (values nil t))
+               (t
+                (dotimes (index (max 0 (or attempts
+                                          +ssh-default-passphrase-attempts+))
+                          (values nil t))
+                  (declare (ignore index))
+                  (let ((answer
+                          (funcall passphrase-callback (namestring path))))
+                    (when (or (null answer) (not (stringp answer))
+                              (zerop (length answer)))
+                      (return (values nil t)))
+                    (let ((error (ssh-private-key-load-error path answer)))
+                      (cond
+                        ((null error) (return (values answer nil)))
+                        ((not (ssh-locked-key-error-p error))
+                         (return (values answer nil)))))))))))))))
 
 (defun ssh-private-key-public-blob (path)
   "The public key blob in the openssh-key-v1 header at PATH, or NIL.

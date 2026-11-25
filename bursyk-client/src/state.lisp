@@ -66,9 +66,9 @@ forwards, disconnect, or open the escape command line."
 (defvar *stdin-watcher* nil
   "The POSIX readable watch on stdin, or NIL.")
 (defvar *stdin-thread* nil
-  "The Windows thread that moves stdin to the channel, or NIL.")
+  "The thread that moves an unwatchable stdin to the channel, or NIL.")
 (defvar *stdin-stopped* nil
-  "True once the Windows stdin thread must stop posting input.")
+  "True once the stdin thread must stop posting input.")
 (defvar *finishing* nil
   "True once FINISH is tearing down, so nested close callbacks do not quit early.")
 (defvar *log-stream* nil
@@ -122,5 +122,5 @@ forwards, disconnect, or open the escape command line."
     :control-master nil :control-path nil :control-command nil
     :host nil :no-control-persist nil
     :pkcs11 nil :bind-interface nil :bind-address nil :gssapi-auth nil
-    :tunnel nil :x11-forward nil :escape-char nil)
+    :tunnel nil :tunnel-device nil :x11-forward nil :escape-char nil)
   "The command line as parsed, before ~/.ssh/config is applied.")

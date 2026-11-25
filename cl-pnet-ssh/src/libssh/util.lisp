@@ -643,6 +643,11 @@ libssh exports the blob as base64, the same text a public key file holds."
                 client
                 (make-condition
                  'ssh-connection-error
+                 :kind :connect
+                 :host (ssh-client-connect-host client)
+                 :port (or (ssh-client-connect-port client)
+                           (ssh-client-port client))
+                 :reason "Connection timed out"
                  :detail (format nil "connecting to ~A:~D timed out after ~D seconds"
                                  (ssh-client-connect-host client)
                                  (or (ssh-client-connect-port client)
