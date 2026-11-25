@@ -1069,6 +1069,10 @@ may even be the same method with a second key."
            (progn
              (ssh-log "password rejected~:[~;; partial success~]; asking again"
                       partial)
+             ;; ssh's userauth_passwd announces every prompt after the first,
+             ;; at the error level: -q silences it, -E captures it.
+             (when (plusp (ssh-client-password-attempts client))
+               (ssh-warn "Permission denied, please try again."))
              (ssh-client-send-auth-request client))
            (ssh-client-send-next-auth-method client)))
       ((string= method "keyboard-interactive")

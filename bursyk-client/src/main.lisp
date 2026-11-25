@@ -5453,9 +5453,14 @@ and stops on an empty one."
            (subseq path 0 (min (length path) 100)))))
 
 (defun password-authentication-prompt (client prompt)
-  "Ask for a password the way ssh's password method does."
+  "Ask for a password the way ssh's password method does.
+
+read_passphrase opens the controlling terminal rather than trusting stdin,
+turns echo off and writes a carriage return first.  When there is no
+terminal at all it answers with an empty string, so the method still sends a
+request and NumberOfPasswordPrompts decides when to stop."
   (declare (ignore client))
-  (read-prompt-line prompt))
+  (or (read-tty-line prompt) ""))
 
 (defun keyboard-interactive-authentication-prompt
     (client name instruction prompts)
