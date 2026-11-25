@@ -20,6 +20,11 @@
                #:cl-newzlib
                #:cl-pnet
                #:cl-pnet-sockets
+               ;; SSHFP lookups for VerifyHostKeyDNS; CLIENT-DNS.LISP calls
+               ;; these directly, so the systems are a build dependency of
+               ;; the core rather than of each consumer.
+               #:cl-pnet-dns
+               #:cl-pnet-dns-plain
                #:burzay
                #:iterate
                #:uiop)

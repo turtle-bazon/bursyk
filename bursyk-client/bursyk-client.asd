@@ -4,9 +4,6 @@
   :license "GPL-3.0-or-later"
   :version "0.0.2.86"
   :depends-on (#:cl-pnet-ssh #:cl-pnet #:cl-pnet-sockets #:cl-pnet-socks #:clingon
-               ;; SSHFP queries for VerifyHostKeyDNS; the SSH library finds
-               ;; these packages at call time.
-               #:cl-pnet-dns #:cl-pnet-dns-plain
                #:cffi #:bordeaux-threads #:uiop)
   :serial t
   :components ((:module "src"
