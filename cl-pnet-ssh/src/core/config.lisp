@@ -2491,7 +2491,7 @@ parse_fwd_field."
                            (and (integerp listen-port)
                                 (minusp listen-port)))
                        (null listen-path))
-                  (and (not remotefwd)
+                  (and (or (null remotefwd) (eql remotefwd 0))
                        (eql listen-port 0)))
           (setf ok nil)))
       (when ok
@@ -2787,10 +2787,11 @@ written and -G reprints it unchanged."
   "VALUE as an escape character, or :NONE.
 
 readconf accepts one character, \"none\", or a caret followed by a character
-whose code is 64..127, which it masks to a control code.  That range is what
+whose code is 64..127, which it masks to a control code.  The spelling of
+\"none\" is case-sensitive, as readconf's strcmp is.  That range is what
 makes \"^?\" invalid here, as it is in OpenSSH."
   (cond
-    ((string-equal value "none") :none)
+    ((string= value "none") :none)
     ((= 1 (length value)) (char value 0))
     ((and (= 2 (length value))
           (char= (char value 0) #\^)
@@ -2945,17 +2946,22 @@ be a valid domain, and a path after the port is rejected."
         (when (and (plusp (length host))
                    (char= (char host (1- (length host))) #\.))
           (setf host (subseq host 0 (1- (length host)))))
-        (when tail
+        (when (and tail (plusp (length tail)))
           (cond
             ((eq delimiter #\/)
              ;; A bare path is not allowed.
              (return-from ssh-config-uri-destination (values nil nil nil nil)))
-            ((plusp (length tail))
-             (let ((slash (position #\/ tail)))
-               (when slash
+            (t
+             ;; parse_uri cuts the port at the first slash and only
+             ;; objects when what follows the slash is a non-empty path,
+             ;; so "host:99/" is fine and "host:99/x" is not.
+             (let* ((slash (position #\/ tail))
+                    (port-text (if slash (subseq tail 0 slash) tail))
+                    (path (and slash (subseq tail (1+ slash)))))
+               (when (and path (plusp (length path)))
                  (return-from ssh-config-uri-destination
                    (values nil nil nil nil)))
-               (let ((number (ssh-a2port tail)))
+               (let ((number (ssh-a2port port-text)))
                  (unless (and number (plusp number))
                    (return-from ssh-config-uri-destination
                      (values nil nil nil nil)))
@@ -3417,6 +3423,15 @@ decides both which hop is stored and which failure is reported first."
   "Whether KEYWORD is one ssh's client configuration parser accepts."
   (member keyword +ssh-config-client-keywords+ :test #'string=))
 
+(defvar *ssh-config-notice-consumed* nil
+  "Raw spellings of command-line -o options whose notice was already shown.
+
+ssh applies every -o inside its own getopt loop, before it reads a
+configuration file, so a notice about an earlier option appears before a
+diagnostic for a later flag.  A client that replays the -o lines while
+resolving its configuration would show the notice a second time; recording
+the spellings here lets the replay consume them silently instead.")
+
 (defun ssh-config-note-legacy-option (line)
   "Report LINE when readconf would call its option deprecated or unsupported.
 
@@ -3429,7 +3444,17 @@ both tables because readconf ignores it silently."
          (where (if (ssh-config-line-path line)
                     (namestring (ssh-config-line-path line))
                     "command-line"))
-         (number (or (ssh-config-line-number line) 0)))
+         (number (or (ssh-config-line-number line) 0))
+         (raw (and (ssh-config-line-command-line line)
+                   (ssh-config-line-raw line))))
+    (when (and raw
+               (member raw *ssh-config-notice-consumed* :test #'string=))
+      ;; The getopt phase already printed this option's notice.  Consume one
+      ;; occurrence so a genuinely repeated option still reports each time.
+      (setf *ssh-config-notice-consumed*
+            (remove raw *ssh-config-notice-consumed*
+                    :test #'string= :count 1))
+      (return-from ssh-config-note-legacy-option nil))
     (cond
       ((member keyword +ssh-config-unsupported-keywords+ :test #'string=)
        (if (ssh-config-line-path line)

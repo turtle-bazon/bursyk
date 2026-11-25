@@ -4955,6 +4955,24 @@ newline")))
     (is (eq :none dump))
     (is (null reason))))
 
+(test facade-uri-destinations-follow-parse-uri
+  ;; parse_uri only objects to a path that has something in it, so a bare
+  ;; trailing slash or colon is accepted, while "host:99/" keeps the port
+  ;; and "host//" or "host:99/x" are malformed.  The scheme is
+  ;; case-sensitive.
+  (flet ((uri (text)
+           (multiple-value-list
+            (cl-pnet-ssh::ssh-config-uri-destination text))))
+    (is (equal '(:uri nil "host" -1) (uri "ssh://host/")))
+    (is (equal '(:uri nil "host" -1) (uri "ssh://host:")))
+    (is (equal '(:uri nil "host" 99) (uri "ssh://host:99/")))
+    (is (equal '(:uri "user" "host" 99) (uri "ssh://user@host:99")))
+    (is (equal '(:not-uri nil nil nil) (uri "SSH://host")))
+    (is (equal '(nil nil nil nil) (uri "ssh://host//")))
+    (is (equal '(nil nil nil nil) (uri "ssh://host:/")))
+    (is (equal '(nil nil nil nil) (uri "ssh://host:99/x")))
+    (is (equal '(nil nil nil nil) (uri "ssh://host..")))))
+
 (test facade-proxy-jumps-let-the-command-line-win
   (let ((options (facade-options '(:proxy-jump "from-config.example"))))
     (is (equal "from-config.example"

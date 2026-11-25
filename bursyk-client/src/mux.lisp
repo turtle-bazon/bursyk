@@ -2160,14 +2160,17 @@ gone; it must not keep writing to that client's terminal or pipes."
                   reason))))))
 
 #-win32
-(defun mux-prepare (host command command-given-p)
+(defun mux-prepare (host command command-given-p &optional options)
   "Attach to a master, or arrange for this client to become one.
 
 Runs before the SSH connection is attempted, because a usable master makes
 that connection unnecessary.  As in mux.c, only ControlMaster=no, auto and
 autoask try an existing master; yes and ask go straight to listening, so a
-second invocation cannot quietly join a master it was told to own."
-  (let* ((options (mux-config-options host))
+second invocation cannot quietly join a master it was told to own.
+
+OPTIONS is the already-resolved configuration when the caller needed it for
+an earlier check, so the file is not read a second time."
+  (let* ((options (or options (mux-config-options host)))
          (path (mux-control-path-from-options options))
          (mode (mux-control-master options))
          (persist (mux-control-persist options)))

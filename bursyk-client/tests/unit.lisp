@@ -41,7 +41,7 @@ CLI's decision and at the plist it filled."
 
 ;;; ---- command line ----
 
-(test split-destination-splits-at-the-first-at-sign
+(test split-destination-splits-at-the-last-at-sign
   (multiple-value-bind (host user)
       (burs::split-destination "alice@example.org")
     (is (equal "example.org" host))
@@ -52,8 +52,8 @@ CLI's decision and at the plist it filled."
     (is (null user)))
   (multiple-value-bind (host user)
       (burs::split-destination "a@b@example.org")
-    (is (equal "b@example.org" host))
-    (is (equal "a" user))))
+    (is (equal "example.org" host))
+    (is (equal "a@b" user))))
 
 (test parse-arguments-stops-at-the-destination
   (multiple-value-bind (destination command options)
@@ -268,12 +268,12 @@ CLI's decision and at the plist it filled."
   (multiple-value-bind (destination command options)
       (parse '("-vvT" "host" "-p" "2222"))
     (is (equal "host" destination))
-    ;; Parsing stops at the destination, so -p here belongs to the
-    ;; remote command even though ssh would have taken it as a flag.
-    (is (equal '("-p" "2222") command))
+    ;; ssh restarts its option scan after the destination, so a flag written
+    ;; before the remote command's first word is still an ssh flag.
+    (is (null command))
     (is (= 2 (getf options :verbose)))
     (is (eq :no (getf options :request-tty)))
-    (is (null (getf options :port)))))
+    (is (equal "2222" (getf options :port)))))
 
 (test attached-and-long-option-values
   (multiple-value-bind (destination command options)
