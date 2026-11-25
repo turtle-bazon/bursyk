@@ -8535,6 +8535,20 @@ the first active value."
         (is (typep condition 'ssh-config-error) (car case))
         (is (search (cdr case)
                     (cl-pnet-ssh::ssh-error-detail condition))
+            (car case))))
+    ;; readconf parses the first argument for its own message and only then
+    ;; reports a second one as "invalid arguments", so an unsupported first
+    ;; word names itself rather than the count.
+    (dolist (case '(("ObscureKeystrokeTiming a b" .
+                     "unsupported argument \"a\"")
+                    ("ObscureKeystrokeTiming yes bogus" .
+                     "invalid arguments")))
+      (multiple-value-bind (options condition)
+          (options-for (car case))
+        (declare (ignore options))
+        (is (typep condition 'ssh-config-error) (car case))
+        (is (equal (cdr case)
+                   (cl-pnet-ssh::ssh-error-detail condition))
             (car case))))))
 
 (test remaining-client-keywords-are-parsed

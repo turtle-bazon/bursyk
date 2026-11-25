@@ -2669,40 +2669,45 @@ parse_fwd_field."
       ((string= keyword "obscurekeystroketiming")
        ;; readconf accepts exactly one argument, reassigns only the first
        ;; active line, but parses every line so a mistake later is still fatal.
-       (let ((arguments (ssh-config-line-args line)))
-         (unless arguments
+       ;; It walks the arguments and treats a second one as "invalid
+       ;; arguments", while the first one's own value decides the message.
+       (let ((arguments (ssh-config-line-args line))
+             (value 0)
+             (value-seen nil))
+         (dolist (argument arguments)
+           (when value-seen
+             (error (ssh-config-line-error line "invalid arguments")))
+           (setf value
+                 (cond
+                   ((or (string= argument "yes")
+                        (string= argument "true"))
+                    +ssh-keystroke-default-interval-ms+)
+                   ((or (string= argument "no") (string= argument "false"))
+                    0)
+                   ((and (>= (length argument) 9)
+                         (string= argument "interval:" :end1 9 :end2 9))
+                    (let* ((number (subseq argument 9))
+                           (problem (ssh-config-atoi-error number)))
+                      (when problem
+                        (error (ssh-config-line-error
+                                line "integer value ~A." problem)))
+                      (let ((milliseconds (parse-integer number)))
+                        (when (or (< milliseconds 1)
+                                  (> milliseconds 1000))
+                          (error (ssh-config-line-error
+                                  line "value out of range.")))
+                        milliseconds)))
+                   (t
+                    (error (ssh-config-line-error
+                            line "unsupported argument \"~A\"" argument)))))
+           (setf value-seen t))
+         (unless value-seen
            (error (ssh-config-line-error line "missing argument")))
-         (when (rest arguments)
-           (error (ssh-config-line-error line "invalid arguments")))
-         (let* ((argument (first arguments))
-                (value
-                  (cond
-                    ((or (string= argument "yes")
-                         (string= argument "true"))
-                     +ssh-keystroke-default-interval-ms+)
-                    ((or (string= argument "no") (string= argument "false"))
-                     0)
-                    ((and (>= (length argument) 9)
-                          (string= argument "interval:" :end1 9 :end2 9))
-                     (let* ((number (subseq argument 9))
-                            (problem (ssh-config-atoi-error number)))
-                       (when problem
-                         (error (ssh-config-line-error
-                                 line "integer value ~A." problem)))
-                       (let ((milliseconds (parse-integer number)))
-                         (when (or (< milliseconds 1)
-                                   (> milliseconds 1000))
-                           (error (ssh-config-line-error
-                                   line "value out of range.")))
-                         milliseconds)))
-                    (t
-                     (error (ssh-config-line-error
-                             line "unsupported argument ~S" argument))))))
-           (ssh-config-set-once
-            seen options :obscure-keystroke-timing
-            (lambda (options)
-              (setf (ssh-config-options-obscure-keystroke-timing options)
-                    value))))))
+         (ssh-config-set-once
+          seen options :obscure-keystroke-timing
+          (lambda (options)
+            (setf (ssh-config-options-obscure-keystroke-timing options)
+                  value)))))
       (t
        (ssh-config-set-once
         seen options
