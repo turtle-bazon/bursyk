@@ -913,12 +913,12 @@ built: the master already carries the connection."
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
                                 &key on-forwarded-tcpip
-                                  on-forwarded-streamlocal mux-fd hop-source)
+                                  on-forwarded-streamlocal mux-fd hop-config)
   "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT.
 
 A MUX-FD proxy client does not need the jumps: its connection is the
-master's.  HOP-SOURCE is the config file without the command-line -o
-answers, which is all a ProxyJump hop receives."
+master's.  HOP-CONFIG is the -F value; a jump is a separate ssh that gets
+only -F, never the command-line -o answers."
   (handler-case
       (let ((command (ssh-config-proxy-command options proxy-command)))
         (if mux-fd
@@ -931,7 +931,7 @@ answers, which is all a ProxyJump hop receives."
                       :on-forwarded-streamlocal on-forwarded-streamlocal
                       :mux-fd mux-fd))
             (ssh-config-resolve-hops
-             (or hop-source source)
+             (ssh-config-client-source hop-config nil)
              ;; A ProxyCommand carries the stream itself, so there is no chain.
              (if command nil (ssh-config-proxy-jumps options proxy-jump))
              exec-matcher
@@ -975,9 +975,6 @@ passphrase or NIL.  VALIDATE-OPTIONS, when given, is called with the resolved
 OPTIONS and the canonical host before the client is built, so a program can
 apply the checks ssh.c makes on top of readconf and leave before dialling."
   (let* ((source (ssh-config-client-source config options))
-         ;; ssh runs ProxyJump hops as a separate ssh with only -F, so
-         ;; command-line -o answers do not reach them; the config file does.
-         (hop-source (ssh-config-client-source config nil))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
                      known-hosts host-key-policy host-key-callback resolver
@@ -1013,7 +1010,7 @@ apply the checks ssh.c makes on top of readconf and leave before dialling."
                                 :on-forwarded-streamlocal
                                 on-forwarded-streamlocal
                                 :mux-fd mux-fd
-                                :hop-source hop-source))
+                                :hop-config config))
      :on-error (lambda (condition) (funcall fail condition)))
     (when (and (not finished) (null on-client))
       (error 'ssh-config-error
