@@ -71,17 +71,37 @@ approximation."
 
 SBCL's file conditions render the pathname or stream before the strerror
 text, while ssh prints only the reason: \"Is a directory\", \"Permission
-denied\"."
-  (cond
-    ((typep condition 'sb-int:simple-file-error)
-     (or (ignore-errors (slot-value condition 'sb-kernel::message))
-         (princ-to-string condition)))
-    ((typep condition 'sb-int:simple-stream-error)
-     (let ((arguments (and (typep condition 'simple-condition)
-                           (simple-condition-format-arguments condition))))
-       (let ((reason (car (last arguments))))
-         (if (stringp reason) reason (princ-to-string condition)))))
-    (t (princ-to-string condition))))
+denied\".  Windows reports Win32 messages, but OpenSSH names keys through
+the C runtime's strerror, so the common ones are translated to the wording
+the rest of this client uses."
+  (labels ((runtime-wording (text)
+             #+win32
+             (cond
+               ((search "Access is denied" text) "Permission denied")
+               ((search "cannot find the file" text)
+                "No such file or directory")
+               ((search "cannot find the path" text)
+                "No such file or directory")
+               ((search "being used by another process" text)
+                "Permission denied")
+               ((search "filename or extension is too long" text)
+                "File name too long")
+               ((search "not enough space on the disk" text)
+                "No space left on device")
+               (t text))
+             #-win32 text))
+    (cond
+      ((typep condition 'sb-int:simple-file-error)
+       (runtime-wording
+        (or (ignore-errors (slot-value condition 'sb-kernel::message))
+            (princ-to-string condition))))
+      ((typep condition 'sb-int:simple-stream-error)
+       (let ((arguments (and (typep condition 'simple-condition)
+                             (simple-condition-format-arguments condition))))
+         (let ((reason (car (last arguments))))
+           (runtime-wording
+            (if (stringp reason) reason (princ-to-string condition))))))
+      (t (runtime-wording (princ-to-string condition))))))
 
 (defun ssh-key-load-error-text (condition)
   "CONDITION's reason in the words ssh's Load key line uses.

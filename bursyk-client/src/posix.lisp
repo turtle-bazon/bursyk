@@ -13,6 +13,11 @@
   #+sbcl (plusp (sb-unix:unix-isatty 0))
   #-sbcl nil)
 
+(defun client-user-id ()
+  "The uid ssh's %i percent expansion prints."
+  #+sbcl (sb-posix:getuid)
+  #-sbcl 0)
+
 (cffi:defcfun ("open" c-open) :int (path :string) (flags :int) (mode :int))
 (cffi:defcfun ("dup2" c-dup2) :int (old :int) (new :int))
 (cffi:defcfun ("close" c-close) :int (fd :int))

@@ -88,6 +88,13 @@
 (defun stdin-terminal-p ()
   (not (null (console-mode (c-get-std-handle +std-input-handle+)))))
 
+(defun client-user-id ()
+  "The uid ssh's %i percent expansion prints.
+
+Win32-OpenSSH answers its getuid() compat call with 1, so a Windows client
+expands %i to the same value."
+  1)
+
 (defun call-with-deferrable-signals-unblocked (function)
   "Call FUNCTION; Windows has no signal mask to work around."
   (funcall function))

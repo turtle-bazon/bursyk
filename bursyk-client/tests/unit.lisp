@@ -924,10 +924,14 @@ the lines never reach the output."
     (is (equal "8080" (burs::forward-bind-address forward)))
     (is (= 1080 (burs::forward-bind-port forward)))
     (is (equal "socks" (burs::forward-host forward))))
-  ;; a2port falls back to the TCP services database.
-  (let ((forward (burs::parse-remote-forward "8080:socks")))
-    (is (= 1080 (burs::forward-bind-port forward)))
-    (is (equal "socks" (burs::forward-host forward))))
+  ;; a2port falls back to the TCP services database.  Windows' services file
+  ;; has no socks entry, and ssh there rejects the form for the same reason.
+  (let ((socks (cl-pnet-ssh::ssh-a2port "socks")))
+    (if socks
+        (let ((forward (burs::parse-remote-forward "8080:socks")))
+          (is (= socks (burs::forward-bind-port forward)))
+          (is (equal "socks" (burs::forward-host forward))))
+        (skip "this platform has no TCP service database entry for \"socks\"")))
   ;; The same one-word form in a configuration file or an -o line.
   (let ((forward (burs::parse-config-remote-forward "8080")))
     (is (= 8080 (burs::forward-bind-port forward)))
@@ -975,14 +979,21 @@ the lines never reach the output."
         spec)))
 
 (test forward-specifications-expand-environment-variables
-  ;; parse_forward runs dollar_expand before it classifies the fields.
-  (is (equal (format nil "~A/s" (uiop:getenv "HOME"))
-             (burs::dynamic-forward-bind-path
-              (burs::parse-dynamic-forward "${HOME}/s"))))
-  (let ((forward (burs::parse-local-forward "a${HOME}b:/tmp/x")))
-    (is (equal (format nil "a~Ab" (uiop:getenv "HOME"))
-               (burs::forward-bind-path forward)))
-    (is (equal "/tmp/x" (burs::forward-target-path forward)))))
+  ;; parse_forward runs dollar_expand before it classifies the fields.  The
+  ;; variable must expand to a path fragment with no colon: HOME on Unix, and
+  ;; on Windows HOMEPATH, because a drive letter would add a field of its own
+  ;; (ssh on Windows misreads that form the same way).
+  (let* ((variable #+win32 "HOMEPATH" #-win32 "HOME")
+         (value (uiop:getenv variable))
+         (reference (format nil "${~A}" variable)))
+    (is (equal (format nil "~A/s" value)
+               (burs::dynamic-forward-bind-path
+                (burs::parse-dynamic-forward (format nil "~A/s" reference)))))
+    (let ((forward (burs::parse-local-forward
+                    (format nil "/a~Ab:/tmp/x" reference))))
+      (is (equal (format nil "/a~Ab" value)
+                 (burs::forward-bind-path forward)))
+      (is (equal "/tmp/x" (burs::forward-target-path forward))))))
 
 (test forward-dump-endpoints-match-readconf
   (is (equal "[localhost]:80"
@@ -2239,7 +2250,7 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
                              (get-universal-time) (random 1000000))
                      (uiop:temporary-directory)))
          (path (merge-pathnames "id_ed25519" directory))
-         (native (namestring path)))
+         (native (uiop:native-namestring path)))
     (ensure-directories-exist path)
     (unwind-protect
          (progn
@@ -2659,7 +2670,11 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
         (keygen-call (list "-l" "-f" name))
       (declare (ignore output))
       (is (eql 255 status))
-      (is (search (format nil "~A: No such file or directory" name) error))
+      (is (search (format nil "~A: No such file or directory"
+                          (if (uiop:os-windows-p)
+                              (substitute #\\ #\/ name)
+                              name))
+                  error))
       (is (not (search "FORMAT" error))))))
 
 (test keygen-does-not-create-missing-directories
@@ -3007,7 +3022,7 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
              (declare (ignore output))
              (is (eql 255 status))
              (is (search (format nil "~A is not a key file."
-                                 (namestring locked))
+                                 (uiop:native-namestring locked))
                          error)))
            ;; With a .pub beside it, -l reads that and keeps its comment.
            (with-open-file (stream (burs::keygen-public-path locked)
@@ -3397,7 +3412,7 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
              ;; 10.6 names the file the passphrase will protect.
              (is (search
                   (format nil "Enter passphrase for \"~A\" (empty for no passphrase): "
-                          (namestring retry))
+                          (uiop:native-namestring retry))
                   error))
              (is (search "Passphrases do not match.  Try again." output)))
            (is (cl-pnet-ssh:ssh-private-key-file-encrypted-p retry))
@@ -3436,7 +3451,7 @@ NZwIuJlMZhXY/aLxegbougv9Uavb7GiF4g==
              (is (eql 0 status))
              (is (search "ssh-ed25519" output))
              (is (search (format nil "Enter passphrase for \"~A\": "
-                                 (namestring path))
+                                 (uiop:native-namestring path))
                          error)))
            (multiple-value-bind (status output error)
                (keygen-call (list "-y" "-f" (namestring path)) :input "")

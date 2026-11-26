@@ -659,8 +659,16 @@ the caller can treat the '[' literally."
   "USER's home directory from the local password database, or NIL.
 
 ssh's tilde_expand() calls getpwnam; the password file answers the same
-question for the accounts this client is likely to name."
+question for the accounts this client is likely to name.  Windows has no
+password file: the current account's profile is its passwd entry, and
+another account's home lives in the registry, which this client does not
+consult."
   (and (plusp (length user))
+       #+win32
+       (let ((current (uiop:getenv "USERNAME")))
+         (when (and current (string-equal current user))
+           (namestring (user-homedir-pathname))))
+       #-win32
        (handler-case
            (with-open-file (stream "/etc/passwd" :if-does-not-exist nil)
              (when stream

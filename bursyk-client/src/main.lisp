@@ -3881,7 +3881,7 @@ spelling back out and drops any user and port."
           (cons #\u (cl-pnet-ssh:ssh-default-user))
           (cons #\d (string-right-trim
                      "/" (namestring (user-homedir-pathname))))
-          (cons #\i (format nil "~D" (sb-posix:getuid)))
+          (cons #\i (format nil "~D" (client-user-id)))
           (cons #\k key-alias)
           (cons #\j (or jump ""))
           (cons #\l local-host)
