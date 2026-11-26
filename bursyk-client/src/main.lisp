@@ -3413,7 +3413,7 @@ channel; the descriptor numbers are this implementation's own."
          (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel)))
     (mux-format-channel-status
      out (cl-pnet-ssh::ssh-channel-local-id channel) "client-session"
-     (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
+     (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil 0
      ;; i3 is CHAN_INPUT_CLOSED: the local side has sent EOF.
      (if eof 3 0) 0
      (if (eq state :closing) 3 0)

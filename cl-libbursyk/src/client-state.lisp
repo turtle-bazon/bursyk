@@ -381,7 +381,11 @@
   ;; client with its channel id restored.
   (relay nil)
   ;; The local descriptor -O channels shows for a forwarded connection.
-  (display-fd nil))
+  (display-fd nil)
+  ;; A relayed mux-proxy channel: channel_format_status() reports type 20,
+  ;; the "mux-proxy" extended type and the downstream client's id.
+  (proxy nil)
+  (proxy-downstream-id 0))
 
 (defun ssh-client-closed-p (client)
   "True once CLIENT has shut down."

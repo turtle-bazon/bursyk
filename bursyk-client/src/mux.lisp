@@ -908,7 +908,9 @@ the rest.  The client gets its own id back in the same position."
       (setf (gethash sender (mux-connection-proxy-channels connection)) channel)
       (setf (cl-pnet-ssh::ssh-channel-relay channel)
             (lambda (channel payload)
-              (mux-proxy-upstream connection sender channel payload))))))
+              (mux-proxy-upstream connection sender channel payload)))
+      (setf (cl-pnet-ssh::ssh-channel-proxy channel) t
+            (cl-pnet-ssh::ssh-channel-proxy-downstream-id channel) sender))))
 
 #+ssh-backend-lisp
 (declaim (ftype (function (t t t) *) mux-proxy-global-request)
@@ -1079,6 +1081,10 @@ master's channel through MUX-PROXY-OPEN-CONFIRMATION."
         (setf (cl-pnet-ssh::ssh-channel-relay channel)
               (lambda (channel payload)
                 (mux-proxy-upstream connection proxy-id channel payload))
+              (cl-pnet-ssh::ssh-channel-proxy channel) t
+              (cl-pnet-ssh::ssh-channel-proxy-downstream-id channel) proxy-id
+              (cl-pnet-ssh::ssh-channel-remote-name channel)
+              "mux-down-connect"
               (cl-pnet-ssh::ssh-channel-on-close channel)
               (lambda (channel status)
                 (declare (ignore status))
@@ -1507,15 +1513,15 @@ The parts a transport cannot report are left out rather than guessed."
         (mux-write-crlf out)))))
 
 (defun mux-format-channel-status
-    (out id remote-name type ctype remote-id-p remote-id mux-p
+    (out id remote-name type ctype remote-id-p remote-id mux-p mux-id
      istate input-length ostate output-length extended-usage extended-length
      rfd wfd efd sock ctl-chan ctl-child-p ctl-child-id io-want io-ready
      tty-flag bulk-flag)
   "Write one channel_format_status() line, as channels.c spells it."
   (format out
-          "  #~D ~A (t~D [~A] ~A~D ~A0 i~D/~D o~D/~D e[~A]/~D fd ~D/~D/~D sock ~D cc ~D ~A~D io 0x~2,'0X/0x~2,'0X ~A~A)"
+          "  #~D ~A (t~D [~A] ~A~D ~A~D i~D/~D o~D/~D e[~A]/~D fd ~D/~D/~D sock ~D cc ~D ~A~D io 0x~2,'0X/0x~2,'0X ~A~A)"
           id remote-name type ctype
-          (if remote-id-p "r" "nr") remote-id (if mux-p "m" "nm")
+          (if remote-id-p "r" "nr") remote-id (if mux-p "m" "nm") mux-id
           istate input-length ostate output-length
           extended-usage extended-length
           rfd wfd efd sock ctl-chan
@@ -1529,7 +1535,7 @@ The parts a transport cannot report are left out rather than guessed."
         (output (mux-connection-output connection)))
     (mux-format-channel-status
      out (mux-connection-control-channel-id connection) "mux-control"
-     16 "mux-control" nil 0 t
+     16 "mux-control" nil 0 t 0
      ;; The control channel has no SSH buffer state of its own.
      0 0 0 0 "closed" 0
      fd fd -1 fd -1
@@ -1563,7 +1569,7 @@ stdio-forward channel created by channel_connect_stdio_fwd()."
         (mux-format-channel-status
          out (cl-pnet-ssh::ssh-channel-local-id channel)
          (or (mux-session-remote-name session) "stdio-forward")
-         (if open 4 3) "stdio-forward" (and remote-id t) (or remote-id 0) nil
+         (if open 4 3) "stdio-forward" (and remote-id t) (or remote-id 0) nil 0
          (if eof 3 0) 0
          (if (eq state :closing) 3 0)
          (if write-queue (fill-pointer write-queue) 0)
@@ -1573,7 +1579,7 @@ stdio-forward channel created by channel_connect_stdio_fwd()."
          1 0 "" "B")
         (mux-format-channel-status
          out (cl-pnet-ssh::ssh-channel-local-id channel) "client-session"
-         (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
+         (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil 0
          ;; i3 is CHAN_INPUT_CLOSED: the local side has sent EOF.
          (if eof 3 0) 0
          (if (eq state :closing) 3 0)
@@ -1599,17 +1605,30 @@ connection.  Its remote name is whatever the forwarding code recorded."
          (name (or (cl-pnet-ssh::ssh-channel-remote-name channel) ctype))
          (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel))
          (display (cl-pnet-ssh::ssh-channel-display-fd channel))
+         (proxy (cl-pnet-ssh::ssh-channel-proxy channel))
+         (proxy-id (cl-pnet-ssh::ssh-channel-proxy-downstream-id channel))
          (fd (if (and (integerp display) (>= display 0)) display -1)))
-    (mux-format-channel-status
-     out (cl-pnet-ssh::ssh-channel-local-id channel) name
-     (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
-     0 0 (if (eq state :closing) 3 0)
-     (if write-queue (fill-pointer write-queue) 0)
-     "closed" 0
-     ;; channels.c's rfd/wfd/sock are the accepted socket; there is no
-     ;; separate extended descriptor for these channels.
-     fd fd -1 fd -1 nil 0
-     (if open 1 0) 0 "" "B")))
+    (if proxy
+        ;; channel_proxy_downstream()'s channels: type 20, extended type
+        ;; "mux-proxy", the downstream client's id in the mux slot, and no
+        ;; descriptor or io interest of their own.
+        (mux-format-channel-status
+         out (cl-pnet-ssh::ssh-channel-local-id channel) name
+         20 "mux-proxy" (and remote-id t) (or remote-id 0) t proxy-id
+         0 0 (if (eq state :closing) 3 0) 0
+         "closed" 0
+         -1 -1 -1 -1 -1 nil 0
+         0 0 "" "I")
+        (mux-format-channel-status
+         out (cl-pnet-ssh::ssh-channel-local-id channel) name
+         (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil 0
+         0 0 (if (eq state :closing) 3 0)
+         (if write-queue (fill-pointer write-queue) 0)
+         "closed" 0
+         ;; channels.c's rfd/wfd/sock are the accepted socket; there is no
+         ;; separate extended descriptor for these channels.
+         fd fd -1 fd -1 nil 0
+         (if open 1 0) 0 "" "B"))))
 
 (defun mux-channel-open-message (master)
   "The text -O channels returns, matching channels.c's channel_open_message.
