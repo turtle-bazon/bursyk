@@ -69,7 +69,7 @@
 certifies and suppresses the automatic KEY-cert.pub lookup, while a
 certificate for another key is not attached."
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-certfile"))
              (ca (merge-pathnames "ca" directory))
              (user (merge-pathnames "user" directory))
@@ -249,7 +249,7 @@ BURZAY (which now asks for AAAA under :INET6) instead of being funcalled."
   "AGENT :NONE disables the agent even when SSH_AUTH_SOCK is set, which is
 what IdentityAgent none and IdentitiesOnly ask for."
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-no-agent"))
              (path (merge-pathnames "id_ed25519" directory))
              (delivered '())
@@ -269,11 +269,15 @@ what IdentityAgent none and IdentitiesOnly ask for."
                             (cl-pnet-ssh::ssh-signer-type (first delivered))))
                ;; With no key file the agent would be the only source; :NONE
                ;; must leave nothing to try instead of consulting the socket.
+               ;; Point the default-identity search at the empty test
+               ;; directory, or a real account's ~/.ssh keys would answer.
                (setf delivered nil failure nil)
-               (cl-pnet-ssh::ssh-resolve-signers
-                nil :none nil
-                (lambda (signers) (setf delivered signers))
-                (lambda (condition) (setf failure condition)))
+               (let ((cl-pnet-ssh::*ssh-identity-home*
+                       (uiop:ensure-directory-pathname directory)))
+                 (cl-pnet-ssh::ssh-resolve-signers
+                  nil :none nil
+                  (lambda (signers) (setf delivered signers))
+                  (lambda (condition) (setf failure condition))))
                (is (null delivered))
                (is (typep failure 'ssh-authentication-error)))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
@@ -282,7 +286,7 @@ what IdentityAgent none and IdentitiesOnly ask for."
   "A protected identity asks the callback with its path, an unprotected one
 never asks, and an explicit passphrase wins without asking."
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory
                (ssh-test-directory "cl-pnet-ssh-passphrase-callback"))
              (protected (merge-pathnames "locked" directory))
@@ -326,7 +330,7 @@ never asks, and an explicit passphrase wins without asking."
 
 (test client-builds-a-hostbased-request
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-request"))
              (key-path (merge-pathnames "host_key" directory)))
         (ensure-directories-exist key-path)
@@ -989,7 +993,7 @@ arrived when the server opens the channel."
   "A hostbased request is verified with the client host key and handed to
 the application's trust hook."
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased"))
              (key-path (merge-pathnames "host_key" directory)))
         (ensure-directories-exist key-path)
@@ -1059,7 +1063,7 @@ the application's trust hook."
   "A HostKey whose private half is absent becomes an agent-backed key when
 HostKeyAgent is configured."
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-hostkey"))
              (key-path (merge-pathnames "host_key" directory)))
         (ensure-directories-exist key-path)
@@ -1086,8 +1090,10 @@ HostKeyAgent is configured."
 (test server-kex-signs-with-an-agent-host-key
   "An agent-backed host key sends the exchange hash to the agent and finishes
 the KEX from its signature."
+  #+win32 (skip "no Unix-domain sockets on this platform")
+  #-win32
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-kex"))
              (key-path (merge-pathnames "host_key" directory))
              (agent-path (namestring (merge-pathnames "agent.sock" directory))))
@@ -1294,7 +1300,7 @@ flag at a rekey would make the two sides count packets differently."
 
 (test server-kexinit-honours-configured-algorithms
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let ((directory (ssh-test-directory "cl-pnet-ssh-algos")))
         (unwind-protect
              (let* ((keys (test-server-algorithm-keys directory))
@@ -1349,7 +1355,7 @@ flag at a rekey would make the two sides count packets differently."
 
 (test server-host-keys-obey-required-rsa-size
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let ((directory (ssh-test-directory "cl-pnet-ssh-rsasize")))
         (unwind-protect
              (let* ((short (merge-pathnames "rsa-1024" directory))
@@ -1422,7 +1428,7 @@ flag at a rekey would make the two sides count packets differently."
 
 (test server-user-key-policy-follows-config
   (if (not (ssh-keygen-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+      (skip "no ssh-keygen")
       (let ((directory (ssh-test-directory "cl-pnet-ssh-userkey")))
         (unwind-protect
              (let* ((short (merge-pathnames "rsa-1024" directory))
@@ -1757,7 +1763,7 @@ flag at a rekey would make the two sides count packets differently."
 (test client-rekeys-after-rekeylimit-volume
   "A small client RekeyLimit makes the client start its own exchange and then
 finish the session normally."
-  (if (not (ssh-keygen-available-p))
+  (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let ((count 0)
             (original (symbol-function
@@ -1782,7 +1788,7 @@ finish the session normally."
 (test server-rekeys-after-rekeylimit-volume
   "A small sshd RekeyLimit makes the server start its own exchange, which the
 client answers before the session continues."
-  (if (not (ssh-keygen-available-p))
+  (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let ((count 0)
             (original (symbol-function
@@ -1891,7 +1897,7 @@ sshpkt_fatal, so the client reports :PEER-CLOSED through ON-CLOSE."
 (test client-version-addendum-reaches-the-server
   "A login still verifies when the addendum is part of the greeting, and the
 server records the full string."
-  (if (not (ssh-keygen-available-p))
+  (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-addendum"))
              (server-key (merge-pathnames "host_key" directory))
@@ -1939,7 +1945,7 @@ server records the full string."
   ;; The server presents the certificate, the client checks its CA against
   ;; @cert-authority in known_hosts, and the KEX signature is verified with
   ;; the plain key inside the certificate.
-  (if (not (ssh-keygen-available-p))
+  (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostcert-loop"))
              (ca (merge-pathnames "ca" directory))
@@ -1998,7 +2004,7 @@ server records the full string."
 
 (test client-loopback-hostbased-authentication
   "The client authenticates with a host key and the server's hostbased hook."
-  (if (not (ssh-keygen-available-p))
+  (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-hostbased-loop"))
              (server-key (merge-pathnames "server_key" directory))

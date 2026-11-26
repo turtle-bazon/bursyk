@@ -4,12 +4,19 @@
 ;;;; driven, like cl-pnet-tls: MAKE-SSH-CLIENT returns at once and ON-OPEN
 ;;;; runs when the session is authenticated and ready for channels.
 
+(defvar *ssh-identity-home* nil
+  "The home directory whose .ssh holds default identity files, or NIL.
+
+A caller that keeps identities somewhere other than the process home binds
+this; tests use it so the account's real default keys do not leak into an
+answer.")
+
 (defun ssh-default-private-keys ()
   "The default identity files that exist, or NIL."
-  (iter (for name in +ssh-default-identity-names+)
-    (let ((path (merge-pathnames (format nil ".ssh/~A" name)
-                                 (user-homedir-pathname))))
-      (when (probe-file path) (collect path)))))
+  (let ((home (or *ssh-identity-home* (user-homedir-pathname))))
+    (iter (for name in +ssh-default-identity-names+)
+      (let ((path (merge-pathnames (format nil ".ssh/~A" name) home)))
+        (when (probe-file path) (collect path))))))
 
 (defun ssh-default-private-key ()
   "The first default identity file that exists, or NIL."
