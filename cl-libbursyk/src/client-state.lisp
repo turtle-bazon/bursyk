@@ -271,6 +271,12 @@
   (alive-misses 0)
   (channels (make-hash-table :test #'eql))
   (next-channel-id 0)
+  ;; Local channel ids owned by things outside the channel table (a control
+  ;; master's listener and one mux-control channel per attached client).
+  ;; ssh's channel_new() takes the first free slot of its array, so the
+  ;; allocator skips both these ids and the channels map, and a released
+  ;; control id becomes available again.
+  (reserved-channel-ids nil)
   ;; ChannelTimeout: (PATTERN . SECONDS) pairs from ssh_config; a "global"
   ;; pattern bounds the whole connection, and NIL means no timeout at all.
   (channel-timeouts nil)

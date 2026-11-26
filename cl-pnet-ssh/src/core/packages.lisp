@@ -40,6 +40,8 @@
    #:ssh-client-connect-forward-target
    #:ssh-client-set-ip-qos
    #:ssh-client-send-global-request
+   #:ssh-client-reserve-channel-ids
+   #:ssh-client-release-channel-ids
    #:ssh-channel
    #:ssh-channel-p
    #:ssh-channel-exec

@@ -334,14 +334,21 @@ straight to the terminal without a relay here."
                     (mux-client-watch-winch master-pid))
                   (mux-client-wait-exit fd session-id)))
                (#.+mux-s-permission-denied+
-                (error "the control master refused the session: ~A"
-                       (cl-pnet-ssh:ssh-read-text reader)))
+                (log-error "Master refused session request: ~A"
+                           (cl-pnet-ssh:ssh-read-text reader))
+                :refused)
                (#.+mux-s-failure+
-                (error "the control master failed: ~A"
-                       (cl-pnet-ssh:ssh-read-text reader)))
+                ;; mux_client_request_session() reports through error_f(),
+                ;; whose showfunc prefix appears even without -v.
+                (log-error
+                 "mux_client_request_session: session request failed: ~A"
+                 (cl-pnet-ssh:ssh-read-text reader))
+                :refused)
                (t
-                (error "unexpected reply from the control master: 0x~8,'0X"
-                       type)))))
+                (log-error
+                 "mux_client_request_session: unexpected response from master 0x~8,'0X"
+                 type)
+                :refused))))
       (when raw (restore-terminal)))))
 
 #-win32
@@ -442,6 +449,9 @@ through the alive check before the session starts."
   (fds-received nil)
   (fds-continuation nil)
   (hello nil)
+  ;; mux.c gives every attached client a "mux-control" channel; its id is
+  ;; reserved for the connection's lifetime, like that channel's slot.
+  control-channel-id
   ;; OpenSSH's master allows one session per control connection.
   session
   on-message
@@ -486,6 +496,10 @@ through the alive check before the session starts."
     (setf (mux-connection-fds-received connection) nil
           (mux-connection-fds-wanted connection) 0)
     (mux-close (mux-connection-fd connection))
+    (when (and *client* (mux-connection-control-channel-id connection))
+      (cl-pnet-ssh:ssh-client-release-channel-ids
+       *client* (list (mux-connection-control-channel-id connection))))
+    (setf (mux-connection-control-channel-id connection) nil)
     (when (mux-connection-on-close connection)
       (funcall (mux-connection-on-close connection) connection))))
 
@@ -744,6 +758,9 @@ so another process never sees a bound but unready socket."
             (error "cannot move the control socket to ~A: ~A"
                    path (cl-pnet-sockets:c-strerror errno)))))
     (ignore-errors (delete-file temporary))
+    ;; mux.c's listener is an ordinary channel, so it owns the lowest free id.
+    ;; Reserving it keeps the numbers in "channel N:" diagnostics identical.
+    (cl-pnet-ssh:ssh-client-reserve-channel-ids client 1)
     (let ((master (%make-mux-master :path path :fd fd :mode mode
                                     :persist persist)))
       (setf *mux-master* master)
@@ -780,6 +797,10 @@ so another process never sees a bound but unready socket."
           (progn
             (cl-pnet-sockets:set-nonblocking fd)
             (let ((connection (mux-connection-open fd master)))
+              ;; Each attached client has a mux-control channel of its own.
+              (setf (mux-connection-control-channel-id connection)
+                    (first (cl-pnet-ssh:ssh-client-reserve-channel-ids
+                            *client* 1)))
               (mux-master-register master connection)))
         (error ()
           (mux-close fd))))))
@@ -1205,12 +1226,15 @@ The parts a transport cannot report are left out rather than guessed."
                      (mux-session-close session)))
                  :on-error
                  (lambda (channel condition)
-                   (declare (ignore channel))
+                   ;; mux_session_confirm() reports a refused session open
+                   ;; with one fixed string, whatever the peer said, while
+                   ;; the master's own log carries the reason.
+                   (log-channel-open-failure channel condition)
                    (unless (mux-session-closed session)
                      (mux-connection-send
                       connection
                       (mux-error-payload +mux-s-failure+ request-id
-                                         (format nil "~A" condition)))
+                                         "Session open refused by peer"))
                      (mux-session-close session))))))
           (setf (mux-session-channel session) channel)
           (setf (mux-session-stdin-watcher session)
@@ -1736,8 +1760,7 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                                  (unless (mux-session-closed session)
                                    (mux-session-close session)))
                      :on-error (lambda (channel condition)
-                                 (declare (ignore channel))
-                                 (mux-stdio-failed session condition)))
+                                 (mux-stdio-failed session channel condition)))
                     (cl-pnet-ssh:ssh-open-direct-tcpip
                      *client* host port
                      :on-open (lambda (channel)
@@ -1750,8 +1773,8 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                                  (unless (mux-session-closed session)
                                    (mux-session-close session)))
                      :on-error (lambda (channel condition)
-                                 (declare (ignore channel))
-                                 (mux-stdio-failed session condition))))))
+                                 (mux-stdio-failed session channel
+                                                   condition))))))
           (setf (mux-session-channel session) channel)
           (setf (mux-session-stdin-watcher session)
                 (mux-watch-input
@@ -1776,12 +1799,12 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                           (mux-session-request-id session)
                           (mux-session-sid session)))))
 
-(defun mux-stdio-failed (session condition)
-  (declare (ignore condition))
+(defun mux-stdio-failed (session channel condition)
+  ;; channels.c logs the refused open in the master, then mux_stdio_confirm()
+  ;; sends the same generic text to the client.
+  (log-channel-open-failure channel condition)
   (let ((connection (mux-session-connection session)))
     (unless (mux-connection-closed-p connection)
-      ;; mux_stdio_confirm() always reports the same text for a refused
-      ;; open; the peer's own reason stays in the master's log.
       (mux-connection-send
        connection
        (mux-error-payload +mux-s-failure+ (mux-session-request-id session)
@@ -2159,7 +2182,12 @@ is fatal rather than a reason to fall back to an unshared connection."
                          (status (mux-client-session
                                   fd request :master-pid master-pid)))
                     (mux-close fd)
-                    status))))
+                    (if (eq status :refused)
+                        ;; mux_client() returns -1 after a refused session
+                        ;; request, so ssh(1) connects directly instead of
+                        ;; giving up; do the same.
+                        (values nil :session-refused)
+                        status)))))
            (error (condition)
              (mux-close fd)
              (if alive
@@ -2220,12 +2248,16 @@ gone; it must not keep writing to that client's terminal or pipes."
         (fail "the background control master did not start")))
     (multiple-value-bind (status reason)
         (mux-attach path options command command-given-p :yes)
-      (if status
-          (finish status)
-          (progn
-            (ignore-errors (uiop:terminate-process process))
-            (fail "the background control master is not accepting connections~@[: ~A~]"
-                  reason))))))
+      (cond
+        (status (finish status))
+        ((eq reason :session-refused)
+         ;; The master answered and refused the session; ssh(1) then
+         ;; connects directly, and a persistent master keeps running.
+         nil)
+        (t
+         (ignore-errors (uiop:terminate-process process))
+         (fail "the background control master is not accepting connections~@[: ~A~]"
+               reason))))))
 
 #-win32
 (defun mux-prepare (host command command-given-p &optional options)

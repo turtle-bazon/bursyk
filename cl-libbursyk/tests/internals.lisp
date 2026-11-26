@@ -2460,3 +2460,26 @@ OpenSSH's server default."
                  "diffie-hellman-group-exchange-sha256"))
     (is (not (member kex cl-pnet-ssh:+ssh-server-default-kex-algorithms+
                      :test #'string=)))))
+
+(test channel-ids-reuse-freed-slots
+  "channels.c picks the first free slot, so a closed channel's number comes
+back, while a mux listener or control id stays out until it is released."
+  (let* ((client (cl-pnet-ssh::%make-ssh-client))
+         (channels (cl-pnet-ssh::ssh-client-channels client)))
+    (is (= 0 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))
+    (setf (gethash 0 channels) t)
+    (is (= 1 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))
+    (setf (gethash 1 channels) t)
+    (is (= 2 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))
+    ;; The mux listener takes the lowest free slot and keeps it.
+    (is (equal '(2) (cl-pnet-ssh::ssh-client-reserve-channel-ids client 1)))
+    (is (= 3 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))
+    ;; A control channel is released when its connection closes.
+    (let ((control (cl-pnet-ssh::ssh-client-reserve-channel-ids client 1)))
+      (is (equal '(3) control))
+      (is (= 4 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))
+      (cl-pnet-ssh::ssh-client-release-channel-ids client control)
+      (is (= 3 (cl-pnet-ssh::ssh-client-allocate-channel-id client))))
+    ;; A closed channel frees its number for the next open.
+    (remhash 0 channels)
+    (is (= 0 (cl-pnet-ssh::ssh-client-allocate-channel-id client)))))

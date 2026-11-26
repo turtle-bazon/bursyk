@@ -1716,6 +1716,25 @@ ProxyCommand helper) before quitting, instead of leaving a child behind."
     (apply #'log-message format-string arguments))
   (finish 255))
 
+(defun log-level-setting ()
+  "The effective LogLevel name, defaulting to INFO."
+  (or (getf *options* :log-level) "info"))
+
+(defun log-info (format-string &rest arguments)
+  "Print a logit() line at INFO.
+
+log.c drops INFO when LogLevel is ERROR, FATAL or QUIET, so those levels
+silence the channel diagnostics a session still reports by exit status."
+  (unless (member (log-level-setting) '("quiet" "fatal" "error")
+                  :test #'string-equal)
+    (apply #'log-message format-string arguments)))
+
+(defun log-error (format-string &rest arguments)
+  "Print an error() line, which only LogLevel FATAL or QUIET silences."
+  (unless (member (log-level-setting) '("quiet" "fatal")
+                  :test #'string-equal)
+    (apply #'log-message format-string arguments)))
+
 (defun channel-open-reason-text (reason)
   "ssh's reason2txt() for a refused channel open."
   (case reason
@@ -1724,6 +1743,21 @@ ProxyCommand helper) before quitting, instead of leaving a child behind."
     (3 "unknown channel type")
     (4 "resource shortage")
     (t "unknown reason")))
+
+(defun log-channel-open-failure (channel condition)
+  "Print channels.c's refusal line for an ssh-channel-error CONDITION.
+
+channel_input_open_failure() logs at logit() before the channel's confirm
+callback runs, so a session, a stdio forward and a mux master all report the
+same text for a refused open."
+  (when (and condition
+             (typep condition 'cl-pnet-ssh:ssh-channel-error)
+             (integerp (cl-pnet-ssh:ssh-channel-error-reason condition)))
+    (log-info "channel ~D: open failed: ~A: ~A"
+              (cl-pnet-ssh::ssh-channel-local-id channel)
+              (channel-open-reason-text
+               (cl-pnet-ssh:ssh-channel-error-reason condition))
+              (or (cl-pnet-ssh:ssh-channel-error-description condition) ""))))
 
 (defun start-logging ()
   (when (and (getf *options* :log-file)
@@ -2690,8 +2724,16 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
     (quit-now (or status 255))))
 
 (defun session-error (channel condition)
-  (declare (ignore channel))
-  (format *error-output* "burs: ~A~%" condition)
+  "Report a refused session channel open the way ssh.c does.
+
+channels.c logs \"channel N: open failed: reason: message\" and
+ssh_session2_setup() returns without a second diagnostic, so the process
+leaves with 255 after that one line.  Anything else is a local failure and
+keeps the burs: prefix."
+  (if (and (typep condition 'cl-pnet-ssh:ssh-channel-error)
+           (integerp (cl-pnet-ssh:ssh-channel-error-reason condition)))
+      (log-channel-open-failure channel condition)
+      (format *error-output* "burs: ~A~%" condition))
   (finish 255))
 
 (defun start-session (client command command-given-p)
@@ -2761,15 +2803,7 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
                         (progn
                           ;; channels.c logs the refusal at logit(), then
                           ;; ssh_stdio_confirm() is fatal().
-                          (unless (getf *options* :quiet)
-                            (log-message
-                             "channel ~D: open failed: ~A~@[: ~A~]"
-                             (cl-pnet-ssh::ssh-channel-local-id channel)
-                             (channel-open-reason-text
-                              (cl-pnet-ssh:ssh-channel-error-reason
-                               condition))
-                             (cl-pnet-ssh:ssh-channel-error-description
-                              condition)))
+                          (log-channel-open-failure channel condition)
                           (log-fatal "stdio forwarding failed"))
                         (progn
                           (format *error-output* "burs: ~A~%" condition)
@@ -5785,6 +5819,19 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
            (show-visual-host-key client)
            (cl-pnet-ssh:ssh-client-set-ip-qos
             client (request-tty-p client command-given-p))
+           ;; ssh_init_stdio_forwarding() runs before muxserver_listen()
+           ;; unless ControlPersist is on: then the master listens first and
+           ;; the stdio forward is requested afterwards.  Keeping that order
+           ;; keeps "channel N:" diagnostics identical.
+           (let* ((stdio (and (getf *options* :stdio-forward)
+                              (multiple-value-list
+                               (parse-stdio-forward
+                                (getf *options* :stdio-forward)))))
+                  (deferred (and *mux-create-master*
+                                 (not (eq *mux-create-persist* :no)))))
+             (when (and stdio (not deferred))
+               (start-stdio-forward client (first stdio) (second stdio)
+                                    (third stdio))))
            (mux-start-configured-master client)
            (setf *escape-char* nil
                  *escape-pending* nil
@@ -5812,10 +5859,15 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
              (when background
                (background-ready)))
            (cond
-             ((getf *options* :stdio-forward)
+             ((and (getf *options* :stdio-forward)
+                   *mux-create-master*
+                   (not (eq *mux-create-persist* :no)))
+              ;; ControlPersist deferred the stdio forward until after the
+              ;; master's listener and control channel were in place.
               (multiple-value-bind (target port streamlocal)
                   (parse-stdio-forward (getf *options* :stdio-forward))
                 (start-stdio-forward client target port streamlocal)))
+             ((getf *options* :stdio-forward) nil)
              ((or (getf *options* :no-command) (session-type-none-p client)) nil)
              (t
               (start-session client command command-given-p))))))

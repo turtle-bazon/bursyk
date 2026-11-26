@@ -163,7 +163,7 @@ unset value, or \"none\", is OpenSSH's 1200-second default."
 
 (defun ssh-client-x11-connected (client sender window max-packet fd status)
   "Make the confirmed x11 channel for an already connected display FD."
-  (let* ((id (ssh-client-next-channel-id client))
+  (let* ((id (ssh-client-allocate-channel-id client))
          (channel (%make-ssh-channel
                    :client client
                    :local-id id
@@ -192,7 +192,6 @@ unset value, or \"none\", is OpenSSH's 1200-second default."
                  (lambda (relay condition)
                    (declare (ignore relay))
                    (ssh-client-forward-fail channel condition)))))
-    (incf (ssh-client-next-channel-id client))
     (setf (gethash id (ssh-client-channels client)) channel
           (ssh-channel-target-fd-relay channel) relay)
     (ssh-client-confirm-channel channel)

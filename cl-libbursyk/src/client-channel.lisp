@@ -37,6 +37,18 @@
     (ssh-write-octets writer (ssh-channel-open-extra channel))
     (ssh-writer-output writer)))
 
+(defun ssh-client-allocate-channel-id (client)
+  "Return the lowest local channel id CLIENT may use.
+
+ssh keeps channels in a slot array and channel_new() takes the first free
+slot, so a closed channel's number is reused.  Matching that keeps channel
+numbers in \"channel N:\" diagnostics identical."
+  (let ((channels (ssh-client-channels client))
+        (reserved (ssh-client-reserved-channel-ids client)))
+    (loop for id from 0
+          unless (or (gethash id channels) (member id reserved))
+            return id)))
+
 (defun ssh-open-channel (client type &key open-extra on-data on-open on-eof
                                       on-exit on-close on-error)
   "Register a channel of TYPE on CLIENT and ask the peer for it.
@@ -44,7 +56,7 @@
 The returned channel is usable immediately: requests and writes made before
 the open confirmation are queued and flushed once the peer answers.  ON-OPEN
 runs once the peer has confirmed the channel, before any of its data."
-  (let* ((id (ssh-client-next-channel-id client))
+  (let* ((id (ssh-client-allocate-channel-id client))
          (channel (%make-ssh-channel
                    :client client
                    :local-id id
@@ -56,12 +68,34 @@ runs once the peer has confirmed the channel, before any of its data."
                    :on-data on-data :on-open on-open :on-eof on-eof
                    :on-exit on-exit
                    :on-close on-close :on-error on-error)))
-    (incf (ssh-client-next-channel-id client))
     (setf (ssh-client-channel-last-used client) (ssh-client-now))
     (setf (gethash id (ssh-client-channels client)) channel)
     (ssh-client-run-when-ready
      client (lambda () (ssh-channel-send channel (ssh-channel-open-payload channel))))
     channel))
+
+(defun ssh-client-reserve-channel-ids (client count)
+  "Reserve COUNT fresh local channel ids for users outside the channel table.
+
+ssh creates its mux listener and one mux-control channel per attached client
+as channels of their own, so they occupy ids even though they carry no SSH
+channel.  A control master reserves their ids to keep the numbers in
+\"channel N:\" diagnostics identical; reserving an id also keeps later
+allocations from reusing it.  Returns the reserved ids so the caller can
+release them with SSH-CLIENT-RELEASE-CHANNEL-IDS."
+  (let ((ids nil))
+    (dotimes (index count)
+      (declare (ignore index))
+      (let ((id (ssh-client-allocate-channel-id client)))
+        (push id (ssh-client-reserved-channel-ids client))
+        (push id ids)))
+    (nreverse ids)))
+
+(defun ssh-client-release-channel-ids (client ids)
+  "Give reserved channel IDS back, as a closed mux-control channel would."
+  (setf (ssh-client-reserved-channel-ids client)
+        (set-difference (ssh-client-reserved-channel-ids client) ids
+                        :test #'=)))
 
 (defun ssh-client-forward-agent-path (client)
   "The Unix socket CLIENT forwards when ForwardAgent is on, or NIL.
@@ -344,7 +378,7 @@ side is known to accept."
              client sender
              (format nil "forwarded-tcpip for ~A:~D was not requested"
                      bind-address bind-port)))
-          (let* ((id (ssh-client-next-channel-id client))
+          (let* ((id (ssh-client-allocate-channel-id client))
                  (channel (%make-ssh-channel
                            :client client
                            :local-id id
@@ -355,7 +389,6 @@ side is known to accept."
                            :remote-max-packet max-packet
                            :local-window (ssh-client-window client)
                            :local-max-packet (ssh-client-max-packet client))))
-            (incf (ssh-client-next-channel-id client))
             (setf (gethash id (ssh-client-channels client)) channel)
             (ssh-client-confirm-channel channel)
             (ssh-client-channel-start-timeout channel)
@@ -379,7 +412,7 @@ CHANNEL, or NIL to refuse the request."
           (ssh-client-send-channel-open-failure
            client sender
            (format nil "forwarded-streamlocal for ~A was not requested" path)))
-        (let* ((id (ssh-client-next-channel-id client))
+        (let* ((id (ssh-client-allocate-channel-id client))
                (channel (%make-ssh-channel
                          :client client
                          :local-id id
@@ -390,7 +423,6 @@ CHANNEL, or NIL to refuse the request."
                          :remote-max-packet max-packet
                          :local-window (ssh-client-window client)
                          :local-max-packet (ssh-client-max-packet client))))
-          (incf (ssh-client-next-channel-id client))
           (setf (gethash id (ssh-client-channels client)) channel)
           (ssh-client-confirm-channel channel)
           (ssh-client-channel-start-timeout channel)
@@ -420,7 +452,7 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                 (ssh-client-send-channel-open-failure
                  client sender
                  (format nil "cannot connect to the agent at ~A" path)))
-              (let* ((id (ssh-client-next-channel-id client))
+              (let* ((id (ssh-client-allocate-channel-id client))
                      (channel (%make-ssh-channel
                                :client client
                                :local-id id
@@ -450,7 +482,6 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                              (lambda (relay condition)
                                (declare (ignore relay))
                                (ssh-client-forward-fail channel condition)))))
-                (incf (ssh-client-next-channel-id client))
                 (setf (gethash id (ssh-client-channels client)) channel
                       (ssh-channel-target-fd-relay channel) relay)
                 (ssh-client-confirm-channel channel)

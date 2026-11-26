@@ -949,6 +949,39 @@ description, so the condition must carry both instead of only a detail."
     (setf (getf burs::*options* :log-level) "quiet")
     (is (burs::fatal-message-suppressed-p))))
 
+(defun capture-log-line (function level &rest arguments)
+  "Call log helper FUNCTION with ARGUMENTS at LOG-LEVEL, return its output."
+  (let ((burs::*options* (empty-options))
+        (burs::*log-stream* (make-string-output-stream)))
+    (when level
+      (setf (getf burs::*options* :log-level) level))
+    (apply function arguments)
+    (get-output-stream-string burs::*log-stream*)))
+
+(test log-info-is-silenced-from-error-upwards
+  "logit() logs at INFO, which LogLevel ERROR and below drop."
+  (let ((opened (format nil "channel 2: open failed: connect failed: open failed~%")))
+    (is (equal opened
+               (capture-log-line #'burs::log-info nil
+                                 "channel ~D: open failed: ~A: ~A"
+                                 2 "connect failed" "open failed")))
+    (dolist (level '("info" "verbose" "debug" "debug3"))
+      (is (equal opened
+                 (capture-log-line #'burs::log-info level
+                                   "channel ~D: open failed: ~A: ~A"
+                                   2 "connect failed" "open failed")))))
+  (dolist (level '("quiet" "fatal" "error"))
+    (is (equal "" (capture-log-line #'burs::log-info level "hidden")))))
+
+(test log-error-survives-the-error-level
+  "error() logs at ERROR, so LogLevel ERROR still prints it."
+  (let ((visible (format nil "visible~%")))
+    (is (equal visible (capture-log-line #'burs::log-error nil "visible")))
+    (is (equal visible
+               (capture-log-line #'burs::log-error "error" "visible"))))
+  (dolist (level '("quiet" "fatal"))
+    (is (equal "" (capture-log-line #'burs::log-error level "hidden")))))
+
 (test log-level-keeps-the-first-value
   "readconf only adopts LogLevel while options.log_level is unset, and -q or
 -v already set it, so the first value wins."
