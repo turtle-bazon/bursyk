@@ -14,6 +14,16 @@
   "CLIENT's TCP connection is up: greet and offer our KEXINIT."
   (setf (ssh-client-connection client) connection
         (ssh-client-phase client) :version)
+  ;; Remember the peer while the socket is still healthy.  ssh records the
+  ;; address it dialled, not getpeername(), for its close diagnostics.
+  (when connection
+    (handler-case
+        (multiple-value-bind (local-ip local-port remote-ip remote-port)
+            (ssh-client-connection-endpoints client)
+          (declare (ignore local-ip local-port))
+          (setf (ssh-client-peer-ip client) remote-ip
+                (ssh-client-peer-port client) remote-port))
+      (error () nil)))
   ;; The session type is not known yet; the application may raise this to
   ;; the interactive value once it decides whether to request a pty.
   (ssh-client-set-ip-qos client nil)
@@ -85,11 +95,29 @@ line, and NIL while the line is still incomplete."
     (error (condition)
       (ssh-client-fail client condition))))
 
+(defun ssh-client-peer-closed (client)
+  "The peer closed the connection, in whatever phase CLIENT had reached.
+
+Before user authentication ssh's packet layer treats a close as fatal and
+names the address in a logdie() message; once a session runs, clientloop
+prints its own notice instead, so this only reports the earlier phase.  The
+exit status is 255 either way, as both paths are fatal."
+  (if (eq (ssh-client-phase client) :ready)
+      (ssh-client-finish client :peer-closed :close)
+      (let ((message (format nil "Connection closed by ~A"
+                             (ssh-client-remote-id client))))
+        (ssh-client-fail
+         client
+         (make-condition 'ssh-connection-error
+                         :kind :closed
+                         :reason message
+                         :detail message)))))
+
 (defun ssh-client-receive (client data)
   "The event loop has DATA for CLIENT, or NIL at the end of the connection."
   (unless (ssh-client-closed-p client)
     (if (null data)
-        (ssh-client-finish client :peer-closed :close)
+        (ssh-client-peer-closed client)
         (progn
           (ssh-client-buffer-append client data)
           (ssh-client-advance client)))))

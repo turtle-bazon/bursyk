@@ -1662,6 +1662,19 @@ session down."
         (setf *log-stream* nil
               cl-pnet-ssh:*ssh-log-function* nil)))))
 
+(defun log-notice (format-string &rest arguments)
+  "Write one logit()-level line: to the -E file when one is open, else stderr.
+
+Unlike LOG-LINE this never adds -v's debug1 prefix, because a logit()
+message is not a debug message.  The caller has already applied -q."
+  (let ((stream (or *log-stream* *error-output*)))
+    (handler-case
+        (progn
+          (format stream "~?" format-string arguments)
+          (finish-output stream))
+      (error ()
+        (setf *log-stream* nil)))))
+
 (defun start-logging ()
   (when (and (getf *options* :log-file)
              (null *log-stream*))
@@ -5689,7 +5702,7 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                (unless (getf *options* :quiet)
                  (cond
                    ((typep condition 'cl-pnet-ssh:ssh-host-key-error)
-                    (format *error-output* "Host key verification failed.~%"))
+                    (log-notice "Host key verification failed.~%"))
                    ((typep condition 'cl-pnet-ssh:ssh-connection-error)
                     ;; ssh reports these through error(), with the configured
                     ;; host name rather than the address it dialled.
@@ -5701,30 +5714,38 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                                        condition)
                                       (princ-to-string condition))))
                       (case kind
+                        (:closed
+                         ;; sshpkt_vfatal's logdie() names the peer, or
+                         ;; "UNKNOWN port 65535" for a ProxyCommand pipe.
+                         (log-notice "~A~%" reason))
+                        (:proxy-expand
+                         ;; percent_expand's error_f() and fatal_f() lines;
+                         ;; the library keeps both in the detail.
+                         (log-notice "~A~%"
+                                     (cl-pnet-ssh:ssh-error-detail
+                                      condition)))
                         (:negotiate
                          ;; ssh's sshpkt_vfatal names the address and port it
                          ;; dialled and the peer's proposal, with no prefix.
-                         (format *error-output*
-                                 "Unable to negotiate with ~A port ~D: ~A. Their offer: ~{~A~^,~}~%"
-                                 host
-                                 (cl-pnet-ssh:ssh-connection-error-port
-                                  condition)
-                                 reason
-                                 (cl-pnet-ssh:ssh-connection-error-peer-offer
-                                  condition)))
+                         (log-notice
+                          "Unable to negotiate with ~A port ~D: ~A. Their offer: ~{~A~^,~}~%"
+                          host
+                          (cl-pnet-ssh:ssh-connection-error-port condition)
+                          reason
+                          (cl-pnet-ssh:ssh-connection-error-peer-offer
+                           condition)))
                         (:resolve
-                         (format *error-output*
-                                 "burs: Could not resolve hostname ~A: ~A~%"
-                                 host reason))
+                         (log-notice
+                          "burs: Could not resolve hostname ~A: ~A~%"
+                          host reason))
                         (:connect
-                         (format *error-output*
-                                 "burs: connect to host ~A port ~D: ~A~%"
-                                 host
-                                 (cl-pnet-ssh:ssh-connection-error-port
-                                  condition)
-                                 reason))
+                         (log-notice
+                          "burs: connect to host ~A port ~D: ~A~%"
+                          host
+                          (cl-pnet-ssh:ssh-connection-error-port condition)
+                          reason))
                         (t
-                         (format *error-output* "burs: ~A~%" condition)))))
+                         (log-notice "burs: ~A~%" condition)))))
                    (t
                     (let ((offered
                             (and (typep condition
@@ -5732,12 +5753,12 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                                  (cl-pnet-ssh:ssh-client-auth-offered-methods
                                   client))))
                       (if offered
-                          (format *error-output*
-                                  "~A@~A: Permission denied (~{~A~^,~}).~%"
-                                  (cl-pnet-ssh:ssh-client-user client)
-                                  (cl-pnet-ssh:ssh-client-host client)
-                                  offered)
-                          (format *error-output* "burs: ~A~%" condition))))))
+                          (log-notice
+                           "~A@~A: Permission denied (~{~A~^,~}).~%"
+                           (cl-pnet-ssh:ssh-client-user client)
+                           (cl-pnet-ssh:ssh-client-host client)
+                           offered)
+                          (log-notice "burs: ~A~%" condition))))))
                (finish 255))
    :on-close (lambda (client reason)
                (declare (ignore client reason))

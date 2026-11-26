@@ -1739,14 +1739,75 @@ client answers before the session continues."
   (let ((client (cl-pnet-ssh::%make-ssh-client
                  :host "alias" :connect-host "real.example"
                  :port 2222 :connect-port 2222 :user "alice")))
-    (is (equal "nc real.example 2222"
+    (is (equal "exec nc real.example 2222"
                (cl-pnet-ssh::ssh-proxy-expand-command "nc %h %p" client)))
-    (is (equal "alias:alice:100%"
+    (is (equal "exec alias:alice:100%"
                (cl-pnet-ssh::ssh-proxy-expand-command
                 "%n:%r:100%%" client)))
-    ;; An escape this client does not know stays literal rather than eaten.
-    (is (equal "%z and %" (cl-pnet-ssh::ssh-proxy-expand-command
-                           "%z and %" client)))))
+    ;; %k is HostKeyAlias when one is set, and the typed name otherwise.
+    (is (equal "exec alias"
+               (cl-pnet-ssh::ssh-proxy-expand-command "%k" client)))
+    (setf (cl-pnet-ssh::ssh-client-host-key-alias client) "canonical")
+    (is (equal "exec canonical"
+               (cl-pnet-ssh::ssh-proxy-expand-command "%k" client)))
+    ;; ${VAR} is not expanded: ssh calls percent_expand without the dollar
+    ;; flag, so a ProxyCommand keeps it for the shell.
+    (is (equal "exec echo ${HOME}"
+               (cl-pnet-ssh::ssh-proxy-expand-command "echo ${HOME}" client)))))
+
+(test proxy-command-rejects-escapes-ssh-does-not-know
+  "percent_expand() fails the connection instead of passing an escape on."
+  (let ((client (cl-pnet-ssh::%make-ssh-client
+                 :host "alias" :connect-host "real.example"
+                 :port 2222 :connect-port 2222 :user "alice")))
+    (flet ((detail (command)
+             (handler-case
+                 (progn (cl-pnet-ssh::ssh-proxy-expand-command command client)
+                        nil)
+               (cl-pnet-ssh:ssh-connection-error (condition)
+                 (values (cl-pnet-ssh:ssh-connection-error-kind condition)
+                         (cl-pnet-ssh:ssh-error-detail condition))))))
+      (multiple-value-bind (kind detail) (detail "nc %z %h")
+        (is (eq kind :proxy-expand))
+        (is (equal "vdollar_percent_expand: unknown key %z
+percent_expand: failed"
+                   detail)))
+      (multiple-value-bind (kind detail) (detail "nc %")
+        (is (eq kind :proxy-expand))
+        (is (equal "vdollar_percent_expand: invalid format
+percent_expand: failed"
+                   detail))))))
+
+(test peer-close-before-authentication-is-fatal
+  "A close during the banner, KEX or auth phase is sshpkt_vfatal's logdie():
+it names the peer, and a ProxyCommand pipe has no address to name."
+  (let* ((reported nil)
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example" :connect-host "127.0.0.1"
+                  :port 22 :connect-port 22 :user "alice"
+                  :on-error (lambda (client condition)
+                              (declare (ignore client))
+                              (setf reported condition)))))
+    (setf (cl-pnet-ssh::ssh-client-phase client) :kex)
+    (cl-pnet-ssh::ssh-client-receive client nil)
+    (is (typep reported 'cl-pnet-ssh:ssh-connection-error))
+    (is (eq :closed (cl-pnet-ssh:ssh-connection-error-kind reported)))
+    (is (equal "Connection closed by UNKNOWN port 65535"
+               (cl-pnet-ssh:ssh-connection-error-reason reported)))))
+
+(test peer-close-after-authentication-keeps-the-session-path
+  "Once authenticated the close belongs to the session loop, not to
+sshpkt_fatal, so the client reports :PEER-CLOSED through ON-CLOSE."
+  (let* ((closed nil)
+         (client (cl-pnet-ssh::%make-ssh-client
+                  :host "example" :connect-host "127.0.0.1"
+                  :port 22 :connect-port 22 :user "alice"
+                  :on-close (lambda (client reason)
+                              (declare (ignore client))
+                              (setf closed reason)))))
+    (setf (cl-pnet-ssh::ssh-client-phase client) :ready)
+    (cl-pnet-ssh::ssh-client-receive client nil)
+    (is (eq :peer-closed closed))))
 
 ;;; ---- Behaviour the pure transport provides and libssh does not ----
 ;;;

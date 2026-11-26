@@ -15,6 +15,11 @@
   (port 22)
   (user nil)
   (connection nil)
+  ;; The peer OpenSSH's packet layer names in Connection closed/reset
+  ;; messages.  It records the address and port at connect time, so the
+  ;; strings survive the socket closing; getpeername() would not.
+  (peer-ip nil)
+  (peer-port nil)
   ;; The port actually dialled; PORT stays the logical one known_hosts and
   ;; the server name use, so a tunnel can listen on a loopback port while the
   ;; key is still checked under the host's real port.
@@ -536,6 +541,67 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
   "End CLIENT because of CONDITION, telling its error callback once."
   (ssh-client-finish client condition :error))
 
+(defun ssh-client-remote-id (client)
+  "CLIENT's peer as ssh's sshpkt_fmt_connection_id names it.
+
+OpenSSH reports the address and port it dialled, recording them when the
+connection is set up so they are still available after the socket closes.
+A transport whose read side is not a socket - a ProxyCommand pipe - has no
+peer address at all, so ssh falls back to the \"UNKNOWN port 65535\" it uses
+in exactly that case."
+  (multiple-value-bind (local-ip local-port remote-ip remote-port)
+      (ssh-client-connection-endpoints client)
+    (declare (ignore local-ip local-port))
+    (let ((remote-ip (or (ssh-client-peer-ip client) remote-ip))
+          (remote-port (or (ssh-client-peer-port client) remote-port)))
+      (if (and remote-ip remote-port)
+          (format nil "~A port ~D" remote-ip remote-port)
+          "UNKNOWN port 65535"))))
+
+(defun ssh-client-data-pending-p (client)
+  "True when data from CLIENT's peer is waiting to be read."
+  (or (plusp (fill-pointer (ssh-client-incoming client)))
+      (let ((fd (ssh-client-transport-fd client)))
+        (and fd (integerp fd) (not (minusp fd))
+             (ssh-socket-data-pending-p fd)))))
+
+(defun ssh-client-send-failed (client status)
+  "Report a failed write of CLIENT's banner or packets.
+
+OpenSSH's packet layer turns a reset into sshpkt_fatal()'s \"Connection
+reset by ...\", and a broken pipe into the \"Connection closed by ...\" it
+uses for EOF.  The errno is the only evidence left once the write fails, so
+that mapping happens here; any other write error keeps its own message, as
+does a write error during the session, where ssh reports it differently."
+  (let* ((code (abs (or status 0)))
+         (reset (member code '(54 104 10054)))
+         (closed (member code '(32 10058))))
+    (if (or (not (or reset closed))
+            (eq (ssh-client-phase client) :ready))
+        (ssh-client-fail
+         client
+         (make-condition 'ssh-connection-error
+                         :detail (format nil "send failed (~A)" status)))
+        (let ((message (format nil "Connection ~:[closed~;reset~] by ~A"
+                               reset
+                               (ssh-client-remote-id client))))
+          (when (and reset (eq (ssh-client-phase client) :version)
+                     (not (ssh-client-data-pending-p client)))
+            ;; kex_exchange_identification() reports the failed banner read
+            ;; through error_f() before the packet layer's own message.  When
+            ;; the peer's banner is already waiting, that read would have
+            ;; succeeded, so ssh never prints the line.
+            (setf message
+                  (format nil "kex_exchange_identification: read: ~
+                               Connection reset by peer~%~A"
+                          message)))
+          (ssh-client-fail
+           client
+           (make-condition 'ssh-connection-error
+                           :kind :closed
+                           :reason message
+                           :detail message))))))
+
 (defun ssh-client-send-bytes (client octets)
   "Queue OCTETS on CLIENT's connection. NIL once the client is closed."
   (unless (ssh-client-closed client)
@@ -547,10 +613,7 @@ REQUEST_FAILURE it gets back as proof that the peer is alive."
                 (cl-pnet:send-data
                  connection octets
                  :on-error (lambda (status)
-                             (ssh-client-fail
-                              client
-                              (make-condition 'ssh-connection-error
-                                              :detail (format nil "send failed (~A)" status)))))
+                             (ssh-client-send-failed client status)))
               (error (condition) (ssh-client-fail client condition)))))))
   (not (ssh-client-closed client)))
 

@@ -17,6 +17,14 @@
   #-(or darwin freebsd netbsd openbsd dragonfly) 11
   "The errno a non-blocking read or write reports when it should wait.")
 
+(defparameter +ssh-epipe+ 32
+  "The errno a write reports when the helper has gone away.")
+
+(defparameter +ssh-econnreset+
+  #+(or darwin freebsd netbsd openbsd dragonfly) 54
+  #-(or darwin freebsd netbsd openbsd dragonfly) 104
+  "The errno a write reports when the helper's pipe was reset.")
+
 (defstruct (ssh-proxy (:constructor %make-ssh-proxy))
   command
   process
@@ -41,34 +49,64 @@
 
 ;;; ---- Reading the command ----
 
+(defun ssh-proxy-shell ()
+  "The shell OpenSSH runs a ProxyCommand with: $SHELL, else /bin/sh."
+  (let ((shell (uiop:getenv "SHELL")))
+    (if (or (null shell) (zerop (length shell)))
+        "/bin/sh"
+        shell)))
+
+(defun ssh-proxy-expand-fail (message)
+  "Report an invalid ProxyCommand escape as OpenSSH's percent_expand does.
+
+percent_expand() logs the offending escape through error_f(), then
+expand_proxy_command() turns the parse failure into fatal_f(\"failed\").  Both
+are log.c messages, so -q silences them; the detail carries both lines and
+the command line prints it as it stands."
+  (error 'ssh-connection-error
+         :kind :proxy-expand
+         :detail (format nil "vdollar_percent_expand: ~A~%percent_expand: failed"
+                         message)))
+
 (defun ssh-proxy-expand-command (command client)
-  "COMMAND with OpenSSH's ProxyCommand escapes filled in.
+  "COMMAND with OpenSSH's ProxyCommand escapes filled in, ready for the shell.
 
 %h is the host actually dialled (HostName in ssh_config), %n the name the
-user typed, %p the port and %r the remote user; %% is a literal percent.
-An escape this client does not know is left alone rather than eaten."
+user typed, %p the port, %r the remote user, %k the HostKeyAlias (or the
+typed name) and %% a literal percent.  ssh also prepends \"exec \", so the
+shell replaces itself with the proxy program; without that a wrapper script
+that redirects stdout leaves the shell holding the pipe open and the client
+never sees the helper's end of the stream.
+
+An unknown escape, or a percent with nothing after it, is a fatal error in
+OpenSSH rather than something to pass through."
   (let ((host (ssh-client-connect-host client))
         (original (ssh-client-host client))
         (port (or (ssh-client-connect-port client) (ssh-client-port client)))
         (user (or (ssh-client-user client) ""))
+        (key-alias (or (ssh-client-host-key-alias client)
+                       (ssh-client-host client)))
         (out (make-string-output-stream)))
+    (write-string "exec " out)
     (loop with length = (length command)
           for index = 0 then (1+ index)
           while (< index length)
           do (let ((character (char command index)))
                (cond
-                 ((and (char= character #\%)
-                       (< (1+ index) length))
+                 ((char= character #\%)
+                  (when (= (1+ index) length)
+                    (ssh-proxy-expand-fail "invalid format"))
                   (let ((escape (char command (1+ index))))
                     (incf index)
                     (case escape
                       (#\% (write-char #\% out))
                       (#\h (write-string host out))
+                      (#\k (write-string key-alias out))
                       (#\n (write-string original out))
                       (#\p (princ port out))
                       (#\r (write-string user out))
-                      (t (write-char #\% out)
-                         (write-char escape out)))))
+                      (t (ssh-proxy-expand-fail
+                          (format nil "unknown key %~C" escape))))))
                  (t (write-char character out)))))
     (get-output-stream-string out)))
 
@@ -88,12 +126,15 @@ An escape this client does not know is left alone rather than eaten."
                    :detail (apply #'format nil control arguments))))
 
 (defun ssh-proxy-launch-helper (command)
-  "Start COMMAND under /bin/sh and return its process.
+  "Start COMMAND under $SHELL (or /bin/sh) and return its process.
 
-The helper is a child process, so the shell forks netcat rather than
-replacing itself.  Shutdown closes the pipes and kills the shell; a helper
-that reads its stdin then sees EOF, as nc and socat do."
-  (uiop:launch-program (list "/bin/sh" "-c" command)
+COMMAND already begins with \"exec \", so the shell replaces itself with the
+helper instead of waiting for it.  That is what lets the client see EOF when
+a wrapper script closes or redirects its stdout: with a lingering shell the
+pipe would stay open until the wrapper finally exited.  Shutdown closes the
+pipes and kills the shell; a helper that reads its stdin then sees EOF, as
+nc and socat do."
+  (uiop:launch-program (list (ssh-proxy-shell) "-c" command)
                        :input :stream
                        :output :stream
                        :element-type '(unsigned-byte 8)))
@@ -146,10 +187,16 @@ callback, where a blocking wait on an already-exited helper can hang."
                      ((plusp count)
                       (incf (ssh-proxy-position proxy) count))
                      ((and (minusp count) (/= errno +ssh-eagain+))
-                      (ssh-proxy-fail
-                       client "~A stopped reading its input (~A)"
-                       (ssh-proxy-name proxy)
-                       (cl-pnet-sockets:c-strerror errno))
+                      (if (or (= errno +ssh-epipe+)
+                              (= errno +ssh-econnreset+))
+                          ;; The helper's read side is gone.  Waiting for the
+                          ;; read watcher would race the same close; report
+                          ;; the peer's departure as ssh's packet layer does.
+                          (ssh-client-peer-closed client)
+                          (ssh-proxy-fail
+                           client "~A stopped reading its input (~A)"
+                           (ssh-proxy-name proxy)
+                           (cl-pnet-sockets:c-strerror errno)))
                       (return))
                      (t (return)))))
         (when (>= (ssh-proxy-position proxy) (fill-pointer queue))
@@ -207,7 +254,7 @@ socket the helper sends back."
     (unwind-protect
          (progn
            (setf stream (ssh-proxy-fdpass-child-stream fd))
-           (uiop:launch-program (list "/bin/sh" "-c" command)
+           (uiop:launch-program (list (ssh-proxy-shell) "-c" command)
                                 :input stream :output stream))
       (if stream
           (ignore-errors (close stream))
@@ -264,11 +311,13 @@ socket the helper sends back."
 (defun ssh-open-fdpass-connection (client)
   "Run CLIENT's ProxyCommand with a socketpair and take back a connected fd."
   (handler-case
-      (let ((command (ssh-proxy-expand-command
-                      (ssh-client-proxy-command client) client)))
-        (if (string= command "-")
-            (ssh-proxy-fail
-             client "ProxyCommand=- and ProxyUseFDPass are incompatible")
+      ;; ssh rejects the raw "ProxyCommand=-" before expanding it, because
+      ;; expansion would turn it into "exec -".
+      (if (string= (ssh-client-proxy-command client) "-")
+          (ssh-proxy-fail
+           client "ProxyCommand=- and ProxyUseFDPass are incompatible")
+          (let ((command (ssh-proxy-expand-command
+                          (ssh-client-proxy-command client) client)))
             (multiple-value-bind (parent child errno)
                 (cl-pnet-sockets:make-socketpair)
               (if (null parent)

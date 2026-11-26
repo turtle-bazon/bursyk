@@ -1173,6 +1173,21 @@ REMOTE-PORT), or NIL when the transport is not a socket.")
           (endpoint #'cl-pnet-sockets:c-getpeername)
         (values local-ip local-port remote-ip remote-port)))))
 
+(defun ssh-socket-data-pending-p (fd)
+  "True when FD has unread data waiting in its receive queue.
+
+A non-blocking MSG_PEEK answers without consuming the data, so the event
+loop's own read still sees it.  The packet layer uses this to tell a peer
+that sent its identification before resetting the connection from one that
+reset it before sending anything at all."
+  (and fd
+       (plusp
+        (cffi:with-foreign-object (buffer :unsigned-char 1)
+          (cl-pnet-sockets:c-recv
+           fd buffer 1
+           (logior cl-pnet-sockets:+msg-peek+
+                   cl-pnet-sockets:+msg-dontwait+))))))
+
 (defun ssh-client-release-string (client)
   "CLIENT's identification without the SSH-2.0- prefix, as SSH_RELEASE is."
   (let ((version (ssh-client-version-string client)))
