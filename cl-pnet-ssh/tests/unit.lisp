@@ -980,8 +980,13 @@ SSH-LOOPBACK-AVAILABLE-P instead.  Windows has a native ssh-keygen but no
     (error () nil)))
 
 (defun ssh-loopback-available-p ()
-  "True when the loopback tests can run here: a shell and ssh-keygen."
-  (and (posix-shell-available-p) (ssh-keygen-available-p)))
+  "True when the loopback tests can run here.
+
+The command helper runs cmd.exe on Windows and /bin/sh elsewhere, so only
+the POSIX case needs the shell to exist."
+  (and (ssh-keygen-available-p)
+       #+win32 t
+       #-win32 (posix-shell-available-p)))
 
 (defun ssh-keygen (arguments)
   (uiop:run-program (cons "ssh-keygen" arguments)
@@ -1448,8 +1453,6 @@ the private key it certifies is offered with the certificate's identity."
 (test client-no-host-authentication-for-localhost
   "NoHostAuthenticationForLocalhost accepts a loopback key without recording
 it, and HostKeyAlias turns that exception off."
-  #+win32 (skip "the loopback exec needs a POSIX shell")
-  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-nohostauth"))
          (server-key (merge-pathnames "host_key" directory))
          (client-key (merge-pathnames "client_key" directory))
@@ -3056,11 +3059,28 @@ rebuilt here exactly as SSH-LOAD-PRIVATE-KEY will later read it."
                     (cl-pnet-ssh::ssh-octets-base64 blob)))
           path)))))
 
+(defun ssh-test-loopback-text (text)
+  "TEXT with cmd's CRLF line endings made LF, for comparisons in these tests.
+
+The channel carries exactly what the child wrote; cmd terminates every line
+with CRLF, and these are text-output tests rather than byte-fidelity tests.
+POSIX output is unchanged."
+  #+win32
+  (with-output-to-string (out)
+    (loop with length = (length text)
+          for index below length
+          for character = (char text index)
+          do (unless (and (char= character #\Return)
+                          (< (1+ index) length)
+                          (char= (char text (1+ index)) #\Newline))
+               (write-char character out))))
+  #-win32 text)
+
 (defun ssh-test-loopback-handle-data (stdout stderr)
   "A channel data callback that splits stdout from stderr."
   (lambda (channel data kind)
     (declare (ignore channel))
-    (write-string (ssh-octets-string data)
+    (write-string (ssh-test-loopback-text (ssh-octets-string data))
                   (ecase kind (:stdout stdout) (:stderr stderr)))))
 
 (defun ssh-test-loopback-start (client stdout stderr state &key command)
@@ -3084,7 +3104,8 @@ STATE is (STATUS ERROR): a cons cell so the callbacks can update it."
                        (cl-pnet:event-loop-stop)))))
     (ssh-channel-exec channel
                       (or command
-                          "printf hello; printf oops >&2; exit 3"))))
+                          #+win32 "set /p =hello<nul&set /p =oops<nul 1>&2&exit 3"
+                          #-win32 "printf hello; printf oops >&2; exit 3"))))
 
 (defun ssh-test-loopback-run (server client-key known-hosts stdout stderr
                               &key capture-error (host "127.0.0.1")
@@ -3325,7 +3346,9 @@ share the test, so each must dispatch the same channel requests."
                           (lambda (channel)
                             (lambda ()
                               (ssh-test-run-command
-                               channel "printf pty-shell; exit 7")))))))
+                               channel
+                               #+win32 "set /p =pty-shell<nul&exit 7"
+                               #-win32 "printf pty-shell; exit 7")))))))
            (setf timeout
                  (cl-pnet:timer-start
                   10 0
@@ -3421,8 +3444,8 @@ Windows actually has."
   #-win32 (skip "Windows child execution only")
   #+win32
   (multiple-value-bind (stdout stderr status)
-      (ssh-test-loopback-result :command "echo hello")
-    (is (string= (format nil "hello~C~C" #\Return #\Newline) stdout))
+      (ssh-test-loopback-result :command "set /p =hello<nul&exit 0")
+    (is (string= "hello" stdout))
     (is (string= "" stderr))
     (is (eql 0 status))))
 
@@ -3578,8 +3601,6 @@ Windows actually has."
 
 (test mldsa-client-loopback-exec
   "A composite ML-DSA key authenticates where the transport implements it."
-  #+win32 (skip "the loopback exec needs a POSIX shell")
-  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-mldsa-client"))
          (key (ssh-test-write-mldsa-key
                (merge-pathnames "client_key" directory)))
@@ -3641,8 +3662,10 @@ Windows actually has."
   (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (multiple-value-bind (stdout stderr status)
-          (ssh-test-loopback-result :compression t
-                                    :command "seq 1 20000")
+          (ssh-test-loopback-result
+           :compression t
+           :command #+win32 "for /L %i in (1,1,20000) do @echo %i"
+                    #-win32 "seq 1 20000")
         (declare (ignore stderr))
         (is (eql 0 status))
         (let ((lines (remove "" (uiop:split-string
@@ -3822,6 +3845,8 @@ server-side half of agent forwarding, so the test needs no external tools."
 (test server-loopback-agent-forwarding
   "A session that asks for agent forwarding gets a working SSH_AUTH_SOCK,
 and an agent channel reaches the client's own agent socket."
+  #+win32 (skip "no Unix-domain agent socket on this platform")
+  #-win32
   (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent"))
@@ -3941,6 +3966,8 @@ and an agent channel reaches the client's own agent socket."
 (test client-binds-a-direct-connection
   "BindAddress and BindInterface change where a direct connection comes
 from, and a source the kernel cannot assign fails the connection."
+  #+win32 (skip "this test binds the Unix interface name lo")
+  #-win32
   (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (progn
