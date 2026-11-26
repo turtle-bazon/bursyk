@@ -440,6 +440,41 @@ returns NIL and is refused rather than accepted and abandoned."
                                 (ssh-server-channel-fail channel condition)))))
                  (setf (ssh-server-channel-target-fd-relay channel) relay)))))
 
+#+win32
+(defun ssh-server-agent-adopt-pipe (session handle)
+  "Adopt HANDLE, a connected Windows agent pipe, as an agent channel.
+
+The application's named-pipe listener calls this on the event loop for each
+accepted connection.  Returns T when HANDLE became a channel."
+  (let ((agent (ssh-session-agent-forward session)))
+    (cond
+      ((null agent)
+       (ignore-errors (c-agent-close-handle handle))
+       nil)
+      (t
+       (let* ((channel (ssh-server-open-agent-channel
+                        session (ssh-agent-forward-new-style agent)))
+              (relay (%make-ssh-fd-relay
+                      :pipe handle
+                      :on-data
+                      (lambda (relay octets)
+                        (declare (ignore relay))
+                        (ssh-server-channel-write channel octets))
+                      :on-eof
+                      (lambda (relay)
+                        (declare (ignore relay))
+                        (setf (ssh-server-channel-target-fd-eof channel) t)
+                        (ssh-server-channel-eof channel)
+                        (when (ssh-server-channel-eof-received channel)
+                          (ssh-server-channel-close channel)))
+                      :on-error
+                      (lambda (relay condition)
+                        (declare (ignore relay))
+                        (ssh-server-channel-fail channel condition)))))
+         (setf (ssh-server-channel-target-fd-relay channel) relay)
+         (ssh-fd-relay-start relay)
+         t)))))
+
 (defun ssh-server-handle-agent-request (session channel want-reply new-style)
   "Answer an agent forwarding request, creating the session's listener.
 
@@ -458,7 +493,12 @@ DisableForwarding all answer failure, as sshd's session_auth_agent_req does."
          (when hook
            (multiple-value-bind (fd path cleanup)
                (funcall hook session)
-             (when (and fd path)
+             ;; Windows agents are named pipes: the application owns the
+             ;; listener and adopts each connection there, so no FD (and no
+             ;; fd watcher) exists here.
+             (when (and path
+                        #+win32 t
+                        #-win32 fd)
                (let ((agent (%make-ssh-agent-forward
                              :session session
                              :fd fd
@@ -470,6 +510,7 @@ DisableForwarding all answer failure, as sshd's session_auth_agent_req does."
                  ;; the application copies the channel's environment, so the
                  ;; same place reaches the command it starts.
                  (ssh-server-channel-add-env channel "SSH_AUTH_SOCK" path)
+                 #-win32
                  (setf (ssh-agent-forward-watcher agent)
                        (cl-pnet:fd-watch
                         fd :on-readable

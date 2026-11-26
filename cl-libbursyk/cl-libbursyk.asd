@@ -27,6 +27,10 @@
                              (:file "server-state")
                              (:file "server-transport")
                              (:file "server-channel")
+                             ;; Windows agent forwarding: a named-pipe
+                             ;; listener the application hands to the hook.
+                             (:file "server-agent-windows"
+                                    :if-feature :win32)
                              ;; X11Forwarding: the display listener, the fake
                              ;; cookie and the x11 channel bridge.
                              (:file "server-x11")

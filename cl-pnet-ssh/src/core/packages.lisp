@@ -136,6 +136,9 @@
    #:ssh-server-channel-write-stderr
    #:ssh-server-open-forwarded-tcpip
    #:ssh-server-open-forwarded-streamlocal
+   ;; Windows named-pipe agent forwarding: the application creates the
+   ;; listener and the library adopts each accepted connection.
+   #:ssh-server-agent-forward-pipe-listener
    #:ssh-server-channel-eof
    #:ssh-server-channel-exit
    #:ssh-server-channel-close

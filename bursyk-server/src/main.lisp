@@ -826,6 +826,37 @@ AgentSocketPath is none or the socket cannot be created."
 )
 
 #+win32
+(defun windows-agent-pipe-path-p (path)
+  "PATH as the canonical \\.\pipe\... spelling, or NIL when it is not one."
+  (let ((canonical (substitute #\\ #\/ path)))
+    (and (>= (length canonical) 9)
+         (string-equal canonical "\\\\.\\pipe\\" :end1 9 :end2 9)
+         canonical)))
+
+#+win32
+(defun start-agent-forward (session)
+  "Create the named pipe SESSION's forwarded agent will accept on.
+
+Returns (VALUES NIL PATH CLEANUP): the listener's thread adopts every
+connection on the event loop, so there is no listening descriptor to watch.
+AgentSocketPath is honoured when it names a pipe; the usual
+user:~/.ssh/agent default becomes a unique pipe."
+  (let ((pathspec
+          (or (session-config-setting
+               session
+               #'cl-pnet-ssh:ssh-server-config-agent-socket-path)
+              "user:~/.ssh/agent")))
+    (when (string-equal pathspec "none")
+      (return-from start-agent-forward nil))
+    (multiple-value-bind (path cleanup)
+        (cl-pnet-ssh:ssh-server-agent-forward-pipe-listener
+         session :name (windows-agent-pipe-path-p pathspec))
+      (when path
+        (log-at-session session :verbose
+                        "agent forwarding listening on ~A" path)
+        (values nil path cleanup)))))
+
+#+win32
 (defun close-streamlocal-forwards (&optional session)
   (declare (ignore session))
   nil)

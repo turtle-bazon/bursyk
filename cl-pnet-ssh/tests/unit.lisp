@@ -3882,6 +3882,114 @@ Windows actually has."
 
 ;;; ---- Agent forwarding ----
 
+#+win32
+(defun ssh-test-pipe-wake (name)
+  "Connect to NAME once and close, to wake a blocked ConnectNamedPipe."
+  (multiple-value-bind (pointer length)
+      (cl-pnet-ssh::windows-utf16-pointer name)
+    (declare (ignore length))
+    (unwind-protect
+         (let ((handle
+                 (cl-pnet-ssh::c-agent-create-file
+                  pointer
+                  (logior cl-pnet-ssh::+agent-generic-read+
+                          cl-pnet-ssh::+agent-generic-write+)
+                  0 (cffi:null-pointer) cl-pnet-ssh::+agent-open-existing+
+                  cl-pnet-ssh::+agent-file-attribute-normal+
+                  (cffi:null-pointer))))
+           (unless (cl-pnet-ssh::agent-invalid-handle-p handle)
+             (ignore-errors (cl-pnet-ssh::c-agent-close-handle handle))))
+      (cffi:foreign-free pointer))))
+
+#+win32
+(defun ssh-test-agent-echo-pipe (name)
+  "Create a named-pipe echo agent at NAME; return a stop thunk.
+
+The client's relay opens one connection and sends SSH agent requests; this
+echo answers them, standing in for the user's real agent process."
+  (multiple-value-bind (pointer length)
+      (cl-pnet-ssh::windows-utf16-pointer name)
+    (declare (ignore length))
+    (let ((handle nil) (stop nil))
+      (unwind-protect
+           (setf handle
+                 (c-test-create-named-pipe
+                  pointer 3 0 1 65536 65536 0 (cffi:null-pointer)))
+        (cffi:foreign-free pointer))
+      (when (cl-pnet-ssh::agent-invalid-handle-p handle)
+        (error "cannot create the test echo pipe"))
+      (sb-thread:make-thread
+       (lambda ()
+         (unwind-protect
+              (handler-case
+                  (when (or (plusp (c-test-connect-named-pipe
+                                    handle (cffi:null-pointer)))
+                            (= 535 (c-test-last-error)))
+                    (loop until stop
+                          do (multiple-value-bind (available broken)
+                                 (cl-pnet-ssh::agent-pipe-available handle)
+                               (cond
+                                 (broken (return))
+                                 ((plusp available)
+                                  (multiple-value-bind (octets count)
+                                      (cl-pnet-ssh::agent-read-some
+                                       handle (min available 65536))
+                                    (when (plusp count)
+                                      (cl-pnet-ssh::agent-write-all
+                                       handle octets))))
+                                 (t (sleep 0.01))))))
+                (error () nil))
+           (ignore-errors (cl-pnet-ssh::c-agent-close-handle handle))))
+       :name "test agent echo pipe")
+      (lambda ()
+        (setf stop t)
+        (ignore-errors (ssh-test-pipe-wake name))))))
+
+#+win32
+(defun ssh-test-agent-roundtrip-pipe (channel path)
+  "Send PING to the agent pipe at PATH and report the echo on CHANNEL.
+
+The pipe is driven by the same relay as the forwarding path, so this runs
+asynchronously and leaves the event loop free for the agent channel."
+  (let ((relay nil))
+    (labels ((roundtrip-fail (message)
+               (when relay
+                 (ignore-errors (cl-pnet-ssh::ssh-fd-relay-close relay)))
+               (ssh-server-channel-write channel message)
+               (ssh-server-channel-exit channel 1)
+               (ssh-server-channel-close channel)))
+      (handler-case
+          (let* ((handle (cl-pnet-ssh::agent-open-pipe path))
+                 (reply (make-array 0 :element-type '(unsigned-byte 8)
+                                      :adjustable t :fill-pointer 0)))
+            (setf relay
+                  (cl-pnet-ssh::%make-ssh-fd-relay
+                   :pipe handle
+                   :on-data
+                   (lambda (relay octets)
+                     (declare (ignore relay))
+                     (loop for octet across octets
+                           do (vector-push-extend octet reply))
+                     (when (>= (fill-pointer reply) 4)
+                       (ssh-server-channel-write
+                        channel (map 'string #'code-char reply))
+                       (ssh-server-channel-exit channel 0)
+                       (ssh-server-channel-close channel)
+                       (cl-pnet-ssh::ssh-fd-relay-close relay)))
+                   :on-eof
+                   (lambda (relay)
+                     (declare (ignore relay))
+                     (roundtrip-fail "agent pipe closed"))
+                   :on-error
+                   (lambda (relay condition)
+                     (declare (ignore relay condition))
+                     (roundtrip-fail "agent roundtrip failed"))))
+            (cl-pnet-ssh::ssh-fd-relay-queue
+             relay (make-array 4 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(80 73 78 71)))
+            (cl-pnet-ssh::ssh-fd-relay-start relay))
+        (error () (roundtrip-fail "no agent socket"))))))
+
 (defun ssh-test-agent-echo-listener (path)
   "Listen on PATH and echo every octet back, as a minimal ssh-agent.
 
@@ -3936,6 +4044,8 @@ Returns a thunk that stops the listener and closes its connections."
 
 This stands in for a remote program that uses $SSH_AUTH_SOCK: it is the
 server-side half of agent forwarding, so the test needs no external tools."
+  #+win32 (ssh-test-agent-roundtrip-pipe channel path)
+  #-win32
   (multiple-value-bind (fd status)
       (cl-pnet-sockets:connect-unix path)
     (if (null fd)
@@ -4036,8 +4146,6 @@ server-side half of agent forwarding, so the test needs no external tools."
 (test server-loopback-agent-forwarding
   "A session that asks for agent forwarding gets a working SSH_AUTH_SOCK,
 and an agent channel reaches the client's own agent socket."
-  #+win32 (skip "no Unix-domain agent socket on this platform")
-  #-win32
   (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent"))
@@ -4045,8 +4153,11 @@ and an agent channel reaches the client's own agent socket."
              (client-key (merge-pathnames "client_key" directory))
              (authorized (merge-pathnames "authorized_keys" directory))
              (known-hosts (merge-pathnames "known_hosts" directory))
-             (client-agent (namestring
-                            (merge-pathnames "client-agent.sock" directory)))
+             (client-agent
+               #+win32 (format nil "\\\\.\\pipe\\cl-pnet-ssh-echo-~D-~D"
+                               (get-universal-time) (random 1000000))
+               #-win32 (namestring
+                        (merge-pathnames "client-agent.sock" directory)))
              (server-agent (namestring
                             (merge-pathnames "server-agent.sock" directory)))
              (stdout (make-string-output-stream))
@@ -4063,7 +4174,9 @@ and an agent channel reaches the client's own agent socket."
                                  "-f" (namestring client-key)))
                (ssh-test-write-authorized-keys
                 (merge-pathnames "client_key.pub" directory) authorized)
-               (setf stop-agent (ssh-test-agent-echo-listener client-agent)
+               (setf stop-agent
+                     #+win32 (ssh-test-agent-echo-pipe client-agent)
+                     #-win32 (ssh-test-agent-echo-listener client-agent)
                      server
                      (make-ssh-server
                       "127.0.0.1" 0
@@ -4091,7 +4204,12 @@ and an agent channel reaches the client's own agent socket."
                       ;; bursyk-server does; the library relays it.
                       :on-agent-forward
                       (lambda (session)
-                        (declare (ignore session))
+                        #+win32
+                        (multiple-value-bind (path cleanup)
+                            (cl-pnet-ssh:ssh-server-agent-forward-pipe-listener
+                             session)
+                          (values nil path cleanup))
+                        #-win32
                         (values (cl-pnet-sockets:listen-unix server-agent)
                                 server-agent
                                 (lambda ()
