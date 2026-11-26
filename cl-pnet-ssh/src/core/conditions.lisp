@@ -51,9 +51,11 @@ unchanged."
       (-4 "Non-recoverable failure in name resolution")
       (-5 "No address associated with hostname")
       (-6 "ai_family not supported")
+      (-7 "ai_socktype not supported")
       (-8 "Servname not supported for ai_socktype")
-      (-9 "ai_socktype not supported")
+      (-9 "Address family for hostname not supported")
       (-10 "Memory allocation failure")
+      (-12 "Value too large for defined data type")
       (t (princ-to-string condition)))))
 
 (define-condition ssh-unsupported-feature (ssh-connection-error)

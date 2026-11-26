@@ -257,16 +257,21 @@ passphrase or NIL; PASSPHRASE-ATTEMPTS bounds how often it is asked."
                                          status))))))
 
 (defun ssh-resolution-error (client condition)
-  (let ((reason (cl-pnet-ssh:ssh-resolver-error-text condition)))
-    (ssh-client-fail
-     client
-     (make-condition 'ssh-connection-error
-                     :kind :resolve
-                     :host (ssh-client-connect-host client)
-                     :reason reason
-                     :detail (format nil "could not resolve ~A: ~A"
-                                     (ssh-client-connect-host client)
-                                     reason)))))
+  (if (and (typep condition 'ssh-connection-error)
+           (eq (ssh-connection-error-kind condition) :resolve))
+      ;; The family check already built ssh's getaddrinfo wording; wrapping
+      ;; it again would print the condition instead of the reason.
+      (ssh-client-fail client condition)
+      (let ((reason (cl-pnet-ssh:ssh-resolver-error-text condition)))
+        (ssh-client-fail
+         client
+         (make-condition 'ssh-connection-error
+                         :kind :resolve
+                         :host (ssh-client-connect-host client)
+                         :reason reason
+                         :detail (format nil "could not resolve ~A: ~A"
+                                         (ssh-client-connect-host client)
+                                         reason))))))
 
 (defun ssh-dial (client address)
   "Connect CLIENT to the numeric ADDRESS its CONNECT-HOST resolved to."
@@ -446,12 +451,15 @@ address is known, because it has to be in the same family."
                      (ssh-dial client address)
                      (funcall on-failure
                               (make-condition
-                               'simple-error
-                               :format-control "~A is not an ~A address"
-                               :format-arguments
-                               (list address
-                                     (ssh-client-address-family-name
-                                      client)))))))
+                               'ssh-connection-error
+                               :kind :resolve
+                               :host name
+                               :reason "Address family for hostname not supported"
+                               :detail
+                               (format nil "~A is not an ~A address"
+                                       address
+                                       (ssh-client-address-family-name
+                                        client)))))))
              (try (names)
                (if names
                    (let ((next (lambda (condition)

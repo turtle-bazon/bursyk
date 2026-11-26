@@ -810,7 +810,31 @@ the lines never reach the output."
     (setf (cl-pnet-ssh:ssh-client-config-options client)
           (cl-pnet-ssh::%make-ssh-config-options :address-family :inet6))
     (is (equal '("::1") (burs::forward-listen-targets client nil)))
-    (is (equal '("::") (burs::forward-listen-targets client "*")))))
+    (is (equal '("::") (burs::forward-listen-targets client "*")))
+    ;; A quad-shaped string that getaddrinfo rejects must fail there, not
+    ;; reach bind() as INADDR_NONE and listen on 255.255.255.255.
+    (is (null (ignore-errors
+                (burs::forward-listen-targets client "999.1.1.1"))))))
+
+(test unix-listener-error-text-uses-unix-listener-wording
+  "channels.c's unix_listener() names the path and strerror's reason."
+  (flet ((failure (control arguments)
+           (make-condition 'simple-error
+                           :format-control control
+                           :format-arguments arguments)))
+    (is (string=
+         "unix_listener: cannot bind to path /tmp/x: Address already in use"
+         (burs::unix-listener-error-text
+          "/tmp/x" (failure "cannot bind ~A: ~A"
+                            '("/tmp/x" "Address already in use")))))
+    (is (string=
+         "unix_listener: cannot listen on path /tmp/x: Bad file descriptor"
+         (burs::unix-listener-error-text
+          "/tmp/x" (failure "cannot listen on ~A: ~A"
+                            '("/tmp/x" "Bad file descriptor")))))
+    (is (string= "unix_listener: something else"
+                 (burs::unix-listener-error-text
+                  "/tmp/x" (failure "something else" '()))))))
 
 (test remote-dynamic-forward-specifications-parse
   ;; A one-word -R is the dynamic form: the server listens and the client

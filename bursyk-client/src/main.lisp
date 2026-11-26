@@ -3679,6 +3679,25 @@ performed, matching ssh: the configured host must match exactly, or be *."
     (and options
          (cl-pnet-ssh:ssh-config-options-exit-on-forward-failure options))))
 
+(defun unix-listener-error-text (path condition)
+  "channels.c's unix_listener() wording for a failed local Unix bind.
+
+CL-PNET-SOCKETS signals its own text; ssh prints the same reason under the
+function name error_f() prepends."
+  (let* ((text (princ-to-string condition))
+         (bind (format nil "cannot bind ~A: " path))
+         (listen (format nil "cannot listen on ~A: " path)))
+    (cond
+      ((and (>= (length text) (length bind))
+            (string= bind text :end2 (length bind)))
+       (format nil "unix_listener: cannot bind to path ~A: ~A"
+               path (subseq text (length bind))))
+      ((and (>= (length text) (length listen))
+            (string= listen text :end2 (length listen)))
+       (format nil "unix_listener: cannot listen on path ~A: ~A"
+               path (subseq text (length listen))))
+      (t (format nil "unix_listener: ~A" text)))))
+
 (defun start-local-streamlocal-forward (client forward)
   "Listen on FORWARD's local Unix socket and bridge accepted peers.
 
@@ -3693,17 +3712,16 @@ does when it binds a local forwarding socket."
                         (cl-pnet-ssh:ssh-config-options-streamlocal-bind-mask
                          options))
                    #o177))
-         (listener
-           (handler-case
-               (cl-pnet-sockets:listen-unix path :unlink unlink :mask mask)
-             (error () nil))))
+         (listener nil)
+         (failure nil))
+    (handler-case
+        (setf listener
+              (cl-pnet-sockets:listen-unix path :unlink unlink :mask mask))
+      (error (condition) (setf failure condition)))
     (unless listener
-      (unless (getf *options* :quiet)
-        (format *error-output*
-                "burs: cannot listen on ~A for -L~%" path))
-      (if (exit-on-forward-failure-p client)
-          (finish 255)
-          (return-from start-local-streamlocal-forward nil)))
+      ;; The aggregate forwarding messages belong to START-FORWARDS.
+      (log-error "~A" (unix-listener-error-text path failure))
+      (return-from start-local-streamlocal-forward nil))
     (setf (forward-listener-fd forward) listener
           (forward-listener-watcher forward)
           (cl-pnet:fd-watch
@@ -3805,17 +3823,28 @@ restricts the set, as ssh->chanctxt->IPv4or6 does."
          (unless (eq family :inet) (push "::1" targets))
          (unless (eq family :inet6) (push "127.0.0.1" targets))
          (nreverse targets)))
-      ((cl-pnet-sockets:address-literal-p bind-address)
-       (list bind-address))
       (t
-       (handler-case
-           (cl-pnet-sockets:lookup-host-addresses bind-address
-                                                  :family family)
-         (error () nil))))))
+       ;; channels.c hands every non-wildcard address to getaddrinfo, even one
+       ;; that looks like a literal: a malformed quad such as 999.1.1.1 must
+       ;; fail there rather than reach bind() as INADDR_NONE.  When the lookup
+       ;; fails the condition reaches OPEN-FORWARD-LISTENERS, which prints
+       ;; channel_setup_fwd_listener_tcpip()'s message.
+       (cl-pnet-sockets:lookup-host-addresses bind-address :family family)))))
 
 (defun ipv6-bind-address-p (address)
   (let ((family (nth-value 1 (cl-pnet-sockets:resolve-bind-address address))))
     (eq family :inet6)))
+
+(defun listen-error-reason (status)
+  "channels.c's strerror() text for a listener's error STATUS.
+
+CL-PNET reports a creation failure as a negative errno through the
+listener's on-error callback, which is what bind() and listen() report in
+channels.c."
+  (let ((errno (if (and (integerp status) (minusp status)) (- status) status)))
+    (if (and (integerp errno) (plusp errno))
+        (cl-pnet-sockets:c-strerror errno)
+        "Cannot assign requested address")))
 
 (defun open-forward-listeners (client bind-address port read-cb on-accept
                                describe)
@@ -3823,24 +3852,58 @@ restricts the set, as ssh->chanctxt->IPv4or6 does."
 
 Returns the listener objects that bound, in creation order.  channels.c
 keeps listening when one address fails, so a partially bound forward still
-works; a failure is reported at error level only for the last address."
-  (let ((targets (forward-listen-targets client bind-address))
-        (listeners '()))
-    (dolist (target targets)
-      (handler-case
-          (let ((listener
-                  (cl-pnet:make-tcp-listener
-                   target port
-                   :v6only (ipv6-bind-address-p target)
-                   :read-cb read-cb
-                   :on-accept on-accept
-                   :on-error (lambda (status)
-                               (log-line "~A listen error ~A"
-                                         describe status)))))
-            (when listener
-              (push listener listeners)))
-        (error () nil)))
-    (nreverse listeners)))
+works; a bind failure is reported at error level only for the last address
+and at verbose level for the earlier ones, and a forward that bound nothing
+adds \"cannot listen to port\".  A getaddrinfo failure is reported with
+channel_setup_fwd_listener_tcpip()'s prefix and counts as no listener."
+  (let ((targets
+          (handler-case
+              (forward-listen-targets client bind-address)
+            (error (condition)
+              (log-error
+               "channel_setup_fwd_listener_tcpip: getaddrinfo(~A): ~A"
+               bind-address
+               (cl-pnet-ssh:ssh-resolver-error-text condition))
+              :failed))))
+    (when (eq targets :failed)
+      (return-from open-forward-listeners nil))
+    (let ((listeners '())
+          (remaining targets))
+      (dolist (target targets)
+        (let ((error-code nil)
+              (listener nil))
+          (setf listener
+                (handler-case
+                    (cl-pnet:make-tcp-listener
+                     target port
+                     :v6only (ipv6-bind-address-p target)
+                     :read-cb read-cb
+                     :on-accept on-accept
+                     :on-error (lambda (status)
+                                 (unless error-code
+                                   (setf error-code status))
+                                 (log-line "~A listen error ~A"
+                                           describe status)))
+                  (error () nil)))
+          (setf remaining (rest remaining))
+          (cond
+            (listener
+             (push listener listeners))
+            (t
+             ;; channels.c uses strerror(errno) from the failed bind(); the
+             ;; callback hands us the same number negated.
+             (let ((reason
+                     (if error-code
+                         (listen-error-reason error-code)
+                         (listen-error-reason
+                          (- (cl-pnet-sockets:c-errno))))))
+               (if (null remaining)
+                   (log-error "bind [~A]:~D: ~A" target port reason)
+                   (log-info "bind [~A]:~D: ~A" target port reason)))))))
+      (unless listeners
+        (log-error
+         "channel_setup_fwd_listener_tcpip: cannot listen to port: ~D" port))
+      (nreverse listeners))))
 
 (defun close-forward-listeners (forward)
   (dolist (listener (forward-listeners forward))
@@ -3867,12 +3930,10 @@ works; a failure is reported at error level only for the last address."
               (forward-accept client forward connection))
             "-L")))
     (unless listeners
-      (format *error-output*
-              "burs: cannot listen on ~A:~D for -L~%"
-              (or bind-address "localhost") (forward-bind-port forward))
-      (if (exit-on-forward-failure-p client)
-          (finish 255)
-          (return-from start-local-forward nil)))
+      ;; The aggregate "Could not request local forwarding." and the
+      ;; ExitOnForwardFailure decision belong to START-FORWARDS, which sees
+      ;; every -L and -D together, as ssh_init_forwarding() does.
+      (return-from start-local-forward nil))
     (setf (forward-listeners forward) listeners
           (forward-listener forward) (first listeners))
     (reserve-forward-channel-id client forward)
@@ -4085,12 +4146,7 @@ the four-byte SOCKS4 success reply instead of the SOCKS5 one."
               (socks-accept client connection forward))
             "-D")))
     (unless listeners
-      (format *error-output*
-              "burs: cannot listen on ~A:~D for -D~%"
-              (or bind-address "localhost") (dynamic-forward-bind-port forward))
-      (if (exit-on-forward-failure-p client)
-          (finish 255)
-          (return-from start-dynamic-forward nil)))
+      (return-from start-dynamic-forward nil))
     (setf (dynamic-forward-listeners forward) listeners
           (dynamic-forward-listener forward) (first listeners))
     (reserve-dynamic-forward-channel-id client forward)
@@ -4321,12 +4377,25 @@ peer that connected to it; NIL refuses the channel."
         (when (exit-on-forward-failure-p client)
           (fail "Error: forwarding disabled due to host key check failure"))
         (return-from start-forwards nil)))
-    (dolist (forward local)
-      (start-local-forward client forward))
-    (dolist (forward remote)
-      (start-remote-forward client forward))
-    (dolist (forward dynamic)
-      (start-dynamic-forward client forward))))
+    (let ((attempted (+ (length local) (length dynamic)))
+          (succeeded 0))
+      ;; ssh_init_forwarding(): the local and dynamic forwards are one list
+      ;; in options.local_forwards, and their success is judged together.
+      (dolist (forward local)
+        (when (start-local-forward client forward)
+          (incf succeeded)))
+      (dolist (forward dynamic)
+        (when (start-dynamic-forward client forward)
+          (incf succeeded)))
+      (when (plusp attempted)
+        (cond
+          ((and (/= succeeded attempted)
+                (exit-on-forward-failure-p client))
+           (log-fatal "Could not request local forwarding."))
+          ((zerop succeeded)
+           (log-error "Could not request local forwarding."))))
+      (dolist (forward remote)
+        (start-remote-forward client forward)))))
 
 (defun stop-dynamic-forwards ()
   (dolist (forward *dynamic-forwards*)

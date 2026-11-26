@@ -1069,6 +1069,22 @@ dotted quad and an expanded IPv6 literal is compressed."
                   "256.1" "999.1" "0x100000000" "1.2.3.4.5" "a:b"))
     (is (null (cl-pnet-ssh::ssh-canonical-address-string name)))))
 
+(test numeric-address-canonicalisation-respects-address-family
+  "resolve_addr() passes AddressFamily to getaddrinfo.
+
+An address of the other family is not canonicalised, so the spelling the
+user wrote survives to \"Could not resolve hostname\" exactly as ssh's
+host string does."
+  (is (null (cl-pnet-ssh::ssh-canonical-address-string "127.1"
+                                                       :family :inet6)))
+  (is (string= "127.0.0.1"
+               (cl-pnet-ssh::ssh-canonical-address-string "127.1"
+                                                          :family :inet)))
+  (is (null (cl-pnet-ssh::ssh-canonical-address-string "::1" :family :inet)))
+  (is (string= "::1"
+               (cl-pnet-ssh::ssh-canonical-address-string "::1"
+                                                          :family :inet6))))
+
 (test bubblebabble-fingerprint-matches-openssh
   "The -B form is OpenSSH's Bubble Babble over the SHA1 of the key blob."
   (let ((blob

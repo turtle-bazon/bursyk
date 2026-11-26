@@ -162,19 +162,22 @@ would look a name such as \"999.1\" up in DNS."
                     always (< number 256))
               (< (car (last numbers)) (ash 1 (* 8 (- 5 count))))))))
 
-(defun ssh-canonical-address-string (host)
+(defun ssh-canonical-address-string (host &key family)
   "HOST in the numeric form ssh prints, or NIL when it is a name.
 
 ssh canonicalises a numeric host before printing or dialling it, so a
 short or hexadecimal spelling is shown as the dotted quad the system
 resolver reads.  A name is left alone: nothing here may trigger a DNS
-lookup that ssh would not make."
+lookup that ssh would not make.  FAMILY is the AddressFamily the
+connection will use: ssh's resolve_addr() passes it to getaddrinfo, so an
+address of the other family does not canonicalise and the caller keeps the
+spelling the user wrote."
   (when (and (stringp host)
              (plusp (length host))
              (or (find #\: host)
                  (ssh-ipv4-inet-aton-p host)))
     (handler-case
-        (cl-pnet-sockets:lookup-host-canonical host)
+        (cl-pnet-sockets:lookup-host-canonical host :family family)
       (error () nil))))
 
 (defun ssh-client-resolve-host (client host on-success on-error)

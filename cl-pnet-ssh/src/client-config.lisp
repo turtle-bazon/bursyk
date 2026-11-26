@@ -226,8 +226,14 @@ overrides.  NIL leaves the decision to the config and then to
 MAKE-SSH-CLIENT's own defaults."
   (let* ((hostname (or (ssh-config-options-hostname options) host))
          ;; A numeric HostName is canonicalised before use, as ssh does
-         ;; after readconf; the client keeps a name for the resolver.
-         (hostname (or (ssh-canonical-address-string hostname) hostname)))
+         ;; after readconf; the client keeps a name for the resolver.  The
+         ;; family matters: ssh's resolve_addr() does not rewrite an address
+         ;; the connection will refuse, so the user's spelling survives to
+         ;; the "Could not resolve hostname" message.
+         (hostname (or (ssh-canonical-address-string
+                        hostname
+                        :family (ssh-config-options-address-family options))
+                       hostname)))
     (list :host host
           :connect-host hostname
           :host-key-host (or (ssh-config-options-host-key-alias options)

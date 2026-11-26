@@ -58,13 +58,19 @@ NoHostAuthenticationForLocalhost decide identically on either transport."
 
 (defun ssh-plibssh-resolution-error (host condition)
   "CLIENT's lookup failure for HOST, in ssh's getaddrinfo wording."
-  (let ((reason (ssh-resolver-error-text condition)))
-    (make-condition 'ssh-connection-error
-                    :kind :resolve
-                    :host host
-                    :reason reason
-                    :detail (format nil "could not resolve ~A: ~A"
-                                    host reason))))
+  (if (and (typep condition 'ssh-connection-error)
+           (eq (ssh-connection-error-kind condition) :resolve))
+      ;; The family check already produced ssh's own wording; wrapping it
+      ;; again would replace "Address family for hostname not supported"
+      ;; with the printed condition.
+      condition
+      (let ((reason (ssh-resolver-error-text condition)))
+        (make-condition 'ssh-connection-error
+                        :kind :resolve
+                        :host host
+                        :reason reason
+                        :detail (format nil "could not resolve ~A: ~A"
+                                        host reason)))))
 
 (defun ssh-plibssh-client-connect-failed (client errno)
   (let ((reason (cl-pnet-sockets:c-strerror errno)))
@@ -184,9 +190,13 @@ backend does; the connected descriptor is then handed to libssh."
                       on-failure
                       (make-condition
                        'ssh-connection-error
+                       :kind :resolve
+                       :host name
+                       :reason "Address family for hostname not supported"
                        :detail (format nil "~A is not an ~A address"
                                        address
-                                       (ssh-client-address-family-name client)))))))
+                                       (ssh-client-address-family-name
+                                        client)))))))
              (try (names)
                (if names
                    (let ((next (lambda (condition)

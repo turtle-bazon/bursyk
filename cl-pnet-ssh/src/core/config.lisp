@@ -4174,7 +4174,9 @@ the same family the connection will dial."
                           ((null direct) (ssh-config-options-direct-p options))
                           (t direct)))
                   (effective
-                    (or (ssh-canonical-address-string input)
+                    (or (ssh-canonical-address-string
+                         input
+                         :family (ssh-config-options-address-family options))
                         (if (and input (not (burzay:numeric-address-p input)))
                             (string-downcase input)
                             input))))
