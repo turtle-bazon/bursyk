@@ -2895,6 +2895,164 @@ key under the bare name is still only unknown, so the port entry decides."
            result)
       (fake-agent-close agent))))
 
+#+win32
+(cffi:defcfun ("CreateNamedPipeW" c-test-create-named-pipe) :pointer
+  (name :pointer) (open-mode :unsigned-long) (pipe-mode :unsigned-long)
+  (max-instances :unsigned-long) (out-size :unsigned-long)
+  (in-size :unsigned-long) (timeout :unsigned-long) (security :pointer))
+#+win32
+(cffi:defcfun ("ConnectNamedPipe" c-test-connect-named-pipe) :int
+  (handle :pointer) (overlapped :pointer))
+#+win32
+(cffi:defcfun ("DisconnectNamedPipe" c-test-disconnect-named-pipe) :int
+  (handle :pointer))
+#+win32
+(cffi:defcfun ("FlushFileBuffers" c-test-flush-file-buffers) :int
+  (handle :pointer))
+#+win32
+(cffi:defcfun ("GetLastError" c-test-last-error) :unsigned-long)
+
+#+win32
+(defstruct fake-pipe-agent handle thread)
+
+#+win32
+(defun fake-pipe-agent-name (kind)
+  (format nil "\\\\.\\pipe\\cl-pnet-ssh-~A-~D-~D"
+          kind (get-universal-time) (random 1000000)))
+
+#+win32
+(defun fake-pipe-agent-serve (handle responder)
+  "Serve one agent request on HANDLE, the way the Windows agent does."
+  (unwind-protect
+       (handler-case
+           (let ((connected (c-test-connect-named-pipe
+                             handle (cffi:null-pointer))))
+             ;; ERROR_PIPE_CONNECTED (535) means the client arrived first.
+             (when (or (plusp connected)
+                       (= 535 (c-test-last-error)))
+               (let* ((header (cl-pnet-ssh::agent-read-exactly handle 4))
+                      (length (cl-pnet-ssh::ssh-octets-uint32 header))
+                      (request (cl-pnet-ssh::agent-read-exactly handle length))
+                      (response (funcall responder request)))
+                 (cl-pnet-ssh::agent-write-all
+                  handle
+                  (cl-pnet-ssh::ssh-concat
+                   (cl-pnet-ssh::ssh-uint32-octets (length response))
+                   response))
+                 (ignore-errors (c-test-flush-file-buffers handle)))))
+         (error () nil))
+    (ignore-errors (c-test-disconnect-named-pipe handle))
+    (ignore-errors (cl-pnet-ssh::c-agent-close-handle handle))))
+
+#+win32
+(defun fake-pipe-agent-open (name responder)
+  "A named-pipe agent at NAME that answers one request with RESPONDER."
+  (multiple-value-bind (pointer length)
+      (cl-pnet-ssh::windows-utf16-pointer name)
+    (declare (ignore length))
+    (unwind-protect
+         (let ((handle
+                 (c-test-create-named-pipe
+                  pointer 3 0 1 65536 65536 0 (cffi:null-pointer))))
+           (when (cl-pnet-ssh::agent-invalid-handle-p handle)
+             (error "cannot create a test agent pipe"))
+           (let ((agent (make-fake-pipe-agent :handle handle)))
+             (setf (fake-pipe-agent-thread agent)
+                   (sb-thread:make-thread
+                    (lambda () (fake-pipe-agent-serve handle responder))
+                    :name "fake pipe agent"))
+             agent))
+      (cffi:foreign-free pointer))))
+
+#+win32
+(defun fake-pipe-agent-close (agent)
+  (ignore-errors
+   (cl-pnet-ssh::c-agent-close-handle (fake-pipe-agent-handle agent))))
+
+(test agent-identities-over-a-named-pipe
+  "The Windows transport lists a named-pipe agent's identities."
+  #-win32 (skip "Windows named-pipe agent only")
+  #+win32
+  (let* ((blob (cl-pnet-ssh::ssh-make-public-key-blob
+                "ssh-ed25519" (cl-pnet-ssh::ssh-random-octets 32)))
+         (name (fake-pipe-agent-name "identities"))
+         (agent (fake-pipe-agent-open
+                 name
+                 (lambda (request)
+                   (declare (ignore request))
+                   (let ((writer (cl-pnet-ssh::ssh-writer)))
+                     (cl-pnet-ssh::ssh-write-u8 writer 12)
+                     (cl-pnet-ssh::ssh-write-u32 writer 1)
+                     (cl-pnet-ssh::ssh-write-string writer blob)
+                     (cl-pnet-ssh::ssh-write-text writer "pipe-key")
+                     (cl-pnet-ssh::ssh-writer-output writer)))))
+         (entries :none)
+         (failure nil))
+    (unwind-protect
+         (progn
+           (cl-pnet-ssh:ssh-agent-identities
+            :path name
+            :on-identities (lambda (value) (setf entries value))
+            :on-error (lambda (condition) (setf failure condition)))
+           (is (null failure))
+           (is (= 1 (length entries)))
+           (is (equalp blob (caar entries)))
+           (is (equal "pipe-key" (cdar entries))))
+      (fake-pipe-agent-close agent))))
+
+(test agent-sign-over-a-named-pipe
+  "The Windows transport carries a sign request and returns a real signature."
+  #-win32 (skip "Windows named-pipe agent only")
+  #+win32
+  (let* ((directory (ssh-test-directory "cl-pnet-ssh-pipe-sign"))
+         (path (merge-pathnames "id_ed25519" directory)))
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn
+           (ssh-keygen (list "-q" "-t" "ed25519" "-N" ""
+                             "-f" (namestring path)))
+           (let* ((key (ssh-load-private-key path))
+                  (blob (ssh-public-key-blob-of key))
+                  (data (sb-ext:string-to-octets "named-pipe-data"
+                                                 :external-format :ascii))
+                  (name (fake-pipe-agent-name "sign"))
+                  (agent (fake-pipe-agent-open
+                          name
+                          (lambda (request)
+                            (let* ((reader (cl-pnet-ssh::ssh-make-reader request))
+                                   (type (cl-pnet-ssh::ssh-read-u8 reader))
+                                   (request-blob
+                                     (cl-pnet-ssh::ssh-read-string reader))
+                                   (request-data
+                                     (cl-pnet-ssh::ssh-read-string reader))
+                                   (flags (cl-pnet-ssh::ssh-read-u32 reader))
+                                   (writer (cl-pnet-ssh::ssh-writer)))
+                              (declare (ignore type flags request-blob))
+                              (cl-pnet-ssh::ssh-write-u8 writer 14)
+                              (cl-pnet-ssh::ssh-write-string
+                               writer
+                               (cl-pnet-ssh::ssh-ed25519-signature-blob
+                                key request-data))
+                              (cl-pnet-ssh::ssh-writer-output writer)))))
+                  (signature nil)
+                  (failure nil))
+             (unwind-protect
+                  (progn
+                    (cl-pnet-ssh:ssh-agent-sign
+                     blob data :path name
+                     :on-signature (lambda (value) (setf signature value))
+                     :on-error (lambda (condition) (setf failure condition)))
+                    (is (null failure))
+                    (is (typep signature '(vector (unsigned-byte 8))))
+                    (multiple-value-bind (algorithm bytes)
+                        (ssh-parse-signature-blob signature)
+                      (is (equal "ssh-ed25519" algorithm))
+                      (is (ssh-ed25519-verify
+                           bytes data
+                           (nth-value 1 (ssh-public-key-parts blob))))))
+               (fake-pipe-agent-close agent))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (test agent-missing-socket-reports-error
   (let ((condition nil))
     (cl-pnet-ssh:ssh-agent-identities
