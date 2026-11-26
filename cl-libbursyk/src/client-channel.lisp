@@ -578,6 +578,8 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
       (funcall (ssh-channel-on-error channel) channel
                (make-condition 'ssh-channel-error
                                :channel channel
+                               :reason reason
+                               :description description
                                :detail (format nil "channel open refused: ~A"
                                                description))))
     (ssh-channel-finish channel)))

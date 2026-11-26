@@ -555,6 +555,8 @@
    #:ssh-host-key-error-fingerprint
    #:ssh-channel-error
    #:ssh-channel-error-channel
+   #:ssh-channel-error-reason
+   #:ssh-channel-error-description
    #:ssh-revoked-keys-error
    #:ssh-revoked-keys-error-path
    #:ssh-unsupported-feature

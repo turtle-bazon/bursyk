@@ -1724,6 +1724,18 @@ errors that print one line before the one they report."
     ;; A bare keyword is refused before any keyword-specific handling.
     (is (equal "no argument after keyword \"port\"" (detail "Port")))))
 
+(test a2port-requires-the-number-to-fill-the-string
+  "a2port uses strtonum: leading blanks are skipped, but a trailing blank or
+any other junk rejects the number and lets the service database decide."
+  (is (= 22 (cl-pnet-ssh:ssh-a2port "22")))
+  (is (= 22 (cl-pnet-ssh:ssh-a2port " 22")))
+  (is (= 22 (cl-pnet-ssh:ssh-a2port "+22")))
+  (is (null (cl-pnet-ssh:ssh-a2port "22 ")))
+  (is (null (cl-pnet-ssh:ssh-a2port " 22 ")))
+  (is (null (cl-pnet-ssh:ssh-a2port "22x")))
+  (is (null (cl-pnet-ssh:ssh-a2port "65536")))
+  (is (null (cl-pnet-ssh:ssh-a2port "-1"))))
+
 (test config-checks-inactive-blocks
   "readconf validates every line and only lets an active block act: an
 inactive Port typo is still an error, while RefuseConnection fires only in

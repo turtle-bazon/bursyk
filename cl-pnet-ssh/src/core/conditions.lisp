@@ -82,7 +82,13 @@ unchanged."
                      (ssh-host-key-error-fingerprint condition)))))
 
 (define-condition ssh-channel-error (ssh-error)
-  ((channel :initarg :channel :initform nil :reader ssh-channel-error-channel))
+  ((channel :initarg :channel :initform nil :reader ssh-channel-error-channel)
+   ;; A refused channel open carries the peer's numeric reason and its
+   ;; description separately, because ssh prints them as two fields:
+   ;; "channel 0: open failed: connect failed: open failed".
+   (reason :initarg :reason :initform nil :reader ssh-channel-error-reason)
+   (description :initarg :description :initform nil
+                :reader ssh-channel-error-description))
   (:report (lambda (condition stream)
              (format stream "SSH channel error~@[: ~A~]"
                      (ssh-error-detail condition)))))

@@ -391,6 +391,7 @@ the order the old push-based parser kept them in."
             (getf *options* :proxy-command) nil
             (getf *options* :verbose) (or (value :verbose) 0)
             (getf *options* :quiet) (flag :quiet)
+            (getf *options* :log-level) (and (flag :quiet) "quiet")
             (getf *options* :log-file) (value :log-file)
             (getf *options* :address-family)
             (cond ((flag :address-family-4) "inet")
@@ -1544,12 +1545,20 @@ runs it through cmd.exe."
      (setf (getf *options* :compression)
            (not (member (string-downcase value) '("no" "off") :test #'string=))))
     ((string-equal name "LogLevel")
-     (let ((level (string-upcase value)))
-       (cond ((member level '("QUIET" "FATAL" "ERROR") :test #'string=)
-              (setf (getf *options* :quiet) t))
-             ((member level '("VERBOSE" "DEBUG" "DEBUG1" "DEBUG2" "DEBUG3")
-                      :test #'string=)
-              (setf (getf *options* :verbose) 1)))))
+     ;; readconf keeps the first LogLevel it sees, and -v or -q already
+     ;; claimed options.log_level while the arguments were read, so only an
+     ;; unset level can still be adopted here.
+     (let ((level (string-downcase value)))
+       (when (and (null (getf *options* :log-level))
+                  (zerop (getf *options* :verbose 0))
+                  (member level '("quiet" "fatal" "error" "info"
+                                  "verbose" "debug" "debug1" "debug2"
+                                  "debug3")
+                          :test #'string=))
+         (multiple-value-bind (quiet verbose) (log-level-settings level)
+           (setf (getf *options* :log-level) level
+                 (getf *options* :quiet) quiet
+                 (getf *options* :verbose) verbose)))))
     ((string-equal name "GatewayPorts")
      (setf (getf *options* :gateway-ports) (true-value-p value)))
     ((string-equal name "ForwardAgent")
@@ -1674,6 +1683,47 @@ message is not a debug message.  The caller has already applied -q."
           (finish-output stream))
       (error ()
         (setf *log-stream* nil)))))
+
+(defun log-message (format-string &rest arguments)
+  "Write one log.c message with the escaping ssh applies, without a prefix.
+
+FATAL and INFO messages are not debug lines, so -v must not add its prefix,
+but their text still reaches stderr through log.c's strnvis(), the same way
+LOG-LINE escapes its line."
+  (let ((stream (or *log-stream* *error-output*)))
+    (handler-case
+        (let ((line (apply #'format nil format-string arguments)))
+          (format stream "~A~%" (cl-pnet-ssh::ssh-log-escape line))
+          (finish-output stream))
+      (error ()
+        (setf *log-stream* nil)))))
+
+(defun fatal-message-suppressed-p ()
+  "Whether ssh's log.c would drop a fatal() message.
+
+fatal() logs at SYSLOG_LEVEL_FATAL, which is above QUIET, so only a QUIET
+log level silences it.  LogLevel ERROR or FATAL still prints the line even
+though they silence logit()."
+  (let ((level (getf *options* :log-level)))
+    (and level (string-equal level "quiet"))))
+
+(defun log-fatal (format-string &rest arguments)
+  "Print a fatal() line, honouring LogLevel QUIET, and leave with status 255.
+
+FINISH runs OpenSSH's cleanup_exit path: it closes the client (and any
+ProxyCommand helper) before quitting, instead of leaving a child behind."
+  (unless (fatal-message-suppressed-p)
+    (apply #'log-message format-string arguments))
+  (finish 255))
+
+(defun channel-open-reason-text (reason)
+  "ssh's reason2txt() for a refused channel open."
+  (case reason
+    (1 "administratively prohibited")
+    (2 "connect failed")
+    (3 "unknown channel type")
+    (4 "resource shortage")
+    (t "unknown reason")))
 
 (defun start-logging ()
   (when (and (getf *options* :log-file)
@@ -2199,33 +2249,45 @@ it contains a slash: only a lone field can be a socket path."
 (defun parse-stdio-forward (spec)
   "SPEC as (VALUES HOST PORT STREAMLOCAL-P), the way ssh.c reads -W.
 
-ssh parses -W with parse_forward(..., dynamicfwd=1, ...), which accepts one
-or two fields, and then copies fwd.listen_path when the listener is a socket
-path and fwd.listen_host otherwise.  A socket path is therefore a
-direct-streamlocal target and everything else is a host:port pair.  The two
-remaining dynamic forms - a bare port, or a port followed by a target path -
-leave ssh with a NULL host that it cannot open, so they are rejected with
-the same wording the getopt check uses."
+ssh parses -W with parse_forward(..., dynamicfwd=1, ...) after skipping
+leading whitespace, which accepts one or two fields, and then copies
+fwd.listen_path when the listener is a socket path and fwd.listen_host
+otherwise.  A socket path is therefore a direct-streamlocal target and two
+non-path fields are host:port.  A bare port - or a port followed by a target
+path - passes parse_forward because only the listening port is checked, but
+leaves ssh with a NULL host, so HOST is NIL and nothing is opened.  The
+getopt check already rejects everything else, so a failure here only guards
+against a value that never went through it."
   (let* ((expanded (cl-pnet-ssh::ssh-forward-expand-value spec nil))
-         (fields (and expanded
-                      (cl-pnet-ssh::ssh-config-forward-fields expanded))))
-    (unless (and fields (<= 1 (length fields) 2))
-      (fatal "Bad stdio forwarding specification '~A'" spec))
-    (if (= 1 (length fields))
-        (let ((field (first fields)))
-          (if (cdr field)
-              (values (car field) 0 t)
-              (fatal "Bad stdio forwarding specification '~A'" spec)))
-        (destructuring-bind (listener target) fields
-          (cond
-            ((and (cdr listener) (cdr target))
-             (values (car listener) 0 t))
-            ((cdr target)
-             (fatal "Bad stdio forwarding specification '~A'" spec))
-            (t
-             (values (car listener)
-                     (forwarding-port (car target) spec)
-                     nil)))))))
+         (text (and expanded
+                    (string-left-trim
+                     (list #\Space #\Tab #\Newline #\Return #\Page
+                           (code-char 11))
+                     expanded)))
+         (fields (and text
+                      (cl-pnet-ssh::ssh-config-forward-fields text))))
+    (labels ((bad ()
+               (getopt-fatal "Bad stdio forwarding specification '~A'" spec))
+             (port (field)
+               (cl-pnet-ssh::ssh-config-forward-port (car field)))
+             (usable-port (field)
+               (let ((value (port field)))
+                 (if (plusp value) value (bad)))))
+      (unless (and fields (<= 1 (length fields) 2))
+        (bad))
+      (if (= 1 (length fields))
+          (let ((field (first fields)))
+            (if (cdr field)
+                (values (car field) 0 t)
+                (values nil (usable-port field) nil)))
+          (destructuring-bind (listener target) fields
+            (cond
+              ((and (cdr listener) (cdr target))
+               (values (car listener) 0 t))
+              ((cdr target)
+               (values nil (usable-port listener) nil))
+              (t
+               (values (car listener) (usable-port target) nil))))))))
 
 (defun parse-config-forward (spec remote-p)
   "SPEC as a FORWARD for ssh_config's LocalForward/RemoteForward.
@@ -2675,31 +2737,52 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
 ;;; ---- -W: stream stdin and stdout over one channel ----
 
 (defun start-stdio-forward (client host port streamlocal)
-  (let ((callbacks
-          (list :on-data
-                (lambda (channel data kind)
-                  (declare (ignore channel))
-                  (write-octets (ecase kind (:stdout *standard-output*)
-                                       (:stderr *error-output*))
-                                data))
-                :on-close
-                (lambda (channel status)
-                  (declare (ignore channel status))
-                  (finish *status*))
-                :on-error
-                (lambda (channel condition)
-                  (declare (ignore channel))
-                  (format *error-output* "burs: ~A~%" condition)
-                  (finish 255)))))
-    (setf *status* 0
-          *channel*
-          (if streamlocal
-              (apply #'cl-pnet-ssh:ssh-open-direct-streamlocal
-                     client host callbacks)
-              (apply #'cl-pnet-ssh:ssh-open-direct-tcpip
-                     client host port callbacks))))
-  (log-line "stdio forward to ~A:~D" host (if streamlocal -2 port))
-  (start-input *channel*))
+  ;; A -W specification with no host (a bare port) leaves ssh's
+  ;; stdio_forward_host NULL, so ssh_init_stdio_forwarding returns without
+  ;; opening a channel and the connection simply stays up until it closes.
+  (when host
+    (let ((callbacks
+            (list :on-data
+                  (lambda (channel data kind)
+                    (declare (ignore channel))
+                    (write-octets (ecase kind (:stdout *standard-output*)
+                                         (:stderr *error-output*))
+                                  data))
+                  :on-close
+                  (lambda (channel status)
+                    (declare (ignore channel status))
+                    (finish *status*))
+                  :on-error
+                  (lambda (channel condition)
+                    (if (and (typep condition 'cl-pnet-ssh:ssh-channel-error)
+                             (integerp
+                              (cl-pnet-ssh:ssh-channel-error-reason
+                               condition)))
+                        (progn
+                          ;; channels.c logs the refusal at logit(), then
+                          ;; ssh_stdio_confirm() is fatal().
+                          (unless (getf *options* :quiet)
+                            (log-message
+                             "channel ~D: open failed: ~A~@[: ~A~]"
+                             (cl-pnet-ssh::ssh-channel-local-id channel)
+                             (channel-open-reason-text
+                              (cl-pnet-ssh:ssh-channel-error-reason
+                               condition))
+                             (cl-pnet-ssh:ssh-channel-error-description
+                              condition)))
+                          (log-fatal "stdio forwarding failed"))
+                        (progn
+                          (format *error-output* "burs: ~A~%" condition)
+                          (finish 255)))))))
+      (setf *status* 0
+            *channel*
+            (if streamlocal
+                (apply #'cl-pnet-ssh:ssh-open-direct-streamlocal
+                       client host callbacks)
+                (apply #'cl-pnet-ssh:ssh-open-direct-tcpip
+                       client host port callbacks))))
+    (log-line "stdio forward to ~A:~D" host (if streamlocal -2 port))
+    (start-input *channel*)))
 
 ;;; ---- -L: local forwarding ----
 
@@ -3246,13 +3329,20 @@ closed afterwards."
     (t (values nil 0))))
 
 (defun apply-config-log-level (client)
-  "Adopt CLIENT's LogLevel when the command line did not set one."
+  "Adopt CLIENT's LogLevel when nothing on the command line set one.
+
+-q and -v assign options.log_level while the arguments are read, and
+readconf's own LogLevel only applies while it is still unset.  -o LogLevel
+is recorded in :LOG-LEVEL; -v is only a verbosity count, so it needs its own
+check here."
   (let ((level (config-log-level client)))
     (when (and level
+               (null (getf *options* :log-level))
                (zerop (getf *options* :verbose 0))
                (not (getf *options* :quiet)))
       (multiple-value-bind (quiet verbose) (log-level-settings level)
-        (setf (getf *options* :quiet) quiet
+        (setf (getf *options* :log-level) level
+              (getf *options* :quiet) quiet
               (getf *options* :verbose) verbose)
         (start-logging)))))
 

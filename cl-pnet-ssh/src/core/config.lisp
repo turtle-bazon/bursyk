@@ -1362,11 +1362,19 @@ platforms this client runs on."
                              (return-from ssh-a2port-service number))))))))))))
 
 (defun ssh-a2port (value)
-  "VALUE as OpenSSH's a2port reads it: 0..65535, a TCP service name, or NIL."
-  (let ((number (handler-case (parse-integer value :junk-allowed nil)
-                  (error () nil))))
+  "VALUE as OpenSSH's a2port reads it: 0..65535, a TCP service name, or NIL.
+
+a2port relies on strtonum, which accepts leading blanks but requires the
+number to run to the end of the string; a trailing blank or other junk makes
+the value invalid and lets the service lookup have its turn."
+  (multiple-value-bind (number end)
+      (handler-case (parse-integer value :junk-allowed t)
+        (error () (values nil 0)))
     (cond
-      ((and number (<= 0 number 65535)) number)
+      ((and number
+            (= end (length value))
+            (<= 0 number 65535))
+       number)
       (t (ssh-a2port-service value)))))
 
 (defun ssh-config-port (line value)

@@ -874,6 +874,116 @@ is a direct-streamlocal target while host:port stays a TCP destination."
     (is (equal "/tmp/a.sock" host))
     (is (not (null streamlocal)))))
 
+(test stdio-forward-accepts-a-bare-port-with-no-host
+  "parse_forward(dynamicfwd=1) only checks the listening port, so a bare
+port leaves ssh with a NULL host: ssh_init_stdio_forwarding then opens no
+channel at all.  A port followed by a target path keeps the same NULL host."
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "22")
+    (is (null host))
+    (is (= 22 port))
+    (is (not streamlocal)))
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "2200:/tmp/agent.sock")
+    (is (null host))
+    (is (= 2200 port))
+    (is (not streamlocal)))
+  (let ((service (cl-pnet-ssh::ssh-a2port "ssh")))
+    (if service
+        (multiple-value-bind (host port streamlocal)
+            (burs::parse-stdio-forward "ssh")
+          (is (null host))
+          (is (= service port))
+          (is (not streamlocal)))
+        (skip "this platform has no TCP service database entry for \"ssh\""))))
+
+(test stdio-forward-skips-leading-whitespace
+  "parse_forward skips isspace() after dollar expansion, so a leading blank
+does not become part of the socket path or the host name."
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "  /tmp/agent.sock")
+    (is (equal "/tmp/agent.sock" host))
+    (is (not (null streamlocal))))
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward (format nil "~Cexample.org:2200" #\Tab))
+    (is (equal "example.org" host))
+    (is (= 2200 port))
+    (is (not streamlocal))))
+
+(defun channel-open-failure-condition (reason description)
+  "A refused channel open as the client layer reports it."
+  (make-condition 'cl-pnet-ssh:ssh-channel-error
+                  :reason reason
+                  :description description
+                  :detail (format nil "channel open refused: ~A" description)))
+
+(test channel-error-keeps-the-open-refusal-fields
+  "ssh prints a refused open as reason2txt(reason) plus the peer's
+description, so the condition must carry both instead of only a detail."
+  (let ((condition (channel-open-failure-condition 2 "open failed")))
+    (is (= 2 (cl-pnet-ssh:ssh-channel-error-reason condition)))
+    (is (equal "open failed"
+               (cl-pnet-ssh:ssh-channel-error-description condition)))
+    (is (equal "channel open refused: open failed"
+               (cl-pnet-ssh:ssh-error-detail condition)))))
+
+(test channel-open-reason-text-matches-reason2txt
+  "channels.c's reason2txt(), used by `channel N: open failed:'."
+  (is (equal "administratively prohibited"
+             (burs::channel-open-reason-text 1)))
+  (is (equal "connect failed" (burs::channel-open-reason-text 2)))
+  (is (equal "unknown channel type" (burs::channel-open-reason-text 3)))
+  (is (equal "resource shortage" (burs::channel-open-reason-text 4)))
+  (is (equal "unknown reason" (burs::channel-open-reason-text 0))))
+
+(test fatal-messages-only-vanish-at-quiet-level
+  "fatal() logs at FATAL, above QUIET: only LogLevel QUIET drops it."
+  (let ((burs::*options* (empty-options)))
+    (is (not (burs::fatal-message-suppressed-p)))
+    (setf (getf burs::*options* :log-level) "error")
+    (is (not (burs::fatal-message-suppressed-p)))
+    (setf (getf burs::*options* :log-level) "fatal")
+    (is (not (burs::fatal-message-suppressed-p)))
+    (setf (getf burs::*options* :log-level) "info")
+    (is (not (burs::fatal-message-suppressed-p)))
+    (setf (getf burs::*options* :log-level) "quiet")
+    (is (burs::fatal-message-suppressed-p))))
+
+(test log-level-keeps-the-first-value
+  "readconf only adopts LogLevel while options.log_level is unset, and -q or
+-v already set it, so the first value wins."
+  (let ((burs::*options* (empty-options)))
+    (burs::command-line-option "LogLevel" "ERROR")
+    (is (equal "error" (getf burs::*options* :log-level)))
+    (is (eq t (getf burs::*options* :quiet)))
+    (burs::command-line-option "LogLevel" "QUIET")
+    (is (equal "error" (getf burs::*options* :log-level)))
+    (is (eq t (getf burs::*options* :quiet))))
+  ;; -q claimed the level before the -o lines were applied.
+  (let ((burs::*options* (empty-options)))
+    (setf (getf burs::*options* :log-level) "quiet")
+    (burs::command-line-option "LogLevel" "INFO")
+    (is (equal "quiet" (getf burs::*options* :log-level))))
+  ;; -v claimed it too, even though it is tracked as a verbosity count.
+  (let ((burs::*options* (empty-options)))
+    (setf (getf burs::*options* :verbose) 1)
+    (burs::command-line-option "LogLevel" "ERROR")
+    (is (null (getf burs::*options* :log-level)))))
+
+(test config-log-level-yields-to-command-line-verbosity
+  "-v assigns options.log_level while the arguments are read, so readconf
+keeps its own LogLevel back; -q and -o LogLevel are recorded in :LOG-LEVEL."
+  (let* ((client (cl-pnet-ssh::%make-ssh-client))
+         (options (cl-pnet-ssh::%make-ssh-config-options
+                   :log-level "quiet"))
+         (burs::*options* (empty-options)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client) options)
+    (setf (getf burs::*options* :verbose) 1)
+    (burs::apply-config-log-level client)
+    (is (= 1 (getf burs::*options* :verbose)))
+    (is (not (getf burs::*options* :quiet)))
+    (is (null (getf burs::*options* :log-level)))))
+
 (test stdio-forward-expands-the-environment-before-parsing
   (let ((old (uiop:getenv "BURS_TEST_DIR")))
     (unwind-protect

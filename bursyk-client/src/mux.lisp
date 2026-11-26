@@ -396,11 +396,11 @@ finish and reports its status, exactly as it does for a multiplexed session."
         (#.+mux-s-session-opened+
          (mux-client-wait-stdio fd))
         (#.+mux-s-permission-denied+
-         (error "the control master refused stdio forwarding: ~A"
-                (cl-pnet-ssh:ssh-read-text reader)))
+         (log-fatal "Master refused stdio forwarding request: ~A"
+                    (cl-pnet-ssh:ssh-read-text reader)))
         (#.+mux-s-failure+
-         (error "the control master failed stdio forwarding: ~A"
-                (cl-pnet-ssh:ssh-read-text reader)))
+         (log-fatal "Stdio forwarding request failed: ~A"
+                    (cl-pnet-ssh:ssh-read-text reader)))
         (t
          (error "unexpected reply from the control master: 0x~8,'0X"
                 type))))))
@@ -1214,10 +1214,10 @@ The parts a transport cannot report are left out rather than guessed."
                      (mux-session-close session))))))
           (setf (mux-session-channel session) channel)
           (setf (mux-session-stdin-watcher session)
-                (cl-pnet:fd-watch
-                 stdin :on-readable
-                 (lambda (watcher)
-                   (declare (ignore watcher))
+                (mux-watch-input
+                 stdin
+                 (lambda (watch)
+                   (declare (ignore watch))
                    (mux-session-read-stdin session)))))
       (error (condition)
         (mux-connection-send
@@ -1291,18 +1291,12 @@ The parts a transport cannot report are left out rather than guessed."
           (cl-pnet-ssh:ssh-channel-write
            (mux-session-channel session) octets)))
         ((zerop count)
-         (when (mux-session-stdin-watcher session)
-           (ignore-errors
-            (cl-pnet:fd-unwatch (mux-session-stdin-watcher session)))
-           (setf (mux-session-stdin-watcher session) nil))
+         (mux-session-stop-stdin session)
          (ignore-errors
           (cl-pnet-ssh:ssh-channel-eof (mux-session-channel session))))
         ((member error '(4 11)) nil)
         (t
-         (when (mux-session-stdin-watcher session)
-           (ignore-errors
-            (cl-pnet:fd-unwatch (mux-session-stdin-watcher session)))
-           (setf (mux-session-stdin-watcher session) nil))
+         (mux-session-stop-stdin session)
          (ignore-errors
           (cl-pnet-ssh:ssh-channel-eof
            (mux-session-channel session))))))))
@@ -1360,13 +1354,54 @@ The parts a transport cannot report are left out rather than guessed."
           (setf (mux-session-stderr-watcher session) nil)
           (setf (mux-session-stdout-watcher session) nil)))))
 
+(defstruct (mux-input-watch (:constructor %make-mux-input-watch))
+  fd
+  watcher
+  timer)
+
+(defun mux-watch-input (fd reader)
+  "Watch FD for input, falling back to a timer when the backend refuses it.
+
+epoll cannot register descriptors such as /dev/null or a regular file, and
+those are the usual stdin of a non-interactive multiplex client.  Such an fd
+is always readable, so a repeating timer drives READER instead.  READER is
+called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
+  (let ((watch (%make-mux-input-watch :fd fd)))
+    (handler-case
+        (setf (mux-input-watch-watcher watch)
+              (cl-pnet:fd-watch
+               fd :on-readable
+               (lambda (watcher)
+                 (declare (ignore watcher))
+                 (funcall reader watch))))
+      (error ()
+        (setf (mux-input-watch-timer watch)
+              (cl-pnet:timer-start
+               0.001 0.001
+               (lambda () (funcall reader watch))))))
+    watch))
+
+(defun mux-stop-input-watch (watch)
+  (when watch
+    (when (mux-input-watch-watcher watch)
+      (ignore-errors
+       (cl-pnet:fd-unwatch (mux-input-watch-watcher watch)))
+      (setf (mux-input-watch-watcher watch) nil))
+    (when (mux-input-watch-timer watch)
+      (ignore-errors
+       (cl-pnet:timer-stop (mux-input-watch-timer watch)))
+      (setf (mux-input-watch-timer watch) nil)))
+  nil)
+
+(defun mux-session-stop-stdin (session)
+  (when (mux-session-stdin-watcher session)
+    (mux-stop-input-watch (mux-session-stdin-watcher session))
+    (setf (mux-session-stdin-watcher session) nil)))
+
 (defun mux-session-close (session)
   (unless (mux-session-closed session)
     (setf (mux-session-closed session) t)
-    (when (mux-session-stdin-watcher session)
-      (ignore-errors
-       (cl-pnet:fd-unwatch (mux-session-stdin-watcher session)))
-      (setf (mux-session-stdin-watcher session) nil))
+    (mux-session-stop-stdin session)
     (mux-session-unwatch-output session nil)
     (mux-session-unwatch-output session t)
     (when (and (mux-session-opened session)
@@ -1719,10 +1754,10 @@ The parts a transport cannot report are left out rather than guessed."
                                  (mux-stdio-failed session condition))))))
           (setf (mux-session-channel session) channel)
           (setf (mux-session-stdin-watcher session)
-                (cl-pnet:fd-watch
-                 stdin :on-readable
-                 (lambda (watcher)
-                   (declare (ignore watcher))
+                (mux-watch-input
+                 stdin
+                 (lambda (watch)
+                   (declare (ignore watch))
                    (mux-session-read-stdin session)))))
       (error (condition)
         (mux-connection-send
@@ -1742,12 +1777,15 @@ The parts a transport cannot report are left out rather than guessed."
                           (mux-session-sid session)))))
 
 (defun mux-stdio-failed (session condition)
+  (declare (ignore condition))
   (let ((connection (mux-session-connection session)))
     (unless (mux-connection-closed-p connection)
+      ;; mux_stdio_confirm() always reports the same text for a refused
+      ;; open; the peer's own reason stays in the master's log.
       (mux-connection-send
        connection
        (mux-error-payload +mux-s-failure+ (mux-session-request-id session)
-                          (format nil "~A" condition))))
+                          "Session open refused by peer")))
     (mux-session-close session)))
 
 ;;; ---- Deciding whether to attach, and starting a master ----
@@ -2084,7 +2122,11 @@ is fatal rather than a reason to fall back to an unshared connection."
        (values nil (and errno (cl-pnet-sockets:c-strerror errno))))
       (t
        (let ((alive nil)
-             (extensions nil))
+             (extensions nil)
+             (stdio (and (getf *options* :stdio-forward)
+                         (multiple-value-list
+                          (parse-stdio-forward
+                           (getf *options* :stdio-forward))))))
          (handler-case
              (progn
                (setf extensions (mux-handshake fd))
@@ -2096,15 +2138,18 @@ is fatal rather than a reason to fall back to an unshared connection."
                                  options extensions)))
                     (mux-close fd)
                     (finish status)))
-                 ((getf *options* :stdio-forward)
-                  (multiple-value-bind (host port streamlocal)
-                      (parse-stdio-forward (getf *options* :stdio-forward))
-                    (let ((status
-                            (mux-client-stdio-forward
-                             fd host
-                             (if streamlocal +mux-port-streamlocal+ port))))
-                      (mux-close fd)
-                      status)))
+                 ((and stdio (first stdio))
+                  ;; ssh leaves stdio_forward_host NULL for a bare port, and
+                  ;; muxclient() then takes its OPEN path instead, so an
+                  ;; ordinary session is attached.
+                  (let ((status
+                          (mux-client-stdio-forward
+                           fd (first stdio)
+                           (if (third stdio)
+                               +mux-port-streamlocal+
+                               (second stdio)))))
+                    (mux-close fd)
+                    status))
                  (t
                   (mux-attach-forwards fd options)
                   (let* ((master-pid (mux-alive fd))
