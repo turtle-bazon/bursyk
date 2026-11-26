@@ -1597,15 +1597,19 @@ connection.  Its remote name is whatever the forwarding code recorded."
                     (cl-pnet-ssh::ssh-channel-type channel)
                     "unknown"))
          (name (or (cl-pnet-ssh::ssh-channel-remote-name channel) ctype))
-         (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel)))
+         (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel))
+         (display (cl-pnet-ssh::ssh-channel-display-fd channel))
+         (fd (if (and (integerp display) (>= display 0)) display -1)))
     (mux-format-channel-status
      out (cl-pnet-ssh::ssh-channel-local-id channel) name
      (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
      0 0 (if (eq state :closing) 3 0)
      (if write-queue (fill-pointer write-queue) 0)
      "closed" 0
-     -1 -1 -1 -1 -1 nil 0
-     0 0 "" "B")))
+     ;; channels.c's rfd/wfd/sock are the accepted socket; there is no
+     ;; separate extended descriptor for these channels.
+     fd fd -1 fd -1 nil 0
+     (if open 1 0) 0 "" "B")))
 
 (defun mux-channel-open-message (master)
   "The text -O channels returns, matching channels.c's channel_open_message.

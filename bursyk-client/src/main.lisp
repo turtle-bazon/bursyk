@@ -3192,6 +3192,7 @@ keeps the burs: prefix."
           (ignore-errors (cl-pnet-ssh:ssh-channel-close channel)))
         (let ((bridge (%make-client-streamlocal
                        :channel channel :fd fd :path path)))
+          (setf (cl-pnet-ssh::ssh-channel-display-fd channel) fd)
           (client-streamlocal-install bridge)
           (if (eq state :connected)
               (client-streamlocal-connected bridge)
@@ -3336,6 +3337,11 @@ closed afterwards."
             (setf (cl-pnet-ssh::ssh-channel-remote-name channel)
                   (forward-channel-remote-name
                    forward (forward-tunnel-connection tunnel)))
+            (let ((connection (forward-tunnel-connection tunnel)))
+              (when connection
+                (setf (cl-pnet-ssh::ssh-channel-display-fd channel)
+                      (ignore-errors
+                       (cl-pnet:connection-fileno connection)))))
             (forward-flush tunnel)
             (forward-flush-to-connection tunnel))
         (error (condition) (failed condition))))))
@@ -4067,6 +4073,8 @@ does when it binds a local forwarding socket."
                                         channel condition)
                                        (client-streamlocal-close bridge)))))
                               (setf (client-streamlocal-channel bridge) channel)
+                              (setf (cl-pnet-ssh::ssh-channel-display-fd
+                                     channel) fd)
                               (client-streamlocal-connected bridge))
                           (error ()
                             (client-streamlocal-close bridge))))))))
@@ -4397,6 +4405,7 @@ uses."
                (log-channel-open-failure channel condition)
                (client-streamlocal-close bridge)))))
       (setf (client-streamlocal-channel bridge) channel)
+      (setf (cl-pnet-ssh::ssh-channel-display-fd channel) fd)
       (client-streamlocal-install bridge)
       (client-streamlocal-connected bridge))))
 

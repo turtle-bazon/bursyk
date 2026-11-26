@@ -379,7 +379,9 @@
   ;; A mux-proxy channel: every CHANNEL message from the server is handed to
   ;; this function instead of the usual handlers, and relayed to the proxy
   ;; client with its channel id restored.
-  (relay nil))
+  (relay nil)
+  ;; The local descriptor -O channels shows for a forwarded connection.
+  (display-fd nil))
 
 (defun ssh-client-closed-p (client)
   "True once CLIENT has shut down."

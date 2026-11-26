@@ -575,6 +575,8 @@ arrived before the request (reverse dynamic SOCKS) can send them."
     (if connection
         (progn
           (setf (ssh-channel-target channel) connection)
+          (setf (ssh-channel-display-fd channel)
+                (ignore-errors (cl-pnet:connection-fileno connection)))
           (when on-connected (funcall on-connected)))
         (ssh-client-forward-fail
          channel

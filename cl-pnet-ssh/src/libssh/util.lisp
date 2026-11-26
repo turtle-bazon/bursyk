@@ -256,6 +256,9 @@ beside the readable one on every backend."
   (x-type nil)
   (last-used 0)
   (inactive-timeout 0)
+  ;; The descriptor -O channels shows for a forwarded connection; the pure
+  ;; backend fills it, libssh leaves it NIL.
+  (display-fd nil)
   on-data
   on-eof
   on-exit
