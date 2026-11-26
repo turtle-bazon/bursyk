@@ -36,11 +36,22 @@ resolution must not be printed a second time.")
 
 When the library already printed readconf's lines, only the exit status is
 left to do; otherwise the condition is the whole diagnostic."
-  (if *config-error-reported*
+  (if (typep condition 'cl-pnet-ssh:ssh-jumphost-loop)
+      ;; ssh.c's fatal() has no program-name prefix, and only LogLevel
+      ;; QUIET hides it.
       (progn
+        (let ((level (getf *options* :log-level)))
+          (unless (and level (string-equal level "quiet"))
+            (format *error-output* "~A~%"
+                    (cl-pnet-ssh:ssh-error-detail condition))
+            (finish-output *error-output*)))
         (restore-terminal)
         (uiop:quit 255))
-      (fail "~A" condition)))
+      (if *config-error-reported*
+          (progn
+            (restore-terminal)
+            (uiop:quit 255))
+          (fail "~A" condition))))
 
 (defun unsupported (option &optional (detail "not implemented by this client"))
   (fail "~A is not supported: ~A" option detail))

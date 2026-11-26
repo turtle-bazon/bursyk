@@ -111,6 +111,13 @@ unchanged."
                      (ssh-config-error-keyword condition)
                      (ssh-error-detail condition)))))
 
+(define-condition ssh-jumphost-loop (ssh-config-error)
+  ()
+  (:report (lambda (condition stream)
+             ;; ssh.c's fatal() prints only the detail; there is no config
+             ;; error context to add.
+             (format stream "~A" (ssh-error-detail condition)))))
+
 (define-condition ssh-server-config-error (ssh-error)
   ((path :initarg :path :initform nil :reader ssh-server-config-error-path)
    (line :initarg :line :initform nil :reader ssh-server-config-error-line)

@@ -738,16 +738,14 @@ uses whichever of the two it saw first instead of chaining them."
   "MAKE-SSH-CLIENT arguments for one jump host.
 
 The jump's own @user and :port beat its Host block, as they do in SSH;
-the destination's user and port do not apply to it."
+the destination's user and port do not apply to it.  Command-line -i and -o
+values do not reach the jump either: ssh runs it as a separate process with
+only -F, so its Host block and the default known_hosts/identities decide."
   (let ((parameters
           (ssh-config-client-parameters
            (getf descriptor :host) options
-           :private-key (getf overrides :private-key)
-           :agent (getf overrides :agent)
            :passphrase (getf overrides :passphrase)
            :passphrase-callback (getf overrides :passphrase-callback)
-           :known-hosts (getf overrides :known-hosts)
-           :host-key-policy (getf overrides :host-key-policy)
            :host-key-callback (getf overrides :host-key-callback)
            :resolver (getf overrides :resolver)
            :password-callback (getf overrides :password-callback)
@@ -795,7 +793,18 @@ in the tunnel's buffers."
         (tunnels nil))
     (loop for hop in hops
           for rest = (rest hops) then (rest rest)
-          do (multiple-value-bind (tunnel port)
+          do (let ((next (or (first rest) target-parameters)))
+               ;; ssh.c compares the immediate jump with the host it would
+               ;; reach; the same host, port and user is a loop.
+               (when (and (equal (getf hop :connect-host)
+                                 (getf next :connect-host))
+                          (eql (or (getf hop :port) 22)
+                               (or (getf next :port) 22))
+                          (equal (getf hop :user) (getf next :user)))
+                 (error 'ssh-jumphost-loop
+                        :detail (format nil "jumphost loop via ~A"
+                                        (getf hop :host)))))
+             (multiple-value-bind (tunnel port)
                  (ssh-config-hop-tunnel chain (first rest) target-parameters)
                (push tunnel tunnels)
                (ssh-config-start-jump
@@ -904,11 +913,12 @@ built: the master already carries the connection."
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
                                 &key on-forwarded-tcpip
-                                  on-forwarded-streamlocal mux-fd)
+                                  on-forwarded-streamlocal mux-fd hop-source)
   "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT.
 
 A MUX-FD proxy client does not need the jumps: its connection is the
-master's."
+master's.  HOP-SOURCE is the config file without the command-line -o
+answers, which is all a ProxyJump hop receives."
   (handler-case
       (let ((command (ssh-config-proxy-command options proxy-command)))
         (if mux-fd
@@ -921,7 +931,7 @@ master's."
                       :on-forwarded-streamlocal on-forwarded-streamlocal
                       :mux-fd mux-fd))
             (ssh-config-resolve-hops
-             source
+             (or hop-source source)
              ;; A ProxyCommand carries the stream itself, so there is no chain.
              (if command nil (ssh-config-proxy-jumps options proxy-jump))
              exec-matcher
@@ -965,6 +975,9 @@ passphrase or NIL.  VALIDATE-OPTIONS, when given, is called with the resolved
 OPTIONS and the canonical host before the client is built, so a program can
 apply the checks ssh.c makes on top of readconf and leave before dialling."
   (let* ((source (ssh-config-client-source config options))
+         ;; ssh runs ProxyJump hops as a separate ssh with only -F, so
+         ;; command-line -o answers do not reach them; the config file does.
+         (hop-source (ssh-config-client-source config nil))
          (overrides (ssh-config-client-overrides
                      user port private-key agent passphrase
                      known-hosts host-key-policy host-key-callback resolver
@@ -999,7 +1012,8 @@ apply the checks ssh.c makes on top of readconf and leave before dialling."
                                 :on-forwarded-tcpip on-forwarded-tcpip
                                 :on-forwarded-streamlocal
                                 on-forwarded-streamlocal
-                                :mux-fd mux-fd))
+                                :mux-fd mux-fd
+                                :hop-source hop-source))
      :on-error (lambda (condition) (funcall fail condition)))
     (when (and (not finished) (null on-client))
       (error 'ssh-config-error

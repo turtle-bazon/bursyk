@@ -288,6 +288,7 @@
    #:ssh-config-error-path
    #:ssh-config-error-line
    #:ssh-config-error-keyword
+   #:ssh-jumphost-loop
    ;; sshd_config
    #:ssh-server-config
    #:ssh-server-config-p
