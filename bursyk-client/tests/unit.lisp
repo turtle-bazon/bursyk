@@ -444,6 +444,8 @@ CLI's decision and at the plist it filled."
       ;; A tilde away from the start of a line is ordinary input.
       (is (equal "abc~." (filter "abc~.")))
       (is (equal "a~b" (filter "a~b")))
+      ;; ssh sends an unrecognised sequence on to the peer unchanged.
+      (is (equal "~x" (filter "~x")))
       (is (= 0 forwards)))))
 
 (test log-level-settings-map

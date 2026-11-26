@@ -46,9 +46,12 @@ forwards, disconnect, or open the escape command line."
                           (funcall *escape-commandline-function*))
                         (setf *escape-line-start* t))
                   (t
-                   (format *error-output* "Unknown escape sequence '~C'.~%"
-                           (code-char octet))
-                   (setf *escape-line-start* t))))
+                   ;; An unrecognised sequence is not an error: ssh sends
+                   ;; the escape character and the one after it to the peer
+                   ;; unchanged.
+                   (vector-push-extend (char-code *escape-char*) out)
+                   (vector-push-extend octet out)
+                   (setf *escape-line-start* (member octet '(10 13))))))
                ((and *escape-char*
                      *escape-line-start*
                      (= octet (char-code *escape-char*)))
