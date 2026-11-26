@@ -3326,8 +3326,8 @@ an earlier check, so the file is not read a second time."
 #+win32
 (defun mux-detach-process () nil)
 #+win32
-(defun mux-prepare (host command command-given-p)
-  (declare (ignore host command command-given-p))
+(defun mux-prepare (host command command-given-p &optional options)
+  (declare (ignore host command command-given-p options))
   nil)
 #+win32
 (defun mux-start-configured-master (client)

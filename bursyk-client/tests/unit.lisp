@@ -1454,6 +1454,21 @@ keeps its own LogLevel back; -q and -o LogLevel are recorded in :LOG-LEVEL."
   (is (equal "%z" (burs::mux-expand-control-path
                    "%z" :original "alias"))))
 
+(test mux-prepare-accepts-the-resolved-options
+  ;; MAIN passes the configuration it already resolved for the -O checks.
+  ;; The Windows build uses a stub instead of the control master, and a stub
+  ;; with a shorter parameter list made every Windows session fail with an
+  ;; argument count error before connecting.
+  (let ((burs::*options* (empty-options)))
+    (is (eq :ok
+            (handler-case
+                (progn
+                  (burs::mux-prepare
+                   "example.org" nil nil
+                   (cl-pnet-ssh::%make-ssh-config-options))
+                  :ok)
+              (error () :error))))))
+
 (test mux-expands-a-leading-tilde
   (let ((home (uiop:getenv "HOME"))
         (missing (burs::mux-tilde-expand "~definitely-no-such-user/x")))
