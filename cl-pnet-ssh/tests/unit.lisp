@@ -2964,9 +2964,11 @@ key under the bare name is still only unknown, so the port entry decides."
 (defun ssh-test-run-command (channel command)
   "Run COMMAND, then report its output and status on CHANNEL."
   (multiple-value-bind (stdout stderr status)
-      (uiop:run-program (list "/bin/sh" "-c" command)
-                        :output :string :error-output :string
-                        :ignore-error-status t)
+      (uiop:run-program
+       #+win32 (list "cmd.exe" "/c" command)
+       #-win32 (list "/bin/sh" "-c" command)
+       :output :string :error-output :string
+       :ignore-error-status t)
     (when (plusp (length stdout))
       (ssh-server-channel-write channel stdout))
     (when (plusp (length stderr))
@@ -3409,6 +3411,20 @@ share the test, so each must dispatch the same channel requests."
         (is (equal "hello" stdout))
         (is (equal "oops" stderr))
         (is (eql 3 status)))))
+
+(test server-loopback-exec-on-windows
+  "A Windows loopback runs a child through cmd and returns its exit status.
+
+The rest of the loopback suite sends POSIX shell scripts, so it stays gated
+on /bin/sh; this proves the channel, child and exit plumbing with the shell
+Windows actually has."
+  #-win32 (skip "Windows child execution only")
+  #+win32
+  (multiple-value-bind (stdout stderr status)
+      (ssh-test-loopback-result :command "echo hello")
+    (is (string= (format nil "hello~C~C" #\Return #\Newline) stdout))
+    (is (string= "" stderr))
+    (is (eql 0 status))))
 
 ;;; ---- NIST-curve ECDH key exchange ----
 
@@ -4681,8 +4697,8 @@ environment= list the server recorded for the authenticated key."
 
 The callback is the prompt; returning false has to refuse the host rather
 than connect and quietly skip the known_hosts record."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4696,8 +4712,8 @@ than connect and quietly skip the known_hosts record."
 
 The greeting is what a peer shows in its logs, so leaving it at the
 library's default string hides which program is actually serving."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4710,8 +4726,8 @@ library's default string hides which program is actually serving."
 
 (test server-version-addendum-follows-the-version
   "sshd's VersionAddendum is a comment after the version, not a replacement."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4725,8 +4741,8 @@ library's default string hides which program is actually serving."
 
 (test version-addendum-none-leaves-the-greeting-alone
   "sshd's \"VersionAddendum none\" appends no comment at all."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4740,8 +4756,8 @@ library's default string hides which program is actually serving."
 
 (test server-sends-the-configured-banner
   "sshd's Banner reaches the client before authentication completes."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting banner)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -4759,8 +4775,8 @@ Disconnect immediately if you are not an operator.
 
 (test banner-may-be-a-function-so-the-file-can-change
   "sshd reads its Banner file for each connection; a function keeps that."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (let ((calls 0))
         (multiple-value-bind (opened error greeting banner)
             (ssh-test-loopback-outcome
@@ -4780,8 +4796,8 @@ Disconnect immediately if you are not an operator.
 
 (test no-banner-means-no-userauth-banner-packet
   "A server without Banner leaves the client's banner slot empty."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting banner)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
@@ -7359,8 +7375,8 @@ option the server cannot honour refuses the line rather than being lost."
 
 (test server-records-authorized-key-environment
   "A successful publickey login keeps the environment= options it carried."
-  (if (not (ssh-loopback-available-p))
-      (skip "no ssh-keygen or POSIX shell")
+  (if (not (ssh-keygen-available-p))
+      (skip "no ssh-keygen")
       (multiple-value-bind (opened error greeting banner key-env)
           (ssh-test-loopback-outcome
            (lambda (client fingerprint key)
