@@ -732,6 +732,7 @@ have accepted instead of a local error."
   client)
 
 (defun make-ssh-client (host &key connect-host host-key-host (port 22) connect-port
+                             mux-fd
                              (user (ssh-default-user)) private-key agent
                              passphrase passphrase-callback
                              known-hosts global-known-hosts
@@ -911,8 +912,8 @@ to refuse.
 
 Only the client role uses this entry point; the protocol core beneath it is
 role-neutral."
-  (ssh-resolve-and-connect
-   (ssh-make-client-record host (or connect-host host) host-key-host
+  (let ((record
+          (ssh-make-client-record host (or connect-host host) host-key-host
                            port connect-port user
                            known-hosts
                            host-key-policy
@@ -989,8 +990,20 @@ role-neutral."
                            :forward-x11 forward-x11
                            :forward-x11-trusted forward-x11-trusted
                            :forward-x11-timeout forward-x11-timeout
-                           :xauth-location xauth-location)
-   private-key agent passphrase passphrase-callback))
+                           :xauth-location xauth-location)))
+    (if mux-fd
+        (progn
+          (ssh-client-adopt-mux-fd record mux-fd)
+          (when on-open
+            ;; The configuration resolver still has to attach OPTIONS to the
+            ;; client and run ON-CLIENT first, so the session setup waits for
+            ;; the next event-loop turn, like the post-auth callback it
+            ;; replaces.
+            (cl-pnet:timer-start
+             0 0 (lambda () (funcall on-open record))))
+          record)
+        (ssh-resolve-and-connect record private-key agent passphrase
+                                 passphrase-callback))))
 
 (defun ssh-client-close (client)
   "Close CLIENT and report every open channel as closed."

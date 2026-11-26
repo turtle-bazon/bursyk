@@ -25,6 +25,12 @@
   ;; key is still checked under the host's real port.
   (connect-port 22)
   (phase :connecting)
+  ;; A control-master proxy client rides an existing master connection: its
+  ;; packets are plaintext connection-protocol frames on MUX-FD, not an
+  ;; encrypted SSH transport of its own.
+  (mux-mode nil)
+  (mux-fd nil)
+  (mux-watcher nil)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
   (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.19")
@@ -365,7 +371,11 @@
   (on-eof nil)
   (on-exit nil)
   (on-close nil)
-  (on-error nil))
+  (on-error nil)
+  ;; A mux-proxy channel: every CHANNEL message from the server is handed to
+  ;; this function instead of the usual handlers, and relayed to the proxy
+  ;; client with its channel id restored.
+  (relay nil))
 
 (defun ssh-client-closed-p (client)
   "True once CLIENT has shut down."
@@ -391,6 +401,14 @@
   ;; CL-PNET:CLOSE-CONNECTION is idempotent, so there is nothing expected to
   ;; ignore here; swallowing every error would only hide a real bug.
   (cond
+    ((ssh-client-mux-fd client)
+     (when (ssh-client-mux-watcher client)
+       (ignore-errors
+        (cl-pnet:fd-unwatch (ssh-client-mux-watcher client)))
+       (setf (ssh-client-mux-watcher client) nil))
+     (ignore-errors
+       (cl-pnet-sockets:close-open-fd (ssh-client-mux-fd client)))
+     (setf (ssh-client-mux-fd client) nil))
     ((ssh-client-pipe client) (ssh-proxy-close client))
     ((ssh-client-connection client)
      (cl-pnet:close-connection (ssh-client-connection client)))))
@@ -401,7 +419,8 @@
 A ProxyCommand pipe is not one, and neither is an unconnected client, so
 both answer NIL.  A bound direct connection (and a descriptor received
 with ProxyUseFdpass) is a socket stored without a CL-PNET connection."
-  (or (let ((connection (ssh-client-connection client)))
+  (or (ssh-client-mux-fd client)
+      (let ((connection (ssh-client-connection client)))
         (and connection (cl-pnet:connection-fileno connection)))
       (let ((proxy (ssh-client-pipe client)))
         (when (and proxy
@@ -615,28 +634,57 @@ does a write error during the session, where ssh reports it differently."
 (defun ssh-client-send-bytes (client octets)
   "Queue OCTETS on CLIENT's connection. NIL once the client is closed."
   (unless (ssh-client-closed client)
-    (if (ssh-client-pipe client)
-        (ssh-proxy-send client octets)
-        (let ((connection (ssh-client-connection client)))
-          (when connection
-            (handler-case
-                (cl-pnet:send-data
-                 connection octets
-                 :on-error (lambda (status)
-                             (ssh-client-send-failed client status)))
-              (error (condition) (ssh-client-fail client condition)))))))
+    (cond
+      ((ssh-client-mux-fd client)
+       ;; The control master carries the SSH connection: packets are written
+       ;; to its descriptor unchanged, without encryption or framing of our
+       ;; own beyond the mux packet header built by TRANSMIT.
+       (handler-case
+           (progn
+             (cl-pnet-sockets:write-octets
+              (ssh-client-mux-fd client) octets)
+             t)
+         (error (condition) (ssh-client-fail client condition) nil)))
+      ((ssh-client-pipe client)
+       (ssh-proxy-send client octets))
+      (t
+       (let ((connection (ssh-client-connection client)))
+         (when connection
+           (handler-case
+               (cl-pnet:send-data
+                connection octets
+                :on-error (lambda (status)
+                            (ssh-client-send-failed client status)))
+             (error (condition) (ssh-client-fail client condition))))))))
   (not (ssh-client-closed client)))
+
+(defun ssh-client-mux-frame (payload)
+  "PAYLOAD as OpenSSH's mux-mode packet: u32 length, padlen 0, type, body.
+
+Only the connection protocol travels in mux mode, and there is no padding or
+encryption of its own: the master carries the packets to the server."
+  (when (<= 80 (aref payload 0) 127)
+    (let ((writer (ssh-writer (+ 5 (length payload)))))
+      (ssh-write-u32 writer (+ 1 (length payload)))
+      (ssh-write-u8 writer 0)
+      (ssh-write-octets writer payload)
+      (ssh-writer-output writer))))
 
 (defun ssh-client-transmit-payload (client payload)
   "Frame and send PAYLOAD now, counting it against the rekey limits."
-  (let* ((cipher (ssh-client-cipher client))
-         (octets (ssh-encode-packet payload cipher))
-         (counted (ssh-packet-counted-length (length octets) cipher :send)))
-    (when (ssh-client-send-bytes client octets)
-      (incf (ssh-client-sent-packets client))
-      (incf (ssh-client-sent-bytes client) (length octets))
-      (incf (ssh-client-sent-blocks client)
-            (floor counted (ssh-cipher-state-block-size cipher))))))
+  (if (ssh-client-mux-mode client)
+      (let ((octets (ssh-client-mux-frame payload)))
+        (when (and octets (ssh-client-send-bytes client octets))
+          (incf (ssh-client-sent-packets client))
+          (incf (ssh-client-sent-bytes client) (length octets))))
+      (let* ((cipher (ssh-client-cipher client))
+             (octets (ssh-encode-packet payload cipher))
+             (counted (ssh-packet-counted-length (length octets) cipher :send)))
+        (when (ssh-client-send-bytes client octets)
+          (incf (ssh-client-sent-packets client))
+          (incf (ssh-client-sent-bytes client) (length octets))
+          (incf (ssh-client-sent-blocks client)
+                (floor counted (ssh-cipher-state-block-size cipher)))))))
 
 (defun ssh-client-send-payload (client payload)
   "Frame and send one protocol PAYLOAD, deferring it during a rekey.
@@ -646,6 +694,8 @@ starts a rekey before sending a packet that would exceed RekeyLimit.  The
 queue holds payloads, not wire octets, so each is encrypted with the keys in
 force when it finally goes out."
   (cond
+    ((ssh-client-mux-mode client)
+     (ssh-client-transmit-payload client payload))
     ((and (not (ssh-client-kex-message-p (aref payload 0)))
           (ssh-client-rekeying client))
      (setf (ssh-client-outgoing-queue client)

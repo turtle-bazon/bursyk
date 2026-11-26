@@ -916,6 +916,27 @@ an unrequested one is refused with a CHANNEL_OPEN_FAILURE."
         (is (= cl-pnet-ssh::+ssh-msg-channel-open-failure+ (ssh-read-u8 reader)))
         (is (= 7 (ssh-read-u32 reader)))))))
 
+(test mux-mode-packets-carry-only-the-connection-protocol
+  "A mux proxy client sends plaintext connection-protocol packets.
+
+The frame is a u32 length (pad length plus type and body), a zero pad
+length, then the type and fields, as ssh_packet_send_mux() writes them."
+  (let* ((payload (make-array 5 :element-type '(unsigned-byte 8)
+                              :initial-contents '(90 0 0 0 1)))
+         (frame (cl-pnet-ssh::ssh-client-mux-frame payload)))
+    (is (= 10 (length frame)))
+    (is (= 6 (ssh-octets-uint32 frame 0)))
+    (is (zerop (aref frame 4)))
+    (is (equalp payload (subseq frame 5))))
+  ;; Everything outside the connection protocol is dropped, as OpenSSH does
+  ;; in mux mode.
+  (dolist (type '(1 2 49 80 100 127 128))
+    (let ((payload (make-array 1 :element-type '(unsigned-byte 8)
+                               :initial-contents (list type))))
+      (if (<= 80 type 127)
+          (is (not (null (cl-pnet-ssh::ssh-client-mux-frame payload))))
+          (is (null (cl-pnet-ssh::ssh-client-mux-frame payload)))))))
+
 (test client-accepts-a-forwarded-tcpip-channel-with-a-setup-function
   "A handler returning a function takes over the accepted channel.
 

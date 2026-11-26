@@ -644,6 +644,7 @@ uses whichever of the two it saw first instead of chaining them."
            :connect-host (or connect-host (getf parameters :connect-host))
            :host-key-host (getf parameters :host-key-host)
            :connect-port (or connect-port (getf parameters :port))
+           :mux-fd (getf parameters :mux-fd)
            :port (getf parameters :port)
            :user (getf parameters :user)
            :version-addendum (getf parameters :version-addendum)
@@ -829,8 +830,11 @@ in the tunnel's buffers."
 (defun ssh-config-finish-client (host options hops overrides
                                  on-open on-error on-close
                                  &key proxy-command on-forwarded-tcpip
-                                   on-forwarded-streamlocal)
-  "Build the target client for HOST, directly or through HOPS."
+                                   on-forwarded-streamlocal mux-fd)
+  "Build the target client for HOST, directly or through HOPS.
+
+MUX-FD makes the target a control-master proxy client, so HOPS are not
+built: the master already carries the connection."
   (let ((target (ssh-config-client-parameters
                  host options
                  :user (getf overrides :user)
@@ -848,8 +852,10 @@ in the tunnel's buffers."
                  (getf overrides :kbd-interactive-callback)
                  :canonicalized t
                  :proxy-command proxy-command)))
+    (when mux-fd
+      (setf (getf target :mux-fd) mux-fd))
     (cond
-      (hops
+      ((and hops (null mux-fd))
        (ssh-config-start-chain
         (let ((first t))
           (mapcar (lambda (entry)
@@ -898,25 +904,37 @@ in the tunnel's buffers."
                                 exec-matcher overrides on-open on-error
                                 on-close fail on-built
                                 &key on-forwarded-tcpip
-                                  on-forwarded-streamlocal)
-  "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT."
+                                  on-forwarded-streamlocal mux-fd)
+  "Resolve the jumps for OPTIONS, build the target, and call ON-BUILT.
+
+A MUX-FD proxy client does not need the jumps: its connection is the
+master's."
   (handler-case
       (let ((command (ssh-config-proxy-command options proxy-command)))
-        (ssh-config-resolve-hops
-         source
-         ;; A ProxyCommand carries the stream itself, so there is no chain.
-         (if command nil (ssh-config-proxy-jumps options proxy-jump))
-         exec-matcher
-         (lambda (hops)
-           (funcall on-built
-                    (ssh-config-finish-client
-                     host options hops overrides
-                     on-open on-error on-close
-                     :proxy-command command
-                     :on-forwarded-tcpip on-forwarded-tcpip
-                     :on-forwarded-streamlocal
-                     on-forwarded-streamlocal)))
-         fail))
+        (if mux-fd
+            (funcall on-built
+                     (ssh-config-finish-client
+                      host options nil overrides
+                      on-open on-error on-close
+                      :proxy-command command
+                      :on-forwarded-tcpip on-forwarded-tcpip
+                      :on-forwarded-streamlocal on-forwarded-streamlocal
+                      :mux-fd mux-fd))
+            (ssh-config-resolve-hops
+             source
+             ;; A ProxyCommand carries the stream itself, so there is no chain.
+             (if command nil (ssh-config-proxy-jumps options proxy-jump))
+             exec-matcher
+             (lambda (hops)
+               (funcall on-built
+                        (ssh-config-finish-client
+                         host options hops overrides
+                         on-open on-error on-close
+                         :proxy-command command
+                         :on-forwarded-tcpip on-forwarded-tcpip
+                         :on-forwarded-streamlocal
+                         on-forwarded-streamlocal)))
+             fail)))
     (error (condition) (funcall fail condition))))
 
 (defun make-ssh-client-from-config
@@ -926,7 +944,8 @@ in the tunnel's buffers."
               proxy-command exec-matcher options on-client on-config-error
               on-open on-error on-close on-forwarded-tcpip
               on-forwarded-streamlocal resolver canonical-resolver
-              password-callback kbd-interactive-callback validate-options)
+              password-callback kbd-interactive-callback validate-options
+              mux-fd)
   "Connect to HOST exactly as ssh_config describes, return at once.
 
 CONFIG is an ssh-config, a path, or NIL for ~/.ssh/config; its HostName,
@@ -979,7 +998,8 @@ apply the checks ssh.c makes on top of readconf and leave before dialling."
                                 on-close fail on-built
                                 :on-forwarded-tcpip on-forwarded-tcpip
                                 :on-forwarded-streamlocal
-                                on-forwarded-streamlocal))
+                                on-forwarded-streamlocal
+                                :mux-fd mux-fd))
      :on-error (lambda (condition) (funcall fail condition)))
     (when (and (not finished) (null on-client))
       (error 'ssh-config-error

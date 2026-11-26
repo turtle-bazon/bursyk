@@ -50,12 +50,15 @@ numbers in \"channel N:\" diagnostics identical."
             return id)))
 
 (defun ssh-open-channel (client type &key open-extra on-data on-open on-eof
-                                      on-exit on-close on-error)
+                                      on-exit on-close on-error
+                                      window max-packet)
   "Register a channel of TYPE on CLIENT and ask the peer for it.
 
 The returned channel is usable immediately: requests and writes made before
 the open confirmation are queued and flushed once the peer answers.  ON-OPEN
-runs once the peer has confirmed the channel, before any of its data."
+runs once the peer has confirmed the channel, before any of its data.
+WINDOW and MAX-PACKET override the client defaults; a mux proxy passes the
+values its downstream client advertised."
   (let* ((id (ssh-client-allocate-channel-id client))
          (channel (%make-ssh-channel
                    :client client
@@ -63,8 +66,9 @@ runs once the peer has confirmed the channel, before any of its data."
                    :type type
                    :open-extra (or open-extra
                                    (make-array 0 :element-type '(unsigned-byte 8)))
-                   :local-window (ssh-client-window client)
-                   :local-max-packet (ssh-client-max-packet client)
+                   :local-window (or window (ssh-client-window client))
+                   :local-max-packet (or max-packet
+                                         (ssh-client-max-packet client))
                    :on-data on-data :on-open on-open :on-eof on-eof
                    :on-exit on-exit
                    :on-close on-close :on-error on-error)))
@@ -707,7 +711,12 @@ arrived before the request (reverse dynamic SOCKS) can send them."
         (ssh-client-handle-channel-open client reader)
         (let ((channel (ssh-client-channel-for client (ssh-read-u32 reader))))
           (when channel
-            (case type
+            (if (and (ssh-channel-relay channel)
+                     (not (eq (ssh-channel-state channel) :opening)))
+                ;; A mux-proxy channel is relayed verbatim; the proxy client
+                ;; owns its windows, buffers and requests.
+                (funcall (ssh-channel-relay channel) channel payload)
+                (case type
               (#.+ssh-msg-channel-open-confirmation+
                (ssh-channel-handle-open-confirmation channel reader))
               (#.+ssh-msg-channel-open-failure+
@@ -775,7 +784,7 @@ arrived before the request (reverse dynamic SOCKS) can send them."
                      (funcall (ssh-channel-on-error channel) channel
                               (make-condition 'ssh-channel-error
                                               :channel channel
-                                              :detail "request refused")))))))))))
+                                              :detail "request refused"))))))))))))
 
 ;;; ---- Client shutdown ----
 

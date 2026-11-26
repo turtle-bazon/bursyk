@@ -2799,6 +2799,29 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   (unless *finishing*
     (setf *finishing* t)
     (restore-terminal)
+    ;; clientloop.c reports a connection the peer dropped before it reports
+    ;; the interactive close.
+    (when (and *client*
+               (eq (cl-pnet-ssh::ssh-client-close-reason *client*)
+                   :peer-closed)
+               (not (member (log-level-setting)
+                            '("quiet" "fatal" "error")
+                            :test #'string-equal)))
+      (format *error-output*
+              "Connection to ~A closed by remote host.~C~C"
+              (cl-pnet-ssh:ssh-client-host *client*)
+              #\Return #\Newline)
+      (finish-output *error-output*))
+    ;; client_loop() reports the end of an interactive session before it
+    ;; sends DISCONNECT, and only when the log level still shows INFO.
+    (when (and *pty-channel* *client*
+               (not (member (log-level-setting)
+                            '("quiet" "fatal" "error")
+                            :test #'string-equal)))
+      (format *error-output* "Connection to ~A closed.~C~C"
+              (cl-pnet-ssh:ssh-client-host *client*)
+              #\Return #\Newline)
+      (finish-output *error-output*))
     (stop-pty-timer)
     (stop-winch)
     (stop-stdin)
@@ -6681,6 +6704,7 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
    :host-key-callback #'ask-host-key
    :proxy-jump (getf *options* :jump)
    :proxy-command (getf *options* :proxy-command)
+   :mux-fd *mux-proxy-fd*
    ;; Every -o keyword reaches the same resolver the file uses, so facts the
    ;; command line has no dedicated flag for (HostName, ConnectTimeout,
    ;; ServerAliveInterval, ...) work too.
@@ -6692,7 +6716,10 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
    (lambda (options canonical)
      (check-resolved-options options command-given-p)
      (check-forward-agent-socket options)
-     (report-missing-identity-files options canonical))
+     ;; ssh attaches to the master before load_public_identity_files(), so an
+     ;; -O proxy client never reports identity files it will not load.
+     (unless *mux-proxy-fd*
+       (report-missing-identity-files options canonical)))
    :on-client (lambda (client)
                 (setf *client* client)
                 (apply-config-log-level client)
@@ -6760,10 +6787,7 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                         #'escape-background)
                    *escape-disconnect-function*
                    (lambda ()
-                     (format *error-output* "Connection to ~A closed.~C~C"
-                             (cl-pnet-ssh:ssh-client-host client)
-                             #\Return #\Newline)
-                     (finish-output *error-output*)
+                     ;; FINISH prints client_loop()'s interactive close line.
                      (finish *status*))
                    *escape-commandline-function*
                    (when (escape-commandline-enabled-p client)
@@ -6864,7 +6888,17 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                           (log-notice "burs: ~A~%" condition))))))
                (finish 255))
    :on-close (lambda (client reason)
-               (declare (ignore client reason))
+               ;; clientloop.c's input callback reports a connection the peer
+               ;; dropped, not the ordinary end of a session.
+               (when (eq reason :peer-closed)
+                 (unless (member (log-level-setting)
+                                 '("quiet" "fatal" "error")
+                                 :test #'string-equal)
+                   (format *error-output*
+                           "Connection to ~A closed by remote host.~C~C"
+                           (cl-pnet-ssh:ssh-client-host client)
+                           #\Return #\Newline)
+                   (finish-output *error-output*)))
                (finish *status*))))
 
 (defun background-child-arguments ()

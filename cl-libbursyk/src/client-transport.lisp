@@ -71,29 +71,58 @@ line, and NIL while the line is still incomplete."
               (ssh-log "remote banner ~A" line)
               :banner))))))
 
-(defun ssh-client-advance (client)
-  "Process every complete message in CLIENT's receive buffer."
+(defun ssh-client-advance-mux (client)
+  "Process every complete mux-mode packet in CLIENT's receive buffer.
+
+Each packet is u32 length, a zero pad length, the message type, and the
+message body; there is no padding or encryption of the client's own because
+the control master carries the packets to the server."
   (handler-case
       (iter (while (not (ssh-client-closed-p client)))
-        (if (eq (ssh-client-phase client) :version)
-            (unless (ssh-client-read-version-line client) (leave))
-            (multiple-value-bind (payload consumed)
-                (ssh-decode-packet (ssh-client-incoming client)
-                                   (ssh-client-cipher client))
-              (when (eq payload :incomplete) (leave))
-              (ssh-client-buffer-consume client consumed)
-              (let ((cipher (ssh-client-cipher client)))
-                (when cipher
-                  (incf (ssh-client-received-packets client))
-                  (incf (ssh-client-received-bytes client) consumed)
-                  (incf (ssh-client-received-blocks client)
-                        (floor (ssh-packet-counted-length
-                                consumed cipher :receive)
-                               (ssh-cipher-state-block-size cipher)))))
-              (ssh-client-handle-payload client payload)
-              (ssh-client-maybe-rekey client))))
+        (let ((buffer (ssh-client-incoming client)))
+          (when (< (fill-pointer buffer) 6) (leave))
+          (let ((length (ssh-octets-uint32 buffer 0)))
+            (when (or (< length 2) (> length 262144))
+              (error "invalid mux packet length ~D" length))
+            (when (< (fill-pointer buffer) (+ 4 length)) (leave))
+            (let ((type (aref buffer 5))
+                  (body (subseq buffer 6 (+ 4 length))))
+              (ssh-client-buffer-consume client (+ 4 length))
+              (let ((payload (make-array (1+ (length body))
+                                         :element-type '(unsigned-byte 8))))
+                (setf (aref payload 0) type)
+                (replace payload body :start1 1)
+                (incf (ssh-client-received-packets client))
+                (incf (ssh-client-received-bytes client) (+ 4 length))
+                (ssh-client-handle-payload client payload))))))
     (error (condition)
       (ssh-client-fail client condition))))
+
+(defun ssh-client-advance (client)
+  "Process every complete message in CLIENT's receive buffer."
+  (if (ssh-client-mux-mode client)
+      (ssh-client-advance-mux client)
+      (handler-case
+          (iter (while (not (ssh-client-closed-p client)))
+            (if (eq (ssh-client-phase client) :version)
+                (unless (ssh-client-read-version-line client) (leave))
+                (multiple-value-bind (payload consumed)
+                    (ssh-decode-packet (ssh-client-incoming client)
+                                       (ssh-client-cipher client))
+                  (when (eq payload :incomplete) (leave))
+                  (ssh-client-buffer-consume client consumed)
+                  (let ((cipher (ssh-client-cipher client)))
+                    (when cipher
+                      (incf (ssh-client-received-packets client))
+                      (incf (ssh-client-received-bytes client) consumed)
+                      (incf (ssh-client-received-blocks client)
+                            (floor (ssh-packet-counted-length
+                                    consumed cipher :receive)
+                                   (ssh-cipher-state-block-size cipher)))))
+                  (ssh-client-handle-payload client payload)
+                  (ssh-client-maybe-rekey client))))
+        (error (condition)
+          (ssh-client-fail client condition)))))
 
 (defun ssh-client-peer-closed (client)
   "The peer closed the connection, in whatever phase CLIENT had reached.
@@ -121,6 +150,33 @@ exit status is 255 either way, as both paths are fatal."
         (progn
           (ssh-client-buffer-append client data)
           (ssh-client-advance client)))))
+
+(defun ssh-client-read-mux-fd (client)
+  "Read the control master's descriptor and process its mux packets."
+  (unless (ssh-client-closed-p client)
+    (multiple-value-bind (octets count error)
+        (cl-pnet-sockets:read-octets (ssh-client-mux-fd client) 65536)
+      (cond
+        ((plusp count) (ssh-client-receive client octets))
+        ((and (minusp count) (member error '(4 11))) nil)
+        (t (ssh-client-peer-closed client))))))
+
+(defun ssh-client-adopt-mux-fd (client fd)
+  "Make CLIENT speak mux-mode SSH over the already-connected control FD.
+
+The master has finished the banner exchange and authentication; from here
+the client sends connection-protocol packets and receives the server's,
+with the master relaying them."
+  (setf (ssh-client-mux-mode client) t
+        (ssh-client-mux-fd client) fd
+        (ssh-client-phase client) :ready)
+  (setf (ssh-client-mux-watcher client)
+        (cl-pnet:fd-watch
+         fd :on-readable
+         (lambda (watcher)
+           (declare (ignore watcher))
+           (ssh-client-read-mux-fd client))))
+  client)
 
 (defun ssh-client-handle-payload (client payload)
   "Dispatch one decrypted protocol message."

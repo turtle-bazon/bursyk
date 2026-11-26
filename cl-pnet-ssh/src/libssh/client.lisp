@@ -1185,6 +1185,7 @@ transport limitation into the same diagnostic."
                           host-key-host
                           (port 22)
                           connect-port
+                          mux-fd
                           (user (ssh-default-user))
                           private-key
                           agent
@@ -1278,6 +1279,10 @@ the pure backend.  PROXY-COMMAND asks libssh to run the helper and carry the
 stream on its pipes instead of dialling."
   (ssh-plibssh-reject-option "HostbasedAuthentication" hostbased-authentication)
   (ssh-plibssh-reject-option "HostbasedKeys" hostbased-keys)
+  (when mux-fd
+    (error 'ssh-unsupported-feature
+           :feature :mux-proxy
+           :detail "control-master proxy mode by the libssh transport"))
   ;; A configured algorithm this libssh cannot negotiate is refused before
   ;; the event loop starts: libssh would otherwise reject the option from a
   ;; descriptor callback, where the error is logged and the connection simply
