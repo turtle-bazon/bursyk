@@ -19,12 +19,27 @@
 (defvar *escape-forwards-function* nil)
 (defvar *escape-disconnect-function* nil)
 (defvar *escape-commandline-function* nil)
+(defvar *escape-break-function* nil)
+(defvar *escape-info-function* nil)
+(defvar *escape-rekey-function* nil)
+(defvar *escape-log-level-function* nil)
+(defvar *escape-suspend-function* nil)
+(defvar *escape-background-function* nil)
+
+(defun escape-write-command (character)
+  "Echo the escape sequence ssh shows before a command's output.
+
+The session terminal is raw, so the line ending has to be spelled out."
+  (format *error-output* "~C~C~C~C" *escape-char* character
+          #\Return #\Newline)
+  (finish-output *error-output*))
 
 (defun escape-filter (octets)
   "Return OCTETS with ssh escape sequences consumed.
 
 The command callbacks are set by the application: they print help, list
-forwards, disconnect, or open the escape command line."
+forwards, disconnect, send a break, show connection information, rekey,
+change the log level, suspend, or open the escape command line."
   (let ((out (make-array 0 :element-type '(unsigned-byte 8)
                            :adjustable t :fill-pointer 0)))
     (loop for octet across octets
@@ -32,18 +47,46 @@ forwards, disconnect, or open the escape command line."
                (*escape-pending*
                 (setf *escape-pending* nil)
                 (case (code-char octet)
-                  (#\# (when *escape-forwards-function*
+                  (#\# (escape-write-command #\#)
+                        (when *escape-forwards-function*
                           (funcall *escape-forwards-function*))
                         (setf *escape-line-start* t))
-                  (#\? (when *escape-help-function*
+                  (#\? (escape-write-command #\?)
+                        (when *escape-help-function*
                           (funcall *escape-help-function*))
                         (setf *escape-line-start* t))
                   (#\. (when *escape-disconnect-function*
                           (funcall *escape-disconnect-function*)))
+                  (#\B (escape-write-command #\B)
+                        (when *escape-break-function*
+                          (funcall *escape-break-function*))
+                        (setf *escape-line-start* t))
+                  (#\I (escape-write-command #\I)
+                        (when *escape-info-function*
+                          (funcall *escape-info-function*))
+                        (setf *escape-line-start* t))
+                  (#\R (when *escape-rekey-function*
+                          (funcall *escape-rekey-function*))
+                        (setf *escape-line-start* t))
+                  (#\V (when *escape-log-level-function*
+                          (funcall *escape-log-level-function* -1))
+                        (setf *escape-line-start* t))
+                  (#\v (when *escape-log-level-function*
+                          (funcall *escape-log-level-function* 1))
+                        (setf *escape-line-start* t))
+                  (#.(code-char 26)
+                   (when *escape-suspend-function*
+                     (funcall *escape-suspend-function*))
+                   (setf *escape-line-start* t))
+                  (#\& (when *escape-background-function*
+                          (funcall *escape-background-function*))
+                        (setf *escape-line-start* t))
                   (#\~ (vector-push-extend (char-code *escape-char*) out)
                         (setf *escape-line-start* nil))
-                  (#\C (when *escape-commandline-function*
-                          (funcall *escape-commandline-function*))
+                  (#\C (if *escape-commandline-function*
+                           (funcall *escape-commandline-function*)
+                           (format *error-output* "commandline disabled~C~C"
+                                   #\Return #\Newline))
                         (setf *escape-line-start* t))
                   (t
                    ;; An unrecognised sequence is not an error: ssh sends
@@ -93,6 +136,13 @@ forwards, disconnect, or open the escape command line."
 ;;; intervals instead of being written as they arrive.
 (defvar *pty-channel* nil
   "The session channel that asked for a pty, or NIL for a plain session.")
+(defvar *session-loop-started* nil
+  "True once authentication succeeded and the session loop is set up.
+
+client_loop() prints the verbose byte summary when it returns; a failure
+before it starts (an authentication refusal, for example) does not.")
+(defvar *session-loop-start* nil
+  "CL's internal real-time clock when the session loop began.")
 (defvar *keystroke-timer* nil
   "The one-shot timer that releases the next quantised keystroke.")
 (defvar *keystroke-active* nil

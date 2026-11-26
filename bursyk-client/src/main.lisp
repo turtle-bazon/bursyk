@@ -104,6 +104,12 @@ flag it came from instead of the ssh_config wording used later.  The scanner
 that binds it runs before this file's definition of FORWARDING-FAIL, so the
 declaration lives here.")
 
+(defvar *forwarding-escape-kind* nil
+  "The -L/-R/-D command line being parsed, when it came from the ~C console.
+
+A bad specification there is a logit() line and goes back to the session, not
+the command-line fatal ssh uses while reading argv.")
+
 (defun burs-flag (key description &key short long)
   (clingon:make-option :flag
                        :key key
@@ -1729,6 +1735,14 @@ silence the channel diagnostics a session still reports by exit status."
                   :test #'string-equal)
     (apply #'log-message format-string arguments)))
 
+(defun log-verbose (format-string &rest arguments)
+  "Print a verbose() line, which only a VERBOSE or DEBUG log level shows.
+
+verbose() is SYSLOG_LEVEL_VERBOSE, so the default INFO level and -q drop it
+and -v or LogLevel=VERBOSE print it without a debug prefix."
+  (when (plusp (getf *options* :verbose 0))
+    (apply #'log-message format-string arguments)))
+
 (defun log-error (format-string &rest arguments)
   "Print an error() line, which only LogLevel FATAL or QUIET silences."
   (unless (member (log-level-setting) '("quiet" "fatal")
@@ -2039,14 +2053,23 @@ alias works while other spellings of the same word do not."
 
 (defun forwarding-fail (spec control &rest arguments)
   "Report an unusable forwarding SPEC, in ssh's words for the active flag."
-  (if *forwarding-command-line-kind*
-      (progn
-        (format *error-output* "Bad ~A forwarding specification '~A'~%"
-                *forwarding-command-line-kind* spec)
-        (finish-output *error-output*)
-        (restore-terminal)
-        (uiop:quit 255))
-      (apply #'fail control arguments)))
+  (cond
+    (*forwarding-escape-kind*
+     ;; process_cmdline() logs one line and keeps the session.
+     (log-info "~A"
+               (if (string= *forwarding-escape-kind* "close")
+                   "Bad forwarding close specification."
+                   (format nil "Bad ~A forwarding specification."
+                           *forwarding-escape-kind*)))
+     (throw 'escape-forward-failure nil))
+    (*forwarding-command-line-kind*
+     (progn
+       (format *error-output* "Bad ~A forwarding specification '~A'~%"
+               *forwarding-command-line-kind* spec)
+       (finish-output *error-output*)
+       (restore-terminal)
+       (uiop:quit 255)))
+    (t (apply #'fail control arguments))))
 
 (defun expand-forward-spec (spec)
   "SPEC with ${NAME} expanded as parse_forward's dollar_expand does.
@@ -2455,17 +2478,21 @@ echo and line editing."
   "Run COMMAND on CHANNEL's PTY."
   (send-channel-request
    channel "exec" t
-   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer command))))
+   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer command)))
+  (cl-pnet-ssh::ssh-channel-set-x-type channel "session:command"))
 
 (defun send-shell-request (channel)
   "Start the peer's login shell on CHANNEL, the ssh(1) session default."
   (send-channel-request
-   channel "shell" t (lambda (writer) (declare (ignore writer)))))
+   channel "shell" t (lambda (writer) (declare (ignore writer))))
+  (cl-pnet-ssh::ssh-channel-set-x-type channel "session:shell"))
 
 (defun send-subsystem-request (channel subsystem)
   (send-channel-request
    channel "subsystem" t
-   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer subsystem))))
+   (lambda (writer) (cl-pnet-ssh::ssh-write-text writer subsystem)))
+  (cl-pnet-ssh::ssh-channel-set-x-type
+   channel (concatenate 'string "session:subsystem:" subsystem)))
 
 (defun tty-setting (client)
   "The RequestTTY decision, the command line winning over the config file."
@@ -2722,6 +2749,32 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
   #+sbcl (sb-ext:exit :code status :abort t)
   #-sbcl (uiop:quit status))
 
+(defun report-transfer-stats (client)
+  "Print ssh's verbose exit summary: wire bytes and their rates."
+  (let* ((info (cl-pnet-ssh::ssh-client-connection-info client))
+         (traffic (getf info :traffic))
+         (start (or (getf info :connected-at) (get-universal-time)))
+         (seconds
+           (if *session-loop-start*
+               (max 0.0d0
+                    (/ (float (- (get-internal-real-time)
+                                 *session-loop-start*)
+                              1.0d0)
+                       (float internal-time-units-per-second 1.0d0)))
+               (coerce (max 0 (- (get-universal-time) start)) 'double-float)))
+         (sent (or (getf traffic :sent-bytes) 0))
+         (received (or (getf traffic :received-bytes) 0)))
+    (format *error-output*
+            "Transferred: sent ~D, received ~D bytes, in ~,1F seconds~C~C"
+            sent received seconds #\Return #\Newline)
+    (when (plusp seconds)
+      (format *error-output*
+              "Bytes per second: sent ~,1F, received ~,1F~C~C"
+              (float (/ sent seconds) 1.0d0)
+              (float (/ received seconds) 1.0d0)
+              #\Return #\Newline))
+    (finish-output *error-output*)))
+
 (defun finish (status)
   ;; Closing the client below reports its open channels closed, whose
   ;; callbacks call FINISH again; only the outermost call may quit, or the
@@ -2733,6 +2786,9 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
     (stop-winch)
     (stop-stdin)
     (stop-keystroke-obfuscation)
+    (when (and *session-loop-started*
+               (plusp (getf *options* :verbose 0)))
+      (ignore-errors (report-transfer-stats *client*)))
     (stop-forwards)
     ;; Stop listening before the connection goes away, so a client cannot
     ;; connect to a master that is already closing.
@@ -3270,31 +3326,192 @@ closed afterwards."
           options))))
 
 (defun print-escape-help ()
-  (format *error-output*
-          "~%Supported escape sequences:~%  ~C.  - terminate connection~%  ~C#  - list forwarded connections~%  ~C?  - this message~%  ~C~C  - send the escape character by typing it twice~%"
-          *escape-char* *escape-char* *escape-char*
-          *escape-char* *escape-char*)
+  "Print ssh's escape help, in clientloop.c's order and spelling."
+  (flet ((line (command text)
+           (format *error-output* " ~C~3A - ~A~C~C"
+                   *escape-char* command text #\Return #\Newline)))
+    (format *error-output* "Supported escape sequences:~C~C"
+            #\Return #\Newline)
+    (line "." "terminate connection (and any multiplexed sessions)")
+    (line "B" "send a BREAK to the remote system")
+    (when *escape-commandline-function*
+      (line "C" "open a command line"))
+    (line "I" "show connection information")
+    (line "R" "request rekey")
+    (line "V/v" "decrease/increase verbosity (LogLevel)")
+    (line "^Z" "suspend ssh")
+    (line "#" "list forwarded connections")
+    (line "&" "background ssh (when waiting for connections to terminate)")
+    (line "?" "this message")
+    (format *error-output* " ~C~C   - send the escape character by typing it twice~C~C"
+            *escape-char* *escape-char* #\Return #\Newline)
+    (format *error-output*
+            "(Note that escapes are only recognized immediately after newline.)~C~C"
+            #\Return #\Newline))
   (finish-output *error-output*))
 
+(defun client-session-channel-status (out channel)
+  "Write the client-session channel as channel_format_status() spells it.
+
+Remote names, the extended type and the local pty flag come from the
+channel; the descriptor numbers are this implementation's own."
+  (let* ((state (cl-pnet-ssh::ssh-channel-state channel))
+         (open (member state '(:open :closing)))
+         (remote-id (cl-pnet-ssh::ssh-channel-remote-id channel))
+         (x-type (cl-pnet-ssh::ssh-channel-x-type channel))
+         (ctype (or x-type
+                    (cl-pnet-ssh::ssh-channel-type channel)
+                    "session"))
+         (eof (cl-pnet-ssh::ssh-channel-sent-eof channel))
+         (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel)))
+    (mux-format-channel-status
+     out (cl-pnet-ssh::ssh-channel-local-id channel) "client-session"
+     (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
+     ;; i3 is CHAN_INPUT_CLOSED: the local side has sent EOF.
+     (if eof 3 0) 0
+     (if (eq state :closing) 3 0)
+     (if write-queue (fill-pointer write-queue) 0)
+     "write" 0
+     0 1 2 -1 -1 nil 0
+     1 1
+     ;; remote_has_tty without isatty is "RT"; a pty session requests one.
+     (if (eq channel *pty-channel*) "RT" "")
+     "I")))
+
+(defun client-channel-open-message ()
+  "The text ~# prints: channels.c's channel_open_message() for this client.
+
+Listener channels are hidden by channel_open_message(), as are closed and
+abandoned ones, so only the session and any live forwarded connections
+remain."
+  (with-output-to-string (out)
+    (format out "The following connections are open:")
+    (mux-write-crlf out)
+    (let ((entries '())
+          (printed (make-hash-table :test #'eql)))
+      (when *channel*
+        (setf (gethash (cl-pnet-ssh::ssh-channel-local-id *channel*) printed)
+              t)
+        (push (cons (cl-pnet-ssh::ssh-channel-local-id *channel*)
+                    (lambda (out)
+                      (client-session-channel-status out *channel*)))
+              entries))
+      (when *client*
+        (maphash
+         (lambda (id channel)
+           (unless (or (gethash id printed)
+                       (eq channel *channel*)
+                       (eq (cl-pnet-ssh::ssh-channel-state channel) :closed))
+             (push (cons id
+                         (lambda (out)
+                           (mux-generic-channel-status out channel)))
+                   entries)))
+         (cl-pnet-ssh::ssh-client-channels *client*)))
+      (dolist (entry (sort entries #'< :key #'car))
+        (funcall (cdr entry) out)))))
+
 (defun print-escape-forwards ()
-  (format *error-output* "~%Forwarded connections:~%")
-  (dolist (forward *forwards*)
-    (format *error-output* "  local ~A to ~A~%"
-            (or (forward-bind-path forward)
-                (format nil "~A:~D" (or (forward-bind-address forward) "*")
-                        (forward-bind-port forward)))
-            (forward-target-name forward)))
-  (dolist (forward *remote-forwards*)
-    (format *error-output* "  remote ~A to ~A~%"
-            (or (forward-bind-path forward)
-                (format nil "~A:~D" (or (forward-bind-address forward) "*")
-                        (forward-bind-port forward)))
-            (forward-target-name forward)))
-  (dolist (forward *dynamic-forwards*)
-    (format *error-output* "  dynamic ~A:~D~%"
-            (dynamic-bind-address forward)
-            (dynamic-forward-bind-port forward)))
+  (princ (client-channel-open-message) *error-output*)
   (finish-output *error-output*))
+
+(defun escape-send-break ()
+  "Send a break request, as ~B does."
+  (when *channel*
+    (send-channel-request
+     *channel* "break" nil
+     (lambda (writer)
+       (cl-pnet-ssh::ssh-write-u32 writer 1000)))))
+
+(defun escape-print-connection-info ()
+  "Print connection_info_message(), as ~I does."
+  (format *error-output* "~A" (mux-connection-info-message nil))
+  (finish-output *error-output*))
+
+(defun escape-request-rekey ()
+  "Ask the transport to start a key exchange, as ~R does.
+
+The libssh transport exposes no rekey entry point, so it ignores the
+request rather than failing the session."
+  (let ((rekey (find-symbol "SSH-CLIENT-START-REKEY" :cl-pnet-ssh)))
+    (when (and rekey (fboundp rekey) *client*)
+      (funcall rekey *client*))))
+
+(defparameter +escape-log-levels+
+  '("quiet" "fatal" "error" "info" "verbose" "debug" "debug2" "debug3")
+  "OpenSSH's LogLevel names in order, as log_level_name() spells them.")
+
+(defun escape-adjust-log-level (delta)
+  "Raise or lower the log level by DELTA, as ~v and ~V do."
+  (let* ((current (string-downcase (or (log-level-setting) "info")))
+         (current (if (string= current "debug1") "debug" current))
+         (index (or (position current +escape-log-levels+ :test #'string=)
+                    3))
+         (next (max 0 (min (1- (length +escape-log-levels+))
+                           (+ index delta))))
+         (name (nth next +escape-log-levels+)))
+    (setf (getf *options* :log-level) name)
+    (multiple-value-bind (quiet verbose) (log-level-settings name)
+      (setf (getf *options* :quiet) quiet
+            (getf *options* :verbose) verbose))
+    (format *error-output* "~C~C [LogLevel ~A]~C~C"
+            *escape-char* (if (plusp delta) #\v #\V)
+            (string-upcase name) #\Return #\Newline)
+    (finish-output *error-output*)))
+
+(defun stop-forward-listeners ()
+  "Close every forwarding listener, leaving established tunnels running.
+
+This is the part of channel_stop_listening() that ~& needs: no new
+connections are accepted, but the channels already carrying data stay."
+  (dolist (forward *forwards*)
+    (close-forward-listeners forward)
+    (when (forward-listener-watcher forward)
+      (ignore-errors (cl-pnet:fd-unwatch (forward-listener-watcher forward)))
+      (setf (forward-listener-watcher forward) nil))
+    (when (forward-listener-fd forward)
+      (ignore-errors
+        (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
+      (setf (forward-listener-fd forward) nil)))
+  (setf *forwards* nil)
+  (dolist (forward *dynamic-forwards*)
+    (close-dynamic-forward-listeners forward))
+  (setf *dynamic-forwards* nil
+        *remote-forwards* nil))
+
+(defun escape-background ()
+  "Detach this client as ~& does, leaving established connections alive.
+
+The listener channels are closed first, stdin is treated as EOF, and the
+process forks; the parent exits so the shell gets its prompt back while the
+child keeps serving the channels it already carries."
+  (format *error-output* "~C& [backgrounded]~C~C"
+          *escape-char* #\Return #\Newline)
+  (finish-output *error-output*)
+  (restore-terminal)
+  (stop-forward-listeners)
+  (when *channel*
+    (ignore-errors (cl-pnet-ssh:ssh-channel-eof *channel*)))
+  (stop-stdin)
+  (let* ((package (find-package :sb-posix))
+         (fork (and package (find-symbol "FORK" package)))
+         (pid (and fork (fboundp fork)
+                   (ignore-errors (funcall fork)))))
+    (when (and pid (plusp pid))
+      ;; This is the parent; the child continues the event loop.
+      (quit-now 0))))
+
+(defun escape-suspend ()
+  "Print ~^Z's notice, give the terminal back, and stop this process."
+  (format *error-output* "~C^Z [suspend ssh]~C~C"
+          *escape-char* #\Return #\Newline)
+  (finish-output *error-output*)
+  (restore-terminal)
+  #+sbcl
+  (call-with-deferrable-signals-unblocked
+   (lambda ()
+     (sb-unix:unix-kill (sb-unix:unix-getpid) sb-unix:sigtstp)))
+  ;; The shell may have changed the terminal settings while we were stopped.
+  (terminal-enter-raw))
 
 (defun parse-cancel-listen (spec)
   "SPEC as (VALUES ADDRESS PORT PATH) for -KL/-KR/-KD."
@@ -3386,47 +3603,86 @@ closed afterwards."
                         writer (forward-bind-port forward)))))
         t))))
 
+(defun escape-commandline-help ()
+  "Print clientloop.c's process_cmdline() command list at logit()."
+  (log-info "Commands:")
+  (log-info "      -L[bind_address:]port:host:hostport    Request local forward")
+  (log-info "      -R[bind_address:]port:host:hostport    Request remote forward")
+  (log-info "      -D[bind_address:]port                  Request dynamic forward")
+  (log-info "      -KL[bind_address:]port                 Cancel local forward")
+  (log-info "      -KR[bind_address:]port                 Cancel remote forward")
+  (log-info "      -KD[bind_address:]port                 Cancel dynamic forward")
+  (when (permit-local-command-p *client*)
+    (log-info "      !args                                  Execute local command")))
+
+(defun escape-local-command (command)
+  "Run COMMAND locally, as process_cmdline()'s !args does."
+  (when (and (permit-local-command-p *client*)
+             (plusp (length command)))
+    (let ((shell (or (uiop:getenv "SHELL") "/bin/sh")))
+      (handler-case
+          (call-with-deferrable-signals-unblocked
+           (lambda ()
+             (uiop:run-program
+              (list shell "-c" command)
+              :input :interactive :output :interactive
+              :error-output :interactive)))
+        (error () nil)))))
+
 (defun execute-escape-command (line)
-  "Run one ~C command line."
-  (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline) line)))
+  "Run one ~C command line, in process_cmdline()'s wording."
+  (let* ((line (string-trim '(#\Space #\Tab #\Return #\Newline) line))
+         (text (if (and (plusp (length line)) (char= (char line 0) #\-))
+                   (subseq line 1)
+                   line)))
     (cond
-      ((zerop (length line)) nil)
-      ((member line '("h" "help" "?") :test #'string=)
-       (format *error-output*
-               "~%Commands:~%  -L[bind:]port:host:hostport  request local forward~%  -R[bind:]port:host:hostport  request remote forward~%  -D[bind:]port                 request dynamic forward~%  -KL[bind:]port or -KL path   cancel local forward~%  -KR[bind:]port or -KR path   cancel remote forward~%  -KD[bind:]port               cancel dynamic forward~%  h/help/?                     this message~%")
-       (finish-output *error-output*))
-      ((and (> (length line) 1) (char= (char line 0) #\-))
-       (let* ((letter (char line 1))
-              (rest (string-trim '(#\Space #\Tab) (subseq line 2)))
-              (cancel (and (char-equal letter #\K)
-                           (plusp (length rest))
-                           (member (char rest 0) '(#\L #\R #\D)))))
-         (cond
-           ((and cancel (char-equal (char rest 0) #\L))
-            (cancel-local-forward (subseq rest 1)))
-           ((and cancel (char-equal (char rest 0) #\R))
-            (cancel-remote-forward (subseq rest 1)))
-           ((and cancel (char-equal (char rest 0) #\D))
-            (cancel-dynamic-forward (subseq rest 1)))
-           ((char-equal letter #\L)
-            (start-local-forward *client* (parse-local-forward rest)))
-           ((char-equal letter #\R)
-            (start-remote-forward *client* (parse-remote-forward rest)))
-           ((char-equal letter #\D)
-            (start-dynamic-forward *client* (parse-dynamic-forward rest)))
-           (t
-            (format *error-output* "~%Unknown escape command ~A~%" line)
-            (finish-output *error-output*)))))
-      (t
-       (format *error-output* "~%Unknown escape command ~A~%" line)
-       (finish-output *error-output*)))))
+      ((zerop (length text)) nil)
+      ((member (char text 0) '(#\h #\H #\?))
+       (escape-commandline-help))
+      ((char= (char text 0) #\!)
+       (escape-local-command (subseq text 1)))
+      ((and (> (length text) 1) (char-equal (char text 0) #\K)
+            (member (char text 1) '(#\L #\R #\D)))
+       (let ((letter (char text 1))
+             (rest (string-trim '(#\Space #\Tab) (subseq text 2))))
+         (catch 'escape-forward-failure
+           (let ((*forwarding-escape-kind* "close"))
+             (if (case letter
+                   (#\L (cancel-local-forward rest))
+                   (#\R (cancel-remote-forward rest))
+                   (t (cancel-dynamic-forward rest)))
+                 (log-info "Canceled forwarding.")
+                 (log-info "Unknown port forwarding."))))))
+      ((member (char text 0) '(#\L #\R #\D) :test #'char-equal)
+       (let ((letter (char text 0))
+             (rest (string-trim '(#\Space #\Tab) (subseq text 1))))
+         (catch 'escape-forward-failure
+           (cond
+             ((char-equal letter #\L)
+              (let ((*forwarding-escape-kind* "local"))
+                (if (start-local-forward *client* (parse-local-forward rest))
+                    (log-info "Forwarding port.")
+                    (log-info "Port forwarding failed."))))
+             ((char-equal letter #\R)
+              (let ((*forwarding-escape-kind* "remote"))
+                (if (start-remote-forward *client* (parse-remote-forward rest))
+                    (log-info "Forwarding port.")
+                    (log-info "Port forwarding failed."))))
+             (t
+              ;; -D is one of options.local_forwards, so ssh uses the same
+              ;; "local" wording for a bad dynamic specification.
+              (let ((*forwarding-escape-kind* "local"))
+                (if (start-dynamic-forward *client* (parse-dynamic-forward rest))
+                    (log-info "Forwarding port.")
+                    (log-info "Port forwarding failed."))))))))
+      (t (log-info "Invalid command.")))))
 
 (defun escape-commandline ()
   "Read and run one command from the interactive escape command line."
   (restore-terminal)
   (unwind-protect
        (progn
-         (format *error-output* "~%burs> ")
+         (format *error-output* "~C~Cssh> " #\Return #\Newline)
          (finish-output *error-output*)
          (let ((line (read-line *standard-input* nil nil)))
            (when line
@@ -3899,7 +4155,7 @@ channel_setup_fwd_listener_tcpip()'s prefix and counts as no listener."
                           (- (cl-pnet-sockets:c-errno))))))
                (if (null remaining)
                    (log-error "bind [~A]:~D: ~A" target port reason)
-                   (log-info "bind [~A]:~D: ~A" target port reason)))))))
+                   (log-verbose "bind [~A]:~D: ~A" target port reason)))))))
       (unless listeners
         (log-error
          "channel_setup_fwd_listener_tcpip: cannot listen to port: ~D" port))
@@ -6202,10 +6458,17 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
              (setf *escape-char* (escape-char-setting client)
                    *escape-help-function* #'print-escape-help
                    *escape-forwards-function* #'print-escape-forwards
+                   *escape-break-function* #'escape-send-break
+                   *escape-info-function* #'escape-print-connection-info
+                   *escape-rekey-function* #'escape-request-rekey
+                   *escape-log-level-function* #'escape-adjust-log-level
+                   *escape-suspend-function* #'escape-suspend
+                   *escape-background-function* #'escape-background
                    *escape-disconnect-function*
                    (lambda ()
-                     (format *error-output* "~%Connection to ~A closed.~%"
-                             (cl-pnet-ssh:ssh-client-host client))
+                     (format *error-output* "Connection to ~A closed.~C~C"
+                             (cl-pnet-ssh:ssh-client-host client)
+                             #\Return #\Newline)
                      (finish-output *error-output*)
                      (finish *status*))
                    *escape-commandline-function*
@@ -6215,6 +6478,10 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
            (when (and (config-local-command client)
                       (permit-local-command-p client))
              (run-local-command client))
+           ;; ssh_session2() has reached client_loop() from here: a later
+           ;; failure still reports the byte summary at -v.
+           (setf *session-loop-started* t
+                 *session-loop-start* (get-internal-real-time))
            (let ((background (or (getf *options* :background)
                                  (config-fork-after-authentication-p client)
                                  *background-child*)))

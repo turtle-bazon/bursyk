@@ -1191,14 +1191,17 @@ reset it before sending anything at all."
            (logior cl-pnet-sockets:+msg-peek+
                    cl-pnet-sockets:+msg-dontwait+))))))
 
+(defun ssh-release-string-of (version)
+  "VERSION without the \"SSH-2.0-\" prefix, as SSH_RELEASE reports it."
+  (if (and version
+           (>= (length version) 8)
+           (string= version "SSH-2.0-" :end1 8))
+      (subseq version 8)
+      version))
+
 (defun ssh-client-release-string (client)
   "CLIENT's identification without the SSH-2.0- prefix, as SSH_RELEASE is."
-  (let ((version (ssh-client-version-string client)))
-    (if (and version
-             (>= (length version) 8)
-             (string= version "SSH-2.0-" :end1 8))
-        (subseq version 8)
-        version)))
+  (ssh-release-string-of (ssh-client-version-string client)))
 
 (defun ssh-client-connection-info (client)
   "A plist describing CLIENT's connection, as -O conninfo reports it.
@@ -1207,7 +1210,8 @@ The values the transport does not expose are NIL; the caller prints what it
 has rather than inventing numbers."
   (let ((negotiated (ssh-client-negotiated client)))
     (list :client-version (ssh-client-release-string client)
-          :server-version (ssh-client-server-version client)
+          :server-version (ssh-release-string-of
+                           (ssh-client-server-version client))
           :connected-at (ssh-client-connected-at client)
           :kex (getf negotiated :kex)
           :host-key (getf negotiated :host-key)
