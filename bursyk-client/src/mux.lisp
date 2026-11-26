@@ -1829,7 +1829,7 @@ Returns the logit() text it prints, or NIL when the request is acceptable."
                        (mux-open-forward-invalid-p
                         type listen-host listen-port
                         connect-host connect-port)))
-         (defer (and (= type +mux-fwd-remote+) (zerop listen-port))))
+         (defer (= type +mux-fwd-remote+)))
     (when invalid
       (log-info "mux_master_process_open_fwd: ~A" invalid)
       (return-from mux-master-forward
@@ -1877,19 +1877,31 @@ Returns the logit() text it prints, or NIL when the request is acceptable."
                     (and defer
                          (lambda (port)
                            (unless (mux-connection-closed-p connection)
-                             (mux-connection-send
-                              connection
-                              (mux-request-payload
-                               +mux-s-remote-port+ request-id port)))))
+                             ;; mux_confirm_remote_forward(): OK for a fixed
+                             ;; port, MUX_S_REMOTE_PORT when 0 was asked for.
+                             (mux-forward-reply connection request-id type
+                                               listen-port port))))
                     :on-remote-failed
                     (and defer
                          (lambda ()
                            (unless (mux-connection-closed-p connection)
-                             (mux-connection-send
-                              connection
-                              (mux-error-payload
-                               +mux-s-failure+ request-id
-                               "remote forward refused"))))))))
+                             (let ((message
+                                     (if (= listen-port
+                                            +mux-port-streamlocal+)
+                                         (format nil
+                                                 "remote port forwarding failed for listen path ~A"
+                                                 listen-host)
+                                         (format nil
+                                                 "remote port forwarding failed for listen port ~D"
+                                                 listen-port))))
+                               ;; mux_confirm_remote_forward() logs with
+                               ;; error_f() before answering the client.
+                               (log-error "mux_confirm_remote_forward: ~A"
+                                          message)
+                               (mux-connection-send
+                                connection
+                                (mux-error-payload
+                                 +mux-s-failure+ request-id message)))))))))
              (unless defer
                (mux-forward-reply connection request-id type listen-port
                                   (and (= type +mux-fwd-remote+)

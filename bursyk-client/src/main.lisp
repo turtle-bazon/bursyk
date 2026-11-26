@@ -4246,7 +4246,37 @@ peer that connected to it; NIL refuses the channel."
                         (forward-target-name forward)))
               nil))))))
 
-(defun start-streamlocal-remote-forward (client forward)
+(defun remote-forward-target-description (forward)
+  "The CONNECT half of FORWARD as ssh's forwarding messages format it.
+
+ssh prints `connect_path ? connect_path : connect_host` with connect_port,
+and a socket target carries PORT_STREAMLOCAL, which is -2."
+  (if (forward-target-path forward)
+      (format nil "~A:-2" (forward-target-path forward))
+      (format nil "~A:~D" (or (forward-host forward) "")
+              (or (forward-port forward) 0))))
+
+(defun remote-forward-failed (client forward on-failed)
+  "Report a remote forward the server refused.
+
+A mux master answers the waiting request through ON-FAILED instead of
+logging, as mux_confirm_remote_forward() does."
+  (setf *remote-forwards* (delete forward *remote-forwards*))
+  (when on-failed
+    (return-from remote-forward-failed (funcall on-failed)))
+  (let ((message
+          (if (forward-bind-path forward)
+              (format nil "remote port forwarding failed for listen path ~A"
+                      (forward-bind-path forward))
+              (format nil "remote port forwarding failed for listen port ~D"
+                      (or (forward-bind-port forward) 0)))))
+    (if (exit-on-forward-failure-p client)
+        (log-fatal "Error: ~A" message)
+        ;; logit(), so -q and LogLevel=ERROR drop the warning.
+        (log-info "Warning: ~A" message))))
+
+(defun start-streamlocal-remote-forward (client forward
+                                         &key on-allocated on-failed)
   "Ask the server to listen on FORWARD's Unix socket."
   (push forward *remote-forwards*)
   (cl-pnet-ssh:ssh-client-send-global-request
@@ -4257,6 +4287,7 @@ peer that connected to it; NIL refuses the channel."
    :on-success
    (lambda (reader)
      (declare (ignore reader))
+     (when on-allocated (funcall on-allocated nil))
      (log-line "remote streamlocal forward ~A to ~A"
                (forward-bind-path forward)
                (or (forward-target-path forward)
@@ -4264,20 +4295,16 @@ peer that connected to it; NIL refuses the channel."
                            (forward-host forward) (forward-port forward)))))
    :on-failure
    (lambda ()
-     (setf *remote-forwards* (delete forward *remote-forwards*))
-     (if (exit-on-forward-failure-p client)
-         (finish 255)
-         (unless (getf *options* :quiet)
-           (format *error-output*
-                   "burs: remote streamlocal forward ~A was refused~%"
-                   (forward-bind-path forward))))))
+     (remote-forward-failed client forward on-failed)))
   forward)
 
 (defun start-remote-forward (client forward &key on-allocated on-failed)
   "Ask CLIENT's server to listen for FORWARD and relay to this machine."
   (when (forward-bind-path forward)
     (return-from start-remote-forward
-      (start-streamlocal-remote-forward client forward)))
+      (start-streamlocal-remote-forward client forward
+                                        :on-allocated on-allocated
+                                        :on-failed on-failed)))
   (let ((address (or (forward-bind-address forward) ""))
         (port (forward-bind-port forward)))
     (push forward *remote-forwards*)
@@ -4289,24 +4316,34 @@ peer that connected to it; NIL refuses the channel."
      :on-success
      (lambda (reader)
        ;; RFC 4254 only carries the port back when 0 was requested.
-       (when (zerop port)
-         (setf (forward-bind-port forward)
-               (cl-pnet-ssh::ssh-read-u32 reader)))
-       (log-line "remote forward ~A:~D to ~A:~D"
-                 address (forward-bind-port forward)
-                 (forward-host forward) (forward-port forward))
-       (when on-allocated
-         (funcall on-allocated (forward-bind-port forward))))
+       (let ((allocated (and (zerop port)
+                             (cl-pnet-ssh::ssh-read-u32 reader))))
+         (cond
+           ((and allocated (> allocated 65535))
+            ;; ssh_confirm_remote_forward() reports the bad answer and then
+            ;; runs the failure path, which cancels the permission.
+            (log-error "Invalid allocated port ~D for remote forward to ~A"
+                       allocated
+                       (remote-forward-target-description forward))
+            (remote-forward-failed client forward on-failed))
+           (t
+            (when allocated
+              (setf (forward-bind-port forward) allocated)
+              (unless on-allocated
+                ;; logit(), printed at the default level.
+                (log-info "Allocated port ~D for remote forward to ~A"
+                          allocated
+                          (remote-forward-target-description forward))))
+            ;; A mux master answers the waiting client only now: OK for a
+            ;; fixed port, MUX_S_REMOTE_PORT for an allocated one.
+            (when on-allocated
+              (funcall on-allocated allocated))
+            (log-line "remote forward ~A:~D to ~A"
+                      address (forward-bind-port forward)
+                      (remote-forward-target-description forward))))))
      :on-failure
      (lambda ()
-       (setf *remote-forwards* (delete forward *remote-forwards*))
-       (when on-failed (funcall on-failed))
-       (if (exit-on-forward-failure-p client)
-           (finish 255)
-           (unless (getf *options* :quiet)
-             (format *error-output*
-                     "burs: remote forward ~A:~D was refused~%"
-                     address port)))))
+       (remote-forward-failed client forward on-failed)))
     forward))
 
 (defun expand-forward-for-client (client forward)

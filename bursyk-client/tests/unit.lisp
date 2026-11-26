@@ -836,6 +836,17 @@ the lines never reach the output."
                  (burs::unix-listener-error-text
                   "/tmp/x" (failure "something else" '()))))))
 
+(test remote-forward-target-description-matches-ssh-format
+  "ssh's forwarding messages print connect_host:connect_port or path:-2."
+  (is (string=
+       "example.org:80"
+       (burs::remote-forward-target-description
+        (burs::parse-remote-forward "8080:example.org:80"))))
+  (is (string=
+       "/tmp/socket:-2"
+       (burs::remote-forward-target-description
+        (burs::parse-remote-forward "0:/tmp/socket")))))
+
 (test remote-dynamic-forward-specifications-parse
   ;; A one-word -R is the dynamic form: the server listens and the client
   ;; speaks SOCKS, which readconf records as the "socks" target on port 0.
