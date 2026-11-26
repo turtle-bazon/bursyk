@@ -2035,12 +2035,24 @@ alias works while other spellings of the same word do not."
   ;; As for -L: one listener channel per resolved address.
   listener
   listeners
+  ;; A -D streamlocal SOCKS listener is a raw descriptor with an fd watch,
+  ;; not a CL-PNET listener; the handshakes it accepts are tracked here so a
+  ;; cancel or shutdown closes them.
+  listener-fd
+  listener-watcher
+  (fd-sessions nil)
   (channel-id nil)
   (channel-ids nil))
 
 (defstruct (socks-session (:constructor %make-socks-session))
   client
   connection
+  ;; A streamlocal -D accepts a raw descriptor instead of a CL-PNET
+  ;; connection.  Once the handshake produces a tunnel, BRIDGE owns FD.
+  fd
+  watcher
+  bridge
+  (closed nil)
   ;; The DynamicForward whose listener accepted CONNECTION.  Its bound port
   ;; and address become the "listening port ... to ..." part of the channel's
   ;; remote name, as channels.c takes them from the accepted socket.
@@ -3555,16 +3567,24 @@ child keeps serving the channels it already carries."
 (defun cancel-dynamic-forward (spec)
   "Close the dynamic forward matching SPEC."
   (multiple-value-bind (address port path) (parse-cancel-listen spec)
-    (declare (ignore path))
     (let ((forward
-            (find-if (lambda (candidate)
-                       (and (= port (dynamic-forward-bind-port candidate))
-                            (or (null address)
-                                (null (dynamic-forward-bind-address candidate))
-                                (string-equal address
-                                              (dynamic-forward-bind-address
-                                               candidate)))))
-                     *dynamic-forwards*)))
+            (if path
+                (find-if (lambda (candidate)
+                           (and (dynamic-forward-bind-path candidate)
+                                (string= path
+                                         (dynamic-forward-bind-path candidate))))
+                         *dynamic-forwards*)
+                (find-if (lambda (candidate)
+                           (and (not (dynamic-forward-bind-path candidate))
+                                (= port (dynamic-forward-bind-port candidate))
+                                (or (null address)
+                                    (null (dynamic-forward-bind-address
+                                           candidate))
+                                    (string-equal
+                                     address
+                                     (dynamic-forward-bind-address
+                                      candidate)))))
+                         *dynamic-forwards*))))
       (when forward
         (close-dynamic-forward-listeners forward)
         (setf *dynamic-forwards* (delete forward *dynamic-forwards*))
@@ -4006,7 +4026,8 @@ does when it binds a local forwarding socket."
                                        (client-streamlocal-close bridge))
                                      :on-error
                                      (lambda (channel condition)
-                                       (declare (ignore channel condition))
+                                       (log-channel-open-failure
+                                        channel condition)
                                        (client-streamlocal-close bridge)))))
                               (setf (client-streamlocal-channel bridge) channel)
                               (client-streamlocal-connected bridge))
@@ -4171,7 +4192,25 @@ channel_setup_fwd_listener_tcpip()'s prefix and counts as no listener."
   (dolist (listener (dynamic-forward-listeners forward))
     (ignore-errors (cl-pnet:close-listener listener)))
   (setf (dynamic-forward-listeners forward) nil
-        (dynamic-forward-listener forward) nil))
+        (dynamic-forward-listener forward) nil)
+  (when (dynamic-forward-listener-watcher forward)
+    (ignore-errors
+      (cl-pnet:fd-unwatch (dynamic-forward-listener-watcher forward)))
+    (setf (dynamic-forward-listener-watcher forward) nil))
+  (when (dynamic-forward-listener-fd forward)
+    (ignore-errors
+      (cl-pnet-sockets:close-open-fd (dynamic-forward-listener-fd forward)))
+    (setf (dynamic-forward-listener-fd forward) nil))
+  (dolist (session (dynamic-forward-fd-sessions forward))
+    (setf (socks-session-closed session) t)
+    (when (socks-session-watcher session)
+      (ignore-errors (cl-pnet:fd-unwatch (socks-session-watcher session)))
+      (setf (socks-session-watcher session) nil))
+    (let ((fd (socks-session-fd session)))
+      (setf (socks-session-fd session) nil)
+      (when (and fd (not (minusp fd)))
+        (ignore-errors (cl-pnet-sockets:close-open-fd fd)))))
+  (setf (dynamic-forward-fd-sessions forward) nil))
 
 (defun start-local-forward (client forward)
   (when (forward-bind-path forward)
@@ -4216,21 +4255,104 @@ requested destination port."
 
 (defun socks-abandon (session)
   "Forget SESSION and close its connection without a reply."
-  (let ((connection (socks-session-connection session)))
-    (remhash connection *socks-sessions*)
-    (ignore-errors (cl-pnet:close-connection connection))))
+  (cond
+    ((socks-session-bridge session)
+     ;; The bridge owns the descriptor and its channel now.
+     (setf (socks-session-closed session) t))
+    ((socks-session-fd session)
+     (setf (socks-session-closed session) t)
+     (when (socks-session-watcher session)
+       (ignore-errors (cl-pnet:fd-unwatch (socks-session-watcher session)))
+       (setf (socks-session-watcher session) nil))
+     (let ((fd (socks-session-fd session))
+           (forward (socks-session-forward session)))
+       (setf (socks-session-fd session) nil)
+       (when (and fd (not (minusp fd)))
+         (ignore-errors (cl-pnet-sockets:close-open-fd fd)))
+       (when forward
+         (setf (dynamic-forward-fd-sessions forward)
+               (delete session (dynamic-forward-fd-sessions forward))))))
+    (t
+     (let ((connection (socks-session-connection session)))
+       (remhash connection *socks-sessions*)
+       (ignore-errors (cl-pnet:close-connection connection))))))
+
+(defun socks-fd-write (fd data)
+  "Best-effort write of a SOCKS reply to raw descriptor FD."
+  (when (and fd (not (minusp fd)))
+    (handler-case
+        (cl-pnet-sockets:write-octets fd data)
+      (error () nil))))
 
 (defun socks-send (session data)
   "Send DATA to SESSION's client, abandoning the session on a write error."
-  (let ((connection (socks-session-connection session)))
-    (when connection
-      (handler-case
-          (cl-pnet:send-data
-           connection data
-           :on-error (lambda (status)
-                       (declare (ignore status))
-                       (socks-abandon session)))
-        (error () (socks-abandon session))))))
+  (let ((fd (socks-session-fd session))
+        (connection (socks-session-connection session)))
+    (cond
+      ((and fd (not (minusp fd)))
+       (handler-case
+           (multiple-value-bind (count errno)
+               (cl-pnet-sockets:write-octets fd data)
+             (when (or (minusp count) (plusp errno))
+               (socks-abandon session)))
+         (error () (socks-abandon session))))
+      (connection
+       (handler-case
+           (cl-pnet:send-data
+            connection data
+            :on-error (lambda (status)
+                        (declare (ignore status))
+                        (socks-abandon session)))
+         (error () (socks-abandon session)))))))
+
+(defun socks-start-fd-tunnel (session host port remaining socks4)
+  "Carry a streamlocal SOCKS request through a direct-tcpip channel.
+
+The accepted descriptor becomes a client-streamlocal bridge, so the SOCKS
+client and the SSH channel keep the same byte path a -L streamlocal forward
+uses."
+  (let* ((client (socks-session-client session))
+         (dynamic (socks-session-forward session))
+         (fd (socks-session-fd session))
+         (bridge (%make-client-streamlocal :fd fd :path "socks"))
+         (forward (%make-forward
+                   :host host :port port
+                   :bind-address (dynamic-forward-bind-address dynamic)
+                   :bind-port (dynamic-forward-bind-port dynamic)
+                   :bind-path (dynamic-forward-bind-path dynamic))))
+    ;; The bridge owns FD from here; the session and the listener stop
+    ;; tracking it.
+    (setf (socks-session-fd session) nil
+          (socks-session-closed session) t)
+    (when (socks-session-watcher session)
+      (ignore-errors (cl-pnet:fd-unwatch (socks-session-watcher session)))
+      (setf (socks-session-watcher session) nil))
+    (setf (dynamic-forward-fd-sessions dynamic)
+          (delete session (dynamic-forward-fd-sessions dynamic)))
+    (when (and remaining (plusp (length remaining)))
+      (let ((pending (client-streamlocal-pending bridge)))
+        (loop for octet across remaining
+              do (vector-push-extend octet pending))))
+    (log-line "dynamic forward to ~A:~D" host port)
+    (let ((channel
+            (open-forward-target-channel
+             client forward
+             :on-open
+             (lambda (channel)
+               (declare (ignore channel))
+               (socks-fd-write
+                fd
+                (if socks4
+                    #(0 90 0 0 0 0 0 0)
+                    (socks-reply cl-pnet-socks:+socks5-reply-success+
+                                 :port port))))
+             :on-error
+             (lambda (channel condition)
+               (log-channel-open-failure channel condition)
+               (client-streamlocal-close bridge)))))
+      (setf (client-streamlocal-channel bridge) channel)
+      (client-streamlocal-install bridge)
+      (client-streamlocal-connected bridge))))
 
 (defun socks-start-tunnel (session host port remaining &key socks4)
   "Dial HOST:PORT through the SSH connection for SESSION's client.
@@ -4238,6 +4360,9 @@ requested destination port."
 REMAINING is any stream data the client sent right behind the request; it is
 buffered with the tunnel and flushed once the channel is open.  SOCKS4 selects
 the four-byte SOCKS4 success reply instead of the SOCKS5 one."
+  (when (socks-session-fd session)
+    (return-from socks-start-tunnel
+      (socks-start-fd-tunnel session host port remaining socks4)))
   (let* ((connection (socks-session-connection session))
          (client (socks-session-client session))
          (dynamic (socks-session-forward session))
@@ -4374,6 +4499,67 @@ the four-byte SOCKS4 success reply instead of the SOCKS5 one."
         (%make-socks-session :client client :connection connection
                              :forward forward)))
 
+(defun socks-fd-readable (session)
+  "Read a streamlocal SOCKS client until its tunnel takes the descriptor."
+  (unless (or (socks-session-closed session)
+              (socks-session-bridge session))
+    (multiple-value-bind (data count error)
+        (cl-pnet-sockets:read-octets (socks-session-fd session) 4096)
+      (cond
+        ((plusp count) (socks-process session data))
+        ((and (minusp count) (member error '(4 11))) nil)
+        (t (socks-abandon session))))))
+
+(defun socks-fd-accept (client forward fd)
+  "Start a SOCKS handshake on FD, accepted by FORWARD's Unix listener."
+  (let* ((session (%make-socks-session :client client :fd fd
+                                       :forward forward))
+         (watcher
+           (cl-pnet:fd-watch
+            fd :on-readable
+            (lambda (watcher)
+              (declare (ignore watcher))
+              (socks-fd-readable session)))))
+    (setf (socks-session-watcher session) watcher
+          (dynamic-forward-fd-sessions forward)
+          (push session (dynamic-forward-fd-sessions forward)))
+    session))
+
+(defun start-dynamic-unix-socks (client forward)
+  "Listen for SOCKS clients on FORWARD's Unix socket."
+  (let* ((path (dynamic-forward-bind-path forward))
+         (options (cl-pnet-ssh:ssh-client-config-options client))
+         (unlink (and options
+                      (cl-pnet-ssh:ssh-config-options-streamlocal-bind-unlink
+                       options)))
+         (mask (or (and options
+                        (cl-pnet-ssh:ssh-config-options-streamlocal-bind-mask
+                         options))
+                   #o177))
+         (listener nil)
+         (failure nil))
+    (handler-case
+        (setf listener
+              (cl-pnet-sockets:listen-unix path :unlink unlink :mask mask))
+      (error (condition) (setf failure condition)))
+    (unless listener
+      (log-error "~A" (unix-listener-error-text path failure))
+      (return-from start-dynamic-unix-socks nil))
+    (setf (dynamic-forward-listener-fd forward) listener
+          (dynamic-forward-listener-watcher forward)
+          (cl-pnet:fd-watch
+           listener :on-readable
+           (lambda (watcher)
+             (declare (ignore watcher))
+             (loop for fd = (cl-pnet-sockets:accept-socket listener)
+                   while fd
+                   do (cl-pnet-sockets:set-nonblocking fd)
+                      (socks-fd-accept client forward fd)))))
+    (reserve-dynamic-forward-channel-id client forward)
+    (push forward *dynamic-forwards*)
+    (log-line "dynamic forward ~A" path)
+    forward))
+
 (defun dynamic-bind-address (forward)
   (let ((address (dynamic-forward-bind-address forward)))
     (cond
@@ -4382,34 +4568,38 @@ the four-byte SOCKS4 success reply instead of the SOCKS5 one."
       (t address))))
 
 (defun start-dynamic-forward (client forward)
-  (when (or (dynamic-forward-bind-path forward)
-            (dynamic-forward-target-path forward))
-    ;; The transport can listen on a Unix socket and forward a stream, but
-    ;; this client has no SOCKS server attached to a Unix-socket listener,
-    ;; and readconf's socket-target dynamic form is really a local forward.
-    (unless (getf *options* :quiet)
-      (format *error-output*
-              "burs: dynamic forwarding over a Unix socket is not implemented~%"))
-    (if (exit-on-forward-failure-p client)
-        (finish 255)
-        (return-from start-dynamic-forward nil)))
-  (let* ((bind-address (dynamic-forward-bind-address forward))
-         (listeners
-           (open-forward-listeners
-            client bind-address (dynamic-forward-bind-port forward)
-            #'socks-connection-data
-            (lambda (connection)
-              (socks-accept client connection forward))
-            "-D")))
-    (unless listeners
-      (return-from start-dynamic-forward nil))
-    (setf (dynamic-forward-listeners forward) listeners
-          (dynamic-forward-listener forward) (first listeners))
-    (reserve-dynamic-forward-channel-id client forward)
-    (push forward *dynamic-forwards*)
-    (let ((port (cl-pnet:listener-port (first listeners))))
-      (log-line "dynamic forward ~A:~D" (or bind-address "localhost") port))
-    forward))
+  (cond
+    ((dynamic-forward-target-path forward)
+     ;; parse_forward accepts two dynamic fields whose second is a path
+     ;; (-D port:path, -D path:path).  channels.c turns those into a local
+     ;; forward to the streamlocal target, not into SOCKS.
+     (start-local-forward
+      client
+      (%make-forward
+       :bind-address (dynamic-forward-bind-address forward)
+       :bind-port (dynamic-forward-bind-port forward)
+       :bind-path (dynamic-forward-bind-path forward)
+       :target-path (dynamic-forward-target-path forward))))
+    ((dynamic-forward-bind-path forward)
+     (start-dynamic-unix-socks client forward))
+    (t
+     (let* ((bind-address (dynamic-forward-bind-address forward))
+            (listeners
+              (open-forward-listeners
+               client bind-address (dynamic-forward-bind-port forward)
+               #'socks-connection-data
+               (lambda (connection)
+                 (socks-accept client connection forward))
+               "-D")))
+       (unless listeners
+         (return-from start-dynamic-forward nil))
+       (setf (dynamic-forward-listeners forward) listeners
+             (dynamic-forward-listener forward) (first listeners))
+       (reserve-dynamic-forward-channel-id client forward)
+       (push forward *dynamic-forwards*)
+       (let ((port (cl-pnet:listener-port (first listeners))))
+         (log-line "dynamic forward ~A:~D" (or bind-address "localhost") port))
+       forward))))
 
 (defun configure-dynamic-forwards (client)
   "The DynamicForward lines in CLIENT's config, in file order."

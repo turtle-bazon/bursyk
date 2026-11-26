@@ -787,6 +787,18 @@ the lines never reach the output."
     (is (equal "/tmp/d.sock" (burs::dynamic-forward-bind-path forward)))
     (is (null (burs::dynamic-forward-bind-port forward)))))
 
+(test cancel-dynamic-forward-matches-a-socket-path
+  "A -KD path finds the streamlocal listener it names.
+
+-D path has no port to match, so the path is the only key."
+  (let ((burs::*dynamic-forwards* nil)
+        (burs::*client* nil))
+    (push (burs::%make-dynamic-forward :bind-path "/tmp/d.sock")
+          burs::*dynamic-forwards*)
+    (is (burs::cancel-dynamic-forward "/tmp/d.sock"))
+    (is (null burs::*dynamic-forwards*))
+    (is (null (burs::cancel-dynamic-forward "/tmp/other.sock")))))
+
 (test dynamic-socks-handshake-follows-channels-dot-c
   "channels.c's SOCKS server: three-byte gate, port echo, silent refusals."
   ;; channel_pre_dynamic() needs three bytes before it looks at the version.
