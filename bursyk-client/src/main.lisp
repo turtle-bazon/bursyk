@@ -4748,7 +4748,12 @@ forward returns a setup function: its SOCKS request has not arrived yet."
                                                     bind-address bind-port))
                           *remote-forwards*)))
     (cond
-      ((null forward) (values nil nil))
+      ((null forward)
+       ;; channels.c's channel_connect_by_listen_address() warning.
+       (log-error
+        "WARNING: Server requests forwarding for unknown listen_port ~D"
+        bind-port)
+       (values nil nil))
       ((remote-dynamic-forward-p forward)
        (lambda (channel)
          (start-rdynamic-socks client channel forward)))
@@ -4794,28 +4799,35 @@ The failure messages are channels.c's connect_to() wording."
                      (and (forward-bind-path candidate)
                           (string= (forward-bind-path candidate) path)))
                    *remote-forwards*)))
-    (when forward
-      ;; A one-word -R path is accepted by readconf, but channels.c's
-      ;; streamlocal path has no reverse-dynamic branch: it tries to connect
-      ;; to the "socks" placeholder and fails.
-      (let ((allowed
-              (if (forward-target-path forward)
-                  (permit-remote-open-allowed-p
-                   client (forward-target-path forward) :streamlocal)
-                  (permit-remote-open-allowed-p
-                   client (forward-host forward) (forward-port forward)))))
-        (if allowed
-            (lambda (channel)
-              (if (forward-target-path forward)
-                  (open-client-streamlocal channel
-                                           (forward-target-path forward))
-                  (attach-client-tcp-target channel forward)))
-            (progn
-              (unless (getf *options* :quiet)
-                (format *error-output*
-                        "burs: PermitRemoteOpen refuses ~A~%"
-                        (forward-target-name forward)))
-              nil))))))
+    (if (null forward)
+        (progn
+          ;; channel_connect_by_listen_path()'s warning, with the same
+          ;; 100-character cut.
+          (log-error "WARNING: Server requests forwarding for unknown path ~A"
+                     (subseq path 0 (min 100 (length path))))
+          nil)
+        (progn
+          ;; A one-word -R path is accepted by readconf, but channels.c's
+          ;; streamlocal path has no reverse-dynamic branch: it tries to
+          ;; connect to the "socks" placeholder and fails.
+          (let ((allowed
+                  (if (forward-target-path forward)
+                      (permit-remote-open-allowed-p
+                       client (forward-target-path forward) :streamlocal)
+                      (permit-remote-open-allowed-p
+                       client (forward-host forward) (forward-port forward)))))
+            (if allowed
+                (lambda (channel)
+                  (if (forward-target-path forward)
+                      (open-client-streamlocal channel
+                                               (forward-target-path forward))
+                      (attach-client-tcp-target channel forward)))
+                (progn
+                  (unless (getf *options* :quiet)
+                    (format *error-output*
+                            "burs: PermitRemoteOpen refuses ~A~%"
+                            (forward-target-name forward)))
+                  nil)))))))
 
 (defun remote-forward-target-description (forward)
   "The CONNECT half of FORWARD as ssh's forwarding messages format it.

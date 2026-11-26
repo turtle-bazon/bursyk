@@ -31,6 +31,10 @@
   (mux-mode nil)
   (mux-fd nil)
   (mux-watcher nil)
+  ;; A control master's function of (CLIENT TYPE READER) that may take over a
+  ;; server-initiated OPEN (relaying it to a mux proxy client).  NIL leaves
+  ;; the ordinary handlers in charge.
+  (forwarded-open-relay nil)
   (incoming (make-array 4096 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0))
   (client-version "SSH-2.0-cl-pnet-ssh_0.0.1.19")

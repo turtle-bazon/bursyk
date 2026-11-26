@@ -630,6 +630,20 @@ through the alive check before the session starts."
                  (mux-connection-proxy-channels connection))
         (dolist (channel channels)
           (ignore-errors (cl-pnet-ssh::ssh-channel-finish channel)))
+        ;; A proxy client's forwarding permissions and any OPEN it never
+        ;; answered die with its control connection.
+        (let ((master (mux-connection-master connection)))
+          (when master
+            (let ((listeners (mux-master-proxy-listeners master)))
+              (loop for key being the hash-keys of listeners
+                      using (hash-value owner)
+                    when (eq owner connection)
+                      do (remhash key listeners)))
+            (let ((opens (mux-master-proxy-opens master)))
+              (loop for key being the hash-keys of opens
+                      using (hash-value entry)
+                    when (eq (getf entry :connection) connection)
+                      do (remhash key opens)))))
         (clrhash (mux-connection-proxy-channels connection))
         (clrhash (mux-connection-proxy-remotes connection))))
     (when (and *client* (mux-connection-control-channel-id connection))
@@ -897,6 +911,11 @@ the rest.  The client gets its own id back in the same position."
               (mux-proxy-upstream connection sender channel payload))))))
 
 #+ssh-backend-lisp
+(declaim (ftype (function (t t t) *) mux-proxy-global-request)
+         (ftype (function (t t t) *) mux-proxy-open-confirmation)
+         (ftype (function (t t t) *) mux-proxy-open-failure))
+
+#+ssh-backend-lisp
 (defun mux-proxy-downstream (connection payload)
   "Handle one packet from a proxy client: PAYLOAD starts with its pad length."
   (when (< (length payload) 2)
@@ -908,17 +927,14 @@ the rest.  The client gets its own id back in the same position."
       ((= type cl-pnet-ssh::+ssh-msg-channel-open+)
        (mux-proxy-open connection payload))
       ((= type cl-pnet-ssh::+ssh-msg-global-request+)
-       ;; Global requests need the master's permission bookkeeping and a way
-       ;; to route the reply (and any server-initiated channel) back to this
-       ;; proxy client.  Ref's channel_proxy_downstream() forwards
-       ;; tcpip-forward but the reply never reaches the downstream client, so
-       ;; dropping the request has the same observable effect: no allocated
-       ;; port is reported and the session continues.
-       nil)
-      ((member type (list cl-pnet-ssh::+ssh-msg-channel-open-confirmation+
-                          cl-pnet-ssh::+ssh-msg-channel-open-failure+))
-       ;; Server-initiated channels are not relayed to proxy clients.
-       nil)
+       (mux-proxy-global-request (mux-connection-master connection)
+                                 connection payload))
+      ((= type cl-pnet-ssh::+ssh-msg-channel-open-confirmation+)
+       (mux-proxy-open-confirmation (mux-connection-master connection)
+                                    connection payload))
+      ((= type cl-pnet-ssh::+ssh-msg-channel-open-failure+)
+       (mux-proxy-open-failure (mux-connection-master connection)
+                               connection payload))
       (t
        ;; Everything else addresses the server's own channel id, so the
        ;; master forwards the packet unchanged.  A CLOSE for a channel the
@@ -946,6 +962,157 @@ the rest.  The client gets its own id back in the same position."
 
 ;;; ---- The master ----
 
+#+ssh-backend-lisp
+(defun mux-proxy-raw-fields (reader)
+  "READER's unread octets, as a fresh vector."
+  (subseq (cl-pnet-ssh::ssh-reader-data reader)
+          (cl-pnet-ssh::ssh-reader-position reader)
+          (cl-pnet-ssh::ssh-reader-end reader)))
+
+#+ssh-backend-lisp
+(defun mux-proxy-tcp-connection (master bind-address bind-port)
+  "The proxy connection that asked for BIND-ADDRESS:BIND-PORT, or NIL."
+  (let ((table (mux-master-proxy-listeners master)))
+    (or (gethash (list :tcp bind-address bind-port) table)
+        (gethash (list :tcp "" bind-port) table)
+        (gethash (list :tcp "*" bind-port) table)
+        (loop for key being the hash-keys of table
+                using (hash-value connection)
+              when (and (eq (first key) :tcp)
+                        (eql (third key) 0)
+                        (or (string= (second key) "")
+                            (string= (second key) "*")
+                            (string-equal (second key) bind-address)))
+                return connection))))
+
+#+ssh-backend-lisp
+(defun mux-master-relay-open (master client type reader)
+  "Relay a server-initiated OPEN to the proxy client that requested it.
+
+Returns true when the OPEN was handed over; the ordinary forwarded-tcpip
+handler then leaves it alone.  The proxy client's confirmation creates the
+master's channel through MUX-PROXY-OPEN-CONFIRMATION."
+  (let* ((all (mux-proxy-raw-fields reader))
+         (fields (cl-pnet-ssh:ssh-make-reader all))
+         (sender (cl-pnet-ssh:ssh-read-u32 fields))
+         (window (cl-pnet-ssh:ssh-read-u32 fields))
+         (max-packet (cl-pnet-ssh:ssh-read-u32 fields))
+         (connection nil))
+    (declare (ignore client))
+    (cond
+      ((string= type "forwarded-tcpip")
+       (let ((bind-address (cl-pnet-ssh:ssh-read-text fields))
+             (bind-port (cl-pnet-ssh:ssh-read-u32 fields)))
+         (setf connection
+               (mux-proxy-tcp-connection master bind-address bind-port))))
+      ((string= type "forwarded-streamlocal@openssh.com")
+       (let ((path (cl-pnet-ssh:ssh-read-text fields)))
+         (setf connection
+               (gethash (list :streamlocal path)
+                        (mux-master-proxy-listeners master))))))
+    (when connection
+      (let ((writer (cl-pnet-ssh:ssh-writer)))
+        (cl-pnet-ssh::ssh-write-u8 writer
+                                   cl-pnet-ssh::+ssh-msg-channel-open+)
+        (cl-pnet-ssh::ssh-write-text writer type)
+        (cl-pnet-ssh::ssh-write-octets writer all)
+        (mux-connection-send-ssh-packet
+         connection (cl-pnet-ssh:ssh-writer-output writer)))
+      (setf (gethash sender (mux-master-proxy-opens master))
+            (list :connection connection :type type
+                  :window window :max-packet max-packet))
+      t)))
+
+#+ssh-backend-lisp
+(defun mux-master-install-open-relay (master client)
+  "Let MASTER intercept server-initiated OPENs for its proxy clients."
+  (setf (cl-pnet-ssh::ssh-client-forwarded-open-relay client)
+        (lambda (client type reader)
+          (declare (ignore client))
+          (mux-master-relay-open master client type reader))))
+
+#+ssh-backend-lisp
+(defun mux-proxy-global-request (master connection payload)
+  "Forward a proxy client's forwarding request and remember its listener."
+  (let* ((reader (cl-pnet-ssh:ssh-make-reader payload 2))
+         (name (cl-pnet-ssh:ssh-read-text reader)))
+    (cond
+      ((string= name "tcpip-forward")
+       (let ((want-reply (cl-pnet-ssh:ssh-read-boolean reader))
+             (host (cl-pnet-ssh:ssh-read-text reader))
+             (port (cl-pnet-ssh:ssh-read-u32 reader)))
+         (declare (ignore want-reply))
+         (setf (gethash (list :tcp host port)
+                        (mux-master-proxy-listeners master))
+               connection)
+         (cl-pnet-ssh::ssh-client-send-payload
+          *client* (subseq payload 1))))
+      ((string= name "streamlocal-forward@openssh.com")
+       (let ((want-reply (cl-pnet-ssh:ssh-read-boolean reader))
+             (path (cl-pnet-ssh:ssh-read-text reader)))
+         (declare (ignore want-reply))
+         (setf (gethash (list :streamlocal path)
+                        (mux-master-proxy-listeners master))
+               connection)
+         (cl-pnet-ssh::ssh-client-send-payload
+          *client* (subseq payload 1))))
+      (t
+       (log-error "channel_proxy_downstream: unsupported request ~A" name)
+       (mux-connection-stop connection)))))
+
+#+ssh-backend-lisp
+(defun mux-proxy-open-confirmation (master connection payload)
+  "Adopt the channel a proxy client confirmed for a relayed OPEN."
+  (let* ((reader (cl-pnet-ssh:ssh-make-reader payload 2))
+         (remote-id (cl-pnet-ssh:ssh-read-u32 reader))
+         (proxy-id (cl-pnet-ssh:ssh-read-u32 reader))
+         (window (cl-pnet-ssh:ssh-read-u32 reader))
+         (max-packet (cl-pnet-ssh:ssh-read-u32 reader))
+         (pending (gethash remote-id (mux-master-proxy-opens master))))
+    (when pending
+      (remhash remote-id (mux-master-proxy-opens master))
+      (let ((channel
+              (cl-pnet-ssh::ssh-client-adopt-server-channel
+               *client* (getf pending :type) remote-id
+               (getf pending :window) (getf pending :max-packet)
+               window max-packet)))
+        (setf (cl-pnet-ssh::ssh-channel-relay channel)
+              (lambda (channel payload)
+                (mux-proxy-upstream connection proxy-id channel payload))
+              (cl-pnet-ssh::ssh-channel-on-close channel)
+              (lambda (channel status)
+                (declare (ignore status))
+                (remhash proxy-id
+                         (mux-connection-proxy-channels connection))
+                (remhash remote-id
+                         (mux-connection-proxy-remotes connection))))
+        (setf (gethash proxy-id
+                       (mux-connection-proxy-channels connection))
+              channel)
+        (setf (gethash remote-id
+                       (mux-connection-proxy-remotes connection))
+              channel)
+        (cl-pnet-ssh::ssh-client-confirm-channel channel)))))
+
+#+ssh-backend-lisp
+(defun mux-proxy-open-failure (master connection payload)
+  "Forward a proxy client's refusal of a relayed OPEN to the server."
+  (let* ((reader (cl-pnet-ssh:ssh-make-reader payload 2))
+         (remote-id (cl-pnet-ssh:ssh-read-u32 reader))
+         (reason (cl-pnet-ssh:ssh-read-u32 reader))
+         (description (cl-pnet-ssh:ssh-read-text reader))
+         (language (cl-pnet-ssh:ssh-read-text reader))
+         (writer (cl-pnet-ssh:ssh-writer)))
+    (remhash remote-id (mux-master-proxy-opens master))
+    (cl-pnet-ssh::ssh-write-u8
+     writer cl-pnet-ssh::+ssh-msg-channel-open-failure+)
+    (cl-pnet-ssh::ssh-write-u32 writer remote-id)
+    (cl-pnet-ssh::ssh-write-u32 writer reason)
+    (cl-pnet-ssh::ssh-write-text writer description)
+    (cl-pnet-ssh::ssh-write-text writer language)
+    (cl-pnet-ssh::ssh-client-send-payload
+     *client* (cl-pnet-ssh:ssh-writer-output writer))))
+
 #-ssh-backend-lisp
 (defun mux-proxy-downstream (connection payload)
   "Mux packet mode needs the pure transport's raw channel relay."
@@ -966,6 +1133,11 @@ the rest.  The client gets its own id back in the same position."
   (connections nil)
   (sessions nil)
   (next-session-id 1)
+  ;; Forwarding permissions requested by -O proxy clients: (KIND KEY...) to
+  ;; the mux connection that asked for them, and OPENs relayed to a proxy
+  ;; client, keyed by the server's sender id.
+  (proxy-listeners (make-hash-table :test #'equal))
+  (proxy-opens (make-hash-table :test #'eql))
   ;; A ControlPersist timeout only starts once this master has carried a
   ;; client; a master that has never been used is not idle.
   (seen-client nil)
@@ -1054,6 +1226,9 @@ its session ends, so this timer is only for a configured timeout."
     (dolist (connection (copy-list (mux-master-connections master)))
       (mux-connection-stop connection))
     (setf (mux-master-connections master) nil)
+    #+ssh-backend-lisp
+    (when *client*
+      (setf (cl-pnet-ssh::ssh-client-forwarded-open-relay *client*) nil))
     (when (eq master *mux-master*)
       (setf *mux-master* nil))))
 
@@ -1087,6 +1262,8 @@ so another process never sees a bound but unready socket."
                                     :persist persist)))
       (setf (mux-master-listener-id master) (first listener-id))
       (setf *mux-master* master)
+      #+ssh-backend-lisp
+      (mux-master-install-open-relay master client)
       (setf (mux-master-watcher master)
             (cl-pnet:fd-watch
              fd :on-readable

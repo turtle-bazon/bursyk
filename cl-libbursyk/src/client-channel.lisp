@@ -328,28 +328,34 @@ side is known to accept."
     (ssh-client-send-payload client (ssh-writer-output writer))))
 
 (defun ssh-client-handle-channel-open (client reader)
-  "Answer a server-initiated CHANNEL_OPEN; only forwarded-tcpip is wanted."
-  (let ((type (ssh-read-text reader))
-        (sender (ssh-read-u32 reader))
-        (window (ssh-read-u32 reader))
-        (max-packet (ssh-read-u32 reader)))
-    (cond
-      ((string= type "forwarded-tcpip")
-       (ssh-client-accept-forwarded-tcpip client reader sender window
+  "Answer a server-initiated CHANNEL_OPEN; only forwarded-tcpip is wanted.
+
+A control master may take the OPEN over before any channel is created, to
+relay it to a mux proxy client; the reader then still points after the type."
+  (let ((type (ssh-read-text reader)))
+    (unless (and (ssh-client-forwarded-open-relay client)
+                 (funcall (ssh-client-forwarded-open-relay client)
+                          client type reader))
+      (let ((sender (ssh-read-u32 reader))
+            (window (ssh-read-u32 reader))
+            (max-packet (ssh-read-u32 reader)))
+        (cond
+          ((string= type "forwarded-tcpip")
+           (ssh-client-accept-forwarded-tcpip client reader sender window
+                                              max-packet))
+          ((string= type "forwarded-streamlocal@openssh.com")
+           (ssh-client-accept-forwarded-streamlocal client reader sender window
+                                                    max-packet))
+          ((string= type "x11")
+           (ssh-client-accept-x11-channel client reader sender window
                                           max-packet))
-      ((string= type "forwarded-streamlocal@openssh.com")
-       (ssh-client-accept-forwarded-streamlocal client reader sender window
-                                                max-packet))
-      ((string= type "x11")
-       (ssh-client-accept-x11-channel client reader sender window
-                                      max-packet))
-      ((member type '("auth-agent@openssh.com" "agent-connect")
-               :test #'string=)
-       (ssh-client-accept-agent-channel client type sender window
-                                        max-packet))
-      (t
-       (ssh-client-send-channel-open-failure
-        client sender (format nil "unsupported channel type ~A" type))))))
+          ((member type '("auth-agent@openssh.com" "agent-connect")
+                   :test #'string=)
+           (ssh-client-accept-agent-channel client type sender window
+                                            max-packet))
+          (t
+           (ssh-client-send-channel-open-failure
+            client sender (format nil "unsupported channel type ~A" type))))))))
 
 (defun ssh-client-confirm-channel (channel)
   "Confirm a server-initiated CHANNEL, our half of the open handshake."
@@ -361,6 +367,28 @@ side is known to accept."
     (ssh-write-u32 writer (ssh-channel-local-max-packet channel))
     (ssh-client-send-payload (ssh-channel-client channel)
                              (ssh-writer-output writer))))
+
+(defun ssh-client-adopt-server-channel (client type remote-id
+                                        remote-window remote-max-packet
+                                        local-window local-max-packet)
+  "Register a server-initiated channel whose OPEN is being relayed elsewhere.
+
+The master creates this once a proxy client confirms the open; it must call
+SSH-CLIENT-CONFIRM-CHANNEL itself after installing the relay."
+  (let* ((id (ssh-client-allocate-channel-id client))
+         (channel (%make-ssh-channel
+                   :client client
+                   :local-id id
+                   :remote-id remote-id
+                   :type type
+                   :state :open
+                   :remote-window remote-window
+                   :remote-max-packet remote-max-packet
+                   :local-window local-window
+                   :local-max-packet local-max-packet)))
+    (setf (gethash id (ssh-client-channels client)) channel)
+    (ssh-client-channel-start-timeout channel)
+    channel))
 
 (defun ssh-client-register-incoming-channel (client type sender window
                                             max-packet)
