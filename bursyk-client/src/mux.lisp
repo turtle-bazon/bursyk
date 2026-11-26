@@ -672,16 +672,21 @@ through the alive check before the session starts."
 
 Reads never overshoot a frame: NEW_SESSION is followed by the client's three
 descriptors as ancillary data, and a bulk read would swallow the dummy byte
-each one rides on."
+each one rides on.  A frame too short to hold a type is what mux.c calls a
+malformed message."
   (let* ((input (mux-connection-input connection))
          (length (mux-connection-frame-length connection))
          (payload (subseq input 4 (+ 4 length))))
     (setf (fill-pointer input) 0
           (mux-connection-frame-length connection) nil)
-    (funcall (mux-connection-on-message connection) connection
-             (mux-u32 payload 0)
-             (cl-pnet-ssh:ssh-make-reader payload 4)
-             payload)))
+    (if (< length 4)
+        (progn
+          (log-error "mux_master_read_cb: malformed message")
+          (mux-connection-stop connection))
+        (funcall (mux-connection-on-message connection) connection
+                 (mux-u32 payload 0)
+                 (cl-pnet-ssh:ssh-make-reader payload 4)
+                 payload))))
 
 (defun mux-connection-read-frame (connection)
   (unless (mux-connection-closed-p connection)
@@ -1156,17 +1161,44 @@ The parts a transport cannot report are left out rather than guessed."
 
 (defun mux-master-message (master connection type reader payload)
   "Handle one frame from a control client; READER starts after TYPE."
-  (declare (ignore payload))
   (cond
     ((eql type +mux-msg-hello+)
-     (let ((version (cl-pnet-ssh:ssh-read-u32 reader)))
-       (if (= version +mux-version+)
-           (setf (mux-connection-hello connection) t)
-           (progn
-             (log-line "control client asked for mux version ~D" version)
-             (mux-connection-stop connection)))))
+     (cond
+       ((mux-connection-hello connection)
+        (log-error "mux_master_process_hello: HELLO received twice")
+        (mux-connection-stop connection))
+       ((< (length payload) 8)
+        (log-error "mux_master_process_hello: parse: incomplete message")
+        (mux-connection-stop connection))
+       (t
+        (let ((version (cl-pnet-ssh:ssh-read-u32 reader)))
+          (cond
+            ((/= version +mux-version+)
+             (log-error
+              "mux_master_process_hello: unsupported multiplexing protocol version ~D (expected ~D)"
+              version +mux-version+)
+             (mux-connection-stop connection))
+            (t
+             (handler-case
+                 ;; No extensions are presently defined; the pairs still
+                 ;; have to parse, as mux.c checks.
+                 (progn
+                   (loop while (plusp (cl-pnet-ssh:ssh-reader-remaining
+                                       reader))
+                         do (cl-pnet-ssh:ssh-read-text reader) ; name
+                            (cl-pnet-ssh:ssh-read-string reader)) ; value
+                   (setf (mux-connection-hello connection) t))
+               (error ()
+                 (log-error
+                  "mux_master_process_hello: parse extension: incomplete message")
+                 (mux-connection-stop connection)))))))))
     ((not (mux-connection-hello connection))
-     (log-line "control client sent a message before its hello")
+     (log-error
+      "mux_master_read_cb: expected MUX_MSG_HELLO(0x~8,'0X), received 0x~8,'0X"
+      +mux-msg-hello+ type)
+     (mux-connection-stop connection))
+    ((< (length payload) 8)
+     (log-error "mux_master_read_cb: malformed message")
      (mux-connection-stop connection))
     ((eql type +mux-c-alive-check+)
      (let ((request-id (cl-pnet-ssh:ssh-read-u32 reader))
@@ -1207,10 +1239,11 @@ The parts a transport cannot report are left out rather than guessed."
     ((eql type +mux-c-ext-info+)
      (mux-master-ext-info master connection reader))
     (t
+     (log-error "mux_master_read_cb: unsupported mux message 0x~8,'0X" type)
      (mux-connection-send
       connection
-      (mux-error-payload +mux-s-failure+ 0
-                         (format nil "unsupported mux request 0x~8,'0X" type))))))
+      (mux-error-payload +mux-s-failure+ (mux-u32 payload 4)
+                         "unsupported request")))))
 
 (defun mux-master-stop-listening (master)
   (when (mux-master-watcher master)
