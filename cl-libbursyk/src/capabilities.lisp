@@ -31,6 +31,7 @@
 The algorithm-shaped features are answered by the facade from the lists
 above; these are the role features that have no algorithm name."
   (not (null (member feature '(:remote-forward :streamlocal-forward
+                               :remote-dynamic-forward
                                :x11-forward :hostbased-authentication
                                :version-addendum :agent-forward)))))
 

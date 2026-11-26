@@ -358,9 +358,32 @@ side is known to accept."
     (ssh-client-send-payload (ssh-channel-client channel)
                              (ssh-writer-output writer))))
 
+(defun ssh-client-register-incoming-channel (client type sender window
+                                            max-packet)
+  "Create, confirm and register a server-initiated channel of TYPE."
+  (let* ((id (ssh-client-allocate-channel-id client))
+         (channel (%make-ssh-channel
+                   :client client
+                   :local-id id
+                   :remote-id sender
+                   :type type
+                   :state :open
+                   :remote-window window
+                   :remote-max-packet max-packet
+                   :local-window (ssh-client-window client)
+                   :local-max-packet (ssh-client-max-packet client))))
+    (setf (gethash id (ssh-client-channels client)) channel)
+    (ssh-client-confirm-channel channel)
+    (ssh-client-channel-start-timeout channel)
+    channel))
+
 (defun ssh-client-accept-forwarded-tcpip (client reader sender window
                                           max-packet)
-  "Accept a forwarded-tcpip channel and dial the application's local target."
+  "Accept a forwarded-tcpip channel and dial the application's local target.
+
+The handler returns (VALUES HOST PORT) to dial, or a function of CHANNEL to
+take over the new channel (reverse dynamic SOCKS forwarding), or NIL to
+refuse it."
   (let* ((bind-address (ssh-read-text reader))
          (bind-port (ssh-read-u32 reader))
          (origin-address (ssh-read-text reader))
@@ -371,29 +394,25 @@ side is known to accept."
     (multiple-value-bind (host port)
         (and handler (funcall handler client bind-address bind-port
                               origin-address origin-port))
-      (if (null host)
-          (progn
-            (ssh-log "refusing forwarded-tcpip for ~A:~D" bind-address bind-port)
-            (ssh-client-send-channel-open-failure
-             client sender
-             (format nil "forwarded-tcpip for ~A:~D was not requested"
-                     bind-address bind-port)))
-          (let* ((id (ssh-client-allocate-channel-id client))
-                 (channel (%make-ssh-channel
-                           :client client
-                           :local-id id
-                           :remote-id sender
-                           :type "forwarded-tcpip"
-                           :state :open
-                           :remote-window window
-                           :remote-max-packet max-packet
-                           :local-window (ssh-client-window client)
-                           :local-max-packet (ssh-client-max-packet client))))
-            (setf (gethash id (ssh-client-channels client)) channel)
-            (ssh-client-confirm-channel channel)
-            (ssh-client-channel-start-timeout channel)
-            (ssh-client-connect-forward-target channel host port)
-            channel)))))
+      (cond
+        ((functionp host)
+         (let ((channel
+                 (ssh-client-register-incoming-channel
+                  client "forwarded-tcpip" sender window max-packet)))
+           (funcall host channel)
+           channel))
+        ((null host)
+         (ssh-log "refusing forwarded-tcpip for ~A:~D" bind-address bind-port)
+         (ssh-client-send-channel-open-failure
+          client sender
+          (format nil "forwarded-tcpip for ~A:~D was not requested"
+                  bind-address bind-port)))
+        (t
+         (let ((channel
+                 (ssh-client-register-incoming-channel
+                  client "forwarded-tcpip" sender window max-packet)))
+           (ssh-client-connect-forward-target channel host port)
+           channel))))))
 
 (defun ssh-client-accept-forwarded-streamlocal (client reader sender window
                                                 max-packet)
@@ -489,18 +508,22 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                 (ssh-fd-relay-start relay)
                 channel))))))
 
-(defun ssh-client-connect-forward-target (channel host port)
-  "Connect a forwarded CHANNEL to HOST:PORT without blocking."
+(defun ssh-client-connect-forward-target (channel host port &key on-connected)
+  "Connect a forwarded CHANNEL to HOST:PORT without blocking.
+
+ON-CONNECTED runs once the local socket exists, so a caller with bytes that
+arrived before the request (reverse dynamic SOCKS) can send them."
   (handler-case
       (burzay:resolve-host
        host
        (lambda (address)
-         (ssh-client-dial-forward-target channel address port))
+         (ssh-client-dial-forward-target channel address port on-connected))
        (lambda (condition)
          (ssh-client-forward-fail channel condition)))
     (error (condition) (ssh-client-forward-fail channel condition))))
 
-(defun ssh-client-dial-forward-target (channel address port)
+(defun ssh-client-dial-forward-target (channel address port
+                                       &optional on-connected)
   (ssh-log "forwarded-tcpip dialling ~A:~D" address port)
   (let ((connection
           (cl-pnet:tcp-connect
@@ -518,7 +541,9 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                               :detail (format nil "target connect failed (~A)"
                                               status)))))))
     (if connection
-        (setf (ssh-channel-target channel) connection)
+        (progn
+          (setf (ssh-channel-target channel) connection)
+          (when on-connected (funcall on-connected)))
         (ssh-client-forward-fail
          channel
          (make-condition 'ssh-channel-error

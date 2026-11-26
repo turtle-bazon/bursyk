@@ -916,6 +916,54 @@ an unrequested one is refused with a CHANNEL_OPEN_FAILURE."
         (is (= cl-pnet-ssh::+ssh-msg-channel-open-failure+ (ssh-read-u8 reader)))
         (is (= 7 (ssh-read-u32 reader)))))))
 
+(test client-accepts-a-forwarded-tcpip-channel-with-a-setup-function
+  "A handler returning a function takes over the accepted channel.
+
+The reverse dynamic SOCKS server uses this: the SOCKS request has not
+arrived when the server opens the channel."
+  (let ((writer (ssh-writer)))
+    (ssh-write-u8 writer cl-pnet-ssh::+ssh-msg-channel-open+)
+    (ssh-write-text writer "forwarded-tcpip")
+    (ssh-write-u32 writer 7)
+    (ssh-write-u32 writer 2097152)
+    (ssh-write-u32 writer 32768)
+    (ssh-write-text writer "127.0.0.1")
+    (ssh-write-u32 writer 8080)
+    (ssh-write-text writer "127.0.0.1")
+    (ssh-write-u32 writer 40000)
+    (let* ((client (cl-pnet-ssh::%make-ssh-client))
+           (seen nil)
+           (setup-channel nil)
+           (sent '()))
+      (setf (cl-pnet-ssh::ssh-client-on-forwarded-tcpip client)
+            (lambda (client bind-address bind-port
+                      origin-address origin-port)
+              (declare (ignore client origin-address origin-port))
+              (push (list bind-address bind-port) seen)
+              (lambda (channel) (setf setup-channel channel))))
+      (let ((original (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                     (lambda (client payload)
+                       (declare (ignore client))
+                       (push payload sent)
+                       t))
+               (cl-pnet-ssh::ssh-client-handle-channel-message
+                client (ssh-writer-output writer)))
+          (setf (symbol-function 'cl-pnet-ssh::ssh-client-send-payload)
+                original)))
+      (is (equal '(("127.0.0.1" 8080)) seen))
+      (is (not (null setup-channel)))
+      (is (equal "forwarded-tcpip"
+                 (cl-pnet-ssh::ssh-channel-type setup-channel)))
+      (is (eq :open (cl-pnet-ssh::ssh-channel-state setup-channel)))
+      ;; The confirmation names the server's sender id.
+      (let ((reader (ssh-make-reader (first sent))))
+        (is (= cl-pnet-ssh::+ssh-msg-channel-open-confirmation+
+               (ssh-read-u8 reader)))
+        (is (= 7 (ssh-read-u32 reader)))))))
+
 (test server-accepts-a-hostbased-request
   "A hostbased request is verified with the client host key and handed to
 the application's trust hook."

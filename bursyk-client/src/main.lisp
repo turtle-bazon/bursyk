@@ -1478,17 +1478,19 @@ refusal."
         (when (and tunnel (not (eq tunnel :no)))
           (unsupported "Tunnel" "TUN/TAP forwarding is not implemented")))
       ;; A one-word RemoteForward asks the server for a SOCKS proxy.  The
-      ;; forwarding streams work, but this client has no SOCKS server on the
-      ;; server-initiated channel, so say so rather than expose a dead port.
+      ;; reverse-dynamic path is part of the pure transport; a transport
+      ;; without it must say so rather than expose a dead port.
       (let ((dynamic
               (find-if (lambda (forward)
                          (equal (forward-host forward) "socks"))
                        (mapcar #'parse-config-remote-forward
                                (cl-pnet-ssh:ssh-config-options-remote-forwards
                                 options)))))
-        (when dynamic
+        (when (and dynamic
+                   (not (cl-pnet-ssh:ssh-client-feature-supported-p
+                         :remote-dynamic-forward)))
           (unsupported "RemoteForward"
-                       "remote dynamic (SOCKS) forwarding is not implemented"))))))
+                       "remote dynamic (SOCKS) forwarding is not implemented by this transport"))))))
 
 ;;; ---- ~/.ssh/config and -o ----
 
@@ -2047,6 +2049,9 @@ alias works while other spellings of the same word do not."
 (defstruct (socks-session (:constructor %make-socks-session))
   client
   connection
+  ;; A reverse dynamic forward (ssh -R port) runs SOCKS on a server-initiated
+  ;; channel instead of a local socket.
+  channel
   ;; A streamlocal -D accepts a raw descriptor instead of a CL-PNET
   ;; connection.  Once the handshake produces a tunnel, BRIDGE owns FD.
   fd
@@ -4281,6 +4286,10 @@ requested destination port."
        (when forward
          (setf (dynamic-forward-fd-sessions forward)
                (delete session (dynamic-forward-fd-sessions forward))))))
+    ((socks-session-channel session)
+     (setf (socks-session-closed session) t)
+     (ignore-errors
+       (cl-pnet-ssh:ssh-channel-close (socks-session-channel session))))
     (t
      (let ((connection (socks-session-connection session)))
        (remhash connection *socks-sessions*)
@@ -4296,6 +4305,7 @@ requested destination port."
 (defun socks-send (session data)
   "Send DATA to SESSION's client, abandoning the session on a write error."
   (let ((fd (socks-session-fd session))
+        (channel (socks-session-channel session))
         (connection (socks-session-connection session)))
     (cond
       ((and fd (not (minusp fd)))
@@ -4304,6 +4314,10 @@ requested destination port."
                (cl-pnet-sockets:write-octets fd data)
              (when (or (minusp count) (plusp errno))
                (socks-abandon session)))
+         (error () (socks-abandon session))))
+      (channel
+       (handler-case
+           (cl-pnet-ssh:ssh-channel-write channel data)
          (error () (socks-abandon session))))
       (connection
        (handler-case
@@ -4363,15 +4377,68 @@ uses."
       (client-streamlocal-install bridge)
       (client-streamlocal-connected bridge))))
 
+(defun socks-start-rdynamic-tunnel (session host port remaining socks4)
+  "Finish a reverse dynamic SOCKS request by dialling HOST:PORT locally.
+
+channels.c buffers the success reply while decoding the request and flushes
+it only once the local connect succeeds; a refused connect logs
+connect_to()'s error and closes the channel with no reply."
+  (let* ((channel (socks-session-channel session))
+         (client (socks-session-client session)))
+    (if (not (permit-remote-open-allowed-p client host port))
+        (socks-abandon session)
+        (progn
+          (setf (cl-pnet-ssh:ssh-channel-on-error channel)
+                (lambda (channel condition)
+                  (declare (ignore channel condition))
+                  (log-error "connect_to ~A port ~D: failed." host port)))
+          (cl-pnet-ssh:ssh-client-connect-forward-target
+           channel host port
+           :on-connected
+           (lambda ()
+             (socks-send session
+                         (if socks4
+                             #(0 90 0 0 0 0 0 0)
+                             (socks-reply cl-pnet-socks:+socks5-reply-success+
+                                          :port port)))
+             (when (and remaining (plusp (length remaining)))
+               (let* ((symbol (find-symbol "SSH-CHANNEL-TARGET" :cl-pnet-ssh))
+                      (target (and symbol (fboundp symbol)
+                                   (funcall symbol channel))))
+                 (when target
+                   (ignore-errors (cl-pnet:send-data target remaining)))))))))))
+
+(defun start-rdynamic-socks (client channel forward)
+  "Run the SOCKS handshake on a server-initiated reverse dynamic CHANNEL."
+  (let ((session (%make-socks-session :client client :channel channel
+                                      :forward forward)))
+    (setf (cl-pnet-ssh:ssh-channel-on-data channel)
+          (lambda (channel data kind)
+            (declare (ignore channel kind))
+            (socks-process session data))
+          (cl-pnet-ssh:ssh-channel-on-eof channel)
+          (lambda (channel)
+            (declare (ignore channel))
+            (socks-abandon session))
+          (cl-pnet-ssh:ssh-channel-on-close channel)
+          (lambda (channel &optional status)
+            (declare (ignore channel status))
+            (setf (socks-session-closed session) t)))
+    session))
+
 (defun socks-start-tunnel (session host port remaining &key socks4)
   "Dial HOST:PORT through the SSH connection for SESSION's client.
 
 REMAINING is any stream data the client sent right behind the request; it is
 buffered with the tunnel and flushed once the channel is open.  SOCKS4 selects
 the four-byte SOCKS4 success reply instead of the SOCKS5 one."
-  (when (socks-session-fd session)
-    (return-from socks-start-tunnel
-      (socks-start-fd-tunnel session host port remaining socks4)))
+  (cond
+    ((socks-session-fd session)
+     (return-from socks-start-tunnel
+       (socks-start-fd-tunnel session host port remaining socks4)))
+    ((socks-session-channel session)
+     (return-from socks-start-tunnel
+       (socks-start-rdynamic-tunnel session host port remaining socks4))))
   (let* ((connection (socks-session-connection session))
          (client (socks-session-client session))
          (dynamic (socks-session-forward session))
@@ -4641,12 +4708,17 @@ the four-byte SOCKS4 success reply instead of the SOCKS5 one."
            (string= (forward-bind-address forward) "*")
            (string-equal (forward-bind-address forward) bind-address))))
 
+(defun remote-dynamic-forward-p (forward)
+  "Whether FORWARD is a one-port -R reverse dynamic SOCKS forward."
+  (equal (forward-host forward) "socks"))
+
 (defun forwarded-tcpip-target (client bind-address bind-port
                                origin-address origin-port)
   "Answer the local target for a server-initiated forwarded-tcpip channel.
 
 The library calls this with the listener the server actually used and the
-peer that connected to it; NIL refuses the channel."
+peer that connected to it; NIL refuses the channel.  A reverse dynamic
+forward returns a setup function: its SOCKS request has not arrived yet."
   (declare (ignore origin-address origin-port))
   (let ((forward (find-if (lambda (candidate)
                             (remote-forward-match-p candidate
@@ -4654,10 +4726,14 @@ peer that connected to it; NIL refuses the channel."
                           *remote-forwards*)))
     (cond
       ((null forward) (values nil nil))
+      ((remote-dynamic-forward-p forward)
+       (lambda (channel)
+         (start-rdynamic-socks client channel forward)))
       ((permit-remote-open-allowed-p client
                                      (forward-host forward)
                                      (forward-port forward))
-       (values (forward-host forward) (forward-port forward)))
+       (lambda (channel)
+         (attach-client-tcp-target channel forward)))
       (t
        (unless (getf *options* :quiet)
          (format *error-output*
@@ -4665,11 +4741,25 @@ peer that connected to it; NIL refuses the channel."
                  (forward-host forward) (forward-port forward)))
        (values nil nil)))))
 
+(defun report-forward-target-error (forward condition)
+  "Log a failed -R target the way channels.c's connect_to() does."
+  (let ((host (forward-host forward))
+        (port (forward-port forward)))
+    (if (typep condition 'cl-pnet-ssh:ssh-channel-error)
+        (log-error "connect_to ~A port ~D: failed." host port)
+        ;; The resolver's getaddrinfo text, in channel_connect_to_port()'s
+        ;; "unknown host" wording.
+        (log-error "connect_to ~A: unknown host (~A)"
+                   host (cl-pnet-ssh:ssh-resolver-error-text condition)))))
+
 (defun attach-client-tcp-target (channel forward)
-  "Bridge a server-initiated streamlocal channel to FORWARD's TCP target."
+  "Bridge a server-initiated channel to FORWARD's TCP target.
+
+The failure messages are channels.c's connect_to() wording."
   (setf (cl-pnet-ssh:ssh-channel-on-error channel)
         (lambda (channel condition)
-          (declare (ignore condition))
+          (declare (ignore channel))
+          (report-forward-target-error forward condition)
           (ignore-errors (cl-pnet-ssh:ssh-channel-close channel))))
   (cl-pnet-ssh:ssh-client-connect-forward-target
    channel (forward-host forward) (forward-port forward)))
@@ -4682,6 +4772,9 @@ peer that connected to it; NIL refuses the channel."
                           (string= (forward-bind-path candidate) path)))
                    *remote-forwards*)))
     (when forward
+      ;; A one-word -R path is accepted by readconf, but channels.c's
+      ;; streamlocal path has no reverse-dynamic branch: it tries to connect
+      ;; to the "socks" placeholder and fails.
       (let ((allowed
               (if (forward-target-path forward)
                   (permit-remote-open-allowed-p

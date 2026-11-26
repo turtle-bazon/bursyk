@@ -900,6 +900,15 @@ the lines never reach the output."
        (burs::remote-forward-target-description
         (burs::parse-remote-forward "0:/tmp/socket")))))
 
+(test reverse-dynamic-forwards-are-recognised
+  (is (burs::remote-dynamic-forward-p (burs::parse-remote-forward "8080")))
+  (is (burs::remote-dynamic-forward-p
+       (burs::parse-remote-forward "[::1]:8080")))
+  (is (not (burs::remote-dynamic-forward-p
+            (burs::parse-remote-forward "8080:example.org:80"))))
+  (is (not (burs::remote-dynamic-forward-p
+            (burs::parse-remote-forward "/a:/b")))))
+
 (test remote-dynamic-forward-specifications-parse
   ;; A one-word -R is the dynamic form: the server listens and the client
   ;; speaks SOCKS, which readconf records as the "socks" target on port 0.
