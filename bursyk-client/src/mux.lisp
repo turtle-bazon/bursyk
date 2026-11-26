@@ -762,6 +762,9 @@ malformed message."
   path
   fd
   watcher
+  ;; mux.c's listener is a channel too (SSH_CHANNEL_MUX_LISTENER, type 15),
+  ;; hidden from -O channels but holding the slot.
+  listener-id
   mode
   persist
   (connections nil)
@@ -880,9 +883,11 @@ so another process never sees a bound but unready socket."
     (ignore-errors (delete-file temporary))
     ;; mux.c's listener is an ordinary channel, so it owns the lowest free id.
     ;; Reserving it keeps the numbers in "channel N:" diagnostics identical.
-    (cl-pnet-ssh:ssh-client-reserve-channel-ids client 1)
-    (let ((master (%make-mux-master :path path :fd fd :mode mode
+    (let ((listener-id
+            (cl-pnet-ssh:ssh-client-reserve-channel-ids client 1))
+          (master (%make-mux-master :path path :fd fd :mode mode
                                     :persist persist)))
+      (setf (mux-master-listener-id master) (first listener-id))
       (setf *mux-master* master)
       (setf (mux-master-watcher master)
             (cl-pnet:fd-watch
@@ -1126,18 +1131,157 @@ The parts a transport cannot report are left out rather than guessed."
                 (mux-format-scaled (getf traffic :sent-bytes)))
         (mux-write-crlf out)))))
 
+(defun mux-format-channel-status
+    (out id remote-name type ctype remote-id-p remote-id mux-p
+     istate input-length ostate output-length extended-usage extended-length
+     rfd wfd efd sock ctl-chan ctl-child-p ctl-child-id io-want io-ready
+     tty-flag bulk-flag)
+  "Write one channel_format_status() line, as channels.c spells it."
+  (format out
+          "  #~D ~A (t~D [~A] ~A~D ~A0 i~D/~D o~D/~D e[~A]/~D fd ~D/~D/~D sock ~D cc ~D ~A~D io 0x~2,'0X/0x~2,'0X ~A~A)"
+          id remote-name type ctype
+          (if remote-id-p "r" "nr") remote-id (if mux-p "m" "nm")
+          istate input-length ostate output-length
+          extended-usage extended-length
+          rfd wfd efd sock ctl-chan
+          (if ctl-child-p "c" "nc") ctl-child-id
+          io-want io-ready tty-flag bulk-flag)
+  (mux-write-crlf out))
+
+(defun mux-control-channel-status (out connection child-id)
+  "Write the mux-control channel mux.c gives every attached client."
+  (let ((fd (mux-connection-fd connection))
+        (output (mux-connection-output connection)))
+    (mux-format-channel-status
+     out (mux-connection-control-channel-id connection) "mux-control"
+     16 "mux-control" nil 0 t
+     ;; The control channel has no SSH buffer state of its own.
+     0 0 0 0 "closed" 0
+     fd fd -1 fd -1
+     (and child-id t) (or child-id 0)
+     1 (if (and output (plusp (fill-pointer output))) 0 1)
+     "" "I")))
+
+(defun mux-session-channel-status (out session)
+  "Write the channel a mux client's session runs on.
+
+A normal session is channels.c's client-session; a -W stdio forward is a
+stdio-forward channel created by channel_connect_stdio_fwd()."
+  (let* ((channel (mux-session-channel session))
+         (connection (mux-session-connection session))
+         (state (and channel (cl-pnet-ssh::ssh-channel-state channel)))
+         (open (member state '(:open :closing)))
+         (remote-id (and channel (cl-pnet-ssh::ssh-channel-remote-id channel)))
+         (x-type (and channel (cl-pnet-ssh::ssh-channel-x-type channel)))
+         (ctype (or x-type
+                    (and channel (cl-pnet-ssh::ssh-channel-type channel))
+                    "session"))
+         (eof (and channel (cl-pnet-ssh::ssh-channel-sent-eof channel)))
+         (write-queue (and channel (cl-pnet-ssh::ssh-channel-write-queue channel)))
+         (stdin (if (mux-session-stdin-watcher session)
+                    (mux-session-stdin-fd session)
+                    -1))
+         (stderr (if (mux-session-closed session)
+                     -1
+                     (mux-session-stderr-fd session))))
+    (if (mux-session-stdio session)
+        (mux-format-channel-status
+         out (cl-pnet-ssh::ssh-channel-local-id channel)
+         (or (mux-session-remote-name session) "stdio-forward")
+         (if open 4 3) "stdio-forward" (and remote-id t) (or remote-id 0) nil
+         (if eof 3 0) 0
+         (if (eq state :closing) 3 0)
+         (if write-queue (fill-pointer write-queue) 0)
+         "closed" 0
+         stdin (mux-session-stdout-fd session) -1 -1
+         (mux-connection-control-channel-id connection) nil 0
+         1 0 "" "B")
+        (mux-format-channel-status
+         out (cl-pnet-ssh::ssh-channel-local-id channel) "client-session"
+         (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
+         ;; i3 is CHAN_INPUT_CLOSED: the local side has sent EOF.
+         (if eof 3 0) 0
+         (if (eq state :closing) 3 0)
+         (if write-queue (fill-pointer write-queue) 0)
+         (if (= stderr -1) "closed" "write")
+         (fill-pointer (mux-session-stderr-buffer session))
+         stdin (mux-session-stdout-fd session) stderr -1
+         (mux-connection-control-channel-id connection) nil 0
+         0 0
+         (if (mux-session-want-tty session) "T" "")
+         ;; CHANNEL_NONBLOCK_STDIO marks the stdio-backed session bulk.
+         "B"))))
+
+(defun mux-generic-channel-status (out channel)
+  "Write a channel the mux layer did not create itself, such as a forwarded
+connection.  Its remote name is whatever the forwarding code recorded."
+  (let* ((state (cl-pnet-ssh::ssh-channel-state channel))
+         (open (member state '(:open :closing)))
+         (remote-id (cl-pnet-ssh::ssh-channel-remote-id channel))
+         (ctype (or (cl-pnet-ssh::ssh-channel-x-type channel)
+                    (cl-pnet-ssh::ssh-channel-type channel)
+                    "unknown"))
+         (name (or (cl-pnet-ssh::ssh-channel-remote-name channel) ctype))
+         (write-queue (cl-pnet-ssh::ssh-channel-write-queue channel)))
+    (mux-format-channel-status
+     out (cl-pnet-ssh::ssh-channel-local-id channel) name
+     (if open 4 3) ctype (and remote-id t) (or remote-id 0) nil
+     0 0 (if (eq state :closing) 3 0)
+     (if write-queue (fill-pointer write-queue) 0)
+     "closed" 0
+     -1 -1 -1 -1 -1 nil 0
+     0 0 "" "B")))
+
 (defun mux-channel-open-message (master)
-  "The text -O channels returns: one line per open multiplexed session."
-  (with-output-to-string (out)
-    (format out "The following connections are open:")
-    (mux-write-crlf out)
-    (dolist (session (reverse (mux-master-sessions master)))
+  "The text -O channels returns, matching channels.c's channel_open_message.
+
+Every entry is printed from the real channel table, so the ids, the
+client-session/mux-control names and the control/session links agree with
+the numbers \"channel N:\" diagnostics use.  Descriptor numbers and the
+libssh input/output flags are this implementation's own."
+  (let ((entries '())
+        (printed (make-hash-table :test #'eql)))
+    (dolist (connection (mux-master-connections master))
+      (when (mux-connection-control-channel-id connection)
+        (let* ((session (mux-connection-session connection))
+               (channel (and session (mux-session-channel session)))
+               (child-id (and channel
+                              (cl-pnet-ssh::ssh-channel-local-id channel))))
+          (setf (gethash (mux-connection-control-channel-id connection)
+                         printed)
+                t)
+          (push (cons (mux-connection-control-channel-id connection)
+                      (lambda (out)
+                        (mux-control-channel-status out connection child-id)))
+                entries))))
+    (dolist (session (mux-master-sessions master))
       (unless (mux-session-closed session)
-        (format out "  #~D ~A (~A)"
-                (mux-session-sid session)
-                (mux-session-remote-name session)
-                (if (mux-session-opened session) "open" "opening"))
-        (mux-write-crlf out)))))
+        (let ((channel (mux-session-channel session)))
+          (when channel
+            (let ((id (cl-pnet-ssh::ssh-channel-local-id channel)))
+              (setf (gethash id printed) t)
+              (push (cons id
+                          (lambda (out)
+                            (mux-session-channel-status out session)))
+                    entries))))))
+    ;; Everything else the client holds open, such as a forwarded
+    ;; connection the master is carrying.
+    (when *client*
+      (maphash
+       (lambda (id channel)
+         (unless (or (gethash id printed)
+                     (eql id (mux-master-listener-id master))
+                     (eq (cl-pnet-ssh::ssh-channel-state channel) :closed))
+           (push (cons id
+                       (lambda (out)
+                         (mux-generic-channel-status out channel)))
+                 entries)))
+       (cl-pnet-ssh::ssh-client-channels *client*)))
+    (with-output-to-string (out)
+      (format out "The following connections are open:")
+      (mux-write-crlf out)
+      (dolist (entry (sort entries #'< :key #'car))
+        (funcall (cdr entry) out)))))
 
 (defun mux-master-ext-info (master connection reader)
   "Answer a MUX_C_EXT_INFO request for the connection or channel list."
@@ -1436,6 +1580,14 @@ The parts a transport cannot report are left out rather than guessed."
         channel "shell" t
         (lambda (writer) (declare (ignore writer))))))
     (setf (mux-session-opened session) t)
+    ;; clientloop.c's client_session2_setup() records the same extended
+    ;; type, which -O channels shows in brackets.
+    (cl-pnet-ssh::ssh-channel-set-x-type
+     channel
+     (cond
+       (want-subsystem (format nil "session:subsystem:~A" command))
+       ((plusp (length command)) "session:command")
+       (t "session:shell")))
     (mux-connection-send
      (mux-session-connection session)
      (mux-request-payload +mux-s-session-opened+
@@ -1643,6 +1795,28 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
         :connect-host (cl-pnet-ssh:ssh-read-text reader)
         :connect-port (cl-pnet-ssh:ssh-read-u32 reader)))
 
+(defun mux-open-forward-invalid-p (type listen-host listen-port
+                                   connect-host connect-port)
+  "Whether mux_master_process_open_fwd() refuses this forward.
+
+Returns the logit() text it prints, or NIL when the request is acceptable."
+  (cond
+    ((not (member type (list +mux-fwd-local+ +mux-fwd-remote+
+                             +mux-fwd-dynamic+)))
+     (format nil "invalid forwarding type ~D" type))
+    ((and (= type +mux-fwd-dynamic+)
+          (= listen-port +mux-port-streamlocal+))
+     "streamlocal and dynamic forwards are mutually exclusive")
+    ((and (/= listen-port +mux-port-streamlocal+) (>= listen-port 65536))
+     (format nil "invalid listen port ~D" listen-port))
+    ((and (/= connect-port +mux-port-streamlocal+) (>= connect-port 65536))
+     (format nil "invalid connect port ~D" connect-port))
+    ((and (/= type +mux-fwd-dynamic+) (/= type +mux-fwd-remote+)
+          (zerop connect-port))
+     "invalid connect port 0")
+    ((and (/= type +mux-fwd-dynamic+) (string= connect-host ""))
+     "missing connect host")))
+
 (defun mux-master-forward (master connection reader cancel-p)
   (let* ((request-id (cl-pnet-ssh:ssh-read-u32 reader))
          (fields (mux-forward-fields reader))
@@ -1651,12 +1825,29 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
          (listen-port (getf fields :listen-port))
          (connect-host (getf fields :connect-host))
          (connect-port (getf fields :connect-port))
+         (invalid (and (not cancel-p)
+                       (mux-open-forward-invalid-p
+                        type listen-host listen-port
+                        connect-host connect-port)))
          (defer (and (= type +mux-fwd-remote+) (zerop listen-port))))
+    (when invalid
+      (log-info "mux_master_process_open_fwd: ~A" invalid)
+      (return-from mux-master-forward
+        (mux-connection-send
+         connection
+         (mux-error-payload +mux-s-failure+ request-id
+                            "Invalid forwarding request"))))
     (handler-case
         (cond
           (cancel-p
-           (mux-cancel-forward type listen-host listen-port)
-           (mux-connection-send connection (mux-ok-payload request-id)))
+           (if (mux-cancel-forward type listen-host listen-port)
+               (mux-connection-send connection (mux-ok-payload request-id))
+               ;; mux_master_process_close_fwd() reports a forward it never
+               ;; held instead of pretending it cancelled something.
+               (mux-connection-send
+                connection
+                (mux-error-payload +mux-s-failure+ request-id
+                                   "port not forwarded"))))
           ((mux-forward-registered-p type listen-host listen-port)
            ;; OpenSSH acknowledges a forward it already holds rather than
            ;; trying to listen on the same port twice.
@@ -1701,7 +1892,9 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                                "remote forward refused"))))))))
              (unless defer
                (mux-forward-reply connection request-id type listen-port
-                                  (and forward (forward-bind-port forward)))))))
+                                  (and (= type +mux-fwd-remote+)
+                                       forward
+                                       (forward-bind-port forward)))))))
       (error (condition)
         (mux-connection-send
          connection
@@ -1729,7 +1922,7 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
     (#.+mux-fwd-dynamic+
      (some (lambda (forward)
              (mux-forward-bind-matches-p
-              (dynamic-bind-address forward)
+              (dynamic-forward-bind-address forward)
               (dynamic-forward-bind-port forward) nil
               listen-host listen-port))
            *dynamic-forwards*))
@@ -1792,55 +1985,83 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                   ""))))
 
 (defun mux-cancel-forward (type listen-host listen-port)
-  (declare (ignore type))
-  (let ((forward (find-if (lambda (candidate)
-                            (mux-cancelled-forward-p
-                             candidate listen-host listen-port))
-                          (append *forwards* *remote-forwards*))))
-    (when forward
-      (setf *forwards* (delete forward *forwards*)
-            *remote-forwards* (delete forward *remote-forwards*))
-      (when (forward-listener forward)
-        (ignore-errors (cl-pnet:close-listener (forward-listener forward)))
-        (setf (forward-listener forward) nil))
-      (when (forward-listener-watcher forward)
-        (ignore-errors
-         (cl-pnet:fd-unwatch (forward-listener-watcher forward)))
-        (setf (forward-listener-watcher forward) nil))
-      (when (forward-listener-fd forward)
-        (ignore-errors
-         (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
-        (setf (forward-listener-fd forward) nil)))))
+  "Stop the forward TYPE names; true when it was registered."
+  (if (= type +mux-fwd-dynamic+)
+      (let ((forward (find-if
+                      (lambda (candidate)
+                        (mux-forward-bind-matches-p
+                         (dynamic-forward-bind-address candidate)
+                         (dynamic-forward-bind-port candidate) nil
+                         listen-host listen-port))
+                      *dynamic-forwards*)))
+        (when forward
+          (close-dynamic-forward-listeners forward)
+          (setf *dynamic-forwards* (delete forward *dynamic-forwards*))
+          (release-dynamic-forward-channel-id *client* forward))
+        (and forward t))
+      (let ((forward (find-if (lambda (candidate)
+                                (mux-cancelled-forward-p
+                                 candidate listen-host listen-port))
+                              (append *forwards* *remote-forwards*))))
+        (when forward
+          (setf *forwards* (delete forward *forwards*)
+                *remote-forwards* (delete forward *remote-forwards*))
+          (close-forward-listeners forward)
+          (when (forward-listener-watcher forward)
+            (ignore-errors
+             (cl-pnet:fd-unwatch (forward-listener-watcher forward)))
+            (setf (forward-listener-watcher forward) nil))
+          (when (forward-listener-fd forward)
+            (ignore-errors
+             (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
+            (setf (forward-listener-fd forward) nil))
+          ;; The listener channels' slots are free again, as channels.c's
+          ;; channel_free() makes them.
+          (release-forward-channel-id *client* forward))
+        (and forward t))))
 
 (defun mux-apply-forward (type listen-host listen-port connect-host connect-port
                           &key on-remote-allocated on-remote-failed)
-  (let* ((streamlocal (or (= listen-port +mux-port-streamlocal+)
-                          (= connect-port +mux-port-streamlocal+)))
-         (forward
-           (%make-forward
-            :bind-address (unless (= listen-port +mux-port-streamlocal+)
-                            (unless (string= listen-host "") listen-host))
-            :bind-port (unless (= listen-port +mux-port-streamlocal+)
-                         listen-port)
-            :bind-path (and (= listen-port +mux-port-streamlocal+)
-                            listen-host)
-            :host (unless (= connect-port +mux-port-streamlocal+)
-                    (unless (string= connect-host "") connect-host))
-            :port (unless (= connect-port +mux-port-streamlocal+)
-                    connect-port)
-            :target-path (and (= connect-port +mux-port-streamlocal+)
-                              connect-host))))
-    (declare (ignore streamlocal))
-    (unless (case type
-              (#.+mux-fwd-local+ (start-local-forward *client* forward))
-              (#.+mux-fwd-remote+
-               (start-remote-forward *client* forward
-                                     :on-allocated on-remote-allocated
-                                     :on-failed on-remote-failed))
-              (#.+mux-fwd-dynamic+ (start-dynamic-forward *client* forward))
-              (t (error "unknown forwarding type ~D" type)))
-      (error "cannot start the requested forward"))
-    forward))
+  (if (= type +mux-fwd-dynamic+)
+      ;; -D is one entry of ssh's local_forwards with connect_port 0, and the
+      ;; master installs it with channel_setup_local_fwd_listener().
+      (let ((forward
+              (%make-dynamic-forward
+               :bind-address (unless (= listen-port +mux-port-streamlocal+)
+                               (unless (string= listen-host "") listen-host))
+               :bind-port (unless (= listen-port +mux-port-streamlocal+)
+                            listen-port)
+               :bind-path (and (= listen-port +mux-port-streamlocal+)
+                               listen-host))))
+        (unless (start-dynamic-forward *client* forward)
+          (error "cannot start the requested forward"))
+        forward)
+      (let* ((streamlocal (or (= listen-port +mux-port-streamlocal+)
+                              (= connect-port +mux-port-streamlocal+)))
+             (forward
+               (%make-forward
+                :bind-address (unless (= listen-port +mux-port-streamlocal+)
+                                (unless (string= listen-host "") listen-host))
+                :bind-port (unless (= listen-port +mux-port-streamlocal+)
+                             listen-port)
+                :bind-path (and (= listen-port +mux-port-streamlocal+)
+                                listen-host)
+                :host (unless (= connect-port +mux-port-streamlocal+)
+                        (unless (string= connect-host "") connect-host))
+                :port (unless (= connect-port +mux-port-streamlocal+)
+                        connect-port)
+                :target-path (and (= connect-port +mux-port-streamlocal+)
+                                  connect-host))))
+        (declare (ignore streamlocal))
+        (unless (case type
+                  (#.+mux-fwd-local+ (start-local-forward *client* forward))
+                  (#.+mux-fwd-remote+
+                   (start-remote-forward *client* forward
+                                         :on-allocated on-remote-allocated
+                                         :on-failed on-remote-failed))
+                  (t (error "unknown forwarding type ~D" type)))
+          (error "cannot start the requested forward"))
+        forward)))
 
 ;;; ---- Stdio forwarding over the control socket ----
 
@@ -1881,7 +2102,7 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
   (mux-master-note-session master)
   (dolist (fd (list stdin stdout))
     (ignore-errors (cl-pnet-sockets:set-nonblocking fd)))
-  (let ((session (%make-mux-session
+    (let ((session (%make-mux-session
                   :master master :connection connection
                   :request-id request-id
                   :sid (prog1 (mux-master-next-session-id master)
@@ -1890,7 +2111,16 @@ called with the watch and stops it with MUX-STOP-INPUT-WATCH at EOF."
                   ;; A direct channel has no remote command and no exit
                   ;; status; a normal close is success.
                   :stdio t
-                  :exit-status 0)))
+                  :exit-status 0
+                  ;; channel_connect_stdio_fwd() names the channel from
+                  ;; port_open_helper(), whose socket is -1.
+                  :remote-name
+                  (format nil "~A: listening port 0 for ~A port ~D, connect from 127.0.0.1 port 65535 to UNKNOWN port 65536"
+                          (if (= port +mux-port-streamlocal+)
+                              "direct-streamlocal@openssh.com"
+                              "direct-tcpip")
+                          host
+                          (if (= port +mux-port-streamlocal+) -2 port)))))
     (setf (mux-connection-session connection) session)
     (push session (mux-master-sessions master))
     (handler-case
@@ -2157,8 +2387,12 @@ the SSH connection is even attempted."
                              0)))
     (:dynamic
      (list :type +mux-fwd-dynamic+
-           :listen-host (or (dynamic-forward-bind-address forward) "")
-           :listen-port (or (dynamic-forward-bind-port forward) 0)
+           :listen-host (or (dynamic-forward-bind-address forward)
+                            (dynamic-forward-bind-path forward) "")
+           :listen-port (or (dynamic-forward-bind-port forward)
+                            (and (dynamic-forward-bind-path forward)
+                                 +mux-port-streamlocal+)
+                            0)
            :connect-host ""
            :connect-port 0))))
 

@@ -1985,14 +1985,27 @@ alias works while other spellings of the same word do not."
   host
   port
   target-path
+  ;; channels.c resolves a bind address to every matching address and listens
+  ;; on each, so the first listener is not the whole forward.  LISTENER stays
+  ;; the first one for callers that only need the bound port.
   listener
+  listeners
   listener-fd
-  listener-watcher)
+  listener-watcher
+  ;; channels.c creates one listener channel per address, so a running
+  ;; forward occupies a slot for each and the ids in "channel N:"
+  ;; diagnostics follow them.
+  (channel-id nil)
+  (channel-ids nil))
 
 (defstruct (forward-tunnel (:constructor %make-forward-tunnel))
   forward
   connection
   channel
+  ;; Some channels are not the type they open with on the wire: a -D SOCKS
+  ;; connection is a direct-tcpip channel that channels.c calls
+  ;; "dynamic-tcpip".  NIL means the wire type is the display type.
+  display-type
   (to-channel (make-array 0 :element-type '(unsigned-byte 8)
                             :adjustable t :fill-pointer 0))
   (to-connection (make-array 0 :element-type '(unsigned-byte 8)
@@ -2005,12 +2018,24 @@ alias works while other spellings of the same word do not."
   bind-port
   bind-path
   target-path
-  listener)
+  ;; As for -L: one listener channel per resolved address.
+  listener
+  listeners
+  (channel-id nil)
+  (channel-ids nil))
 
 (defstruct (socks-session (:constructor %make-socks-session))
   client
   connection
-  (state (cl-pnet-socks:make-socks5-server-state)))
+  ;; The DynamicForward whose listener accepted CONNECTION.  Its bound port
+  ;; and address become the "listening port ... to ..." part of the channel's
+  ;; remote name, as channels.c takes them from the accepted socket.
+  forward
+  (state (cl-pnet-socks:make-socks5-server-state))
+  ;; channels.c waits for three bytes before it even looks at the SOCKS
+  ;; version, and a SOCKS4 request only parses once its NUL-terminated user
+  ;; (and host) have arrived.  Bytes held here cover both cases.
+  (pending nil))
 
 (defun forwarding-fail (spec control &rest arguments)
   "Report an unusable forwarding SPEC, in ssh's words for the active flag."
@@ -3109,6 +3134,61 @@ The target is a Unix socket when FORWARD names one and TCP otherwise."
   (or (forward-target-path forward)
       (format nil "~A:~D" (forward-host forward) (forward-port forward))))
 
+(defun connection-local-endpoint (connection)
+  "The (VALUES ADDRESS PORT) CONNECTION is bound to, or NIL NIL.
+
+channels.c's remote_name takes both from the accepted socket with
+getsockname(), so a wildcard listener reports the address that actually
+received the connection rather than the wildcard it bound."
+  (let ((fd (and connection
+                 (ignore-errors (cl-pnet:connection-fileno connection)))))
+    (when (and (integerp fd) (>= fd 0))
+      (handler-case
+          (cffi:with-foreign-objects
+              ((address '(:struct cl-pnet-sockets:sockaddr-in6))
+               (length :unsigned-int))
+            (setf (cffi:mem-ref length :unsigned-int)
+                  cl-pnet-sockets:+sockaddr-in6-size+)
+            (when (>= (cl-pnet-sockets:c-getsockname fd address length) 0)
+              (cl-pnet-sockets:sockaddr-to-string address)))
+        (error () (values nil nil))))))
+
+(defun forward-channel-remote-name (forward connection)
+  "channels.c's c->remote_name for a forwarded connection.
+
+The accepted connection supplies the peer and the local address, the
+listener the bound port, and the forward what the peer is asked to reach."
+  (let* ((peer (and connection
+                   (ignore-errors
+                    (cl-pnet:connection-peer-address connection))))
+         (remote-ip (getf peer :address))
+         (remote-port (getf peer :port))
+         (listener (forward-listener forward))
+         (bound-address (and listener
+                             (ignore-errors
+                              (cl-pnet:listener-bound-address listener))))
+         (bound-port (and listener
+                          (ignore-errors (cl-pnet:listener-port listener)))))
+    (multiple-value-bind (local-ip local-port)
+        (if connection
+            (connection-local-endpoint connection)
+            (values nil nil))
+      (setf local-ip (or local-ip bound-address
+                         (forward-bind-address forward) "0.0.0.0")
+            local-port (or local-port bound-port
+                           (forward-bind-port forward) 0))
+      (format nil "~A: listening port ~D for ~A port ~D, connect from ~A port ~D to ~A port ~D"
+              (if (forward-target-path forward)
+                  "direct-streamlocal@openssh.com"
+                  "direct-tcpip")
+              (or bound-port (forward-bind-port forward) 0)
+              (or (forward-target-path forward)
+                  (forward-host forward)
+                  "unknown")
+              (or (forward-port forward) 0)
+              (or remote-ip "unknown") (or remote-port 0)
+              local-ip local-port))))
+
 (defun open-forward-channel (client tunnel &key on-open on-error)
   "Open a direct channel for TUNNEL and start bridging bytes.
 
@@ -3119,11 +3199,19 @@ closed afterwards."
     (flet ((failed (condition)
              (if on-error
                  (funcall on-error condition)
-                 (unless (getf *options* :quiet)
-                   (format *error-output*
-                           "burs: forward to ~A failed: ~A~%"
-                           (forward-target-name forward)
-                           condition)))
+                 ;; channels.c's channel_input_open_failure() already
+                 ;; printed the refusal; ssh adds nothing of its own for a
+                 ;; local forward, so only report failures that did not go
+                 ;; through an SSH open.
+                 (unless (and (typep condition 'cl-pnet-ssh:ssh-channel-error)
+                              (integerp
+                               (cl-pnet-ssh:ssh-channel-error-reason
+                                condition)))
+                   (unless (getf *options* :quiet)
+                     (format *error-output*
+                             "burs: forward to ~A failed: ~A~%"
+                             (forward-target-name forward)
+                             condition))))
              (forward-close tunnel)))
       (handler-case
           (let ((channel
@@ -3143,9 +3231,15 @@ closed afterwards."
                                (declare (ignore channel reason))
                                (forward-close tunnel))
                    :on-error (lambda (channel condition)
-                               (declare (ignore channel))
+                               (log-channel-open-failure channel condition)
                                (failed condition)))))
             (setf (forward-tunnel-channel tunnel) channel)
+            (when (forward-tunnel-display-type tunnel)
+              (setf (cl-pnet-ssh::ssh-channel-x-type channel)
+                    (forward-tunnel-display-type tunnel)))
+            (setf (cl-pnet-ssh::ssh-channel-remote-name channel)
+                  (forward-channel-remote-name
+                   forward (forward-tunnel-connection tunnel)))
             (forward-flush tunnel)
             (forward-flush-to-connection tunnel))
         (error (condition) (failed condition))))))
@@ -3229,10 +3323,7 @@ closed afterwards."
                                           (forward-bind-address candidate))))))
              *forwards*)))
       (when forward
-        (when (forward-listener forward)
-          (ignore-errors
-            (cl-pnet:close-listener (forward-listener forward)))
-          (setf (forward-listener forward) nil))
+        (close-forward-listeners forward)
         (when (forward-listener-watcher forward)
           (cl-pnet:fd-unwatch (forward-listener-watcher forward))
           (setf (forward-listener-watcher forward) nil))
@@ -3241,6 +3332,7 @@ closed afterwards."
             (cl-pnet-sockets:close-open-fd (forward-listener-fd forward)))
           (setf (forward-listener-fd forward) nil))
         (setf *forwards* (delete forward *forwards*))
+        (release-forward-channel-id *client* forward)
         t))))
 
 (defun cancel-dynamic-forward (spec)
@@ -3257,11 +3349,9 @@ closed afterwards."
                                                candidate)))))
                      *dynamic-forwards*)))
       (when forward
-        (when (dynamic-forward-listener forward)
-          (ignore-errors
-            (cl-pnet:close-listener (dynamic-forward-listener forward)))
-          (setf (dynamic-forward-listener forward) nil))
+        (close-dynamic-forward-listeners forward)
         (setf *dynamic-forwards* (delete forward *dynamic-forwards*))
+        (release-dynamic-forward-channel-id *client* forward)
         t))))
 
 (defun cancel-remote-forward (spec)
@@ -3649,42 +3739,148 @@ does when it binds a local forwarding socket."
                           (error ()
                             (client-streamlocal-close bridge))))))))
     (push forward *forwards*)
+    (reserve-forward-channel-id client forward)
     (log-line "local streamlocal forward ~A to ~A"
               path (forward-target-name forward))
     forward))
+
+(defun reserve-forward-channel-id (client forward)
+  "Give FORWARD the channel slots channels.c's listener channels would hold."
+  (let ((count (max 1 (length (forward-listeners forward)))))
+    (setf (forward-channel-ids forward)
+          (cl-pnet-ssh:ssh-client-reserve-channel-ids client count)
+          (forward-channel-id forward)
+          (first (forward-channel-ids forward)))))
+
+(defun release-forward-channel-id (client forward)
+  (when (and client (forward-channel-ids forward))
+    (cl-pnet-ssh:ssh-client-release-channel-ids
+     client (forward-channel-ids forward))
+    (setf (forward-channel-id forward) nil
+          (forward-channel-ids forward) nil)))
+
+(defun reserve-dynamic-forward-channel-id (client forward)
+  (let ((count (max 1 (length (dynamic-forward-listeners forward)))))
+    (setf (dynamic-forward-channel-ids forward)
+          (cl-pnet-ssh:ssh-client-reserve-channel-ids client count)
+          (dynamic-forward-channel-id forward)
+          (first (dynamic-forward-channel-ids forward)))))
+
+(defun release-dynamic-forward-channel-id (client forward)
+  (when (and client (dynamic-forward-channel-ids forward))
+    (cl-pnet-ssh:ssh-client-release-channel-ids
+     client (dynamic-forward-channel-ids forward))
+    (setf (dynamic-forward-channel-id forward) nil
+          (dynamic-forward-channel-ids forward) nil)))
+
+(defun forward-listen-targets (client bind-address)
+  "The addresses a client forward on BIND-ADDRESS has to bind.
+
+channels.c resolves the address the way channel_fwd_bind_addr() selects it
+and then listens on every answer: a missing address means both loopbacks,
+\"*\" and an empty address mean both wildcards, \"localhost\" also means
+both loopbacks, and anything else is taken literally.  AddressFamily
+restricts the set, as ssh->chanctxt->IPv4or6 does."
+  (let* ((options (cl-pnet-ssh:ssh-client-config-options client))
+         (gateway (gateway-ports-p options))
+         (family (ignore-errors
+                   (cl-pnet-ssh::ssh-normalize-address-family
+                    (or (and options
+                             (cl-pnet-ssh:ssh-config-options-address-family
+                              options))
+                        (getf *options* :address-family)))))
+         (wildcard
+           (if (null bind-address)
+               gateway
+               (or (zerop (length bind-address))
+                   (string= bind-address "*")))))
+    (cond
+      (wildcard
+       (let ((targets '()))
+         (unless (eq family :inet6) (push "0.0.0.0" targets))
+         (unless (eq family :inet) (push "::" targets))
+         (nreverse targets)))
+      ((or (null bind-address) (string= bind-address "localhost"))
+       (let ((targets '()))
+         (unless (eq family :inet) (push "::1" targets))
+         (unless (eq family :inet6) (push "127.0.0.1" targets))
+         (nreverse targets)))
+      ((cl-pnet-sockets:address-literal-p bind-address)
+       (list bind-address))
+      (t
+       (handler-case
+           (cl-pnet-sockets:lookup-host-addresses bind-address
+                                                  :family family)
+         (error () nil))))))
+
+(defun ipv6-bind-address-p (address)
+  (let ((family (nth-value 1 (cl-pnet-sockets:resolve-bind-address address))))
+    (eq family :inet6)))
+
+(defun open-forward-listeners (client bind-address port read-cb on-accept
+                               describe)
+  "Listen for a client forward on every address BIND-ADDRESS resolves to.
+
+Returns the listener objects that bound, in creation order.  channels.c
+keeps listening when one address fails, so a partially bound forward still
+works; a failure is reported at error level only for the last address."
+  (let ((targets (forward-listen-targets client bind-address))
+        (listeners '()))
+    (dolist (target targets)
+      (handler-case
+          (let ((listener
+                  (cl-pnet:make-tcp-listener
+                   target port
+                   :v6only (ipv6-bind-address-p target)
+                   :read-cb read-cb
+                   :on-accept on-accept
+                   :on-error (lambda (status)
+                               (log-line "~A listen error ~A"
+                                         describe status)))))
+            (when listener
+              (push listener listeners)))
+        (error () nil)))
+    (nreverse listeners)))
+
+(defun close-forward-listeners (forward)
+  (dolist (listener (forward-listeners forward))
+    (ignore-errors (cl-pnet:close-listener listener)))
+  (setf (forward-listeners forward) nil
+        (forward-listener forward) nil))
+
+(defun close-dynamic-forward-listeners (forward)
+  (dolist (listener (dynamic-forward-listeners forward))
+    (ignore-errors (cl-pnet:close-listener listener)))
+  (setf (dynamic-forward-listeners forward) nil
+        (dynamic-forward-listener forward) nil))
 
 (defun start-local-forward (client forward)
   (when (forward-bind-path forward)
     (return-from start-local-forward
       (start-local-streamlocal-forward client forward)))
-  (let* ((options (cl-pnet-ssh:ssh-client-config-options client))
-         (address (or (forward-bind-address forward)
-                      (if (gateway-ports-p options)
-                          "0.0.0.0"
-                          "127.0.0.1")))
-         (listener
-           (cl-pnet:make-tcp-listener
-            address (forward-bind-port forward)
-            :read-cb #'forward-connection-data
-            :on-accept (lambda (connection)
-                         (forward-accept client forward connection))
-            :on-error (lambda (status)
-                        (log-line "forward listen error ~A" status)))))
-    (unless listener
+  (let* ((bind-address (forward-bind-address forward))
+         (listeners
+           (open-forward-listeners
+            client bind-address (forward-bind-port forward)
+            #'forward-connection-data
+            (lambda (connection)
+              (forward-accept client forward connection))
+            "-L")))
+    (unless listeners
       (format *error-output*
               "burs: cannot listen on ~A:~D for -L~%"
-              address (forward-bind-port forward))
+              (or bind-address "localhost") (forward-bind-port forward))
       (if (exit-on-forward-failure-p client)
           (finish 255)
           (return-from start-local-forward nil)))
-    (setf (forward-listener forward) listener)
+    (setf (forward-listeners forward) listeners
+          (forward-listener forward) (first listeners))
+    (reserve-forward-channel-id client forward)
     (push forward *forwards*)
-    (let ((port (cl-pnet:listener-port listener)))
+    (let ((port (cl-pnet:listener-port (first listeners))))
       (log-line "local forward ~A:~D to ~A:~D"
-                address port (forward-host forward) (forward-port forward))
-      (when (and (zerop (forward-bind-port forward))
-                 (not (getf *options* :quiet)))
-        (format *error-output* "Allocated port ~D for local forward~%" port)))
+                (or bind-address "localhost") port
+                (forward-host forward) (forward-port forward)))
     forward))
 
 ;;; ---- -D: dynamic SOCKS forwarding ----
@@ -3694,34 +3890,18 @@ does when it binds a local forwarding socket."
 ;;; session keeps its bytes until the greeting and request are complete; after
 ;;; that the ordinary -L tunnel machinery carries the stream.
 
-(defun socks-reply (reply)
-  "A SOCKS5 reply with code REPLY and an all-zero bound address."
-  (cl-pnet-socks:make-socks5-reply reply))
+(defun socks-reply (reply &key (port 0))
+  "A SOCKS5 reply with code REPLY and an all-zero bound address.
 
-(defun socks-write-then-close (connection data)
-  "Send DATA and close CONNECTION once the kernel has it."
-  (handler-case
-      (cl-pnet:send-data
-       connection data
-       :on-write (lambda (count)
-                   (declare (ignore count))
-                   (ignore-errors (cl-pnet:close-connection connection)))
-       :on-error (lambda (status)
-                   (declare (ignore status))
-                   (ignore-errors (cl-pnet:close-connection connection))))
-    (error () (ignore-errors (cl-pnet:close-connection connection)))))
+channels.c's channel_decode_socks5() always reports INADDR_ANY and echoes the
+requested destination port."
+  (cl-pnet-socks:make-socks5-reply reply :port port))
 
 (defun socks-abandon (session)
   "Forget SESSION and close its connection without a reply."
   (let ((connection (socks-session-connection session)))
     (remhash connection *socks-sessions*)
     (ignore-errors (cl-pnet:close-connection connection))))
-
-(defun socks-fail (session reply)
-  "Answer SESSION with SOCKS5 reply REPLY, then close it."
-  (let ((connection (socks-session-connection session)))
-    (remhash connection *socks-sessions*)
-    (socks-write-then-close connection (socks-reply reply))))
 
 (defun socks-send (session data)
   "Send DATA to SESSION's client, abandoning the session on a write error."
@@ -3735,17 +3915,27 @@ does when it binds a local forwarding socket."
                        (socks-abandon session)))
         (error () (socks-abandon session))))))
 
-(defun socks-start-tunnel (session request remaining)
-  "Dial REQUEST's target through the SSH connection for SESSION's client.
+(defun socks-start-tunnel (session host port remaining &key socks4)
+  "Dial HOST:PORT through the SSH connection for SESSION's client.
 
 REMAINING is any stream data the client sent right behind the request; it is
-buffered with the tunnel and flushed once the channel is open."
+buffered with the tunnel and flushed once the channel is open.  SOCKS4 selects
+the four-byte SOCKS4 success reply instead of the SOCKS5 one."
   (let* ((connection (socks-session-connection session))
          (client (socks-session-client session))
-         (host (cl-pnet-socks:socks5-request-host request))
-         (port (cl-pnet-socks:socks5-request-port request))
+         (dynamic (socks-session-forward session))
+         (listener (and dynamic (dynamic-forward-listener dynamic)))
+         (listen-port (and listener
+                           (ignore-errors (cl-pnet:listener-port listener))))
          (tunnel (%make-forward-tunnel
-                  :forward (%make-forward :host host :port port)
+                  :forward (%make-forward
+                            :host host :port port
+                            :bind-address (and dynamic
+                                               (dynamic-forward-bind-address
+                                                dynamic))
+                            :bind-port listen-port
+                            :listener listener)
+                  :display-type "dynamic-tcpip"
                   :connection connection)))
     (remhash connection *socks-sessions*)
     (setf (gethash connection *tunnels*) tunnel)
@@ -3756,10 +3946,15 @@ buffered with the tunnel and flushed once the channel is open."
      client tunnel
      :on-open
      (lambda ()
-       ;; The peer accepted the connection: release the SOCKS client.
+       ;; The peer accepted the connection: release the SOCKS client with
+       ;; the success reply channels.c composes while parsing the request.
        (handler-case
            (cl-pnet:send-data
-            connection (socks-reply cl-pnet-socks:+socks5-reply-success+)
+            connection
+            (if socks4
+                #(0 90 0 0 0 0 0 0)
+                (socks-reply cl-pnet-socks:+socks5-reply-success+
+                             :port port))
             :on-error (lambda (status)
                         (declare (ignore status))
                         (forward-close tunnel)))
@@ -3767,39 +3962,86 @@ buffered with the tunnel and flushed once the channel is open."
      :on-error
      (lambda (condition)
        (declare (ignore condition))
-       ;; The open was refused, so answer the SOCKS request instead of just
-       ;; dropping the connection: FORWARD-CLOSE would hide why it failed.
+       ;; channels.c logs the refusal and then frees the channel, so the
+       ;; SOCKS client sees its connection closed with no reply at all.
        (setf (forward-tunnel-connection tunnel) nil)
        (remhash connection *tunnels*)
-       (socks-write-then-close
-        connection
-        (socks-reply cl-pnet-socks:+socks5-reply-general-failure+))))))
+       (ignore-errors (cl-pnet:close-connection connection))))))
+
+(defun socks4-request (data)
+  "VALUES (HOST PORT CONSUMED COMMAND) from DATA, or NIL when incomplete."
+  (when (< (length data) 9)
+    (return-from socks4-request nil))
+  (let ((user-end (position 0 data :start 8)))
+    (when (or (null user-end) (> user-end 1031))
+      (return-from socks4-request nil))
+    (let* ((command (aref data 1))
+           (port (logior (ash (aref data 2) 8) (aref data 3)))
+           (address (subseq data 4 8))
+           (socks4a (and (zerop (aref address 0)) (zerop (aref address 1))
+                         (zerop (aref address 2))
+                         (not (zerop (aref address 3))))))
+      (if socks4a
+          (let ((host-end (position 0 data :start (1+ user-end))))
+            (when (or (null host-end) (> (- host-end user-end 1) 1024))
+              (return-from socks4-request nil))
+            (values (map 'string #'code-char
+                         (subseq data (1+ user-end) host-end))
+                    port (1+ host-end) command))
+          (values (format nil "~D.~D.~D.~D"
+                          (aref address 0) (aref address 1)
+                          (aref address 2) (aref address 3))
+                  port (1+ user-end) command)))))
 
 (defun socks-process (session data)
   "Feed DATA to SESSION and act on whatever the handshake produced."
-  (multiple-value-bind (output request error remaining)
-      (cl-pnet-socks:socks5-server-consume (socks-session-state session) data)
-    (cond
-      (error
-       ;; OUTPUT is the protocol's own last word: a method refusal, an
-       ;; authentication failure, or a reply for a malformed request.
-       (let ((connection (socks-session-connection session)))
-         (remhash connection *socks-sessions*)
-         (if output
-             (socks-write-then-close connection output)
-             (ignore-errors (cl-pnet:close-connection connection)))))
-      (request
-       (when output
-         (socks-send session output))
+  (let ((pending (socks-session-pending session)))
+    (when pending
+      (setf data (concatenate '(vector (unsigned-byte 8)) pending data)
+            (socks-session-pending session) nil)))
+  ;; channel_pre_dynamic() needs three bytes before it inspects the version.
+  (when (< (length data) 3)
+    (setf (socks-session-pending session) (copy-seq data))
+    (return-from socks-process nil))
+  (case (aref data 0)
+    (4
+     (multiple-value-bind (host port consumed command)
+         (socks4-request data)
        (cond
-         ((= (cl-pnet-socks:socks5-request-command request)
-             cl-pnet-socks:+socks5-cmd-connect+)
-          (socks-start-tunnel session request remaining))
+         ((null host)
+          (setf (socks-session-pending session) (copy-seq data)))
+         ((/= command 1)
+          ;; Only CONNECT is supported; channels.c just drops the channel.
+          (socks-abandon session))
          (t
-          (socks-fail session
-                      cl-pnet-socks:+socks5-reply-command-unsupported+))))
-      (output
-       (socks-send session output)))))
+          (socks-start-tunnel session host port
+                              (subseq data consumed)
+                              :socks4 t)))))
+    (5
+     (multiple-value-bind (output request error remaining)
+         (cl-pnet-socks:socks5-server-consume (socks-session-state session)
+                                              data)
+       (cond
+         (error
+          ;; channels.c answers nothing at all when the greeting or request
+          ;; cannot be decoded, including an unacceptable auth method.
+          (socks-abandon session))
+         (request
+          (when output
+            (socks-send session output))
+          (if (= (cl-pnet-socks:socks5-request-command request)
+                 cl-pnet-socks:+socks5-cmd-connect+)
+              (socks-start-tunnel
+               session
+               (cl-pnet-socks:socks5-request-host request)
+               (cl-pnet-socks:socks5-request-port request)
+               remaining)
+              (socks-abandon session)))
+         (output
+          (socks-send session output)))))
+    (otherwise
+     ;; Unknown SOCKS version: channels.c marks the channel dead.
+     (socks-abandon session))))
 
 (defun socks-connection-data (connection data)
   "Listener callback for -D: run the handshake, then bridge bytes."
@@ -3810,9 +4052,10 @@ buffered with the tunnel and flushed once the channel is open."
             (socks-abandon session))
         (forward-connection-data connection data))))
 
-(defun socks-accept (client connection)
+(defun socks-accept (client connection forward)
   (setf (gethash connection *socks-sessions*)
-        (%make-socks-session :client client :connection connection)))
+        (%make-socks-session :client client :connection connection
+                             :forward forward)))
 
 (defun dynamic-bind-address (forward)
   (let ((address (dynamic-forward-bind-address forward)))
@@ -3833,29 +4076,27 @@ buffered with the tunnel and flushed once the channel is open."
     (if (exit-on-forward-failure-p client)
         (finish 255)
         (return-from start-dynamic-forward nil)))
-  (let* ((address (dynamic-bind-address forward))
-         (listener
-           (cl-pnet:make-tcp-listener
-            address (dynamic-forward-bind-port forward)
-            :read-cb #'socks-connection-data
-            :on-accept (lambda (connection)
-                         (socks-accept client connection))
-            :on-error (lambda (status)
-                        (log-line "dynamic forward listen error ~A" status)))))
-    (unless listener
+  (let* ((bind-address (dynamic-forward-bind-address forward))
+         (listeners
+           (open-forward-listeners
+            client bind-address (dynamic-forward-bind-port forward)
+            #'socks-connection-data
+            (lambda (connection)
+              (socks-accept client connection forward))
+            "-D")))
+    (unless listeners
       (format *error-output*
               "burs: cannot listen on ~A:~D for -D~%"
-              address (dynamic-forward-bind-port forward))
+              (or bind-address "localhost") (dynamic-forward-bind-port forward))
       (if (exit-on-forward-failure-p client)
           (finish 255)
           (return-from start-dynamic-forward nil)))
-    (setf (dynamic-forward-listener forward) listener)
+    (setf (dynamic-forward-listeners forward) listeners
+          (dynamic-forward-listener forward) (first listeners))
+    (reserve-dynamic-forward-channel-id client forward)
     (push forward *dynamic-forwards*)
-    (let ((port (cl-pnet:listener-port listener)))
-      (log-line "dynamic forward ~A:~D" address port)
-      (when (and (zerop (dynamic-forward-bind-port forward))
-                 (not (getf *options* :quiet)))
-        (format *error-output* "Allocated port ~D for dynamic forward~%" port)))
+    (let ((port (cl-pnet:listener-port (first listeners))))
+      (log-line "dynamic forward ~A:~D" (or bind-address "localhost") port))
     forward))
 
 (defun configure-dynamic-forwards (client)
@@ -4031,6 +4272,25 @@ peer that connected to it; NIL refuses the channel."
                                    :port port :user user))))
   forward)
 
+(defun expand-dynamic-forward-for-client (client forward)
+  "FORWARD with its socket paths percent-expanded for CLIENT."
+  (let ((options (cl-pnet-ssh:ssh-client-config-options client))
+        (host (cl-pnet-ssh:ssh-client-host client))
+        (canonical (cl-pnet-ssh:ssh-client-connect-host client))
+        (port (cl-pnet-ssh:ssh-client-connect-port client))
+        (user (cl-pnet-ssh:ssh-client-user client)))
+    (when (dynamic-forward-bind-path forward)
+      (setf (dynamic-forward-bind-path forward)
+            (expand-client-percent options host canonical
+                                   (dynamic-forward-bind-path forward)
+                                   :port port :user user)))
+    (when (dynamic-forward-target-path forward)
+      (setf (dynamic-forward-target-path forward)
+            (expand-client-percent options host canonical
+                                   (dynamic-forward-target-path forward)
+                                   :port port :user user))))
+  forward)
+
 (defun start-forwards (client)
   (when (clear-all-forwardings-p client)
     (return-from start-forwards nil))
@@ -4043,11 +4303,12 @@ peer that connected to it; NIL refuses the channel."
                          (append (configured-remote-forwards client)
                                  (getf *options* :remote-forward))))
          (dynamic (append (mapcar (lambda (forward)
-                                    (expand-forward-for-client client
-                                                               forward))
+                                    (expand-dynamic-forward-for-client
+                                     client forward))
                                   (configure-dynamic-forwards client))
                           (mapcar (lambda (forward)
-                                    (expand-forward-for-client client forward))
+                                    (expand-dynamic-forward-for-client
+                                     client forward))
                                   (getf *options* :dynamic-forward)))))
     (let ((forwards (append local remote dynamic)))
       ;; ssh refuses every forward once a changed host key was accepted under
@@ -4069,10 +4330,7 @@ peer that connected to it; NIL refuses the channel."
 
 (defun stop-dynamic-forwards ()
   (dolist (forward *dynamic-forwards*)
-    (when (dynamic-forward-listener forward)
-      (ignore-errors
-        (cl-pnet:close-listener (dynamic-forward-listener forward)))
-      (setf (dynamic-forward-listener forward) nil)))
+    (close-dynamic-forward-listeners forward))
   (setf *dynamic-forwards* nil)
   (let ((connections '()))
     (maphash (lambda (connection session)
@@ -4086,9 +4344,7 @@ peer that connected to it; NIL refuses the channel."
 (defun stop-forwards ()
   (stop-dynamic-forwards)
   (dolist (forward *forwards*)
-    (when (forward-listener forward)
-      (ignore-errors (cl-pnet:close-listener (forward-listener forward)))
-      (setf (forward-listener forward) nil))
+    (close-forward-listeners forward)
     (when (forward-listener-watcher forward)
       (cl-pnet:fd-unwatch (forward-listener-watcher forward))
       (setf (forward-listener-watcher forward) nil))

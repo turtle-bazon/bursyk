@@ -215,6 +215,9 @@ beside the readable one on every backend."
   (remote-id nil)
   (type "session")
   (state :queued)
+  ;; channels.c's c->remote_name, shown by -O channels for forwarded
+  ;; connections.
+  (remote-name nil)
   target-host
   target-port
   (origin-address "0.0.0.0")

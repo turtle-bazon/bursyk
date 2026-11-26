@@ -309,6 +309,10 @@
   local-id
   (remote-id nil)
   (type "session")
+  ;; channels.c's c->remote_name, shown by -O channels for forwarded
+  ;; connections.  Sessions and mux-control channels get theirs from the
+  ;; mux layer.
+  (remote-name nil)
   ;; ChannelTimeout support: the extended type a session request gives the
   ;; channel ("session:command", "session:subsystem:git-upload-pack", ...),
   ;; the resolved inactivity limit in seconds, and when it was last used.

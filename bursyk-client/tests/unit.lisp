@@ -746,6 +746,72 @@ the lines never reach the output."
     (is (equal "/tmp/d.sock" (burs::dynamic-forward-bind-path forward)))
     (is (null (burs::dynamic-forward-bind-port forward)))))
 
+(test dynamic-socks-handshake-follows-channels-dot-c
+  "channels.c's SOCKS server: three-byte gate, port echo, silent refusals."
+  ;; channel_pre_dynamic() needs three bytes before it looks at the version.
+  (let ((session (burs::%make-socks-session :connection nil)))
+    (burs::socks-process
+     session (make-array 2 :element-type '(unsigned-byte 8)
+                           :initial-contents '(5 0)))
+    (is (equalp #(5 0) (burs::socks-session-pending session))))
+  ;; The success reply repeats the requested port behind INADDR_ANY.
+  (is (equalp #(5 0 0 1 0 0 0 0 0 22)
+              (burs::socks-reply
+               cl-pnet-socks:+socks5-reply-success+ :port 22)))
+  ;; SOCKS4 and SOCKS4A both name the destination host and port.
+  (multiple-value-bind (host port consumed command)
+      (burs::socks4-request
+       (concatenate '(vector (unsigned-byte 8))
+                    #(4 1 0 22 127 0 0 1) #(117 115 101 114 0)))
+    (is (equal "127.0.0.1" host))
+    (is (= 22 port))
+    (is (= 13 consumed))
+    (is (= 1 command)))
+  (multiple-value-bind (host port consumed command)
+      (burs::socks4-request
+       (concatenate '(vector (unsigned-byte 8))
+                    #(4 1 0 22 0 0 0 1) #(117 115 101 114 0)
+                    #(101 120 97 109 112 108 101 46 111 114 103 0)))
+    (is (equal "example.org" host))
+    (is (= 22 port))
+    (is (= 25 consumed))
+    (is (= 1 command))))
+
+(test forward-listen-targets-follow-channel-fwd-bind-addr
+  "channels.c listens on every address channel_fwd_bind_addr() resolves."
+  (let ((burs::*options* nil)
+        (client (cl-pnet-ssh::%make-ssh-client)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options))
+    ;; No address means both loopbacks; "*" and an empty address mean both
+    ;; wildcards; a literal is taken as written.
+    (is (equal '("::1" "127.0.0.1")
+               (burs::forward-listen-targets client nil)))
+    (is (equal '("::1" "127.0.0.1")
+               (burs::forward-listen-targets client "localhost")))
+    (is (equal '("0.0.0.0" "::")
+               (burs::forward-listen-targets client "*")))
+    (is (equal '("0.0.0.0" "::")
+               (burs::forward-listen-targets client "")))
+    (is (equal '("127.0.0.1")
+               (burs::forward-listen-targets client "127.0.0.1")))
+    ;; GatewayPorts makes the default wildcard, and AddressFamily filters
+    ;; the set the way ssh->chanctxt->IPv4or6 does.
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options :gateway-ports t))
+    (is (equal '("0.0.0.0" "::")
+               (burs::forward-listen-targets client nil)))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options :address-family :inet))
+    (is (equal '("127.0.0.1")
+               (burs::forward-listen-targets client nil)))
+    (is (equal '("0.0.0.0")
+               (burs::forward-listen-targets client "*")))
+    (setf (cl-pnet-ssh:ssh-client-config-options client)
+          (cl-pnet-ssh::%make-ssh-config-options :address-family :inet6))
+    (is (equal '("::1") (burs::forward-listen-targets client nil)))
+    (is (equal '("::") (burs::forward-listen-targets client "*")))))
+
 (test remote-dynamic-forward-specifications-parse
   ;; A one-word -R is the dynamic form: the server listens and the client
   ;; speaks SOCKS, which readconf records as the "socks" target on port 0.
@@ -1203,14 +1269,61 @@ keeps its own LogLevel back; -q and -o LogLevel are recorded in :LOG-LEVEL."
       (is (char= #\Return (char text (- (length text) 2)))))))
 
 (test mux-channel-open-message-lists-open-sessions
-  "The master's -O channels text names each open multiplexed session."
-  (let* ((master (burs::%make-mux-master))
+  "The master's -O channels text follows channels.c's channel_open_message."
+  (let* ((channel (cl-pnet-ssh::%make-ssh-channel
+                   :local-id 2 :remote-id 0 :type "session"
+                   :state :open :x-type "session:command"))
+         (connection (burs::%make-mux-connection
+                      :fd 7 :control-channel-id 1))
          (session (burs::%make-mux-session
-                   :sid 1 :remote-name "echo hi" :opened t)))
-    (setf (burs::mux-master-sessions master) (list session))
+                   :sid 1 :opened t :connection connection
+                   :channel channel
+                   :stdin-fd 10 :stdout-fd 11 :stderr-fd 12))
+         (master (burs::%make-mux-master))
+         (burs::*client* nil))
+    (setf (burs::mux-connection-session connection) session
+          (burs::mux-master-connections master) (list connection)
+          (burs::mux-master-sessions master) (list session))
     (let ((text (burs::mux-channel-open-message master)))
       (is (not (null (search "The following connections are open:" text))))
-      (is (not (null (search "  #1 echo hi (open)" text)))))))
+      ;; The control channel owns id 1 and points at the session on id 2,
+      ;; exactly as channel_format_status() prints them.
+      (is (not (null
+                (search
+                 (format nil "  #1 mux-control (t16 [mux-control] nr0 m0 i0/0 o0/0 e[closed]/0 fd 7/7/-1 sock 7 cc -1 c2 io 0x01/0x01 I)~C~C"
+                         #\Return #\Newline)
+                 text))))
+      (is (not (null
+                (search
+                 (format nil "  #2 client-session (t4 [session:command] r0 nm0 i0/0 o0/0 e[write]/0 fd -1/11/12 sock -1 cc 1 nc0 io 0x00/0x00 B)~C~C"
+                         #\Return #\Newline)
+                 text)))))))
+
+(test mux-channel-open-message-describes-stdio-forwards
+  "-W sessions print as channels.c's stdio-forward channel."
+  (let* ((channel (cl-pnet-ssh::%make-ssh-channel
+                   :local-id 2 :remote-id 0 :type "direct-tcpip"
+                   :state :open))
+         (connection (burs::%make-mux-connection
+                      :fd 7 :control-channel-id 1))
+         (session (burs::%make-mux-session
+                   :sid 1 :opened t :connection connection :channel channel
+                   :stdin-fd 10 :stdout-fd 11 :stderr-fd 11
+                   :stdin-watcher t
+                   :stdio t
+                   :remote-name
+                   "direct-tcpip: listening port 0 for 127.0.0.1 port 22, connect from 127.0.0.1 port 65535 to UNKNOWN port 65536"))
+         (master (burs::%make-mux-master))
+         (burs::*client* nil))
+    (setf (burs::mux-connection-session connection) session
+          (burs::mux-master-connections master) (list connection)
+          (burs::mux-master-sessions master) (list session))
+    (let ((text (burs::mux-channel-open-message master)))
+      (is (not (null
+                (search
+                 (format nil "  #2 direct-tcpip: listening port 0 for 127.0.0.1 port 22, connect from 127.0.0.1 port 65535 to UNKNOWN port 65536 (t4 [stdio-forward] r0 nm0 i0/0 o0/0 e[closed]/0 fd 10/11/-1 sock -1 cc 1 nc0 io 0x01/0x00 B)~C~C"
+                         #\Return #\Newline)
+                 text)))))))
 
 (test mux-expands-control-path-tokens
   (is (equal "/tmp/cm-alice@203.0.113.7-2222"
