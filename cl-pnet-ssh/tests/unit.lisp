@@ -2925,7 +2925,18 @@ no running ssh-agent service skips instead."
                        (typep (car entry) '(vector (unsigned-byte 8))))
                      entries))
           (is (eq t (cl-pnet-ssh::ssh-config-client-agent
-                     (cl-pnet-ssh::%make-ssh-config-options) nil)))))))
+                     (cl-pnet-ssh::%make-ssh-config-options) nil)))
+          ;; The agent holds none of our keys, so it must refuse this one;
+          ;; the request and its reply still cross the pipe.
+          (let ((sign-error nil))
+            (cl-pnet-ssh:ssh-agent-sign
+             (cl-pnet-ssh::ssh-make-public-key-blob
+              "ssh-ed25519" (cl-pnet-ssh::ssh-random-octets 32))
+             (sb-ext:string-to-octets "agent-pipe" :external-format :ascii)
+             :path t
+             :on-signature (lambda (signature) (declare (ignore signature)))
+             :on-error (lambda (condition) (setf sign-error condition)))
+            (is (typep sign-error 'ssh-authentication-error)))))))
 
 (test agent-identities-over-a-unix-socket
   #+win32 (skip "no Unix-domain sockets on this platform")
