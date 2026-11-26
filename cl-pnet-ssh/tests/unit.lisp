@@ -6267,6 +6267,40 @@ check_follow_cname() refuses when CanonicalizeHostname is no."
                                     (setf failure condition)))
     (is (typep failure 'ssh-config-error))))
 
+(test log-verbose-keeps-only-the-first-argument
+  "readconf's oLogVerbose stores an argument only while num_log_verbose is
+zero, so the first argument of the first active line wins and later words are
+parsed but dropped.  \"none\" is reserved for a line of its own."
+  (labels ((options (&rest lines)
+             (let ((options nil))
+               (ssh-config-resolve
+                (cl-pnet-ssh::%make-ssh-config
+                 :directives
+                 (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+                "alias"
+                :on-options (lambda (value) (setf options value)))
+               (ssh-config-options-log-verbose options)))
+           (failure (&rest lines)
+             (let ((condition nil))
+               (ssh-config-resolve
+                (cl-pnet-ssh::%make-ssh-config
+                 :directives
+                 (mapcar #'cl-pnet-ssh::ssh-config-option-line lines))
+                "alias"
+                :on-error (lambda (value) (setf condition value)))
+               condition)))
+    (is (equal '("a") (options (cons "LogVerbose" (list "a" "b")))))
+    (is (equal '("a") (options "LogVerbose a" "LogVerbose b")))
+    (is (equal '("a") (options (cons "LogVerbose" (list "a" "b"))
+                               "LogVerbose c")))
+    (is (equal '("none") (options "LogVerbose none")))
+    (is (equal "keyword logverbose \"none\" argument must appear alone."
+               (ssh-error-detail
+                (failure (cons "LogVerbose" (list "none" "foo"))))))
+    (is (equal "keyword logverbose \"none\" argument must appear alone."
+               (ssh-error-detail
+                (failure (cons "LogVerbose" (list "foo" "none"))))))))
+
 (test local-command-parses
   (let* ((config
            (cl-pnet-ssh::%make-ssh-config

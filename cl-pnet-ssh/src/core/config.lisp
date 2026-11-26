@@ -3332,13 +3332,26 @@ decides both which hop is stored and which failure is reported first."
                      line "unsupported log level '~A'" value)))
            (setf (ssh-config-options-log-level options) level)))
         ((string= keyword "logverbose")
-         (dolist (argument (ssh-config-line-args line))
-           (when (zerop (length argument))
-             (error (ssh-config-line-error
-                     line "keyword logverbose empty argument"))))
-         (unless (ssh-config-options-log-verbose options)
-           (setf (ssh-config-options-log-verbose options)
-                 (ssh-config-line-args line))))
+         ;; readconf walks every argument but records only the first one of
+         ;; the first active line: the store is gated on num_log_verbose
+         ;; being zero, which the first stored argument clears.  It also
+         ;; reserves "none" for the sole argument of the line.
+         (let ((arguments (ssh-config-line-args line))
+               (index 0)
+               (length (length (ssh-config-line-args line))))
+           (dolist (argument arguments)
+             (when (zerop (length argument))
+               (error (ssh-config-line-error
+                       line "keyword logverbose empty argument")))
+             (when (and (string-equal argument "none")
+                        (or (plusp index) (< (1+ index) length)))
+               (error (ssh-config-line-error
+                       line "keyword logverbose \"none\" argument must appear alone.")))
+             (incf index))
+           (unless (ssh-config-options-log-verbose options)
+             (when arguments
+               (setf (ssh-config-options-log-verbose options)
+                     (list (first arguments)))))))
         ((string= keyword "escapechar")
          (let ((value (ssh-config-escape-char-value
                        (ssh-config-string-arg line))))
