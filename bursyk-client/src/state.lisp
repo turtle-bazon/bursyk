@@ -78,9 +78,16 @@ change the log level, suspend, or open the escape command line."
                    (when *escape-suspend-function*
                      (funcall *escape-suspend-function*))
                    (setf *escape-line-start* t))
-                  (#\& (when *escape-background-function*
-                          (funcall *escape-background-function*))
-                        (setf *escape-line-start* t))
+                  (#\& (if *escape-background-function*
+                           (progn
+                             (funcall *escape-background-function*)
+                             (setf *escape-line-start* t))
+                           (progn
+                             (vector-push-extend
+                              (char-code *escape-char*) out)
+                             (vector-push-extend octet out)
+                             (setf *escape-line-start*
+                                   (member octet '(10 13))))))
                   (#\~ (vector-push-extend (char-code *escape-char*) out)
                         (setf *escape-line-start* nil))
                   (#\C (if *escape-commandline-function*

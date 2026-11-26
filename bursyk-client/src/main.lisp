@@ -3353,7 +3353,8 @@ closed afterwards."
     (line "V/v" "decrease/increase verbosity (LogLevel)")
     (line "^Z" "suspend ssh")
     (line "#" "list forwarded connections")
-    (line "&" "background ssh (when waiting for connections to terminate)")
+    (when *escape-background-function*
+      (line "&" "background ssh (when waiting for connections to terminate)"))
     (line "?" "this message")
     (format *error-output* " ~C~C   - send the escape character by typing it twice~C~C"
             *escape-char* *escape-char* #\Return #\Newline)
@@ -3490,12 +3491,20 @@ connections are accepted, but the channels already carrying data stay."
   (setf *dynamic-forwards* nil
         *remote-forwards* nil))
 
+(defun escape-background-available-p ()
+  "Whether this Lisp can fork into the background, as ~& needs."
+  (let* ((package (find-package :sb-posix))
+         (fork (and package (find-symbol "FORK" package))))
+    (and fork (fboundp fork))))
+
 (defun escape-background ()
   "Detach this client as ~& does, leaving established connections alive.
 
 The listener channels are closed first, stdin is treated as EOF, and the
 process forks; the parent exits so the shell gets its prompt back while the
 child keeps serving the channels it already carries."
+  (unless (escape-background-available-p)
+    (return-from escape-background nil))
   (format *error-output* "~C& [backgrounded]~C~C"
           *escape-char* #\Return #\Newline)
   (finish-output *error-output*)
@@ -3518,7 +3527,7 @@ child keeps serving the channels it already carries."
           *escape-char* #\Return #\Newline)
   (finish-output *error-output*)
   (restore-terminal)
-  #+sbcl
+  #+(and sbcl (not win32))
   (call-with-deferrable-signals-unblocked
    (lambda ()
      (sb-unix:unix-kill (sb-unix:unix-getpid) sb-unix:sigtstp)))
@@ -6653,7 +6662,9 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                    *escape-rekey-function* #'escape-request-rekey
                    *escape-log-level-function* #'escape-adjust-log-level
                    *escape-suspend-function* #'escape-suspend
-                   *escape-background-function* #'escape-background
+                   *escape-background-function*
+                   (and (escape-background-available-p)
+                        #'escape-background)
                    *escape-disconnect-function*
                    (lambda ()
                      (format *error-output* "Connection to ~A closed.~C~C"
