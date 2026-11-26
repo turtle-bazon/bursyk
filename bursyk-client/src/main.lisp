@@ -5126,18 +5126,33 @@ Like every message after log_init they are silent under -q."
     (when (background-without-command-p options command-given-p)
       (say "Cannot fork into background without a command to execute."))))
 
+#+win32
+(defun windows-agent-pipe-path-p (path)
+  "Whether PATH names a Windows named pipe rather than a file."
+  (let ((name (substitute #\\ #\/ path)))
+    (and (>= (length name) 9)
+         (string-equal name "\\\\.\\pipe\\" :end1 9 :end2 9))))
+
 (defun check-forward-agent-socket (options)
   "Warn when ForwardAgent names a socket path that does not exist.
 
 readconf accepts anything that is not a boolean as an agent socket path, and
 fill_default_options stats it before -G prints or the connection starts; the
 loss is reported at ERROR level, so -q hides the line but the connection
-still goes ahead."
+still goes ahead.  On Windows a pipe path is asked with WaitNamedPipe; a
+file-oriented stat would always fail it."
   (let ((path (and options
                    (cl-pnet-ssh:ssh-config-options-forward-agent-sock-path
                     options))))
     (when path
       (multiple-value-bind (exists reason)
+          #+win32
+          (if (and (uiop:os-windows-p) (windows-agent-pipe-path-p path))
+              (if (cl-pnet-ssh::ssh-windows-agent-available-p path)
+                  (values t nil)
+                  (values nil "No such file or directory"))
+              (cl-pnet-ssh::ssh-stat-reason path))
+          #-win32
           (cl-pnet-ssh::ssh-stat-reason path)
         (unless exists
           (cl-pnet-ssh:ssh-warn "Cannot forward agent socket path \"~A\": ~A"
