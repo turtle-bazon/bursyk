@@ -660,14 +660,16 @@ the caller can treat the '[' literally."
 
 ssh's tilde_expand() calls getpwnam; the password file answers the same
 question for the accounts this client is likely to name.  Windows has no
-password file: the current account's profile is its passwd entry, and
-another account's home lives in the registry, which this client does not
-consult."
+password file, so SSH-WINDOWS-USER-HOME reads the account's profile from the
+registry instead, the way Win32-OpenSSH's getpwnam() does."
   (and (plusp (length user))
        #+win32
-       (let ((current (uiop:getenv "USERNAME")))
-         (when (and current (string-equal current user))
-           (namestring (user-homedir-pathname))))
+       (or (ssh-windows-user-home user)
+           ;; The registry may be unreadable for a restricted account; the
+           ;; current user's own home is still known from the environment.
+           (let ((current (uiop:getenv "USERNAME")))
+             (when (and current (string-equal current user))
+               (namestring (user-homedir-pathname)))))
        #-win32
        (handler-case
            (with-open-file (stream "/etc/passwd" :if-does-not-exist nil)

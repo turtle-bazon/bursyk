@@ -2049,6 +2049,19 @@ rejects an account that does not exist."
     ;; A name without a leading ~ is left alone.
     (is (equal "/tmp/x" (expand "/tmp/x")))))
 
+(test config-tilde-expands-another-windows-account
+  "Windows has no passwd file: ~user reads the profile registry, as
+Win32-OpenSSH's getpwnam does, and expands variables in ProfileImagePath."
+  #-win32 (skip "Windows profile registry only")
+  #+win32
+  (let ((local (cl-pnet-ssh::ssh-config-expand-tilde "~LocalService/x")))
+    (is (stringp local))
+    (is (search "ServiceProfiles/LocalService/x" local)))
+  (multiple-value-bind (expanded unknown)
+      (cl-pnet-ssh::ssh-config-expand-tilde "~burs_no_such_user_xyz/x")
+    (is (null expanded))
+    (is (equal "burs_no_such_user_xyz" unknown))))
+
 (test config-percent-dollar-expansion
   "ssh.c expands % tokens and ${NAME}; a missing variable and a bad token
 are different failures."

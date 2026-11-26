@@ -20,6 +20,7 @@
                #:cl-newzlib
                #:cl-pnet
                #:cl-pnet-sockets
+               #:cffi
                ;; SSHFP lookups for VerifyHostKeyDNS; CLIENT-DNS.LISP calls
                ;; these directly, so the systems are a build dependency of
                ;; the core rather than of each consumer.
@@ -39,6 +40,12 @@
                                :components ((:file "packages")
                                             (:file "conditions")
                                             (:file "log")
+                                            ;; Windows has no /etc/passwd; this
+                                            ;; resolves ~user through the
+                                            ;; profile registry, as OpenSSH's
+                                            ;; Windows getpwnam does.
+                                            (:file "windows-home"
+                                                   :if-feature :win32)
                                             (:file "config")
                                             (:file "algorithms")
                                             (:file "server-config")
