@@ -362,6 +362,20 @@ straight to the terminal without a relay here."
            (return 255))
           (t nil))))))
 
+(defun mux-client-wait-stdio (fd)
+  "Wait for the master to finish a stdio forward, as ssh's client does.
+
+A stdio forward has no exit status.  The master passes the channel's bytes
+over the descriptors it received and, when the channel ends, closes the
+control connection; ssh reads once more and treats the resulting EPIPE as
+success.  A packet arriving there instead means the master broke the
+protocol, which ssh treats as fatal."
+  (handler-case
+      (let ((payload (mux-read-packet fd)))
+        (fail "master returned unexpected message 0x~8,'0X"
+              (mux-u32 payload 0)))
+    (error () 0)))
+
 #-win32
 (defun mux-client-stdio-forward (fd host port)
   "Ask the master to connect FD's stdin and stdout to HOST:PORT.
@@ -380,7 +394,7 @@ finish and reports its status, exactly as it does for a multiplexed session."
     (multiple-value-bind (type reader) (mux-read-reply fd request-id)
       (case type
         (#.+mux-s-session-opened+
-         (mux-client-wait-exit fd (cl-pnet-ssh:ssh-read-u32 reader)))
+         (mux-client-wait-stdio fd))
         (#.+mux-s-permission-denied+
          (error "the control master refused stdio forwarding: ~A"
                 (cl-pnet-ssh:ssh-read-text reader)))
@@ -1093,6 +1107,10 @@ The parts a transport cannot report are left out rather than guessed."
   ;; The command, subsystem or "session" shown by -O channels.
   (remote-name "session")
   (exit-status 255)
+  ;; A -W stdio forward is a direct channel: ssh sends no exit status for
+  ;; it, closing the control channel instead, so the slave must not expect
+  ;; one.
+  (stdio nil)
   (opened nil)
   (closed nil))
 
@@ -1351,7 +1369,8 @@ The parts a transport cannot report are left out rather than guessed."
       (setf (mux-session-stdin-watcher session) nil))
     (mux-session-unwatch-output session nil)
     (mux-session-unwatch-output session t)
-    (when (mux-session-opened session)
+    (when (and (mux-session-opened session)
+               (not (mux-session-stdio session)))
       (let ((connection (mux-session-connection session)))
         (unless (mux-connection-closed-p connection)
           (mux-connection-send
@@ -1663,6 +1682,7 @@ The parts a transport cannot report are left out rather than guessed."
                   :stdin-fd stdin :stdout-fd stdout :stderr-fd stdout
                   ;; A direct channel has no remote command and no exit
                   ;; status; a normal close is success.
+                  :stdio t
                   :exit-status 0)))
     (setf (mux-connection-session connection) session)
     (push session (mux-master-sessions master))
@@ -2077,9 +2097,12 @@ is fatal rather than a reason to fall back to an unshared connection."
                     (mux-close fd)
                     (finish status)))
                  ((getf *options* :stdio-forward)
-                  (multiple-value-bind (host port)
-                      (parse-host-port (getf *options* :stdio-forward))
-                    (let ((status (mux-client-stdio-forward fd host port)))
+                  (multiple-value-bind (host port streamlocal)
+                      (parse-stdio-forward (getf *options* :stdio-forward))
+                    (let ((status
+                            (mux-client-stdio-forward
+                             fd host
+                             (if streamlocal +mux-port-streamlocal+ port))))
                       (mux-close fd)
                       status)))
                  (t

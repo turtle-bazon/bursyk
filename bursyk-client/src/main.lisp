@@ -2196,6 +2196,37 @@ it contains a slash: only a lone field can be a socket path."
       (forwarding-fail spec "~A must be host:port" spec))
     (values host (forwarding-port port spec))))
 
+(defun parse-stdio-forward (spec)
+  "SPEC as (VALUES HOST PORT STREAMLOCAL-P), the way ssh.c reads -W.
+
+ssh parses -W with parse_forward(..., dynamicfwd=1, ...), which accepts one
+or two fields, and then copies fwd.listen_path when the listener is a socket
+path and fwd.listen_host otherwise.  A socket path is therefore a
+direct-streamlocal target and everything else is a host:port pair.  The two
+remaining dynamic forms - a bare port, or a port followed by a target path -
+leave ssh with a NULL host that it cannot open, so they are rejected with
+the same wording the getopt check uses."
+  (let* ((expanded (cl-pnet-ssh::ssh-forward-expand-value spec nil))
+         (fields (and expanded
+                      (cl-pnet-ssh::ssh-config-forward-fields expanded))))
+    (unless (and fields (<= 1 (length fields) 2))
+      (fatal "Bad stdio forwarding specification '~A'" spec))
+    (if (= 1 (length fields))
+        (let ((field (first fields)))
+          (if (cdr field)
+              (values (car field) 0 t)
+              (fatal "Bad stdio forwarding specification '~A'" spec)))
+        (destructuring-bind (listener target) fields
+          (cond
+            ((and (cdr listener) (cdr target))
+             (values (car listener) 0 t))
+            ((cdr target)
+             (fatal "Bad stdio forwarding specification '~A'" spec))
+            (t
+             (values (car listener)
+                     (forwarding-port (car target) spec)
+                     nil)))))))
+
 (defun parse-config-forward (spec remote-p)
   "SPEC as a FORWARD for ssh_config's LocalForward/RemoteForward.
 
@@ -2643,24 +2674,31 @@ more and hang instead of exiting; :ABORT T skips that and the exit hooks."
 
 ;;; ---- -W: stream stdin and stdout over one channel ----
 
-(defun start-stdio-forward (client host port)
-  (setf *status* 0
-        *channel*
-        (cl-pnet-ssh:ssh-open-direct-tcpip
-         client host port
-         :on-data (lambda (channel data kind)
-                    (declare (ignore channel))
-                    (write-octets (ecase kind (:stdout *standard-output*)
-                                         (:stderr *error-output*))
-                                  data))
-         :on-close (lambda (channel status)
-                     (declare (ignore channel status))
-                     (finish *status*))
-         :on-error (lambda (channel condition)
-                     (declare (ignore channel))
-                     (format *error-output* "burs: ~A~%" condition)
-                     (finish 255))))
-  (log-line "stdio forward to ~A:~D" host port)
+(defun start-stdio-forward (client host port streamlocal)
+  (let ((callbacks
+          (list :on-data
+                (lambda (channel data kind)
+                  (declare (ignore channel))
+                  (write-octets (ecase kind (:stdout *standard-output*)
+                                       (:stderr *error-output*))
+                                data))
+                :on-close
+                (lambda (channel status)
+                  (declare (ignore channel status))
+                  (finish *status*))
+                :on-error
+                (lambda (channel condition)
+                  (declare (ignore channel))
+                  (format *error-output* "burs: ~A~%" condition)
+                  (finish 255)))))
+    (setf *status* 0
+          *channel*
+          (if streamlocal
+              (apply #'cl-pnet-ssh:ssh-open-direct-streamlocal
+                     client host callbacks)
+              (apply #'cl-pnet-ssh:ssh-open-direct-tcpip
+                     client host port callbacks))))
+  (log-line "stdio forward to ~A:~D" host (if streamlocal -2 port))
   (start-input *channel*))
 
 ;;; ---- -L: local forwarding ----
@@ -5685,9 +5723,9 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                (background-ready)))
            (cond
              ((getf *options* :stdio-forward)
-              (multiple-value-bind (target port)
-                  (parse-host-port (getf *options* :stdio-forward))
-                (start-stdio-forward client target port)))
+              (multiple-value-bind (target port streamlocal)
+                  (parse-stdio-forward (getf *options* :stdio-forward))
+                (start-stdio-forward client target port streamlocal)))
              ((or (getf *options* :no-command) (session-type-none-p client)) nil)
              (t
               (start-session client command command-given-p))))))

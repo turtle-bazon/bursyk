@@ -850,6 +850,41 @@ the lines never reach the output."
     (is (equal "::1" host))
     (is (= 22 port))))
 
+(test stdio-forward-recognises-a-socket-path
+  "ssh reads -W with parse_forward(dynamicfwd=1), so a one-field socket path
+is a direct-streamlocal target while host:port stays a TCP destination."
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "/tmp/agent.sock")
+    (is (equal "/tmp/agent.sock" host))
+    (is (not (null streamlocal))))
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "example.org:2200")
+    (is (equal "example.org" host))
+    (is (= 2200 port))
+    (is (not streamlocal)))
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "[::1]:22")
+    (is (equal "::1" host))
+    (is (= 22 port))
+    (is (not streamlocal)))
+  ;; Two fields where both name sockets use the listening path, exactly as
+  ;; ssh.c copies fwd.listen_path.
+  (multiple-value-bind (host port streamlocal)
+      (burs::parse-stdio-forward "/tmp/a.sock:/tmp/b.sock")
+    (is (equal "/tmp/a.sock" host))
+    (is (not (null streamlocal)))))
+
+(test stdio-forward-expands-the-environment-before-parsing
+  (let ((old (uiop:getenv "BURS_TEST_DIR")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "BURS_TEST_DIR") "/tmp")
+           (multiple-value-bind (host port streamlocal)
+               (burs::parse-stdio-forward "${BURS_TEST_DIR}/agent.sock")
+             (is (equal "/tmp/agent.sock" host))
+             (is (not (null streamlocal)))))
+      (setf (uiop:getenv "BURS_TEST_DIR") (or old "")))))
+
 (test command-line-option-maps-the-supported-keywords
   (let ((burs::*options* (empty-options)))
     (burs::command-line-option "Port" "2200")
