@@ -6888,17 +6888,7 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
                           (log-notice "burs: ~A~%" condition))))))
                (finish 255))
    :on-close (lambda (client reason)
-               ;; clientloop.c's input callback reports a connection the peer
-               ;; dropped, not the ordinary end of a session.
-               (when (eq reason :peer-closed)
-                 (unless (member (log-level-setting)
-                                 '("quiet" "fatal" "error")
-                                 :test #'string-equal)
-                   (format *error-output*
-                           "Connection to ~A closed by remote host.~C~C"
-                           (cl-pnet-ssh:ssh-client-host client)
-                           #\Return #\Newline)
-                   (finish-output *error-output*)))
+               (declare (ignore client reason))
                (finish *status*))))
 
 (defun background-child-arguments ()
