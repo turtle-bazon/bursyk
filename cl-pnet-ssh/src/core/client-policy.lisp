@@ -732,6 +732,21 @@ certificate, its plain key or its CA refuses it without that fallback."
                          (t (write-char character out))))
                      (write-char character out)))))))
 
+(defun ssh-known-hosts-command-program (expanded)
+  "VALUES PROGRAM ARGUMENTS that run EXPANDED in the platform's shell.
+
+POSIX uses $SHELL (or /bin/sh) with -c.  Windows normally has no shell
+variable; when it does it may name cmd.exe, which wants /c, or a POSIX
+shell such as bash, which wants -c."
+  (let ((shell (uiop:getenv "SHELL")))
+    #+win32
+    (let ((shell (or shell "cmd.exe")))
+      (if (string-equal (or (pathname-name (pathname shell)) "") "cmd")
+          (values shell (list "/c" expanded))
+          (values shell (list "-c" expanded))))
+    #-win32
+    (values (or shell "/bin/sh") (list "-c" expanded))))
+
 (defun ssh-client-known-hosts-command-entries (client host host-key)
   "The known_hosts entries KnownHostsCommand prints for HOST, or NIL."
   (let ((command (ssh-client-known-hosts-command client)))
@@ -739,13 +754,14 @@ certificate, its plain key or its CA refuses it without that fallback."
       (let* ((expanded
                (ssh-client-expand-known-hosts-command
                 client host host-key command))
-             (shell (or (uiop:getenv "SHELL") "/bin/sh"))
              (output
                (handler-case
-                   (uiop:run-program (list shell "-c" expanded)
-                                     :output :string
-                                     :error-output :string
-                                     :ignore-error-status nil)
+                   (multiple-value-bind (program arguments)
+                       (ssh-known-hosts-command-program expanded)
+                     (uiop:run-program (cons program arguments)
+                                       :output :string
+                                       :error-output :string
+                                       :ignore-error-status nil))
                  (error (condition)
                    (error 'ssh-host-key-error
                           :detail (format nil "KnownHostsCommand failed: ~A"
@@ -755,7 +771,10 @@ certificate, its plain key or its CA refuses it without that fallback."
                            host-key
                            (ssh-client-fingerprint-hash client)))))))
         (loop for line in (uiop:split-string output :separator '(#\Newline))
-              for entry = (ssh-known-host-line-entry line)
+              ;; A Windows command ends its lines with CRLF; the CR is not
+              ;; part of the key material.
+              for entry = (ssh-known-host-line-entry
+                           (string-right-trim '(#\Return) line))
               when entry collect entry)))))
 
 (defun ssh-client-known-hosts-command-status (client host host-key)

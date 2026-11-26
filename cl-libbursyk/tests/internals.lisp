@@ -373,10 +373,9 @@ never asks, and an explicit passphrase wins without asking."
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test client-known-hosts-command-supplies-keys
-  #+win32 (skip "the test key command is a POSIX shell script")
-  #-win32
   (let* ((directory (ssh-test-directory "cl-pnet-ssh-khc"))
-         (script (merge-pathnames "keys.sh" directory))
+         (script (merge-pathnames #+win32 "keys.bat" #-win32 "keys.sh"
+                                  directory))
          (blob (ssh-make-public-key-blob "ssh-ed25519"
                                          (ssh-random-octets 32)))
          (other (ssh-make-public-key-blob "ssh-ed25519"
@@ -387,8 +386,11 @@ never asks, and an explicit passphrase wins without asking."
            (with-open-file (out script :direction :output
                                        :if-exists :supersede
                                        :if-does-not-exist :create)
-             (format out "#!/bin/sh~%printf '%s ssh-ed25519 ~A~%' \"$1\"~%"
+             (format out
+                     #+win32 "@echo %1 ssh-ed25519 ~A~%"
+                     #-win32 "#!/bin/sh~%printf '%s ssh-ed25519 ~A~%' \"$1\"~%"
                      (ssh-octets-base64 blob)))
+           #-win32
            (ignore-errors (uiop:run-program (list "chmod" "700"
                                                   (namestring script))))
            (let ((client (cl-pnet-ssh::%make-ssh-client
