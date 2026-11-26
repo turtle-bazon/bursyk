@@ -53,6 +53,20 @@
           (ash (aref octets (+ position 2)) 8)
           (aref octets (+ position 3))))
 
+(defun mux-cstring-at (payload position)
+  "The length-prefixed string at POSITION, or an empty string.
+Some mux.c client replies read their error message directly after the type,
+without skipping the request id; decoding the id as a length then yields the
+empty string for the usual request id 0, which the message must reproduce."
+  (if (> (+ position 4) (length payload))
+      ""
+      (let ((length (mux-u32 payload position)))
+        (if (> (+ position 4 length) (length payload))
+            ""
+            (map 'string #'code-char
+                 (subseq payload (+ position 4) (+ position 4 length)))))))
+
+
 (defun mux-frame (payload)
   "PAYLOAD with the four-byte length prefix mux.c puts in front of a packet."
   (let ((frame (make-array (+ 4 (length payload))
@@ -105,6 +119,22 @@ implements.  Both sides skip the pairs they do not recognise."
 ;;; ---- Blocking helpers for the client side ----
 
 #-win32
+(define-condition mux-io-error (error)
+  ((operation :initarg :operation :reader mux-io-error-operation)
+   (errno :initarg :errno :reader mux-io-error-errno)
+   (text :initarg :text :reader mux-io-error-text))
+  (:report (lambda (condition stream)
+             (write-string (mux-io-error-text condition) stream))))
+
+#-win32
+(defun mux-io-strerror (condition)
+  "The C library text for CONDITION's errno, as mux.c's strerror() prints it."
+  (let ((errno (mux-io-error-errno condition)))
+    (if (and errno (plusp errno))
+        (cl-pnet-sockets:c-strerror errno)
+        "Unknown error")))
+
+#-win32
 (defun mux-read-exact (fd count)
   "Read exactly COUNT octets from the blocking descriptor FD."
   (let ((buffer (make-array count :element-type '(unsigned-byte 8)))
@@ -118,7 +148,13 @@ implements.  Both sides skip the pairs they do not recognise."
                   (incf have got))
                  ((and (minusp got) (eql error 4))) ; EINTR
                  (t
-                  (error "the control socket closed before ~D octets" count)))))
+                  ;; mux.c turns a zero-length read into EPIPE.
+                  (error 'mux-io-error
+                         :operation :read
+                         :errno (if (and error (plusp error)) error 32)
+                         :text (format nil
+                                       "the control socket closed before ~D octets"
+                                       count))))))
     buffer))
 
 #-win32
@@ -132,7 +168,12 @@ implements.  Both sides skip the pairs they do not recognise."
                  ((plusp count) (incf have count))
                  ((and (minusp count) (eql error 4)))
                  (t
-                  (error "write to the control socket failed (~A)" error)))))))
+                  (error 'mux-io-error
+                         :operation :write
+                         :errno error
+                         :text (format nil
+                                       "write to the control socket failed (~A)"
+                                       error))))))))
 
 #-win32
 (defun mux-read-packet (fd)
@@ -202,26 +243,55 @@ implements.  Both sides skip the pairs they do not recognise."
 (defun mux-handshake (fd)
   "Exchange HELLO with the master on FD; return its extension names.
 
-The master speaks first, as OpenSSH's does.  Its hello may carry (NAME
-VALUE) pairs after the version; only the names matter to this client, and
-unknown names are ignored exactly as ssh(1) ignores them."
-  (let* ((payload (mux-read-packet fd))
-         (type (and (>= (length payload) 4) (mux-u32 payload 0))))
-    (unless (eql type +mux-msg-hello+)
-      (error "the control socket did not answer with a mux hello"))
+VALUES EXTENSIONS EXCHANGED-P.  The master speaks first, as OpenSSH's does.
+Its hello may carry (NAME VALUE) pairs after the version; only the names
+matter to this client, and unknown names are ignored exactly as ssh(1)
+ignores them.
+
+mux_client_hello_exchange() writes the client hello before reading the
+master's and, except for a buffer too short to parse, reports a failure and
+lets ssh(1) fall back to a direct connection instead of dying."
+  (handler-case (mux-write-packet fd (mux-hello-payload))
+    (mux-io-error ()
+      ;; mux.c debug-logs the write failure; muxclient() reports the
+      ;; exchange failure itself.
+      (log-error "muxclient: master hello exchange failed")
+      (return-from mux-handshake (values nil nil))))
+  (let ((payload
+          (handler-case (mux-read-packet fd)
+            (mux-io-error () nil))))
+    (unless payload
+      (log-error "muxclient: master hello exchange failed")
+      (return-from mux-handshake (values nil nil)))
+    (when (< (length payload) 4)
+      (log-fatal "mux_client_hello_exchange: parse type: incomplete message"))
+    (let ((type (mux-u32 payload 0)))
+      (unless (eql type +mux-msg-hello+)
+        (log-error "mux_client_hello_exchange: expected HELLO (~D) got ~D"
+                   +mux-msg-hello+ type)
+        (log-error "muxclient: master hello exchange failed")
+        (return-from mux-handshake (values nil nil))))
     (when (< (length payload) 8)
-      (error "the control master sent a truncated hello"))
+      (log-fatal "mux_client_hello_exchange: parse version: incomplete message"))
     (let ((version (mux-u32 payload 4))
           (extensions '()))
       (unless (= version +mux-version+)
-        (error "unsupported control master version ~D" version))
+        (log-error "Unsupported multiplexing protocol version ~D (expected ~D)"
+                   version +mux-version+)
+        (log-error "muxclient: master hello exchange failed")
+        (return-from mux-handshake (values nil nil)))
       (let ((reader (cl-pnet-ssh:ssh-make-reader payload 8)))
         (loop while (plusp (cl-pnet-ssh:ssh-reader-remaining reader))
-              do (let ((name (cl-pnet-ssh:ssh-read-text reader)))
-                   (cl-pnet-ssh:ssh-read-text reader) ; value
-                   (push name extensions))))
-      (mux-write-packet fd (mux-hello-payload))
-      (nreverse extensions))))
+              do (handler-case
+                     (let ((name (cl-pnet-ssh:ssh-read-text reader)))
+                       (cl-pnet-ssh:ssh-read-text reader) ; value
+                       (push name extensions))
+                   (error ()
+                     (log-error
+                      "mux_client_hello_exchange: parse extension: incomplete message")
+                     (log-error "muxclient: master hello exchange failed")
+                     (return-from mux-handshake (values nil nil))))))
+      (values (nreverse extensions) t))))
 
 #-win32
 (defun mux-alive (fd)
@@ -282,31 +352,76 @@ unknown names are ignored exactly as ssh(1) ignores them."
                        (or connect-port 0)))
 
 #-win32
-(defun mux-send-forwards (fd forwards cancel-p)
-  "Send FORWARDS, a list of plists, and fail on the first refusal."
-  (dolist (forward forwards)
-    (let* ((request-id 2)
-           (type (getf forward :type))
-           (listen-host (or (getf forward :listen-host) ""))
-           (listen-port (or (getf forward :listen-port) 0))
-           (connect-host (or (getf forward :connect-host) ""))
-           (connect-port (or (getf forward :connect-port) 0)))
-      (mux-write-packet
-       fd (mux-open-forward-payload request-id cancel-p type listen-host
-                                    listen-port connect-host connect-port))
-      (multiple-value-bind (reply reader) (mux-read-reply fd request-id)
-        (cond
-          ((eql reply +mux-s-ok+) nil)
-          ((eql reply +mux-s-remote-port+)
-           (let ((port (cl-pnet-ssh:ssh-read-u32 reader)))
-             (unless (getf *options* :quiet)
-               (format *error-output*
-                       "Allocated port ~D for remote forward to ~A:~A~%"
-                       port connect-host connect-port))))
-          (t
-           (error "the control master refused forward ~A:~A: ~A"
-                  listen-host listen-port
-                  (cl-pnet-ssh:ssh-read-text reader))))))))
+(defun mux-send-forwards (fd forwards cancel-p &key forward-command-p)
+  "Send FORWARDS, a list of plists, and report whether every one was accepted.
+
+mux.c's mux_client_forwards() keeps going after a refusal: each rejected
+forward logs its own line, the command still fails at the end, and
+-O forward prints an allocated remote port on stdout.  The verbose line only
+appears at LogLevel VERBOSE or above, which -q and the default do not reach."
+  (let ((failed nil)
+        (request-id 0))
+    (dolist (forward forwards)
+      (let* ((type (getf forward :type))
+             (listen-host (or (getf forward :listen-host) ""))
+             (listen-port (or (getf forward :listen-port) 0))
+             (connect-host (or (getf forward :connect-host) ""))
+             (connect-port (or (getf forward :connect-port) 0))
+             (payload nil))
+        (handler-case
+            (mux-write-packet
+             fd (mux-open-forward-payload request-id cancel-p type listen-host
+                                          listen-port connect-host connect-port))
+          (mux-io-error (condition)
+            (log-fatal "mux_client_forward: write packet: ~A"
+                       (mux-io-strerror condition))))
+        (setf payload
+              (handler-case (mux-read-packet fd)
+                (mux-io-error () nil)))
+        (if (null payload)
+            ;; mux_client_forward() returns -1 silently and the caller
+            ;; keeps trying the remaining forwards.
+            (setf failed t)
+            (progn
+              (when (< (length payload) 8)
+                (log-fatal "mux_client_forward: parse: incomplete message"))
+              (let ((reply (mux-u32 payload 0))
+                    (rid (mux-u32 payload 4)))
+                (unless (= rid request-id)
+                  (log-fatal
+                   "mux_client_forward: out of sequence reply: my id ~D theirs ~D"
+                   request-id rid))
+                (case reply
+                  (#.+mux-s-ok+ (incf request-id))
+                  (#.+mux-s-remote-port+
+                   (when cancel-p
+                     (log-fatal
+                      "mux_client_forward: got MUX_S_REMOTE_PORT for cancel"))
+                   (when (< (length payload) 12)
+                     (log-fatal "mux_client_forward: parse port: incomplete message"))
+                   (let ((port (mux-u32 payload 8)))
+                     (when (plusp (getf *options* :verbose 0))
+                       (log-message
+                        "Allocated port ~D for remote forward to ~A:~A"
+                        port connect-host connect-port))
+                     (when forward-command-p
+                       (format t "~D~%" port)
+                       (finish-output)))
+                   (incf request-id))
+                  (#.+mux-s-permission-denied+
+                   (log-error "Master refused forwarding request: ~A"
+                              (mux-cstring-at payload 8))
+                   (setf failed t))
+                  (#.+mux-s-failure+
+                   (log-error "mux_client_forward: forwarding request failed: ~A"
+                              (mux-cstring-at payload 8))
+                   (setf failed t))
+                  (t
+                   (log-fatal
+                    "mux_client_forward: unexpected response from master 0x~8,'0X"
+                    reply))))))))
+    (not failed)))
+
 
 #-win32
 (defun mux-client-session (fd request &key master-pid)
@@ -2046,31 +2161,159 @@ the SSH connection is even attempted."
                        options))))))
 
 (defun mux-attach-forwards (fd options)
-  "Give the master the forwards this invocation asks for, as ssh(1) does."
-  (unless (and options
-               (cl-pnet-ssh:ssh-config-options-clear-all-forwardings options))
-    (let ((specs (append (mux-config-forward-plists options)
-                         (mux-forward-plists))))
-      (when specs
-        (mux-send-forwards fd specs nil)))))
+  "Give the master the forwards this invocation asks for, as ssh(1) does.
+
+Returns true when every forward was accepted."
+  (if (and options
+           (cl-pnet-ssh:ssh-config-options-clear-all-forwardings options))
+      t
+      (let ((specs (append (mux-config-forward-plists options)
+                           (mux-forward-plists))))
+        (or (null specs) (mux-send-forwards fd specs nil)))))
 
 (defun mux-client-info (fd name)
   "Ask the master on FD for its info NAME and return the text.
 
 NAME is \"connection\" for -O conninfo or \"channels\" for -O channels.  The
 master formats the text, including its CRLF line endings, so it is printed
-unchanged."
-  (mux-write-packet fd (mux-request-payload +mux-c-ext-info+ 0
-                                            (cons "name" name)))
-  (multiple-value-bind (type reader) (mux-read-reply fd 0)
-    (unless (eql type +mux-s-ext-info+)
-      (error "the control master refused the info request: ~A"
-             (cl-pnet-ssh:ssh-read-text reader)))
-    (let ((status (cl-pnet-ssh:ssh-read-u32 reader))
-          (message (cl-pnet-ssh:ssh-read-text reader)))
-      (if (plusp status)
-          message
-          (error "the control master refused the info request: ~A" message)))))
+unchanged.  mux.c ignores the status word and returns the message either
+way, and its error path reads the message right after the type, so the
+request id is decoded as a length; both quirks are reproduced here."
+  (handler-case
+      (mux-write-packet fd (mux-request-payload +mux-c-ext-info+ 0
+                                                (cons "name" name)))
+    (mux-io-error (condition)
+      (log-fatal "mux_client_request_info: write packet: ~A"
+                 (mux-io-strerror condition))))
+  (let ((payload (handler-case (mux-read-packet fd)
+                   (mux-io-error () nil))))
+    (unless payload
+      ;; mux_client_request_info() returns NULL and muxclient() dies with
+      ;; its own message.
+      (log-fatal "muxclient: info request failed"))
+    (when (< (length payload) 4)
+      (log-fatal "mux_client_request_info: parse type: incomplete message"))
+    (let ((type (mux-u32 payload 0)))
+      (unless (eql type +mux-s-ext-info+)
+        (log-fatal "mux_client_request_info: master returned error: ~A"
+                   (mux-cstring-at payload 4)))
+      (when (< (length payload) 8)
+        (log-fatal "mux_client_request_info: parse remote ID: incomplete message"))
+      (let ((rid (mux-u32 payload 4)))
+        (unless (zerop rid)
+          (log-fatal
+           "mux_client_request_info: out of sequence reply: my id 0 theirs ~D"
+           rid)))
+      (when (< (length payload) 16)
+        (log-fatal
+         "mux_client_request_info: parse connection info: incomplete message"))
+      (mux-u32 payload 8)               ; status, which mux.c ignores
+      (mux-cstring-at payload 12))))
+
+(defun mux-client-alive-check (fd)
+  "Ask the master on FD for its pid, as mux_client_request_alive() does."
+  (handler-case
+      (mux-write-packet fd (mux-request-payload +mux-c-alive-check+ 0))
+    (mux-io-error (condition)
+      (log-fatal "mux_client_request_alive: write packet: ~A"
+                 (mux-io-strerror condition))))
+  (let ((payload (handler-case (mux-read-packet fd)
+                   (mux-io-error () nil))))
+    (unless payload
+      ;; A failed read makes mux_client_request_alive() return 0, which
+      ;; muxclient() reports with its own function name.
+      (log-fatal "muxclient: master alive check failed"))
+    (when (< (length payload) 4)
+      (log-fatal "mux_client_request_alive: parse type: incomplete message"))
+    (let ((type (mux-u32 payload 0)))
+      (unless (eql type +mux-s-alive+)
+        (log-fatal "mux_client_request_alive: master returned error: ~A"
+                   (mux-cstring-at payload 4)))
+      (when (< (length payload) 8)
+        (log-fatal "mux_client_request_alive: parse remote ID: incomplete message"))
+      (let ((rid (mux-u32 payload 4)))
+        (unless (zerop rid)
+          (log-fatal
+           "mux_client_request_alive: out of sequence reply: my id 0 theirs ~D"
+           rid)))
+      (when (< (length payload) 12)
+        (log-fatal "mux_client_request_alive: parse PID: incomplete message"))
+      (mux-u32 payload 8))))
+
+(defun mux-client-reply-type-and-id (fd function)
+  "Read a reply on FD and return TYPE and REQUEST-ID.
+
+FUNCTION names the mux.c client routine for the fatal messages, matching
+fatal_fr()'s \"parse\" wording when the packet is too short."
+  (let ((payload (mux-read-packet fd)))
+    (when (< (length payload) 8)
+      (log-fatal "~A: parse: incomplete message" function))
+    (values (mux-u32 payload 0) (mux-u32 payload 4) payload)))
+
+(defun mux-client-terminate (fd)
+  "Send MUX_C_TERMINATE and handle its reply the way mux.c does."
+  (handler-case
+      (mux-write-packet fd (mux-request-payload +mux-c-terminate+ 0))
+    (mux-io-error (condition)
+      (log-fatal "mux_client_request_terminate: write packet: ~A"
+                 (mux-io-strerror condition))))
+  (handler-case
+      (multiple-value-bind (type rid payload)
+          (mux-client-reply-type-and-id fd "mux_client_request_terminate")
+        (unless (zerop rid)
+          (log-fatal
+           "mux_client_request_terminate: out of sequence reply: my id 0 theirs ~D"
+           rid))
+        (case type
+          (#.+mux-s-ok+ nil)
+          (#.+mux-s-permission-denied+
+           (log-fatal "Master refused termination request: ~A"
+                      (mux-cstring-at payload 8)))
+          (#.+mux-s-failure+
+           (log-fatal
+            "mux_client_request_terminate: termination request failed: ~A"
+            (mux-cstring-at payload 8)))
+          (t
+           (log-fatal
+            "mux_client_request_terminate: unexpected response from master 0x~8,'0X"
+            type))))
+    (mux-io-error (condition)
+      ;; The master usually exits before its acknowledgement arrives; mux.c
+      ;; treats EPIPE as success and any other read error as fatal.
+      (unless (eql (mux-io-error-errno condition) 32)
+        (log-fatal "mux_client_request_terminate: read from master failed: ~A"
+                   (mux-io-strerror condition))))))
+
+(defun mux-client-stop-listening (fd)
+  "Send MUX_C_STOP_LISTENING and handle its reply the way mux.c does."
+  (handler-case
+      (mux-write-packet fd (mux-request-payload +mux-c-stop-listening+ 0))
+    (mux-io-error (condition)
+      (log-fatal "mux_client_request_stop_listening: write packet: ~A"
+                 (mux-io-strerror condition))))
+  (handler-case
+      (multiple-value-bind (type rid payload)
+          (mux-client-reply-type-and-id fd "mux_client_request_stop_listening")
+        (unless (zerop rid)
+          (log-fatal
+           "mux_client_request_stop_listening: out of sequence reply: my id 0 theirs ~D"
+           rid))
+        (case type
+          (#.+mux-s-ok+ nil)
+          (#.+mux-s-permission-denied+
+           (log-fatal "Master refused stop listening request: ~A"
+                      (mux-cstring-at payload 8)))
+          (#.+mux-s-failure+
+           (log-fatal
+            "mux_client_request_stop_listening: stop listening request failed: ~A"
+            (mux-cstring-at payload 8)))
+          (t
+           (log-fatal
+            "mux_client_request_stop_listening: unexpected response from master 0x~8,'0X"
+            type))))
+    (mux-io-error (condition)
+      (log-fatal "mux_client_request_stop_listening: read from master failed: ~A"
+                 (mux-io-strerror condition)))))
 
 (defun mux-client-control (fd command options &optional extensions)
   "Run one -O COMMAND against the master on FD and return a status.
@@ -2078,45 +2321,41 @@ unchanged."
 EXTENSIONS are the names the master advertised in its hello."
   (cond
     ((or (null command) (string-equal command "check"))
-     (format t "Master running (pid=~D)~%" (mux-alive fd))
+     ;; mux.c writes this one with fprintf(stderr), not through log.c, so it
+     ;; goes to stderr even when -E redirects the log.
+     (format *error-output* "Master running (pid=~D)~%"
+             (mux-client-alive-check fd))
      0)
     ((member command '("exit" "terminate") :test #'string-equal)
-     (mux-write-packet fd (mux-request-payload +mux-c-terminate+ 0))
-     ;; The master may exit before its acknowledgement reaches the socket,
-     ;; which ssh(1) treats as success for this command.
-     (let ((message nil))
-       (handler-case
-           (multiple-value-bind (type reader) (mux-read-reply fd 0)
-             (when (member type (list +mux-s-permission-denied+
-                                      +mux-s-failure+))
-               (setf message (cl-pnet-ssh:ssh-read-text reader))))
-         (error () nil))
-       (when message
-         (error "the control master refused to terminate: ~A" message)))
-     (format *error-output* "Exit request sent.~%")
+     (mux-client-terminate fd)
+     (unless (fatal-message-suppressed-p)
+       (format *error-output* "Exit request sent.~%"))
      0)
     ((string-equal command "stop")
-     (mux-write-packet fd (mux-request-payload +mux-c-stop-listening+ 0))
-     (mux-read-reply fd 0)
-     (format *error-output* "Stop listening request sent.~%")
+     (mux-client-stop-listening fd)
+     (unless (fatal-message-suppressed-p)
+       (format *error-output* "Stop listening request sent.~%"))
      0)
     ((string-equal command "forward")
-     (mux-send-forwards
-      fd (append (mux-config-forward-plists options)
-                 (mux-forward-plists))
-      nil)
+     (unless (mux-send-forwards
+              fd (append (mux-config-forward-plists options)
+                         (mux-forward-plists))
+              nil :forward-command-p t)
+       (log-fatal "muxclient: master forward request failed"))
      0)
     ((string-equal command "cancel")
-     (mux-send-forwards
-      fd (append (mux-config-forward-plists options)
-                 (mux-forward-plists))
-      t)
+     (unless (mux-send-forwards
+              fd (append (mux-config-forward-plists options)
+                         (mux-forward-plists))
+              t)
+       ;; mux.c logs the failure at ERROR and still exits 0 for cancel.
+       (log-error "muxclient: master cancel forward request failed"))
      0)
     ((member command '("conninfo" "channels") :test #'string-equal)
      ;; A master that did not advertise the extension has no info handler;
      ;; asking anyway would only produce a generic "unsupported request".
      (unless (member "info" extensions :test #'string-equal)
-       (error "mux server does not support info request"))
+       (log-fatal "mux server does not support info request"))
      (princ (mux-client-info
              fd (if (string-equal command "conninfo")
                     "connection"
@@ -2125,6 +2364,7 @@ EXTENSIONS are the names the master advertised in its hello."
      0)
     (t
      (error "unsupported control command ~S" command))))
+
 
 #-win32
 (defun mux-attach (path options command command-given-p mode)
@@ -2152,7 +2392,14 @@ is fatal rather than a reason to fall back to an unshared connection."
                            (getf *options* :stdio-forward))))))
          (handler-case
              (progn
-               (setf extensions (mux-handshake fd))
+               (multiple-value-bind (names exchanged)
+                   (mux-handshake fd)
+                 (unless exchanged
+                   (mux-close fd)
+                   ;; ssh(1) connects directly when the master cannot even
+                   ;; complete the hello exchange; it does not fail here.
+                   (return-from mux-attach (values nil :hello-failed)))
+                 (setf extensions names))
                (setf alive t)
                (cond
                  ((getf *options* :control-command)
@@ -2174,20 +2421,26 @@ is fatal rather than a reason to fall back to an unshared connection."
                     (mux-close fd)
                     status))
                  (t
-                  (mux-attach-forwards fd options)
-                  (let* ((master-pid (mux-alive fd))
-                         (request (mux-build-request
-                                   options command command-given-p
-                                   (not (null (getf *options* :subsystem)))))
-                         (status (mux-client-session
-                                  fd request :master-pid master-pid)))
-                    (mux-close fd)
-                    (if (eq status :refused)
-                        ;; mux_client() returns -1 after a refused session
-                        ;; request, so ssh(1) connects directly instead of
-                        ;; giving up; do the same.
-                        (values nil :session-refused)
-                        status)))))
+                  (if (mux-attach-forwards fd options)
+                      (let* ((master-pid (mux-alive fd))
+                             (request (mux-build-request
+                                       options command command-given-p
+                                       (not (null (getf *options* :subsystem)))))
+                             (status (mux-client-session
+                                      fd request :master-pid master-pid)))
+                        (mux-close fd)
+                        (if (eq status :refused)
+                            ;; mux_client() returns -1 after a refused session
+                            ;; request, so ssh(1) connects directly instead of
+                            ;; giving up; do the same.
+                            (values nil :session-refused)
+                            status))
+                      (progn
+                        ;; mux_client_forwards() reports and returns -1, so
+                        ;; ssh(1) falls back to a direct connection.
+                        (log-error "muxclient: master forward request failed")
+                        (mux-close fd)
+                        (values nil :forward-refused))))))
            (error (condition)
              (mux-close fd)
              (if alive
@@ -2286,7 +2539,8 @@ an earlier check, so the file is not read a second time."
         (multiple-value-bind (status reason)
             (mux-attach path options command command-given-p mode)
           (when status (finish status))
-          (when (getf *options* :control-command)
+          (when (and (getf *options* :control-command)
+                     (not (eq reason :hello-failed)))
             (fail "Control socket connect(~A): ~A"
                   path (or reason "no control master is running")))))
       (when (mux-start-requested-p mode)
