@@ -60,6 +60,8 @@
                                             (:file "revoked-keys")
                                             (:file "server-policy")
                                             (:file "kex")
+                                            (:file "agent-windows"
+                                                   :if-feature :win32)
                                             (:file "agent")
                                             (:file "channel-fd")
                                             (:file "client-signer")

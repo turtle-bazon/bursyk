@@ -2905,6 +2905,28 @@ key under the bare name is still only unknown, so the port entry decides."
     (is (search "cannot connect"
                 (ssh-error-detail condition)))))
 
+(test windows-agent-pipe-lists-identities
+  "The Windows transport reaches the default named-pipe agent.
+
+The agent may hold no keys, so an empty list is a success; a machine with
+no running ssh-agent service skips instead."
+  #-win32 (skip "Windows named-pipe agent only")
+  #+win32
+  (let ((entries :none) (failure nil))
+    (cl-pnet-ssh:ssh-agent-identities
+     :path t
+     :on-identities (lambda (value) (setf entries value))
+     :on-error (lambda (condition) (setf failure condition)))
+    (if failure
+        (skip (format nil "no Windows ssh-agent: ~A" failure))
+        (progn
+          (is (listp entries))
+          (is (every (lambda (entry)
+                       (typep (car entry) '(vector (unsigned-byte 8))))
+                     entries))
+          (is (eq t (cl-pnet-ssh::ssh-config-client-agent
+                     (cl-pnet-ssh::%make-ssh-config-options) nil)))))))
+
 (test agent-identities-over-a-unix-socket
   #+win32 (skip "no Unix-domain sockets on this platform")
   #-win32

@@ -39,7 +39,8 @@ EXPLICIT may be T for SSH_AUTH_SOCK or a path.  A missing socket is an
 authentication error, not a protocol error: the caller asked for an agent
 that is not there."
   (let ((path (if (eq explicit t)
-                  (uiop:getenv "SSH_AUTH_SOCK")
+                  (or (uiop:getenv "SSH_AUTH_SOCK")
+                      #+win32 +ssh-default-agent-pipe+)
                   explicit)))
     (or path
         (error 'ssh-authentication-error
@@ -242,6 +243,9 @@ Returns :CONTINUE after octets arrived, :WAIT when nothing is ready yet,
 Asynchronous like the rest of the client: this returns at once, and the
 callbacks run on the loop that owns PATH's socket.  PAYLOAD is the agent
 message body; the protocol's length prefix is added here."
+  #+win32
+  (ssh-agent-request-windows path payload on-response on-error)
+  #-win32
   (let ((call (%make-ssh-agent-call
                :path path
                :outgoing (ssh-concat (ssh-uint32-octets (length payload))

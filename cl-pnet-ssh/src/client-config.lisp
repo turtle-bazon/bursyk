@@ -100,7 +100,9 @@ as ssh.c's post-configuration handling does."
              (case value
                (:none :none)
                (:environment t)
-               ((nil) (or (and (uiop:getenv "SSH_AUTH_SOCK") t) :none))
+               ((nil) (or (and (uiop:getenv "SSH_AUTH_SOCK") t)
+                          #+win32 (ssh-windows-agent-available-p)
+                          :none))
                (t (legacy-agent value))))))
       ((eq explicit :none) :none)
       ((and (stringp explicit) (string-equal explicit "none")) :none)
