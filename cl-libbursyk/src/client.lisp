@@ -353,6 +353,56 @@ passphrase or NIL; PASSPHRASE-ATTEMPTS bounds how often it is asked."
              (ssh-proxy-close client)
              (ssh-connect-error client errno))))))))
 
+#+win32
+(defun ssh-connect-tcp-bound (address port bind-address)
+  "A Windows connect that knows WSA's pending codes.
+
+CL-PNET-SOCKETS:CONNECT-TCP recognises the POSIX pending errnos only.  On
+Windows a non-blocking connect reports WSAEWOULDBLOCK (10035) or one of its
+neighbours, which that test does not include, so it would close a perfectly
+good socket and report the connect as failed.  The same steps are repeated
+here with the WSA codes included."
+  (let* ((ipv6 (cl-pnet-sockets:ipv6-address-p address))
+         (family (if ipv6
+                     cl-pnet-sockets:+af-inet6+
+                     cl-pnet-sockets:+af-inet+))
+         (fd (cl-pnet-sockets:c-socket
+              family cl-pnet-sockets:+sock-stream+ 0)))
+    (when (minusp fd)
+      (return-from ssh-connect-tcp-bound
+        (values nil nil (cl-pnet-sockets:c-errno) :socket)))
+    (labels ((fail (errno stage)
+               (cl-pnet-sockets:c-close fd)
+               (return-from ssh-connect-tcp-bound
+                 (values nil nil errno stage))))
+      (when bind-address
+        (unless (eql (cl-pnet-sockets:ipv6-address-p bind-address) ipv6)
+          (fail 22 :bind-address))
+        (multiple-value-bind (pointer length)
+            (cl-pnet-sockets:make-sockaddr bind-address 0)
+          (unless pointer
+            (fail 22 :bind-address))
+          (unwind-protect
+               (when (minusp (cl-pnet-sockets:c-bind fd pointer length))
+                 (fail (cl-pnet-sockets:c-errno) :bind-address))
+            (cffi:foreign-free pointer))))
+      (when (minusp (cl-pnet-sockets:set-nonblocking fd))
+        (fail (cl-pnet-sockets:c-errno) :nonblocking))
+      (multiple-value-bind (pointer length)
+          (cl-pnet-sockets:make-sockaddr address port)
+        (unless pointer
+          (fail 22 :connect))
+        (unwind-protect
+             (let ((result (cl-pnet-sockets:c-connect fd pointer length))
+                   (errno (cl-pnet-sockets:c-errno)))
+               (cond
+                 ((zerop result) (values fd :connected))
+                 ;; WSAEWOULDBLOCK, WSAEINPROGRESS and WSAEALREADY.
+                 ((member errno '(10035 10036 10037))
+                  (values fd :pending))
+                 (t (fail errno :connect))))
+          (cffi:foreign-free pointer))))))
+
 (defun ssh-dial-bound (client address)
   "Dial ADDRESS from CLIENT's BindAddress or BindInterface.
 
@@ -366,6 +416,13 @@ through the same event-loop watchers the proxy path uses."
     (ssh-log "connecting to ~A:~D bound to ~A"
              address port (ssh-client-bind-description client))
     (multiple-value-bind (fd state errno stage)
+        #+win32
+        (if interface
+            (cl-pnet-sockets:connect-tcp address port
+                                         :bind-address bind
+                                         :bind-interface interface)
+            (ssh-connect-tcp-bound address port bind))
+        #-win32
         (cl-pnet-sockets:connect-tcp address port
                                      :bind-address bind
                                      :bind-interface interface)
@@ -385,11 +442,12 @@ through the same event-loop watchers the proxy path uses."
                        (cl-pnet-sockets:c-strerror errno))))))
         ((eq state :connected)
          (setf (ssh-client-pipe client)
-               (%make-ssh-proxy :read-fd fd :write-fd fd :close-fds t))
+               (%make-ssh-proxy :read-fd fd :write-fd fd :close-fds t
+                                       :socket-p t))
          (ssh-proxy-connect-complete client))
         (t
          (let ((proxy (%make-ssh-proxy :read-fd fd :write-fd fd
-                                       :close-fds t)))
+                                       :close-fds t :socket-p t)))
            (setf (ssh-client-pipe client) proxy
                  (ssh-proxy-write-watcher proxy)
                  (cl-pnet:fd-watch

@@ -4157,8 +4157,6 @@ and an agent channel reaches the client's own agent socket."
 (test client-binds-a-direct-connection
   "BindAddress and BindInterface change where a direct connection comes
 from, and a source the kernel cannot assign fails the connection."
-  #+win32 (skip "this test binds the Unix interface name lo")
-  #-win32
   (if (not (ssh-loopback-available-p))
       (skip "no ssh-keygen or POSIX shell")
       (progn

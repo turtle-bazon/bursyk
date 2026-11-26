@@ -25,6 +25,23 @@
   #-(or darwin freebsd netbsd openbsd dragonfly) 104
   "The errno a write reports when the helper's pipe was reset.")
 
+(defun ssh-wait-errno-p (errno)
+  "Whether ERRNO tells a non-blocking operation to wait.
+
+Windows sockets report WSAEWOULDBLOCK (10035) or WSAEINPROGRESS (10036)
+rather than the POSIX values above."
+  (or (eql errno +ssh-eagain+)
+      #+win32 (member errno '(10035 10036))))
+
+(defun ssh-peer-gone-errno-p (errno)
+  "Whether ERRNO says the other side of the connection has gone.
+
+WSAECONNABORTED, WSAECONNRESET, WSAENOTCONN and WSAESHUTDOWN are the
+Windows spellings of a closed pipe or socket."
+  (or (eql errno +ssh-epipe+)
+      (eql errno +ssh-econnreset+)
+      #+win32 (member errno '(10053 10054 10057 10058))))
+
 (defstruct (ssh-proxy (:constructor %make-ssh-proxy))
   command
   process
@@ -33,6 +50,10 @@
   output-stream
   read-fd
   write-fd
+  ;; T when READ-FD/WRITE-FD are a socket (a bound source or an adopted
+  ;; helper descriptor) rather than a pipe.  Windows needs send/receive for
+  ;; sockets; its CRT read/write cannot drive a Winsock handle.
+  (socket-p nil)
   read-watcher
   write-watcher
   ;; ProxyUseFdpass: the socketpair end on which the helper sends the
@@ -180,15 +201,18 @@ callback, where a blocking wait on an already-exited helper can hang."
       (let ((queue (ssh-proxy-queue proxy)))
         (loop while (< (ssh-proxy-position proxy) (fill-pointer queue))
               do (multiple-value-bind (count errno)
-                     (cl-pnet-sockets:write-octets
-                      (ssh-proxy-write-fd proxy) queue
-                      :start (ssh-proxy-position proxy))
+                     (if (ssh-proxy-socket-p proxy)
+                         (cl-pnet-sockets:send-octets
+                          (ssh-proxy-write-fd proxy) queue
+                          :start (ssh-proxy-position proxy))
+                         (cl-pnet-sockets:write-octets
+                          (ssh-proxy-write-fd proxy) queue
+                          :start (ssh-proxy-position proxy)))
                    (cond
                      ((plusp count)
                       (incf (ssh-proxy-position proxy) count))
-                     ((and (minusp count) (/= errno +ssh-eagain+))
-                      (if (or (= errno +ssh-epipe+)
-                              (= errno +ssh-econnreset+))
+                     ((and (minusp count) (not (ssh-wait-errno-p errno)))
+                      (if (ssh-peer-gone-errno-p errno)
                           ;; The helper's read side is gone.  Waiting for the
                           ;; read watcher would race the same close; report
                           ;; the peer's departure as ssh's packet layer does.
@@ -277,6 +301,7 @@ socket the helper sends back."
        (cl-pnet-sockets:set-nonblocking fd)
        (setf (ssh-proxy-read-fd proxy) fd
              (ssh-proxy-write-fd proxy) fd
+             (ssh-proxy-socket-p proxy) t
              (ssh-proxy-close-fds proxy) t
              (ssh-proxy-read-watcher proxy)
              (cl-pnet:fd-watch
@@ -298,7 +323,7 @@ socket the helper sends back."
           (cl-pnet-sockets:receive-fd (ssh-proxy-control-fd proxy))
         (cond
           (fd (ssh-proxy-adopt-fd client fd))
-          ((eql errno +ssh-eagain+) nil)
+          ((ssh-wait-errno-p errno) nil)
           ((zerop errno)
            (ssh-proxy-fail
             client
@@ -356,14 +381,16 @@ socket the helper sends back."
                (not (ssh-proxy-closed proxy))
                (not (ssh-client-closed client)))
       (multiple-value-bind (octets count errno)
-          (cl-pnet-sockets:read-octets (ssh-proxy-read-fd proxy) 65536)
+          (if (ssh-proxy-socket-p proxy)
+              (cl-pnet-sockets:receive-octets (ssh-proxy-read-fd proxy) 65536)
+              (cl-pnet-sockets:read-octets (ssh-proxy-read-fd proxy) 65536))
         (cond
           ((and octets (plusp count))
            (ssh-client-receive client octets))
           ((zerop count)
            ;; The peer closed its output: one close, not a hang.
            (ssh-client-receive client nil))
-          ((= errno +ssh-eagain+)
+          ((ssh-wait-errno-p errno)
            nil)
           (t
            (ssh-proxy-fail

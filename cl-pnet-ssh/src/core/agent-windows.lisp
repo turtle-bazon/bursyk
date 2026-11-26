@@ -28,6 +28,8 @@
   (written :pointer) (overlapped :pointer))
 (cffi:defcfun ("CloseHandle" c-agent-close-handle) :int (handle :pointer))
 (cffi:defcfun ("GetLastError" c-agent-last-error) :unsigned-long)
+(cffi:defcfun ("WaitNamedPipeW" c-agent-wait-named-pipe) :int
+  (name :pointer) (timeout :unsigned-long))
 
 (defconstant +agent-generic-read+ #x80000000)
 (defconstant +agent-generic-write+ #x40000000)
@@ -47,23 +49,32 @@
   (cl-pnet-sockets:c-strerror errno))
 
 (defun agent-open-pipe (path)
-  "Open the named pipe at PATH, or signal an authentication error."
+  "Open the named pipe at PATH, or signal an authentication error.
+
+A busy agent (ERROR_PIPE_BUSY, 231) is waited for once, as Win32-OpenSSH's
+ssh-add does, rather than failing a login while another client finishes."
   (multiple-value-bind (name name-length)
       (windows-utf16-pointer (substitute #\\ #\/ path))
     (declare (ignore name-length))
-    (unwind-protect
-         (let ((handle (c-agent-create-file
-                        name
-                        (logior +agent-generic-read+ +agent-generic-write+)
-                        0 (cffi:null-pointer) +agent-open-existing+
-                        +agent-file-attribute-normal+ (cffi:null-pointer))))
-           (when (agent-invalid-handle-p handle)
-             (error 'ssh-authentication-error
-                    :detail (format nil "cannot connect to the ssh-agent at ~A: ~A"
-                                    path
-                                    (agent-error-text (c-agent-last-error)))))
-           handle)
-      (cffi:foreign-free name))))
+    (labels ((open-handle ()
+               (c-agent-create-file
+                name
+                (logior +agent-generic-read+ +agent-generic-write+)
+                0 (cffi:null-pointer) +agent-open-existing+
+                +agent-file-attribute-normal+ (cffi:null-pointer))))
+      (unwind-protect
+           (let ((handle (open-handle)))
+             (when (and (agent-invalid-handle-p handle)
+                        (eql (c-agent-last-error) 231)
+                        (plusp (c-agent-wait-named-pipe name 2000)))
+               (setf handle (open-handle)))
+             (when (agent-invalid-handle-p handle)
+               (error 'ssh-authentication-error
+                      :detail (format nil "cannot connect to the ssh-agent at ~A: ~A"
+                                      path
+                                      (agent-error-text (c-agent-last-error)))))
+             handle)
+        (cffi:foreign-free name)))))
 
 (defun agent-write-all (handle octets)
   "Write every octet of OCTETS to HANDLE."
@@ -134,9 +145,15 @@ identity discovery finish before the event loop starts."
   t)
 
 (defun ssh-windows-agent-available-p ()
-  "Whether the default Windows agent pipe accepts a connection."
+  "Whether the default Windows agent pipe has an instance free.
+
+WaitNamedPipe with a zero timeout only asks; it does not connect, so
+checking availability many times cannot consume the agent's instances."
   (handler-case
-      (let ((handle (agent-open-pipe +ssh-default-agent-pipe+)))
-        (ignore-errors (c-agent-close-handle handle))
-        t)
+      (multiple-value-bind (name name-length)
+          (windows-utf16-pointer +ssh-default-agent-pipe+)
+        (declare (ignore name-length))
+        (unwind-protect
+             (plusp (c-agent-wait-named-pipe name 0))
+          (cffi:foreign-free name)))
     (error () nil)))
