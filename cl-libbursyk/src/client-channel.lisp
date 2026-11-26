@@ -102,14 +102,19 @@ release them with SSH-CLIENT-RELEASE-CHANNEL-IDS."
                         :test #'=)))
 
 (defun ssh-client-forward-agent-path (client)
-  "The Unix socket CLIENT forwards when ForwardAgent is on, or NIL.
+  "The agent CLIENT forwards when ForwardAgent is on, or NIL.
 
-ForwardAgent's path form wins over SSH_AUTH_SOCK.  A path that does not
-exist is treated as no agent at all, as ssh's check_agent_present disables
-forwarding rather than asking the server and failing every channel."
+ForwardAgent's path form wins over SSH_AUTH_SOCK.  On Windows the agent is
+a named pipe, often the default one, and availability is asked with
+WaitNamedPipe; elsewhere a path that does not exist is treated as no agent
+at all, as ssh's check_agent_present disables forwarding rather than asking
+the server and failing every channel."
   (let ((path (or (ssh-client-forward-agent-sock-path client)
-                  (uiop:getenv "SSH_AUTH_SOCK"))))
-    (and path (plusp (length path)) (probe-file path) path)))
+                  (uiop:getenv "SSH_AUTH_SOCK")
+                  #+win32 +ssh-default-agent-pipe+)))
+    (and path (plusp (length path))
+         #+win32 (and (ssh-windows-agent-available-p path) path)
+         #-win32 (and (probe-file path) path))))
 
 (defun ssh-channel-send-agent-request (channel)
   "Ask the peer to forward authentication-agent connections on CHANNEL.
@@ -480,6 +485,36 @@ CHANNEL, or NIL to refuse the request."
           (funcall setup channel)
           channel))))
 
+(defun ssh-client-agent-target (path)
+  "VALUES FD PIPE STATUS for an agent at PATH, or three NILs.
+
+Windows named pipes and POSIX Unix sockets are the two transports an agent
+can use; the caller builds the same relay around whichever one opened."
+  #+win32
+  (if (uiop:os-windows-p)
+      (handler-case
+          (values nil (agent-open-pipe path) :connected)
+        (error (condition)
+          (ssh-log "cannot connect to the agent at ~A: ~A" path condition)
+          (values nil nil nil)))
+      (multiple-value-bind (fd status)
+          (cl-pnet-sockets:connect-unix path)
+        (if fd
+            (values fd nil status)
+            (progn
+              (ssh-log "cannot connect to the agent at ~A: ~A"
+                       path (cl-pnet-sockets:c-strerror status))
+              (values nil nil nil)))))
+  #-win32
+  (multiple-value-bind (fd status)
+      (cl-pnet-sockets:connect-unix path)
+    (if fd
+        (values fd nil status)
+        (progn
+          (ssh-log "cannot connect to the agent at ~A: ~A"
+                   path (cl-pnet-sockets:c-strerror status))
+          (values nil nil nil)))))
+
 (defun ssh-client-accept-agent-channel (client type sender window max-packet)
   "Accept a server-initiated agent channel and dial the local agent.
 
@@ -494,15 +529,12 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
           (ssh-client-send-channel-open-failure
            client sender
            "agent forwarding was not requested"))
-        (multiple-value-bind (fd status)
-            (cl-pnet-sockets:connect-unix path)
-          (if (null fd)
-              (progn
-                (ssh-log "cannot connect to the agent at ~A: ~A"
-                         path (cl-pnet-sockets:c-strerror status))
-                (ssh-client-send-channel-open-failure
-                 client sender
-                 (format nil "cannot connect to the agent at ~A" path)))
+        (multiple-value-bind (fd pipe status)
+            (ssh-client-agent-target path)
+          (if (and (null fd) (null pipe))
+              (ssh-client-send-channel-open-failure
+               client sender
+               (format nil "cannot connect to the agent at ~A" path))
               (let* ((id (ssh-client-allocate-channel-id client))
                      (channel (%make-ssh-channel
                                :client client
@@ -516,6 +548,7 @@ is the check OpenSSH's client_request_agent makes before touching an agent."
                                :local-max-packet (ssh-client-max-packet client)))
                      (relay (%make-ssh-fd-relay
                              :fd fd
+                             :pipe pipe
                              :phase (if (eq status :connected)
                                         :connected :connecting)
                              :on-data

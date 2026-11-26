@@ -30,6 +30,9 @@
 (cffi:defcfun ("GetLastError" c-agent-last-error) :unsigned-long)
 (cffi:defcfun ("WaitNamedPipeW" c-agent-wait-named-pipe) :int
   (name :pointer) (timeout :unsigned-long))
+(cffi:defcfun ("PeekNamedPipe" c-agent-peek-named-pipe) :int
+  (handle :pointer) (buffer :pointer) (size :unsigned-long)
+  (read :pointer) (available :pointer) (left :pointer))
 
 (defconstant +agent-generic-read+ #x80000000)
 (defconstant +agent-generic-write+ #x40000000)
@@ -125,6 +128,46 @@ ssh-add does, rather than failing a login while another client finishes."
              :detail "the ssh-agent sent an invalid reply length"))
     (agent-read-exactly handle length)))
 
+(defun agent-pipe-available (handle)
+  "VALUES BYTES BROKEN-P for the agent pipe HANDLE.
+
+PeekNamedPipe never blocks, so the event loop can poll a pipe the way it
+watches a socket."
+  (cffi:with-foreign-object (available :unsigned-long)
+    (setf (cffi:mem-ref available :unsigned-long) 0)
+    (if (plusp (c-agent-peek-named-pipe handle (cffi:null-pointer) 0
+                                        (cffi:null-pointer) available
+                                        (cffi:null-pointer)))
+        (values (cffi:mem-ref available :unsigned-long) nil)
+        (let ((errno (c-agent-last-error)))
+          ;; ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED and the closing
+          ;; state all mean the other end is gone.
+          (if (member errno '(109 232 233))
+              (values 0 t)
+              (error 'ssh-authentication-error
+                     :detail (format nil "cannot check the ssh-agent pipe: ~A"
+                                     (agent-error-text errno))))))))
+
+(defun agent-read-some (handle size)
+  "VALUES OCTETS COUNT read from HANDLE; COUNT is zero at end of file.
+
+Only call this after AGENT-PIPE-AVAILABLE reports octets, because ReadFile
+blocks when the pipe is empty."
+  (let ((buffer (make-array size :element-type '(unsigned-byte 8))))
+    (cffi:with-pointer-to-vector-data (pointer buffer)
+      (cffi:with-foreign-object (read :unsigned-long)
+        (if (plusp (c-agent-read-file handle pointer size read
+                                      (cffi:null-pointer)))
+            (let ((count (cffi:mem-ref read :unsigned-long)))
+              (values (subseq buffer 0 count) count))
+            (let ((errno (c-agent-last-error)))
+              (if (member errno '(109 232 233))
+                  (values (make-array 0 :element-type '(unsigned-byte 8)) 0)
+                  (error 'ssh-authentication-error
+                         :detail
+                         (format nil "cannot read from the ssh-agent: ~A"
+                                 (agent-error-text errno))))))))))
+
 (defun ssh-agent-request-windows (path payload on-response on-error)
   "Send PAYLOAD to the named-pipe agent at PATH and report its reply.
 
@@ -144,14 +187,15 @@ identity discovery finish before the event loop starts."
         (funcall on-error condition))))
   t)
 
-(defun ssh-windows-agent-available-p ()
-  "Whether the default Windows agent pipe has an instance free.
+(defun ssh-windows-agent-available-p
+    (&optional (path +ssh-default-agent-pipe+))
+  "Whether the Windows agent pipe at PATH has an instance free.
 
 WaitNamedPipe with a zero timeout only asks; it does not connect, so
 checking availability many times cannot consume the agent's instances."
   (handler-case
       (multiple-value-bind (name name-length)
-          (windows-utf16-pointer +ssh-default-agent-pipe+)
+          (windows-utf16-pointer (substitute #\\ #\/ path))
         (declare (ignore name-length))
         (unwind-protect
              (plusp (c-agent-wait-named-pipe name 0))

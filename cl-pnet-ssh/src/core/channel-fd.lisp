@@ -11,6 +11,10 @@
 
 (defstruct (ssh-fd-relay (:constructor %make-ssh-fd-relay))
   (fd nil)
+  ;; A Windows named-pipe handle when the relay bridges a pipe instead of a
+  ;; socket; FD is then NIL and PIPE-TIMER polls PeekNamedPipe.
+  (pipe nil)
+  (pipe-timer nil)
   ;; :CONNECTING until a non-blocking connect finishes, then :CONNECTED.
   (phase :connected)
   (read-watcher nil)
@@ -45,10 +49,62 @@
     (setf (ssh-fd-relay-closed relay) t)
     (ssh-fd-relay-unwatch-read relay)
     (ssh-fd-relay-unwatch-write relay)
+    (when (ssh-fd-relay-pipe-timer relay)
+      (ignore-errors (cl-pnet:timer-stop (ssh-fd-relay-pipe-timer relay)))
+      (setf (ssh-fd-relay-pipe-timer relay) nil))
+    #+win32
+    (when (ssh-fd-relay-pipe relay)
+      (ignore-errors (c-agent-close-handle (ssh-fd-relay-pipe relay)))
+      (setf (ssh-fd-relay-pipe relay) nil))
     (let ((fd (ssh-fd-relay-fd relay)))
       (when (and fd (>= fd 0))
         (ignore-errors (cl-pnet-sockets:close-open-fd fd)))
       (setf (ssh-fd-relay-fd relay) nil))))
+
+#+win32
+(defun ssh-fd-relay-pipe-eof (relay)
+  "Report a pipe's end of file once, stopping its poll timer."
+  (unless (or (ssh-fd-relay-closed relay)
+              (ssh-fd-relay-read-closed relay))
+    (setf (ssh-fd-relay-read-closed relay) t)
+    (when (ssh-fd-relay-pipe-timer relay)
+      (ignore-errors (cl-pnet:timer-stop (ssh-fd-relay-pipe-timer relay)))
+      (setf (ssh-fd-relay-pipe-timer relay) nil))
+    (when (ssh-fd-relay-on-eof relay)
+      (funcall (ssh-fd-relay-on-eof relay) relay))))
+
+#+win32
+(defun ssh-fd-relay-pipe-fail (relay condition)
+  "Close a pipe relay and report CONDITION through ON-ERROR."
+  (unless (ssh-fd-relay-closed relay)
+    (ssh-fd-relay-close relay)
+    (when (ssh-fd-relay-on-error relay)
+      (funcall (ssh-fd-relay-on-error relay) relay condition))))
+
+#+win32
+(defun ssh-fd-relay-pipe-poll (relay)
+  "Move one pipe read's worth of octets to the channel.
+
+PeekNamedPipe says how much is there, so ReadFile cannot block the loop."
+  (unless (or (ssh-fd-relay-closed relay)
+              (ssh-fd-relay-read-closed relay)
+              (null (ssh-fd-relay-pipe relay)))
+    (handler-case
+        (multiple-value-bind (available broken)
+            (agent-pipe-available (ssh-fd-relay-pipe relay))
+          (cond
+            (broken
+             (ssh-fd-relay-pipe-eof relay))
+            ((plusp available)
+             (multiple-value-bind (octets count)
+                 (agent-read-some (ssh-fd-relay-pipe relay)
+                                  (min available 65536))
+               (if (plusp count)
+                   (when (ssh-fd-relay-on-data relay)
+                     (funcall (ssh-fd-relay-on-data relay) relay octets))
+                   (ssh-fd-relay-pipe-eof relay))))))
+      (error (condition)
+        (ssh-fd-relay-pipe-fail relay condition)))))
 
 (defun ssh-fd-relay-fail (relay errno)
   "Close RELAY and report a socket error."
@@ -158,14 +214,30 @@
 (defun ssh-fd-relay-queue (relay octets)
   "Queue OCTETS for the descriptor, writing what it will take now."
   (unless (ssh-fd-relay-closed relay)
-    (let ((outgoing (ssh-fd-relay-outgoing relay)))
-      (loop for octet across octets
-            do (vector-push-extend octet outgoing))
-      (ssh-fd-relay-flush relay))))
+    (cond
+      ((ssh-fd-relay-pipe relay)
+       #+win32 (handler-case
+                   (agent-write-all (ssh-fd-relay-pipe relay) octets)
+                 (error (condition)
+                   (ssh-fd-relay-pipe-fail relay condition)))
+       #-win32 nil)
+      (t
+       (let ((outgoing (ssh-fd-relay-outgoing relay)))
+         (loop for octet across octets
+               do (vector-push-extend octet outgoing))
+         (ssh-fd-relay-flush relay))))))
 
 (defun ssh-fd-relay-start (relay)
   "Begin watching RELAY's descriptor for input, or for connect completion."
   (cond
+    ((ssh-fd-relay-pipe relay)
+     #+win32
+     (unless (ssh-fd-relay-pipe-timer relay)
+       (setf (ssh-fd-relay-pipe-timer relay)
+             (cl-pnet:timer-start
+              0 0.01
+              (lambda () (ssh-fd-relay-pipe-poll relay)))))
+     #-win32 nil)
     ((eq (ssh-fd-relay-phase relay) :connecting)
      (ssh-fd-relay-watch-write relay))
     (t
@@ -173,8 +245,21 @@
 
 (defun ssh-fd-relay-shutdown-write (relay)
   "Tell the descriptor the channel will send nothing more."
-  (unless (or (ssh-fd-relay-closed relay)
-              (eq (ssh-fd-relay-phase relay) :connecting))
-    (let ((fd (ssh-fd-relay-fd relay)))
-      (when fd
-        (ignore-errors (cl-pnet-sockets:c-shutdown fd 1))))))
+  (cond
+    ((ssh-fd-relay-pipe relay)
+     ;; A named pipe has no half-close: closing it is how the other end
+     ;; learns that no more requests will arrive.
+     #+win32
+     (progn
+       (let ((pipe (ssh-fd-relay-pipe relay)))
+         (setf (ssh-fd-relay-pipe relay) nil)
+         (ignore-errors (c-agent-close-handle pipe)))
+       (ssh-fd-relay-pipe-eof relay))
+     #-win32 nil)
+    ((or (ssh-fd-relay-closed relay)
+         (eq (ssh-fd-relay-phase relay) :connecting))
+     nil)
+    (t
+     (let ((fd (ssh-fd-relay-fd relay)))
+       (when fd
+         (ignore-errors (cl-pnet-sockets:c-shutdown fd 1)))))))
