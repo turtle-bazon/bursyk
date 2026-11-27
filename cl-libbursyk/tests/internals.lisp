@@ -1092,13 +1092,15 @@ HostKeyAgent is configured."
 (test server-kex-signs-with-an-agent-host-key
   "An agent-backed host key sends the exchange hash to the agent and finishes
 the KEX from its signature."
-  #+win32 (skip "no Unix-domain sockets on this platform")
-  #-win32
   (if (not (ssh-keygen-available-p))
       (skip "no ssh-keygen")
       (let* ((directory (ssh-test-directory "cl-pnet-ssh-agent-kex"))
              (key-path (merge-pathnames "host_key" directory))
-             (agent-path (namestring (merge-pathnames "agent.sock" directory))))
+             (agent-path
+               #+win32 (format nil "\\\\.\\pipe\\cl-pnet-ssh-kex-~D-~D"
+                               (get-universal-time) (random 1000000))
+               #-win32 (namestring
+                        (merge-pathnames "agent.sock" directory))))
         (ensure-directories-exist key-path)
         (unwind-protect
              (progn
@@ -1107,6 +1109,25 @@ the KEX from its signature."
                (let* ((private (ssh-load-private-key key-path))
                       (blob (ssh-public-key-blob-of private))
                       (agent
+                        #+win32
+                        (fake-pipe-agent-open
+                         agent-path
+                         (lambda (payload)
+                           (let* ((reader (ssh-make-reader payload))
+                                  (type (ssh-read-u8 reader))
+                                  (request-blob (ssh-read-string reader))
+                                  (data (ssh-read-string reader))
+                                  (flags (ssh-read-u32 reader))
+                                  (writer (ssh-writer)))
+                             (declare (ignore type flags request-blob))
+                             (ssh-write-u8
+                              writer cl-pnet-ssh::+ssh-agent-sign-response+)
+                             (ssh-write-string
+                              writer
+                              (cl-pnet-ssh::ssh-ed25519-signature-blob
+                               private data))
+                             (ssh-writer-output writer))))
+                        #-win32
                         (fake-agent-open
                          agent-path
                          (lambda (payload)
@@ -1157,6 +1178,9 @@ the KEX from its signature."
                    (ssh-write-string writer client-public))
                  (cl-pnet-ssh::ssh-server-handle-kex-init
                   session (ssh-writer-output writer))
+                 ;; The Windows named-pipe transport completes the agent
+                 ;; sign inline, so the signature may already be applied.
+                 #-win32
                  (is (cl-pnet-ssh::ssh-session-kex-signature-pending session))
                  (loop repeat 10000
                        until (cl-pnet-ssh::ssh-session-derived-keys session)
@@ -1165,7 +1189,8 @@ the KEX from its signature."
                                  session))))
                  (is (not (cl-pnet-ssh::ssh-session-kex-signature-pending
                            session)))
-                 (fake-agent-close agent)))
+                 #+win32 (fake-pipe-agent-close agent)
+                 #-win32 (fake-agent-close agent)))
           (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
 (test ext-info-records-the-ping-extension
