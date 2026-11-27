@@ -131,11 +131,13 @@ PATH's own type, so a caller that passed a string gets a string back."
                                      &key host user port)
   "The private keys to offer, EXPLICIT followed by every IdentityFile.
 
-ssh adds -i and command-line -o IdentityFile values while it parses its
-arguments, before it reads any file, so the configuration's own IdentityFile
-entries come after them rather than replacing them.  Duplicates are dropped
-only within EXPLICIT, as readconf's userprovided check does.  Every spelling
-is expanded as the loader expands it, after the duplicates are gone."
+EXPLICIT is a list of identity file paths, not a single path; a caller with
+one file passes (list PATH).  ssh adds -i and command-line -o IdentityFile
+values while it parses its arguments, before it reads any file, so the
+configuration's own IdentityFile entries come after them rather than
+replacing them.  Duplicates are dropped only within EXPLICIT, as readconf's
+userprovided check does.  Every spelling is expanded as the loader expands
+it, after the duplicates are gone."
   (labels ((expand (path)
              (ssh-config-client-identity-path
               path options :host host :user user :port port))
@@ -970,10 +972,12 @@ receives an asynchronous client; ON-CONFIG-ERROR reports resolution
 failures.  RESOLVER dials addresses for the built clients; CANONICAL-RESOLVER
 performs the CanonicalizeHostname lookup, may report a CNAME as its second
 value, and receives the resolved AddressFamily as its :FAMILY keyword.
-PASSWORD-CALLBACK and KBD-INTERACTIVE-CALLBACK reach the built client and
-every ProxyJump hop, as they would in ssh.  PASSPHRASE-CALLBACK answers for
-a passphrase-protected identity file, receiving its path and returning the
-passphrase or NIL.  VALIDATE-OPTIONS, when given, is called with the resolved
+PRIVATE-KEY is a list of identity file paths, not a single path; a caller
+with one file passes (list PATH).  PASSWORD-CALLBACK and
+KBD-INTERACTIVE-CALLBACK reach the built client and every ProxyJump hop, as
+they would in ssh.  PASSPHRASE-CALLBACK answers for a passphrase-protected
+identity file, receiving its path and returning the passphrase or NIL.
+VALIDATE-OPTIONS, when given, is called with the resolved
 OPTIONS and the canonical host before the client is built, so a program can
 apply the checks ssh.c makes on top of readconf and leave before dialling."
   (let* ((source (ssh-config-client-source config options))
