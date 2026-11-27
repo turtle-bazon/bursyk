@@ -9150,8 +9150,7 @@ build has no GSSAPI, exactly as in an OpenSSH compiled without it."
              (remove-if-not (lambda (message) (search needle message))
                             messages)))
       (is (equal
-           '("/etc/ssh/ssh_config line 53: Unsupported option \"compressionlevel\""
-             "command-line line 0: Unsupported option \"gssapiauthentication\"")
+           '("/etc/ssh/ssh_config line 53: Unsupported option \"compressionlevel\"")
            (matching "Unsupported option" warnings)))
       ;; The -o spelling of a deprecated option stays quiet, as in ssh.
       (is (equal
@@ -9171,12 +9170,12 @@ applying the directive."
         :directives
         (list (cl-pnet-ssh::ssh-config-option-line "Host other")
               (cl-pnet-ssh::ssh-config-option-line
-               "GSSAPIAuthentication yes")))
+               "CompressionLevel 6")))
        "alias.example"
        :on-options (lambda (value) (declare (ignore value)))
        :on-error (lambda (value) (setf condition value))))
     (is (null condition))
-    (is (equal '("command-line line 0: Unsupported option \"gssapiauthentication\"")
+    (is (equal '("command-line line 0: Unsupported option \"compressionlevel\"")
                (nreverse warnings)))))
 
 (test command-line-unsupported-option-bypasses-quiet
@@ -9194,18 +9193,57 @@ not, because logging is already initialised by then."
        (cl-pnet-ssh::%make-ssh-config
         :directives
         (list (cl-pnet-ssh::ssh-config-option-line
-               "GSSAPIAuthentication yes")
+               "KerberosAuthentication no")
               (cl-pnet-ssh::%make-ssh-config-line
-               :keyword "gssapidelegatecredentials" :args '("no")
+               :keyword "compressionlevel" :args '("6")
                :path "/home/user/.ssh/config" :number 4)))
        "alias.example"
        :on-options (lambda (value) (declare (ignore value)))
        :on-error (lambda (value) (setf condition value))))
     (is (null condition))
-    (is (equal '("command-line line 0: Unsupported option \"gssapiauthentication\"")
+    (is (equal '("command-line line 0: Unsupported option \"kerberosauthentication\"")
                (nreverse forced)))
-    (is (equal '("/home/user/.ssh/config line 4: Unsupported option \"gssapidelegatecredentials\"")
+    (is (equal '("/home/user/.ssh/config line 4: Unsupported option \"compressionlevel\"")
                (nreverse warnings)))))
+
+(test gssapi-options-are-accepted-silently
+  "A build without GSSAPI accepts the switches a GSSAPI-enabled OpenSSH
+does, without warning; the method itself is never offered."
+  (let ((warnings '())
+        (forced '())
+        (condition nil)
+        (options nil))
+    (let ((cl-pnet-ssh:*ssh-warning-function*
+            (lambda (message) (push message warnings)))
+          (cl-pnet-ssh:*ssh-forced-warning-function*
+            (lambda (message) (push message forced))))
+      (ssh-config-resolve
+       (cl-pnet-ssh::%make-ssh-config
+        :directives
+        (list (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIAuthentication yes")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIKeyExchange yes")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIKexAlgorithms gss-group14-sha256-")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIClientIdentity user@EXAMPLE.COM")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIServerIdentity host.example.com")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPIRenewalForcesRekey yes")
+              (cl-pnet-ssh::ssh-config-option-line
+               "GSSAPITrustDNS no")
+              (cl-pnet-ssh::%make-ssh-config-line
+               :keyword "gssapidelegatecredentials" :args '("no")
+               :path "/etc/ssh/ssh_config" :number 53)))
+       "alias.example"
+       :on-options (lambda (value) (setf options value))
+       :on-error (lambda (value) (setf condition value))))
+    (is (null condition))
+    (is (null warnings))
+    (is (null forced))
+    (is (not (null options)))))
 
 (test host-blocks-log-like-readconf
   "readconf names the block it applies at debug level, and the negated

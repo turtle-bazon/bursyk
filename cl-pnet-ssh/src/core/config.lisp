@@ -89,6 +89,8 @@ relative Include is anchored here.")
     "forkafterauthentication" "forwardagent" "forwardx11" "forwardx11timeout"
     "forwardx11trusted" "gatewayports" "globalknownhostsfile"
     "globalknownhostsfile2" "gssapiauthentication" "gssapidelegatecredentials"
+    "gssapikexalgorithms" "gssapikeyexchange" "gssapiclientidentity"
+    "gssapirenewalforcesrekey" "gssapiserveridentity" "gssapitrustdns"
     "hashknownhosts" "host" "hostbasedacceptedalgorithms" "hostbasedauthentication"
     "hostbasedkeytypes" "hostkeyalgorithms" "hostkeyalias"
     "hostname" "identitiesonly" "identityagent" "identityfile" "identityfile2"
@@ -132,14 +134,14 @@ silently.")
 
 (defparameter +ssh-config-unsupported-keywords+
   '("afstokenpassing" "kerberosauthentication" "kerberostgtpassing"
-    "rsaauthentication" "rhostsrsaauthentication" "compressionlevel"
-    ;; readconf maps these two to oUnsupported when OpenSSH is built without
-    ;; GSSAPI, and this build has none either.
-    "gssapiauthentication" "gssapidelegatecredentials")
+    "rsaauthentication" "rhostsrsaauthentication" "compressionlevel")
   "Keywords accepted but reported, as readconf's oUnsupported entries.
 
-readconf prints these by default and a single -q silences them, which is the
-warning reporter's own rule; the option itself never takes effect.")
+GSSAPI switches are accepted silently: this build does not offer the method,
+but a GSSAPI-enabled OpenSSH accepts the directives, and the option simply
+has no effect here.  readconf prints the remaining entries by default and a
+single -q silences them, which is the warning reporter's own rule; the option
+itself never takes effect.")
 
 (defstruct (ssh-config (:constructor %make-ssh-config))
   (path nil)

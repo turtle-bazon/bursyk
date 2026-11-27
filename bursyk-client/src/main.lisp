@@ -6762,6 +6762,11 @@ log_init, so LogLevel QUIET keeps the line back but the status is still 255.
    :validate-options
    (lambda (options canonical)
      (check-resolved-options options command-given-p)
+     (unless *getopt-mux-command*
+       ;; Ordinary sessions reach mux here, with the configuration already
+       ;; resolved, so it is not read a second time.  COMMAND is already the
+       ;; joined command string.
+       (mux-prepare host command command-given-p options))
      (check-forward-agent-socket options)
      ;; ssh attaches to the master before load_public_identity_files(), so an
      ;; -O proxy client never reports identity files it will not load.
@@ -7033,14 +7038,19 @@ options are returned so the attach path can reuse them."
             ;; ssh checks -O against the configured ControlPath, and attaches
             ;; to a running master, before it loads identities or dumps public
             ;; keys, so `-O check -Z' with no master fails without a dump.
-            (let ((mux-options
-                    (and *getopt-mux-command*
-                         (resolve-multiplex-options host))))
-              (mux-prepare host (and command (join-command command))
-                           (and command t)
-                           mux-options)
-              (when (getf *options* :dump-public-keys)
-                (dump-public-keys host (and command t))))
+            ;; An ordinary session defers mux until its configuration has
+            ;; been resolved, so the file is read once; -O and -Z still run
+            ;; it here, before the control command or the dump.
+            (when (or *getopt-mux-command*
+                      (getf *options* :dump-public-keys))
+              (let ((mux-options
+                      (and *getopt-mux-command*
+                           (resolve-multiplex-options host))))
+                (mux-prepare host (and command (join-command command))
+                             (and command t)
+                             mux-options)))
+            (when (getf *options* :dump-public-keys)
+              (dump-public-keys host (and command t)))
             (handler-case
                 (start-client host (and command (join-command command))
                               (and command t))
