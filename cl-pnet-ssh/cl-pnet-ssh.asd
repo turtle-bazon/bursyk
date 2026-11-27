@@ -86,7 +86,7 @@
   ;; code that turns libssh into this API lives below, in src/libssh, and is
   ;; compiled only for that backend.
   :depends-on (#:cl-pnet-ssh/core
-               (:feature (:not :ssh-backend-ffi) #:cl-libbursyk)
+               (:feature (:not :ssh-backend-ffi) #:cl-bursyk-ssh)
                (:feature :ssh-backend-ffi #:cl-plibssh)
                #:burzay
                #:cl-pnet

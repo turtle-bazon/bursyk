@@ -1,4 +1,4 @@
-(defsystem #:cl-libbursyk
+(defsystem #:cl-bursyk-ssh
   :description "Pure Common Lisp SSH-2 client and server"
   :author "pesekey"
   :license "GPL-3.0-or-later"

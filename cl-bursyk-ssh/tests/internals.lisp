@@ -1,4 +1,4 @@
-;;;; Wire- and state-level tests for the pure cl-libbursyk transport.
+;;;; Wire- and state-level tests for the pure cl-bursyk-ssh transport.
 ;;;; They drive internal functions and raw protocol messages, so they are
 ;;;; not part of the backend-agnostic facade suite.
 

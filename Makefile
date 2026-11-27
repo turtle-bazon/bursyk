@@ -1,7 +1,7 @@
 # bursyk -- the SSH client, server, and the SSH stack behind them.
 #
 # This repository carries bursyk-client, bursyk-server, cl-pnet-ssh (the
-# facade), cl-libbursyk (the pure SSH-2 implementation) and cl-plibssh (the
+# facade), cl-bursyk-ssh (the pure SSH-2 implementation) and cl-plibssh (the
 # libssh CFFI bindings).  The remaining systems they use (cl-pnet,
 # cl-pnet-sockets, cl-pnet-socks, cl-pnet-dns, cl-pnet-dns-plain, cl-puma,
 # burzay) still live in the pesekey checkout.  ~/.sbclrc adds that directory
@@ -12,10 +12,10 @@
 # The backend selection is a compile-time feature, so this Makefile pushes it
 # itself instead of reading another project's test helper.  The defaults are
 # the pure stack: puma multiplexes with epoll/kqueue from Lisp and the SSH
-# backend is cl-libbursyk.  Neither libev/libuv nor libssh is needed.
+# backend is cl-bursyk-ssh.  Neither libev/libuv nor libssh is needed.
 #
 # Each axis has a short matrix name: ev, uv and puma for the event loop, and
-# lisp and libssh for the SSH stack (cl-libbursyk, or the adapter in
+# lisp and libssh for the SSH stack (cl-bursyk-ssh, or the adapter in
 # cl-pnet-ssh over cl-plibssh).  The underlying spellings libev, libuv and
 # ffi are still accepted.
 #
@@ -180,7 +180,7 @@ test-ssh: deps-check
 	  --eval '(sb-ext:exit :abort t :code (if (fiveam:run! (quote cl-pnet-ssh-tests::cl-pnet-ssh)) 0 1))'
 ifeq ($(SSH_BACKEND_NAME),lisp)
 	$(LISP) $(LISP_FLAGS) --non-interactive $(QL_EVAL) $(CACHE_EVAL) $(FEATURE_EVAL) \
-	  --eval '(ql:quickload :cl-libbursyk-tests)' \
+	  --eval '(ql:quickload :cl-bursyk-ssh-tests)' \
 	  --eval '(sb-ext:exit :abort t :code (if (fiveam:run! (quote cl-pnet-ssh-tests::lisp-internals)) 0 1))'
 endif
 
@@ -193,11 +193,11 @@ test-ssh-live: deps-check
 # ---- The build matrix ----
 #
 # Every event loop backend (ev, uv, puma) is built and tested against both
-# SSH stacks (lisp = cl-libbursyk, libssh = cl-plibssh).  The cells run one
+# SSH stacks (lisp = cl-bursyk-ssh, libssh = cl-plibssh).  The cells run one
 # at a time, and each keeps its fasls in _build/matrix/<ssh>-<pnet>/fasl so
 # a later test-matrix reuses the matching build instead of recompiling it.
 # Every cell runs the same facade suite.  The pure transport's internal
-# wire/state tests belong to cl-libbursyk and run in the lisp cells only;
+# wire/state tests belong to cl-bursyk-ssh and run in the lisp cells only;
 # they are not facade behaviour, so the libssh cells neither run nor skip
 # them.
 #

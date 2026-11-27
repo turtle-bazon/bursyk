@@ -1,5 +1,5 @@
-(asdf:defsystem #:cl-libbursyk-tests
-  :description "Internal protocol tests for the pure cl-libbursyk SSH transport"
+(asdf:defsystem #:cl-bursyk-ssh-tests
+  :description "Internal protocol tests for the pure cl-bursyk-ssh transport"
   :author "pesekey"
   :license "GPL-3.0-or-later"
   ;; These tests drive wire messages and transport state directly.  They are
@@ -10,7 +10,7 @@
   ;; The shared fixtures (key generation, temporary directories, DNS and
   ;; certificate helpers) stay in CL-PNET-SSH-TESTS, which is why this system
   ;; depends on it.
-  :depends-on (#:cl-libbursyk #:cl-pnet-ssh-tests #:fiveam)
+  :depends-on (#:cl-bursyk-ssh #:cl-pnet-ssh-tests #:fiveam)
   :serial t
   :components ((:module "tests"
                 :serial t
