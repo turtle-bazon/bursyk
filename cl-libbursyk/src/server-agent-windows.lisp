@@ -16,6 +16,30 @@
   (:windows "kernel32.dll"))
 (cffi:use-foreign-library cl-pnet-ssh-server-agent-kernel32)
 
+(cffi:define-foreign-library cl-pnet-ssh-server-agent-advapi32
+  (:windows "advapi32.dll"))
+(cffi:use-foreign-library cl-pnet-ssh-server-agent-advapi32)
+
+(cffi:defcfun ("GetCurrentProcess" c-server-agent-get-current-process) :pointer)
+(cffi:defcfun ("OpenProcessToken" c-server-agent-open-process-token) :int
+  (process :pointer) (access :unsigned-long) (token :pointer))
+(cffi:defcfun ("GetTokenInformation" c-server-agent-get-token-information) :int
+  (token :pointer) (class :int) (information :pointer)
+  (length :unsigned-long) (returned :pointer))
+(cffi:defcfun ("ConvertStringSecurityDescriptorToSecurityDescriptorW"
+               c-server-agent-string-security-descriptor) :int
+  (string :pointer) (revision :unsigned-long) (descriptor :pointer)
+  (size :pointer))
+
+(cffi:defcstruct server-agent-security-attributes
+  (length :unsigned-long)
+  (descriptor :pointer)
+  (inherit :int))
+
+(defconstant +server-agent-token-query+ 8)
+(defconstant +server-agent-token-user+ 1)
+(defconstant +server-agent-sddl-revision-1+ 1)
+
 (cffi:defcfun ("CreateNamedPipeW" c-server-agent-create-pipe) :pointer
   (name :pointer) (open-mode :unsigned-long) (pipe-mode :unsigned-long)
   (max-instances :unsigned-long) (out-size :unsigned-long)
@@ -49,23 +73,98 @@
   (format nil "\\\\.\\pipe\\openssh-agent-~D-~D-~D"
           (get-universal-time) (random 1000000) (random 1000000)))
 
+(defun server-agent-user-sid-string ()
+  "The process user's SID as S-1-..., or NIL."
+  (cffi:with-foreign-objects ((token :pointer)
+                              (returned :unsigned-long))
+    (when (plusp (c-server-agent-open-process-token
+                  (c-server-agent-get-current-process)
+                  +server-agent-token-query+ token))
+      (unwind-protect
+           (let ((buffer (cffi:foreign-alloc :unsigned-char :count 256)))
+             (unwind-protect
+                  (when (plusp
+                         (c-server-agent-get-token-information
+                          (cffi:mem-ref token :pointer)
+                          +server-agent-token-user+
+                          buffer 256 returned))
+                    ;; TOKEN_USER's first field is the SID pointer.
+                    (let ((sid (cffi:mem-ref buffer :pointer)))
+                      (cffi:with-foreign-object (string :pointer)
+                        (when (plusp (c-convert-sid-to-string sid string))
+                          (unwind-protect
+                               (windows-utf16-c-string
+                                (cffi:mem-ref string :pointer))
+                            (c-local-free (cffi:mem-ref string :pointer)))))))
+               (cffi:foreign-free buffer)))
+        (ignore-errors
+         (c-agent-close-handle (cffi:mem-ref token :pointer)))))))
+
+(defun server-agent-pipe-security ()
+  "VALUES SECURITY-ATTRIBUTES DESCRIPTOR for a user-only pipe DACL.
+
+The DACL grants only the process user full control, so another account cannot
+connect to a forwarded agent.  NILs mean the caller should fall back to the
+process default DACL.  The caller frees DESCRIPTOR with LocalFree and
+SECURITY-ATTRIBUTES with FOREIGN-FREE after CreateNamedPipe."
+  (let ((sid (ignore-errors (server-agent-user-sid-string))))
+    (when sid
+      (multiple-value-bind (sddl sddl-length)
+          (windows-utf16-pointer (format nil "D:P(A;;GA;;;~A)" sid))
+        (declare (ignore sddl-length))
+        (unwind-protect
+             (cffi:with-foreign-object (descriptor :pointer)
+               (when (plusp
+                      (c-server-agent-string-security-descriptor
+                       sddl +server-agent-sddl-revision-1+ descriptor
+                       (cffi:null-pointer)))
+                 (let ((attributes
+                         (cffi:foreign-alloc
+                          '(:struct server-agent-security-attributes))))
+                   (setf (cffi:foreign-slot-value
+                          attributes
+                          '(:struct server-agent-security-attributes)
+                          'length)
+                         (cffi:foreign-type-size
+                          '(:struct server-agent-security-attributes))
+                         (cffi:foreign-slot-value
+                          attributes
+                          '(:struct server-agent-security-attributes)
+                          'descriptor)
+                         (cffi:mem-ref descriptor :pointer)
+                         (cffi:foreign-slot-value
+                          attributes
+                          '(:struct server-agent-security-attributes)
+                          'inherit)
+                         0)
+                   (values attributes (cffi:mem-ref descriptor :pointer)))))
+          (cffi:foreign-free sddl))))))
+
 (defun ssh-agent-pipe-create (path)
   "A new listening instance of the pipe at PATH."
   (multiple-value-bind (pointer length)
       (windows-utf16-pointer path)
     (declare (ignore length))
     (unwind-protect
-         (let ((handle (c-server-agent-create-pipe
-                        pointer +server-agent-pipe-duplex+ 0
-                        +server-agent-pipe-instances+
-                        65536 65536 0 (cffi:null-pointer))))
-           (when (agent-invalid-handle-p handle)
-             (error 'ssh-error
-                    :detail
-                    (format nil "cannot create agent pipe ~A: ~A"
-                            path
-                            (agent-error-text (c-agent-last-error)))))
-           handle)
+         (multiple-value-bind (attributes descriptor)
+             (server-agent-pipe-security)
+           (unwind-protect
+                (let ((handle (c-server-agent-create-pipe
+                               pointer +server-agent-pipe-duplex+ 0
+                               +server-agent-pipe-instances+
+                               65536 65536 0 attributes)))
+                  (when (agent-invalid-handle-p handle)
+                    (error 'ssh-error
+                           :detail
+                           (format nil "cannot create agent pipe ~A: ~A"
+                                   path
+                                   (agent-error-text
+                                    (c-agent-last-error)))))
+                  handle)
+             (when descriptor
+               (ignore-errors (c-local-free descriptor)))
+             (when attributes
+               (cffi:foreign-free attributes))))
       (cffi:foreign-free pointer))))
 
 (defun ssh-agent-pipe-wait (handle)

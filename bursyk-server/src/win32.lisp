@@ -262,11 +262,13 @@ draining it."
   (bridge-start bridge)
   bridge)
 
-(defun start-command (channel command &key extra-environment)
+(defun start-command (channel command &key extra-environment chroot)
   "Run COMMAND as a child, on a ConPTY when the client asked for a pty.
 
 EXTRA-ENVIRONMENT is added last, for values the server itself sets such as
-SSH_ORIGINAL_COMMAND."
+SSH_ORIGINAL_COMMAND.  CHROOT is accepted for the shared application path and
+ignored: Windows has no chroot."
+  (declare (ignore chroot))
   (let ((environment (session-environment channel)))
     (dolist (pair extra-environment)
       (setf environment
@@ -290,8 +292,9 @@ SSH_ORIGINAL_COMMAND."
                         :input-handle input :output-handle output
                         :stderr-handle error))))))
 
-(defun start-program (channel program arguments)
+(defun start-program (channel program arguments &key chroot)
   "Run PROGRAM with ARGUMENTS on CHANNEL, without shell interpretation."
+  (declare (ignore chroot))
   (let ((environment (session-environment channel)))
     (if (channel-pty-p channel)
         (multiple-value-bind (pid input output console)
@@ -312,11 +315,12 @@ SSH_ORIGINAL_COMMAND."
                         :input-handle input :output-handle output
                         :stderr-handle error))))))
 
-(defun start-login-shell (channel)
+(defun start-login-shell (channel &key chroot)
   "Run the login shell, on the pty when one was requested.
 
 A non-pty login shell keeps its stdout and stderr separate, as sshd does for
 -T; a pty merges them, as a terminal does."
+  (declare (ignore chroot))
   (if (channel-pty-p channel)
       (start-command channel nil)
       (start-program channel (windows-shell) nil)))

@@ -3045,13 +3045,13 @@ guess, so only an explicit PidFile is written."
            #-win32
            (lambda (session) (start-agent-forward session))
            #+win32
-           (lambda (session)
-             (declare (ignore session))
-             nil)
+           (lambda (session) (start-agent-forward session))
            ;; X11 forwarding: the library binds the display listener and asks
            ;; where to record the account's fake cookie.
            #-win32
-           :x11-authority-file #'x11-authority-file
+           :x11-authority-file
+           #-win32
+           #'x11-authority-file
            #+win32
            :x11-authority-file
            #+win32

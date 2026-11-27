@@ -454,12 +454,17 @@ STDOUT and STDERR the handles we read."
           (c-close-handle child-out-write)
           (c-close-handle child-err-write))))))
 
-(defun spawn-shell (command &key environment)
-  "Run COMMAND through cmd.exe; return (VALUES PID STDIN STDOUT STDERR)."
+(defun spawn-shell (command &key environment chroot)
+  "Run COMMAND through cmd.exe; return (VALUES PID STDIN STDOUT STDERR).
+
+CHROOT is accepted for the shared application path and ignored: Windows has
+no chroot, and safely-chroot-path-p refuses one before this point."
+  (declare (ignore chroot))
   (spawn-with-pipes (shell-command-line command) environment))
 
-(defun spawn-program (program arguments &key environment)
+(defun spawn-program (program arguments &key environment chroot)
   "Run PROGRAM with ARGUMENTS, no shell interpretation."
+  (declare (ignore chroot))
   (spawn-with-pipes
    (windows-command-line (cons program arguments))
    environment))
@@ -522,15 +527,17 @@ the packed value is what the foreign call already expects."
         (close-child-fd output-read)
         (error condition)))))
 
-(defun spawn-pty-shell (command shell &key environment rows columns)
+(defun spawn-pty-shell (command shell &key environment rows columns chroot)
   "Run COMMAND (or the login shell) on a ConPTY."
+  (declare (ignore chroot))
   (let ((shell (or shell (windows-shell))))
     (spawn-pty (if (and command (plusp (length command)))
                    (shell-command-line command)
                    (quote-windows-argument shell))
                environment (or rows 24) (or columns 80))))
 
-(defun spawn-pty-program (program arguments &key environment rows columns)
+(defun spawn-pty-program (program arguments &key environment rows columns chroot)
+  (declare (ignore chroot))
   (spawn-pty (windows-command-line (cons program arguments))
              environment (or rows 24) (or columns 80)))
 
